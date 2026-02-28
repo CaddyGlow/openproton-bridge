@@ -1,5 +1,9 @@
 # OpenProton Bridge -- Rust Implementation Plan
 
+## Active Workstream
+
+- Multi-user foundation with direct implementation of split-address mode and event-stream sync is tracked in [MULTIUSER_SPLIT_EVENT_PLAN.md](MULTIUSER_SPLIT_EVENT_PLAN.md).
+
 ## Context
 
 Proton Mail Bridge is a Go application that exposes local IMAP/SMTP servers, allowing standard email clients to access Proton Mail. The official bridge requires a paid account. This project reimplements the bridge in Rust as a headless CLI daemon that supports free Proton accounts.

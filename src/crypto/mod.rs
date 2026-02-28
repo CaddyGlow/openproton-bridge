@@ -1,4 +1,5 @@
 pub mod decrypt;
+pub mod encrypt;
 pub mod keys;
 
 use thiserror::Error;
@@ -16,6 +17,15 @@ pub enum CryptoError {
 
     #[error("decryption failed: {0}")]
     DecryptionFailed(String),
+
+    #[error("encryption failed: {0}")]
+    EncryptionFailed(String),
+
+    #[error("signing failed: {0}")]
+    SigningFailed(String),
+
+    #[error("session key error: {0}")]
+    SessionKeyError(String),
 
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),

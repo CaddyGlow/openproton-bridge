@@ -1,4 +1,4 @@
-use std::io::Read;
+use std::io::{Read, Write};
 
 use openpgp::crypto::{Password, SessionKey};
 use openpgp::parse::stream::{
@@ -6,6 +6,7 @@ use openpgp::parse::stream::{
 };
 use openpgp::parse::Parse;
 use openpgp::policy::StandardPolicy;
+use openpgp::serialize::stream::{Encryptor2, LiteralWriter, Message, Signer};
 use openpgp::types::SymmetricAlgorithm;
 use openpgp::Cert;
 use sequoia_openpgp as openpgp;
@@ -18,7 +19,7 @@ use super::{CryptoError, Result};
 /// An unlocked PGP key: the cert plus the password needed to access secret key material.
 pub struct UnlockedKey {
     pub cert: Cert,
-    password: Password,
+    pub(crate) password: Password,
 }
 
 impl UnlockedKey {
@@ -32,7 +33,7 @@ impl UnlockedKey {
 
 /// A collection of unlocked keys that can decrypt messages.
 pub struct Keyring {
-    keys: Vec<UnlockedKey>,
+    pub(crate) keys: Vec<UnlockedKey>,
 }
 
 impl Keyring {
@@ -42,6 +43,102 @@ impl Keyring {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Get a reference to the first unlocked key.
+    pub fn first_key(&self) -> Result<&UnlockedKey> {
+        self.keys.first().ok_or(CryptoError::NoActiveKey)
+    }
+
+    /// Encrypt plaintext to the first key, return armored PGP message.
+    pub fn encrypt_armored(&self, plaintext: &[u8]) -> Result<String> {
+        let key = self.first_key()?;
+        let policy = StandardPolicy::new();
+        let recipients = key
+            .cert
+            .keys()
+            .with_policy(&policy, None)
+            .supported()
+            .for_transport_encryption()
+            .for_storage_encryption();
+
+        let mut ciphertext = Vec::new();
+        let message = Message::new(&mut ciphertext);
+        let armorer = openpgp::serialize::stream::Armorer::new(message)
+            .kind(openpgp::armor::Kind::Message)
+            .build()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("armorer: {}", e)))?;
+        let encryptor = Encryptor2::for_recipients(armorer, recipients)
+            .build()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("encryptor: {}", e)))?;
+        let mut writer = LiteralWriter::new(encryptor)
+            .build()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("literal: {}", e)))?;
+        writer
+            .write_all(plaintext)
+            .map_err(|e| CryptoError::EncryptionFailed(format!("write: {}", e)))?;
+        writer
+            .finalize()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("finalize: {}", e)))?;
+
+        String::from_utf8(ciphertext)
+            .map_err(|e| CryptoError::EncryptionFailed(format!("utf8: {}", e)))
+    }
+
+    /// Encrypt and sign plaintext to the first key, return binary PGP message.
+    pub fn encrypt_and_sign(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let key = self.first_key()?;
+        let policy = StandardPolicy::new();
+        let recipients = key
+            .cert
+            .keys()
+            .with_policy(&policy, None)
+            .supported()
+            .for_transport_encryption()
+            .for_storage_encryption();
+
+        // Get a signing-capable key
+        let signing_ka = key
+            .cert
+            .keys()
+            .with_policy(&policy, None)
+            .supported()
+            .secret()
+            .for_signing()
+            .next()
+            .ok_or_else(|| CryptoError::SigningFailed("no signing key".to_string()))?;
+
+        let signing_secret = signing_ka
+            .key()
+            .clone()
+            .parts_into_secret()
+            .map_err(|e| CryptoError::SigningFailed(format!("parts_into_secret: {}", e)))?;
+        let signing_decrypted = signing_secret
+            .decrypt_secret(&key.password)
+            .map_err(|e| CryptoError::SigningFailed(format!("decrypt signing key: {}", e)))?;
+        let keypair = signing_decrypted
+            .into_keypair()
+            .map_err(|e| CryptoError::SigningFailed(format!("keypair: {}", e)))?;
+
+        let mut ciphertext = Vec::new();
+        let message = Message::new(&mut ciphertext);
+        let encryptor = Encryptor2::for_recipients(message, recipients)
+            .build()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("encryptor: {}", e)))?;
+        let signer = Signer::new(encryptor, keypair)
+            .build()
+            .map_err(|e| CryptoError::SigningFailed(format!("signer: {}", e)))?;
+        let mut writer = LiteralWriter::new(signer)
+            .build()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("literal: {}", e)))?;
+        writer
+            .write_all(plaintext)
+            .map_err(|e| CryptoError::EncryptionFailed(format!("write: {}", e)))?;
+        writer
+            .finalize()
+            .map_err(|e| CryptoError::EncryptionFailed(format!("finalize: {}", e)))?;
+
+        Ok(ciphertext)
     }
 
     /// Decrypt an armored PGP message.

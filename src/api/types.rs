@@ -161,7 +161,7 @@ pub struct Session {
     pub bridge_password: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EmailAddress {
     pub name: String,
@@ -235,6 +235,112 @@ pub struct MessageFilter {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub end_id: Option<String>,
     pub desc: i32,
+}
+
+// Encryption scheme constants (bitmask)
+pub const INTERNAL_SCHEME: i32 = 1;
+pub const CLEAR_SCHEME: i32 = 4;
+pub const PGP_INLINE_SCHEME: i32 = 8;
+pub const PGP_MIME_SCHEME: i32 = 16;
+pub const CLEAR_MIME_SCHEME: i32 = 32;
+
+// Signature type constants
+pub const NO_SIGNATURE: i32 = 0;
+pub const DETACHED_SIGNATURE: i32 = 1;
+
+// Recipient type constants
+pub const RECIPIENT_INTERNAL: i32 = 1;
+pub const RECIPIENT_EXTERNAL: i32 = 2;
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct DraftTemplate {
+    pub subject: String,
+    pub sender: EmailAddress,
+    pub to_list: Vec<EmailAddress>,
+    #[serde(rename = "CCList")]
+    pub cc_list: Vec<EmailAddress>,
+    #[serde(rename = "BCCList")]
+    pub bcc_list: Vec<EmailAddress>,
+    pub body: String,
+    #[serde(rename = "MIMEType")]
+    pub mime_type: String,
+    pub unread: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct CreateDraftReq {
+    pub message: DraftTemplate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    pub action: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SendDraftReq {
+    pub packages: Vec<MessagePackage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MessagePackage {
+    pub addresses: std::collections::HashMap<String, MessageRecipient>,
+    #[serde(rename = "MIMEType")]
+    pub mime_type: String,
+    #[serde(rename = "Type")]
+    pub package_type: i32,
+    pub body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_key: Option<SessionKeyInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_keys: Option<std::collections::HashMap<String, SessionKeyInfo>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct MessageRecipient {
+    #[serde(rename = "Type")]
+    pub recipient_type: i32,
+    pub signature: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body_key_packet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_key_packets: Option<std::collections::HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SessionKeyInfo {
+    pub key: String,
+    pub algorithm: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PublicKeysResponse {
+    pub keys: Vec<PublicKeyInfo>,
+    pub recipient_type: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct PublicKeyInfo {
+    pub flags: i32,
+    pub public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SendDraftResponse {
+    pub sent: Message,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct AttachmentResponse {
+    pub attachment: Attachment,
 }
 
 #[cfg(test)]
@@ -547,5 +653,191 @@ mod tests {
         assert_eq!(json["LabelID"], "0");
         assert_eq!(json["Desc"], 1);
         assert!(json.get("EndID").is_none());
+    }
+
+    #[test]
+    fn test_email_address_serialize() {
+        let addr = EmailAddress {
+            name: "Alice".to_string(),
+            address: "alice@proton.me".to_string(),
+        };
+        let json = serde_json::to_value(&addr).unwrap();
+        assert_eq!(json["Name"], "Alice");
+        assert_eq!(json["Address"], "alice@proton.me");
+    }
+
+    #[test]
+    fn test_draft_template_serialize() {
+        let draft = DraftTemplate {
+            subject: "Test".to_string(),
+            sender: EmailAddress {
+                name: "Alice".to_string(),
+                address: "alice@proton.me".to_string(),
+            },
+            to_list: vec![EmailAddress {
+                name: "Bob".to_string(),
+                address: "bob@proton.me".to_string(),
+            }],
+            cc_list: vec![],
+            bcc_list: vec![],
+            body: "encrypted body".to_string(),
+            mime_type: "text/plain".to_string(),
+            unread: 0,
+        };
+        let json = serde_json::to_value(&draft).unwrap();
+        assert_eq!(json["Subject"], "Test");
+        assert_eq!(json["Sender"]["Name"], "Alice");
+        assert_eq!(json["ToList"][0]["Address"], "bob@proton.me");
+        assert_eq!(json["MIMEType"], "text/plain");
+    }
+
+    #[test]
+    fn test_create_draft_req_serialize() {
+        let req = CreateDraftReq {
+            message: DraftTemplate {
+                subject: "Hello".to_string(),
+                sender: EmailAddress {
+                    name: "Me".to_string(),
+                    address: "me@proton.me".to_string(),
+                },
+                to_list: vec![],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "body".to_string(),
+                mime_type: "text/html".to_string(),
+                unread: 0,
+            },
+            parent_id: None,
+            action: 0,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["Message"]["Subject"], "Hello");
+        assert_eq!(json["Action"], 0);
+        assert!(json.get("ParentID").is_none());
+    }
+
+    #[test]
+    fn test_message_package_serialize() {
+        let mut addresses = std::collections::HashMap::new();
+        addresses.insert(
+            "bob@proton.me".to_string(),
+            MessageRecipient {
+                recipient_type: INTERNAL_SCHEME,
+                signature: DETACHED_SIGNATURE,
+                body_key_packet: Some("base64packet".to_string()),
+                attachment_key_packets: None,
+            },
+        );
+
+        let pkg = MessagePackage {
+            addresses,
+            mime_type: "text/plain".to_string(),
+            package_type: INTERNAL_SCHEME,
+            body: "base64body".to_string(),
+            body_key: None,
+            attachment_keys: None,
+        };
+
+        let json = serde_json::to_value(&pkg).unwrap();
+        assert_eq!(json["MIMEType"], "text/plain");
+        assert_eq!(json["Type"], 1);
+        assert_eq!(json["Body"], "base64body");
+        let bob = &json["Addresses"]["bob@proton.me"];
+        assert_eq!(bob["Type"], 1);
+        assert_eq!(bob["Signature"], 1);
+        assert_eq!(bob["BodyKeyPacket"], "base64packet");
+    }
+
+    #[test]
+    fn test_session_key_info_round_trip() {
+        let key_info = SessionKeyInfo {
+            key: "base64key".to_string(),
+            algorithm: "aes256".to_string(),
+        };
+        let json = serde_json::to_string(&key_info).unwrap();
+        let restored: SessionKeyInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.key, "base64key");
+        assert_eq!(restored.algorithm, "aes256");
+    }
+
+    #[test]
+    fn test_public_keys_response_deserialize() {
+        let json = serde_json::json!({
+            "Code": 1000,
+            "Keys": [{
+                "Flags": 3,
+                "PublicKey": "-----BEGIN PGP PUBLIC KEY BLOCK-----\nfake\n-----END PGP PUBLIC KEY BLOCK-----"
+            }],
+            "RecipientType": 1
+        });
+        let resp: PublicKeysResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.keys.len(), 1);
+        assert_eq!(resp.keys[0].flags, 3);
+        assert_eq!(resp.recipient_type, RECIPIENT_INTERNAL);
+    }
+
+    #[test]
+    fn test_send_draft_response_deserialize() {
+        let json = serde_json::json!({
+            "Code": 1000,
+            "Sent": {
+                "ID": "sent-1",
+                "AddressID": "addr-1",
+                "LabelIDs": ["2"],
+                "Subject": "Sent msg",
+                "Sender": { "Name": "Alice", "Address": "alice@proton.me" },
+                "ToList": [{ "Name": "Bob", "Address": "bob@proton.me" }],
+                "CCList": [],
+                "BCCList": [],
+                "Time": 1700000000,
+                "Size": 512,
+                "Unread": 0,
+                "NumAttachments": 0,
+                "Header": "",
+                "Body": "encrypted",
+                "MIMEType": "text/plain",
+                "Attachments": []
+            }
+        });
+        let resp: SendDraftResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.sent.metadata.id, "sent-1");
+        assert_eq!(resp.sent.metadata.subject, "Sent msg");
+    }
+
+    #[test]
+    fn test_attachment_response_deserialize() {
+        let json = serde_json::json!({
+            "Code": 1000,
+            "Attachment": {
+                "ID": "att-1",
+                "Name": "file.txt",
+                "Size": 100,
+                "MIMEType": "text/plain",
+                "KeyPackets": "base64kp"
+            }
+        });
+        let resp: AttachmentResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.attachment.id, "att-1");
+        assert_eq!(resp.attachment.name, "file.txt");
+    }
+
+    #[test]
+    fn test_send_draft_req_serialize() {
+        let req = SendDraftReq {
+            packages: vec![MessagePackage {
+                addresses: std::collections::HashMap::new(),
+                mime_type: "text/plain".to_string(),
+                package_type: CLEAR_SCHEME,
+                body: "body64".to_string(),
+                body_key: Some(SessionKeyInfo {
+                    key: "sk".to_string(),
+                    algorithm: "aes256".to_string(),
+                }),
+                attachment_keys: None,
+            }],
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["Packages"][0]["Type"], 4);
+        assert_eq!(json["Packages"][0]["BodyKey"]["Key"], "sk");
     }
 }

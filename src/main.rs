@@ -46,11 +46,14 @@ enum Command {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
-    /// Start the IMAP server
+    /// Start the IMAP and SMTP servers
     Serve {
         /// IMAP port to listen on
         #[arg(long, default_value = "1143")]
         imap_port: u16,
+        /// SMTP port to listen on
+        #[arg(long, default_value = "1025")]
+        smtp_port: u16,
         /// Address to bind to
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
@@ -79,9 +82,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Fetch { limit } => cmd_fetch(limit, &dir).await,
         Command::Serve {
             imap_port,
+            smtp_port,
             bind,
             no_tls,
-        } => cmd_serve(imap_port, &bind, no_tls, &dir).await,
+        } => cmd_serve(imap_port, smtp_port, &bind, no_tls, &dir).await,
     }
 }
 
@@ -326,6 +330,7 @@ async fn cmd_fetch(limit: usize, dir: &std::path::Path) -> anyhow::Result<()> {
 
 async fn cmd_serve(
     imap_port: u16,
+    smtp_port: u16,
     bind: &str,
     no_tls: bool,
     dir: &std::path::Path,
@@ -360,30 +365,53 @@ async fn cmd_serve(
 
     let store = imap::store::InMemoryStore::new();
 
-    let config = imap::session::SessionConfig {
-        session,
+    let imap_config = imap::session::SessionConfig {
+        session: session.clone(),
         bridge_password: bridge_password.clone(),
         store,
     };
 
-    let config = Arc::new(config);
+    let imap_config = Arc::new(imap_config);
+
+    let smtp_config = smtp::session::SmtpSessionConfig {
+        session,
+        bridge_password: bridge_password.clone(),
+    };
+
+    let smtp_config = Arc::new(smtp_config);
 
     if !no_tls {
         let cert_dir = dir.join("tls");
-        let _server = imap::server::ImapServer::new().with_tls(&cert_dir)?;
+        let _imap_server = imap::server::ImapServer::new().with_tls(&cert_dir)?;
+        let _smtp_server = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
     }
 
-    let addr = format!("{}:{}", bind, imap_port);
+    let imap_addr = format!("{}:{}", bind, imap_port);
+    let smtp_addr = format!("{}:{}", bind, smtp_port);
 
     println!("IMAP server configuration:");
     println!("  Server: {}", bind);
     println!("  Port: {}", imap_port);
     println!("  Security: {}", if no_tls { "None" } else { "STARTTLS" });
-    println!("  Username: {}", config.session.email);
+    println!("  Username: {}", imap_config.session.email);
+    println!("  Password: {}", bridge_password);
+    println!();
+    println!("SMTP server configuration:");
+    println!("  Server: {}", bind);
+    println!("  Port: {}", smtp_port);
+    println!("  Security: {}", if no_tls { "None" } else { "STARTTLS" });
+    println!("  Username: {}", smtp_config.session.email);
     println!("  Password: {}", bridge_password);
     println!();
 
-    imap::server::run_server(&addr, config).await?;
+    tokio::select! {
+        result = imap::server::run_server(&imap_addr, imap_config) => {
+            result?;
+        }
+        result = smtp::server::run_server(&smtp_addr, smtp_config) => {
+            result?;
+        }
+    }
 
     Ok(())
 }

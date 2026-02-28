@@ -41,7 +41,6 @@ mod tests {
     use openpgp::parse::Parse;
     use openpgp::policy::StandardPolicy;
     use openpgp::serialize::stream::{Encryptor2, LiteralWriter, Message};
-    use openpgp::serialize::Serialize as _;
     use sequoia_openpgp as openpgp;
     use std::io::Write;
 

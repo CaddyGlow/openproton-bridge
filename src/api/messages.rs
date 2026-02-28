@@ -2,7 +2,10 @@ use tracing::info;
 
 use super::client::{check_api_response, ProtonClient};
 use super::error::Result;
-use super::types::{MessageFilter, MessageResponse, MessagesMetadataResponse};
+use super::types::{
+    AttachmentResponse, CreateDraftReq, MessageFilter, MessageResponse, MessagesMetadataResponse,
+    SendDraftReq, SendDraftResponse,
+};
 
 /// Fetch a full message including encrypted body and attachment metadata.
 ///
@@ -129,6 +132,95 @@ pub async fn unlabel_messages(client: &ProtonClient, ids: &[&str], label_id: &st
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     Ok(())
+}
+
+/// Create a draft message with an encrypted body.
+///
+/// Reference: go-proton-api/message_send.go CreateDraft
+pub async fn create_draft(client: &ProtonClient, req: &CreateDraftReq) -> Result<MessageResponse> {
+    info!("creating draft");
+    let resp = client.post("/mail/v4/messages").json(req).send().await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let msg_resp: MessageResponse = serde_json::from_value(json)?;
+    Ok(msg_resp)
+}
+
+/// Parameters for uploading an encrypted attachment.
+pub struct UploadAttachmentReq {
+    pub message_id: String,
+    pub filename: String,
+    pub mime_type: String,
+    pub disposition: String,
+    pub content_id: String,
+    pub key_packets: Vec<u8>,
+    pub data_packet: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
+/// Upload an encrypted attachment to a draft message.
+///
+/// Reference: go-proton-api/attachment.go UploadAttachment
+pub async fn upload_attachment(
+    client: &ProtonClient,
+    req: UploadAttachmentReq,
+) -> Result<AttachmentResponse> {
+    info!(message_id = %req.message_id, filename = %req.filename, "uploading attachment");
+
+    let form = reqwest::multipart::Form::new()
+        .text("MessageID", req.message_id)
+        .text("Filename", req.filename)
+        .text("MIMEType", req.mime_type)
+        .text("Disposition", req.disposition)
+        .text("ContentID", req.content_id)
+        .part(
+            "KeyPackets",
+            reqwest::multipart::Part::bytes(req.key_packets)
+                .file_name("blob")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        )
+        .part(
+            "DataPacket",
+            reqwest::multipart::Part::bytes(req.data_packet)
+                .file_name("blob")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        )
+        .part(
+            "Signature",
+            reqwest::multipart::Part::bytes(req.signature)
+                .file_name("blob")
+                .mime_str("application/octet-stream")
+                .unwrap(),
+        );
+
+    let resp = client
+        .post("/mail/v4/attachments")
+        .multipart(form)
+        .send()
+        .await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let att_resp: AttachmentResponse = serde_json::from_value(json)?;
+    Ok(att_resp)
+}
+
+/// Send a draft message with encryption packages.
+///
+/// Reference: go-proton-api/message_send.go SendDraft
+pub async fn send_draft(
+    client: &ProtonClient,
+    draft_id: &str,
+    req: &SendDraftReq,
+) -> Result<SendDraftResponse> {
+    info!(draft_id = %draft_id, "sending draft");
+    let path = format!("/mail/v4/messages/{}", draft_id);
+    let resp = client.post(&path).json(req).send().await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let send_resp: SendDraftResponse = serde_json::from_value(json)?;
+    Ok(send_resp)
 }
 
 #[cfg(test)]
@@ -337,5 +429,164 @@ mod tests {
 
         let bytes = get_attachment(&client, "att-456").await.unwrap();
         assert_eq!(bytes, raw_data);
+    }
+
+    #[tokio::test]
+    async fn test_create_draft() {
+        use super::super::types::{CreateDraftReq, DraftTemplate, EmailAddress};
+
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Message": {
+                    "ID": "draft-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["1", "8"],
+                    "Subject": "Test Draft",
+                    "Sender": { "Name": "Alice", "Address": "alice@proton.me" },
+                    "ToList": [{ "Name": "Bob", "Address": "bob@proton.me" }],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 256,
+                    "Unread": 0,
+                    "NumAttachments": 0,
+                    "Header": "",
+                    "Body": "encrypted",
+                    "MIMEType": "text/plain",
+                    "Attachments": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let req = CreateDraftReq {
+            message: DraftTemplate {
+                subject: "Test Draft".to_string(),
+                sender: EmailAddress {
+                    name: "Alice".to_string(),
+                    address: "alice@proton.me".to_string(),
+                },
+                to_list: vec![EmailAddress {
+                    name: "Bob".to_string(),
+                    address: "bob@proton.me".to_string(),
+                }],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "encrypted body".to_string(),
+                mime_type: "text/plain".to_string(),
+                unread: 0,
+            },
+            parent_id: None,
+            action: 0,
+        };
+
+        let resp = create_draft(&client, &req).await.unwrap();
+        assert_eq!(resp.message.metadata.id, "draft-1");
+        assert_eq!(resp.message.metadata.subject, "Test Draft");
+    }
+
+    #[tokio::test]
+    async fn test_create_draft_api_error() {
+        use super::super::types::{CreateDraftReq, DraftTemplate, EmailAddress};
+
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 2500,
+                "Error": "Draft creation failed"
+            })))
+            .mount(&server)
+            .await;
+
+        let req = CreateDraftReq {
+            message: DraftTemplate {
+                subject: "Bad".to_string(),
+                sender: EmailAddress {
+                    name: "".to_string(),
+                    address: "bad".to_string(),
+                },
+                to_list: vec![],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "".to_string(),
+                mime_type: "text/plain".to_string(),
+                unread: 0,
+            },
+            parent_id: None,
+            action: 0,
+        };
+
+        let err = create_draft(&client, &req).await.unwrap_err();
+        assert!(err.to_string().contains("Draft creation failed"));
+    }
+
+    #[tokio::test]
+    async fn test_send_draft() {
+        use super::super::types::SendDraftReq;
+
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages/draft-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Sent": {
+                    "ID": "sent-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["2", "7"],
+                    "Subject": "Sent Email",
+                    "Sender": { "Name": "Alice", "Address": "alice@proton.me" },
+                    "ToList": [{ "Name": "Bob", "Address": "bob@proton.me" }],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 512,
+                    "Unread": 0,
+                    "NumAttachments": 0,
+                    "Header": "",
+                    "Body": "encrypted",
+                    "MIMEType": "text/plain",
+                    "Attachments": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let req = SendDraftReq { packages: vec![] };
+
+        let resp = send_draft(&client, "draft-1", &req).await.unwrap();
+        assert_eq!(resp.sent.metadata.id, "sent-1");
+        assert_eq!(resp.sent.metadata.subject, "Sent Email");
+    }
+
+    #[tokio::test]
+    async fn test_send_draft_api_error() {
+        use super::super::types::SendDraftReq;
+
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages/draft-bad"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 2501,
+                "Error": "Draft not found"
+            })))
+            .mount(&server)
+            .await;
+
+        let req = SendDraftReq { packages: vec![] };
+
+        let err = send_draft(&client, "draft-bad", &req).await.unwrap_err();
+        assert!(err.to_string().contains("Draft not found"));
     }
 }

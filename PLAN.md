@@ -3,6 +3,21 @@
 ## Active Workstream
 
 - Multi-user foundation with direct implementation of split-address mode and event-stream sync is tracked in [MULTIUSER_SPLIT_EVENT_PLAN.md](MULTIUSER_SPLIT_EVENT_PLAN.md).
+- Progress update (2026-02-28): IMAP change signaling now supports both `NOOP` and baseline `IDLE` (`DONE` terminate + `EXISTS` updates from account-scoped store changes).
+- Progress update (2026-02-28): event `Refresh` handling now performs bounded per-account metadata resync and persists checkpoint state as `refresh_resync`.
+- Progress update (2026-02-28): event checkpoints are now persisted in encrypted vault user records (`EventID` + `LastEventTS` + `SyncState`) and reloaded on `serve` for restart continuity.
+- Progress update (2026-02-28): event workers now support coordinated shutdown/join with timeout+abort fallback, and `serve` uses graceful worker stop.
+- Progress update (2026-02-28): event workers now classify poll failures, set per-account health (`Degraded`/`Unavailable`), and use exponential backoff with jitter before retries.
+- Progress update (2026-02-28): per-account worker observability counters added (`auth/transient/permanent` failures, poll totals, recovery logs, periodic stats logs).
+- Progress update (2026-02-28): worker-group isolation test added to verify one unavailable account does not block healthy account event polling/checkpoint progression.
+- Progress update (2026-02-28): restart continuity test added for vault-backed checkpoints, verifying worker resumes polling from persisted cursor after restart.
+- Progress update (2026-02-28): README and multi-user plan docs updated for actual CLI/runtime behavior (`serve`, multi-account auth, vault-backed checkpoints, health/backoff observability).
+- Progress update (2026-02-28): added `serve --event-poll-secs` to tune per-account event worker polling interval (default 30s).
+- Progress update (2026-02-28): Phase 8 event hardening started by fixing Proton numeric action handling (`EventDelete=0`) and adding parser fallback for parent-scoped `Message` events.
+- Progress update (2026-02-28): event parser now also handles scalar/null map-style `Messages` entries for compatibility across payload variants (including null->delete semantics).
+- Progress update (2026-02-28): README operator runbook/troubleshooting section added with concrete multi-account commands and runtime behavior checks.
+- Progress update (2026-02-28): event workers now apply deterministic per-account initial poll staggering (bounded) to reduce startup API burst for high account counts.
+- Progress update (2026-02-28): label events now trigger bounded account resync (`label_resync`) so label-topology changes don't leave stale mailbox projections.
 
 ## Context
 

@@ -72,6 +72,9 @@ enum Command {
         /// Disable TLS (plaintext only)
         #[arg(long)]
         no_tls: bool,
+        /// Event worker poll interval in seconds
+        #[arg(long, default_value = "30")]
+        event_poll_secs: u64,
     },
 }
 
@@ -112,7 +115,8 @@ async fn main() -> anyhow::Result<()> {
             smtp_port,
             bind,
             no_tls,
-        } => cmd_serve(imap_port, smtp_port, &bind, no_tls, &dir).await,
+            event_poll_secs,
+        } => cmd_serve(imap_port, smtp_port, &bind, no_tls, event_poll_secs, &dir).await,
     }
 }
 
@@ -246,13 +250,15 @@ fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::
         return Ok(());
     }
 
-    if all || email.is_none() {
+    if all {
         vault::remove_session(dir)?;
         println!("Logged out all accounts");
-    } else {
-        let email = email.expect("checked is_some");
+    } else if let Some(email) = email {
         vault::remove_session_by_email(dir, email)?;
         println!("Removed account: {}", email);
+    } else {
+        vault::remove_session(dir)?;
+        println!("Logged out all accounts");
     }
     Ok(())
 }
@@ -398,6 +404,7 @@ async fn cmd_serve(
     smtp_port: u16,
     bind: &str,
     no_tls: bool,
+    event_poll_secs: u64,
     dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     // Reject --no-tls with non-loopback bind address
@@ -571,7 +578,7 @@ async fn cmd_serve(
         auth_router.clone(),
         event_store,
         checkpoint_store,
-        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(event_poll_secs),
     );
 
     let health_task = tokio::spawn(report_runtime_health_periodically(runtime_accounts.clone()));
@@ -796,6 +803,19 @@ mod tests {
                 _ => panic!("expected accounts use subcommand"),
             },
             _ => panic!("expected accounts command"),
+        }
+    }
+
+    #[test]
+    fn parse_serve_event_poll_secs_flag() {
+        let cli =
+            Cli::try_parse_from(["openproton-bridge", "serve", "--event-poll-secs", "10"]).unwrap();
+
+        match cli.command {
+            Command::Serve {
+                event_poll_secs, ..
+            } => assert_eq!(event_poll_secs, 10),
+            _ => panic!("expected serve command"),
         }
     }
 }

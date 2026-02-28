@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn test_verify_server_proof_mismatch() {
         let expected = vec![1, 2, 3, 4];
-        let wrong = BASE64.encode(&[5, 6, 7, 8]);
+        let wrong = BASE64.encode([5, 6, 7, 8]);
         let err = verify_server_proof(&expected, &wrong).unwrap_err();
         assert!(err.to_string().contains("server proof verification failed"));
     }

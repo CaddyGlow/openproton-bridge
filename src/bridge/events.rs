@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -203,6 +204,7 @@ const RESYNC_PAGE_SIZE: i32 = 150;
 const RESYNC_MAX_PAGES_PER_MAILBOX: usize = 4;
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_STATS_LOG_EVERY_ATTEMPTS: u64 = 20;
+const MAX_INITIAL_POLL_STAGGER_MS: u64 = 250;
 
 pub struct EventWorkerGroup {
     shutdown_tx: watch::Sender<bool>,
@@ -212,6 +214,10 @@ pub struct EventWorkerGroup {
 impl EventWorkerGroup {
     pub fn len(&self) -> usize {
         self.handles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.handles.is_empty()
     }
 
     pub async fn shutdown(self) {
@@ -315,6 +321,24 @@ fn compute_failure_delay(
     base_delay + Duration::from_millis(jitter_ms.min(500))
 }
 
+fn compute_initial_poll_stagger(account_id: &AccountId, poll_interval: Duration) -> Duration {
+    if poll_interval.is_zero() {
+        return Duration::ZERO;
+    }
+
+    let max_stagger_ms = (poll_interval
+        .as_millis()
+        .min(MAX_INITIAL_POLL_STAGGER_MS as u128)) as u64;
+    if max_stagger_ms == 0 {
+        return Duration::ZERO;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account_id.0.hash(&mut hasher);
+    let stagger_ms = hasher.finish() % (max_stagger_ms + 1);
+    Duration::from_millis(stagger_ms)
+}
+
 #[derive(Clone)]
 pub struct EventWorkerConfig {
     pub account_id: AccountId,
@@ -353,8 +377,11 @@ impl EventWorkerConfig {
 enum EventDelta {
     MessageUpsert(String),
     MessageDelete(String),
+    LabelsChanged,
     AddressesChanged,
 }
+
+const EVENT_ACTION_DELETE: i64 = 0;
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -374,7 +401,23 @@ fn extract_message_id(value: &serde_json::Value, fallback_key: Option<&str>) -> 
     fallback_key.map(str::to_string)
 }
 
-fn is_delete_action(value: &serde_json::Value) -> bool {
+fn is_delete_action(
+    value: &serde_json::Value,
+    fallback_action_source: Option<&serde_json::Value>,
+) -> bool {
+    if let Some(code) = value.as_i64() {
+        return code == EVENT_ACTION_DELETE;
+    }
+    if let Some(name) = value.as_str() {
+        if name.trim() == "0" {
+            return true;
+        }
+        let name = name.to_ascii_lowercase();
+        if name.contains("delete") || name.contains("remove") {
+            return true;
+        }
+    }
+
     if value
         .get("Deleted")
         .and_then(|v| v.as_bool())
@@ -389,11 +432,17 @@ fn is_delete_action(value: &serde_json::Value) -> bool {
     {
         return true;
     }
-    if let Some(action) = value.get("Action") {
+    if let Some(action) = value
+        .get("Action")
+        .or_else(|| fallback_action_source.and_then(|v| v.get("Action")))
+    {
         if let Some(code) = action.as_i64() {
-            return code == 2 || code == 3;
+            return code == EVENT_ACTION_DELETE;
         }
         if let Some(name) = action.as_str() {
+            if name.trim() == "0" {
+                return true;
+            }
             let name = name.to_ascii_lowercase();
             return name.contains("delete") || name.contains("remove");
         }
@@ -402,32 +451,40 @@ fn is_delete_action(value: &serde_json::Value) -> bool {
 }
 
 fn parse_message_deltas(payload: &serde_json::Value, out: &mut Vec<EventDelta>) {
-    let mut push_message_delta = |entry: &serde_json::Value, fallback_key: Option<&str>| {
-        let Some(message_id) = extract_message_id(entry, fallback_key) else {
-            return;
+    let mut push_message_delta =
+        |entry: &serde_json::Value,
+         fallback_key: Option<&str>,
+         fallback_action_source: Option<&serde_json::Value>| {
+            let Some(message_id) = extract_message_id(entry, fallback_key) else {
+                return;
+            };
+            if fallback_key.is_some() && entry.is_null() {
+                out.push(EventDelta::MessageDelete(message_id));
+                return;
+            }
+            if is_delete_action(entry, fallback_action_source) {
+                out.push(EventDelta::MessageDelete(message_id));
+            } else {
+                out.push(EventDelta::MessageUpsert(message_id));
+            }
         };
-        if is_delete_action(entry) {
-            out.push(EventDelta::MessageDelete(message_id));
-        } else {
-            out.push(EventDelta::MessageUpsert(message_id));
-        }
-    };
 
     if let Some(messages) = payload.get("Messages") {
         if let Some(array) = messages.as_array() {
             for entry in array {
-                push_message_delta(entry, None);
+                push_message_delta(entry, None, Some(payload));
             }
         } else if let Some(object) = messages.as_object() {
             for (message_id, entry) in object {
-                push_message_delta(entry, Some(message_id));
+                push_message_delta(entry, Some(message_id), Some(payload));
             }
         }
     }
 
     if let Some(message) = payload.get("Message") {
         if message.is_object() {
-            push_message_delta(message, None);
+            let fallback_id = payload.get("ID").and_then(|v| v.as_str());
+            push_message_delta(message, fallback_id, Some(payload));
         }
     }
 }
@@ -435,6 +492,10 @@ fn parse_message_deltas(payload: &serde_json::Value, out: &mut Vec<EventDelta>) 
 fn parse_event_deltas(payload: &serde_json::Value) -> Vec<EventDelta> {
     let mut out = Vec::new();
     parse_message_deltas(payload, &mut out);
+
+    if payload.get("Labels").is_some() || payload.get("Label").is_some() {
+        out.push(EventDelta::LabelsChanged);
+    }
 
     if payload.get("Addresses").is_some() || payload.get("Address").is_some() {
         out.push(EventDelta::AddressesChanged);
@@ -574,7 +635,7 @@ async fn apply_metadata_to_store(
                 .store_metadata(&scoped, &metadata.id, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-            let flags = mailbox::message_flags(&metadata)
+            let flags = mailbox::message_flags(metadata)
                 .iter()
                 .map(|f| f.to_string())
                 .collect::<Vec<_>>();
@@ -613,8 +674,7 @@ async fn bounded_resync_account(
             continue;
         }
 
-        let mut page = 0i32;
-        for _ in 0..RESYNC_MAX_PAGES_PER_MAILBOX {
+        for page in 0..RESYNC_MAX_PAGES_PER_MAILBOX {
             let filter = MessageFilter {
                 label_id: Some(mb.label_id.to_string()),
                 desc: 1,
@@ -625,7 +685,7 @@ async fn bounded_resync_account(
                 session,
                 client,
                 &filter,
-                page,
+                page as i32,
                 RESYNC_PAGE_SIZE,
             )
             .await?;
@@ -644,7 +704,6 @@ async fn bounded_resync_account(
             if page_count < RESYNC_PAGE_SIZE {
                 break;
             }
-            page += 1;
         }
     }
 
@@ -709,10 +768,11 @@ pub async fn poll_account_once(
         let response = fetch_events_with_retry(config, &mut session, &mut client, &cursor).await?;
 
         let mut address_changed = response.refresh != 0;
-        let mut used_refresh_resync = false;
+        let mut labels_changed = false;
+        let mut resync_state: Option<&str> = None;
         if response.refresh != 0 {
             bounded_resync_account(config, &mut session, &mut client).await?;
-            used_refresh_resync = true;
+            resync_state = Some("refresh_resync");
         }
         for event in &response.events {
             for delta in parse_event_deltas(event) {
@@ -723,11 +783,19 @@ pub async fn poll_account_once(
                     EventDelta::MessageDelete(id) => {
                         apply_message_delete(config, &id).await?;
                     }
+                    EventDelta::LabelsChanged => {
+                        labels_changed = true;
+                    }
                     EventDelta::AddressesChanged => {
                         address_changed = true;
                     }
                 }
             }
+        }
+
+        if labels_changed && resync_state.is_none() {
+            bounded_resync_account(config, &mut session, &mut client).await?;
+            resync_state = Some("label_resync");
         }
 
         if address_changed {
@@ -744,8 +812,8 @@ pub async fn poll_account_once(
             let checkpoint = EventCheckpoint {
                 last_event_id: next_event_id.clone(),
                 last_event_ts: Some(unix_now()),
-                sync_state: Some(if used_refresh_resync {
-                    "refresh_resync".to_string()
+                sync_state: Some(if let Some(state) = resync_state {
+                    state.to_string()
                 } else if response.refresh != 0 {
                     "refresh".to_string()
                 } else if response.more != 0 {
@@ -792,8 +860,16 @@ async fn run_event_worker_with_shutdown(
         .map(|cp| cp.last_event_id)
         .unwrap_or_default();
     let mut consecutive_failures = 0u32;
-    let mut next_delay = Duration::ZERO;
+    let mut next_delay = compute_initial_poll_stagger(&config.account_id, poll_interval);
     let mut stats = EventWorkerStats::default();
+    if !next_delay.is_zero() {
+        debug!(
+            account_id = %config.account_id.0,
+            account_email = %config.account_email,
+            initial_delay_ms = next_delay.as_millis() as u64,
+            "event worker applying initial poll stagger"
+        );
+    }
 
     loop {
         tokio::select! {
@@ -1059,6 +1135,25 @@ mod tests {
     }
 
     #[test]
+    fn compute_initial_poll_stagger_is_bounded_and_stable() {
+        let account_a = AccountId("uid-a".to_string());
+        let account_b = AccountId("uid-b".to_string());
+
+        let poll = Duration::from_secs(30);
+        let stagger_a_1 = compute_initial_poll_stagger(&account_a, poll);
+        let stagger_a_2 = compute_initial_poll_stagger(&account_a, poll);
+        let stagger_b = compute_initial_poll_stagger(&account_b, poll);
+
+        assert_eq!(stagger_a_1, stagger_a_2);
+        assert!(stagger_a_1 <= Duration::from_millis(MAX_INITIAL_POLL_STAGGER_MS));
+        assert!(stagger_b <= Duration::from_millis(MAX_INITIAL_POLL_STAGGER_MS));
+        assert_eq!(
+            compute_initial_poll_stagger(&account_a, Duration::ZERO),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
     fn classify_worker_error_health_mapping() {
         let auth_error = EventWorkerError::Api(ApiError::SessionExpired);
         assert_eq!(
@@ -1107,6 +1202,101 @@ mod tests {
         assert_eq!(stats.permanent_failures, 1);
         assert_eq!(stats.last_failure_ts, Some(30));
         assert_eq!(stats.last_success_ts, Some(40));
+    }
+
+    #[test]
+    fn parse_event_deltas_respects_proton_numeric_actions() {
+        let payload = serde_json::json!({
+            "Messages": [
+                {"ID": "msg-delete", "Action": 0},
+                {"ID": "msg-create", "Action": 1},
+                {"ID": "msg-update", "Action": 2},
+                {"ID": "msg-update-flags", "Action": 3}
+            ]
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(
+            deltas,
+            vec![
+                EventDelta::MessageDelete("msg-delete".to_string()),
+                EventDelta::MessageUpsert("msg-create".to_string()),
+                EventDelta::MessageUpsert("msg-update".to_string()),
+                EventDelta::MessageUpsert("msg-update-flags".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_event_deltas_message_uses_parent_id_and_action_fallback() {
+        let payload = serde_json::json!({
+            "ID": "msg-parent",
+            "Action": 0,
+            "Message": {
+                "Subject": "hello"
+            }
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(
+            deltas,
+            vec![EventDelta::MessageDelete("msg-parent".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_event_deltas_accepts_string_numeric_delete_action() {
+        let payload = serde_json::json!({
+            "Messages": [{"ID": "msg-delete", "Action": "0"}]
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(
+            deltas,
+            vec![EventDelta::MessageDelete("msg-delete".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_event_deltas_supports_scalar_map_message_actions() {
+        let payload = serde_json::json!({
+            "Messages": {
+                "msg-del": 0,
+                "msg-upsert-a": 2,
+                "msg-upsert-b": "update"
+            }
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(deltas.len(), 3);
+        assert!(deltas.contains(&EventDelta::MessageDelete("msg-del".to_string())));
+        assert!(deltas.contains(&EventDelta::MessageUpsert("msg-upsert-a".to_string())));
+        assert!(deltas.contains(&EventDelta::MessageUpsert("msg-upsert-b".to_string())));
+    }
+
+    #[test]
+    fn parse_event_deltas_treats_null_map_message_entry_as_delete() {
+        let payload = serde_json::json!({
+            "Messages": {
+                "msg-null": serde_json::Value::Null
+            }
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(
+            deltas,
+            vec![EventDelta::MessageDelete("msg-null".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_event_deltas_includes_label_change_marker() {
+        let payload = serde_json::json!({
+            "Labels": [{"ID": "label-1", "Action": 2}]
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert!(deltas.contains(&EventDelta::LabelsChanged));
     }
 
     #[test]
@@ -1217,7 +1407,7 @@ mod tests {
                 "EventID": "event-1",
                 "More": 0,
                 "Refresh": 0,
-                "Events": [{"Messages": [{"ID": "msg-1", "Action": 2}]}]
+                "Events": [{"Messages": [{"ID": "msg-1", "Action": 0}]}]
             })))
             .mount(&server)
             .await;
@@ -1422,6 +1612,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_label_event_uses_bounded_resync() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 2,
+                        "Label": {
+                            "ID": "label-custom-1",
+                            "Name": "Projects"
+                        }
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-label-resync-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Resynced from label event",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            store
+                .get_uid("uid-1::INBOX", "msg-label-resync-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("label_resync"));
+    }
+
+    #[tokio::test]
     async fn start_event_workers_starts_one_task_per_account() {
         let accounts = vec![
             RuntimeAccountInfo {
@@ -1599,5 +1872,102 @@ mod tests {
         );
 
         group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn vault_checkpoint_restart_continuity_resumes_cursor() {
+        let tmp = tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session.clone()]));
+        let auth_router = AuthRouter::new(AccountRegistry::from_single_session(session.clone()));
+        let store = InMemoryStore::new();
+        let checkpoints: SharedCheckpointStore =
+            Arc::new(VaultCheckpointStore::new(tmp.path().to_path_buf()));
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store,
+            checkpoints.clone(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_event_worker_with_shutdown(
+            config,
+            Duration::from_secs(3600),
+            shutdown_rx,
+        ));
+        tokio::time::sleep(Duration::from_millis(320)).await;
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-1");
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-1"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-2",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        // Simulate restart with fresh runtime + store + checkpoint store.
+        let runtime_after_restart = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let auth_router_after_restart = AuthRouter::new(AccountRegistry::from_single_session(
+            sample_session("uid-1", "alice@proton.me", "pass-a"),
+        ));
+        let store_after_restart = InMemoryStore::new();
+        let checkpoints_after_restart: SharedCheckpointStore =
+            Arc::new(VaultCheckpointStore::new(tmp.path().to_path_buf()));
+        let config_after_restart = event_worker_config(
+            &server.uri(),
+            runtime_after_restart,
+            auth_router_after_restart,
+            store_after_restart,
+            checkpoints_after_restart.clone(),
+        );
+
+        let (shutdown_tx_2, shutdown_rx_2) = watch::channel(false);
+        let handle_2 = tokio::spawn(run_event_worker_with_shutdown(
+            config_after_restart,
+            Duration::from_secs(3600),
+            shutdown_rx_2,
+        ));
+        tokio::time::sleep(Duration::from_millis(320)).await;
+        let _ = shutdown_tx_2.send(true);
+        let _ = handle_2.await;
+
+        let checkpoint_after_restart = checkpoints_after_restart
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint_after_restart.last_event_id, "event-2");
     }
 }

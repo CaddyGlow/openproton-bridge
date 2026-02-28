@@ -111,6 +111,20 @@ pub async fn refresh_auth(
     Ok(auth)
 }
 
+/// Submit TOTP 2FA code.
+pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorResponse> {
+    info!("submitting 2FA code");
+    let body = json!({ "TwoFactorCode": code });
+
+    let resp = client.post("/auth/v4/2fa").json(&body).send().await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+
+    let result: TwoFactorResponse = serde_json::from_value(json)?;
+    info!("2FA accepted");
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::build_refresh_body;
@@ -138,18 +152,4 @@ mod tests {
         let body = build_refresh_body("uid-1", "refresh-1", Some("access-1"));
         assert_eq!(body["AccessToken"], "access-1");
     }
-}
-
-/// Submit TOTP 2FA code.
-pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorResponse> {
-    info!("submitting 2FA code");
-    let body = json!({ "TwoFactorCode": code });
-
-    let resp = client.post("/auth/v4/2fa").json(&body).send().await?;
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-
-    let result: TwoFactorResponse = serde_json::from_value(json)?;
-    info!("2FA accepted");
-    Ok(result)
 }

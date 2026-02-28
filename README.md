@@ -19,7 +19,7 @@ The official Proton Mail Bridge requires a paid Proton account. This project pro
 
 ## Status
 
-Early development. See [PLAN.md](PLAN.md) for the implementation roadmap and current phase.
+Active development. Core bridge flows are implemented, including multi-account runtime support, per-account event workers, and IMAP `IDLE`/`NOOP` visibility for mailbox changes. See [PLAN.md](PLAN.md) for roadmap and detailed phase tracking.
 
 ## Requirements
 
@@ -38,22 +38,85 @@ cargo build --release
 # Log in to your Proton account
 openproton-bridge login
 
+# Add another account (optional, repeat login)
+openproton-bridge login --username other@proton.me
+
+# List accounts and active/default account
+openproton-bridge status
+openproton-bridge accounts list
+
+# Set default account used by fetch/serve
+openproton-bridge accounts use other@proton.me
+
 # Start the bridge daemon (IMAP on 1143, SMTP on 1025)
-openproton-bridge start
+openproton-bridge serve
+
+# Optional: tune per-account event poll interval
+openproton-bridge serve --event-poll-secs 10
 
 # Check status
 openproton-bridge status
 
 # Log out
-openproton-bridge logout
+openproton-bridge logout --email other@proton.me
+openproton-bridge logout --all
 ```
 
 Then configure your email client:
 
 - **IMAP server:** `localhost:1143`
 - **SMTP server:** `localhost:1025`
-- **Username:** your Proton email address
-- **Password:** the bridge password printed during login
+- **Username:** any enabled address for the target account (primary or alias)
+- **Password:** the bridge password printed during login for that account
+- **Security:** STARTTLS by default (`--no-tls` is restricted to loopback bind addresses)
+
+## Runtime Behavior
+
+- `serve` loads all saved accounts from vault and starts one event worker per account.
+- Event poll interval defaults to 30s and can be changed with `--event-poll-secs`.
+- Event workers apply incremental updates to account-scoped IMAP store data.
+- Checkpoints and sync state are persisted in encrypted vault records, so workers resume from the saved cursor after restart.
+- Failures are isolated per account; one unavailable account does not stop healthy accounts.
+- Workers expose structured health/failure logs (`auth`/`transient`/`permanent`) with retry backoff + jitter.
+
+## Operator Runbook
+
+### Common operations
+
+1. Add or refresh one account credentials:
+
+```
+openproton-bridge login --username user@proton.me
+```
+
+2. Keep one account active while removing another:
+
+```
+openproton-bridge logout --email old-user@proton.me
+```
+
+3. Reduce API polling load for many accounts:
+
+```
+openproton-bridge serve --event-poll-secs 60
+```
+
+4. Faster near-real-time polling for testing:
+
+```
+openproton-bridge serve --event-poll-secs 10
+```
+
+### Troubleshooting quick checks
+
+1. Confirm all accounts loaded and default account selection:
+
+```
+openproton-bridge status
+```
+
+2. If one account shows repeated auth failures in logs, re-run `login` for that account; other accounts continue serving.
+3. After account list changes (`login`, `logout --email`, `logout --all`), restart `serve` so runtime workers match vault state.
 
 ## Configuration
 

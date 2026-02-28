@@ -3,8 +3,8 @@ use reqwest::Client;
 
 use super::error::{ApiError, Result};
 
-const BASE_URL: &str = "https://mail.proton.me/api";
-const APP_VERSION: &str = "web-mail@5.0.0";
+const BASE_URL: &str = "https://mail-api.proton.me";
+const APP_VERSION: &str = "web-mail@5.0.103.3";
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 /// HTTP client preconfigured with Proton API headers.

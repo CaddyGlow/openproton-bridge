@@ -39,6 +39,16 @@ pub struct AuthResponse {
     pub scopes: Vec<String>,
 }
 
+/// API response from POST /auth/v4/refresh
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct RefreshResponse {
+    #[serde(rename = "UID", default)]
+    pub uid: String,
+    pub access_token: String,
+    pub refresh_token: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct TwoFactorInfo {
@@ -270,6 +280,22 @@ mod tests {
         assert_eq!(auth.refresh_token, "refresh-123");
         assert_eq!(auth.scopes, vec!["mail", "calendar"]);
         assert!(!auth.two_factor.totp_required());
+    }
+
+    #[test]
+    fn test_refresh_response_deserialize_without_server_proof() {
+        let json = serde_json::json!({
+            "Code": 1000,
+            "UID": "uid-abc",
+            "AccessToken": "token-xyz",
+            "RefreshToken": "refresh-123",
+            "TokenType": "Bearer"
+        });
+
+        let auth: RefreshResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(auth.uid, "uid-abc");
+        assert_eq!(auth.access_token, "token-xyz");
+        assert_eq!(auth.refresh_token, "refresh-123");
     }
 
     #[test]

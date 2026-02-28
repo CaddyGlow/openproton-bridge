@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -464,7 +466,13 @@ async fn refresh_session(
 ) -> anyhow::Result<api::types::Session> {
     tracing::info!("access token missing, refreshing via stored refresh token");
     let mut client = api::client::ProtonClient::new()?;
-    let auth = api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token).await?;
+    let auth = api::auth::refresh_auth(
+        &mut client,
+        &session.uid,
+        &session.refresh_token,
+        Some(&session.access_token),
+    )
+    .await?;
 
     let refreshed = api::types::Session {
         uid: auth.uid,

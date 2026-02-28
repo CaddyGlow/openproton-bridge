@@ -1,10 +1,12 @@
+use rand::distributions::Alphanumeric;
+use rand::Rng as _;
 use serde_json::json;
 use tracing::{debug, info};
 
 use super::client::{check_api_response, ProtonClient};
 use super::error::Result;
 use super::srp;
-use super::types::{AuthInfoResponse, AuthResponse, TwoFactorResponse};
+use super::types::{AuthInfoResponse, AuthResponse, RefreshResponse, TwoFactorResponse};
 
 /// Perform SRP login against the Proton API.
 ///
@@ -57,6 +59,33 @@ pub async fn login(
     Ok(auth)
 }
 
+fn build_refresh_body(
+    uid: &str,
+    refresh_token: &str,
+    access_token: Option<&str>,
+) -> serde_json::Value {
+    let state: String = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
+
+    let mut body = json!({
+        "UID": uid,
+        "RefreshToken": refresh_token,
+        "GrantType": "refresh_token",
+        "ResponseType": "token",
+        "RedirectURI": "https://protonmail.ch",
+        "State": state,
+    });
+
+    if let Some(token) = access_token.filter(|token| !token.is_empty()) {
+        body["AccessToken"] = json!(token);
+    }
+
+    body
+}
+
 /// Refresh an expired access token using the refresh token.
 ///
 /// On success, updates the client's auth credentials in-place
@@ -65,23 +94,50 @@ pub async fn refresh_auth(
     client: &mut ProtonClient,
     uid: &str,
     refresh_token: &str,
-) -> Result<AuthResponse> {
-    let body = json!({
-        "UID": uid,
-        "RefreshToken": refresh_token,
-        "GrantType": "refresh_token",
-        "ResponseType": "token",
-        "RedirectURI": "https://protonmail.ch",
-    });
+    access_token: Option<&str>,
+) -> Result<RefreshResponse> {
+    let body = build_refresh_body(uid, refresh_token, access_token);
 
     let resp = client.post("/auth/v4/refresh").json(&body).send().await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
 
-    let auth: AuthResponse = serde_json::from_value(json)?;
+    let mut auth: RefreshResponse = serde_json::from_value(json)?;
+    if auth.uid.is_empty() {
+        auth.uid = uid.to_string();
+    }
     client.set_auth(&auth.uid, &auth.access_token);
 
     Ok(auth)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_refresh_body;
+
+    #[test]
+    fn test_build_refresh_body_without_access_token() {
+        let body = build_refresh_body("uid-1", "refresh-1", None);
+        assert_eq!(body["UID"], "uid-1");
+        assert_eq!(body["RefreshToken"], "refresh-1");
+        assert_eq!(body["GrantType"], "refresh_token");
+        assert_eq!(body["ResponseType"], "token");
+        assert_eq!(body["RedirectURI"], "https://protonmail.ch");
+        assert!(body.get("AccessToken").is_none());
+        assert_eq!(
+            body["State"]
+                .as_str()
+                .expect("state should be present")
+                .len(),
+            32
+        );
+    }
+
+    #[test]
+    fn test_build_refresh_body_with_access_token() {
+        let body = build_refresh_body("uid-1", "refresh-1", Some("access-1"));
+        assert_eq!(body["AccessToken"], "access-1");
+    }
 }
 
 /// Submit TOTP 2FA code.

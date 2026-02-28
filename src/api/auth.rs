@@ -57,6 +57,33 @@ pub async fn login(
     Ok(auth)
 }
 
+/// Refresh an expired access token using the refresh token.
+///
+/// On success, updates the client's auth credentials in-place
+/// and returns the new access/refresh token pair.
+pub async fn refresh_auth(
+    client: &mut ProtonClient,
+    uid: &str,
+    refresh_token: &str,
+) -> Result<AuthResponse> {
+    let body = json!({
+        "UID": uid,
+        "RefreshToken": refresh_token,
+        "GrantType": "refresh_token",
+        "ResponseType": "token",
+        "RedirectURI": "https://protonmail.ch",
+    });
+
+    let resp = client.post("/auth/v4/refresh").json(&body).send().await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+
+    let auth: AuthResponse = serde_json::from_value(json)?;
+    client.set_auth(&auth.uid, &auth.access_token);
+
+    Ok(auth)
+}
+
 /// Submit TOTP 2FA code.
 pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorResponse> {
     info!("submitting 2FA code");

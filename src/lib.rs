@@ -3,3 +3,4 @@ pub mod bridge;
 pub mod crypto;
 pub mod imap;
 pub mod smtp;
+pub mod vault;

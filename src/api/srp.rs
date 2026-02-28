@@ -259,6 +259,60 @@ pub fn verify_server_proof(expected: &[u8], server_proof_b64: &str) -> Result<()
     Ok(())
 }
 
+// -- Mailbox password derivation --
+
+/// Derive the mailbox password from raw password bytes and a 16-byte salt.
+///
+/// This is the Proton "MailboxPassword" KDF:
+/// 1. Encode salt (16 bytes) using bcrypt's dot-slash base64 alphabet (22 chars).
+/// 2. Run bcrypt ($2y$10$) on password with that salt.
+/// 3. Return the last 31 bytes of the 60-char bcrypt output string.
+///
+/// Reference: go-srp hash.go MailboxPassword
+pub fn mailbox_password(password: &[u8], salt: &[u8]) -> Result<Vec<u8>> {
+    if salt.len() != 16 {
+        return Err(ApiError::Srp(format!(
+            "mailbox password salt must be 16 bytes, got {}",
+            salt.len()
+        )));
+    }
+
+    let mut salt_16 = [0u8; 16];
+    salt_16.copy_from_slice(salt);
+
+    let hash_parts = bcrypt::hash_with_salt(password, 10, salt_16)
+        .map_err(|e| ApiError::Srp(format!("bcrypt failed: {}", e)))?;
+    let hash_string = hash_parts.format_for_version(bcrypt::Version::TwoY);
+
+    let bytes = hash_string.into_bytes();
+    Ok(bytes[bytes.len() - 31..].to_vec())
+}
+
+/// Look up the salt for a given key ID and derive the mailbox passphrase.
+///
+/// Reference: go-proton-api/salt_types.go SaltForKey
+pub fn salt_for_key(
+    password: &[u8],
+    key_id: &str,
+    salts: &[super::types::KeySalt],
+) -> Result<Vec<u8>> {
+    let salt_entry = salts
+        .iter()
+        .find(|s| s.id == key_id)
+        .ok_or_else(|| ApiError::Srp(format!("no salt found for key {}", key_id)))?;
+
+    let salt_b64 = salt_entry
+        .key_salt
+        .as_deref()
+        .ok_or_else(|| ApiError::Srp(format!("null salt for key {}", key_id)))?;
+
+    let decoded = BASE64
+        .decode(salt_b64)
+        .map_err(|e| ApiError::Srp(format!("salt base64 decode failed: {}", e)))?;
+
+    mailbox_password(password, &decoded)
+}
+
 // -- Helper functions --
 
 fn generate_client_ephemeral(
@@ -489,5 +543,93 @@ mod tests {
         let combined = b"ab".to_vec();
         let err = bcrypt_salt_16(&combined).unwrap_err();
         assert!(err.to_string().contains("too short"));
+    }
+
+    #[test]
+    fn test_mailbox_password_returns_31_bytes() {
+        let salt = [0u8; 16];
+        let result = mailbox_password(b"testpassword", &salt).unwrap();
+        assert_eq!(result.len(), 31);
+    }
+
+    #[test]
+    fn test_mailbox_password_deterministic() {
+        let salt = [1u8; 16];
+        let a = mailbox_password(b"password", &salt).unwrap();
+        let b = mailbox_password(b"password", &salt).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_mailbox_password_different_passwords_differ() {
+        let salt = [2u8; 16];
+        let a = mailbox_password(b"password1", &salt).unwrap();
+        let b = mailbox_password(b"password2", &salt).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_mailbox_password_different_salts_differ() {
+        let salt_a = [3u8; 16];
+        let salt_b = [4u8; 16];
+        let a = mailbox_password(b"password", &salt_a).unwrap();
+        let b = mailbox_password(b"password", &salt_b).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_mailbox_password_wrong_salt_length() {
+        let short_salt = [0u8; 8];
+        let err = mailbox_password(b"password", &short_salt).unwrap_err();
+        assert!(err.to_string().contains("16 bytes"));
+    }
+
+    #[test]
+    fn test_salt_for_key_found() {
+        use crate::api::types::KeySalt;
+
+        let salt_raw = [5u8; 16];
+        let salt_b64 = BASE64.encode(salt_raw);
+
+        let salts = vec![
+            KeySalt {
+                id: "key-1".to_string(),
+                key_salt: Some(salt_b64),
+            },
+            KeySalt {
+                id: "key-2".to_string(),
+                key_salt: Some(BASE64.encode([6u8; 16])),
+            },
+        ];
+
+        let result = salt_for_key(b"password", "key-1", &salts).unwrap();
+        let expected = mailbox_password(b"password", &salt_raw).unwrap();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_salt_for_key_not_found() {
+        use crate::api::types::KeySalt;
+
+        let salts = vec![KeySalt {
+            id: "key-1".to_string(),
+            key_salt: Some(BASE64.encode([0u8; 16])),
+        }];
+
+        let err = salt_for_key(b"password", "key-999", &salts).unwrap_err();
+        assert!(err.to_string().contains("no salt found"));
+    }
+
+    #[test]
+    fn test_salt_for_key_null_salt() {
+        use crate::api::types::KeySalt;
+
+        let salts = vec![KeySalt {
+            id: "key-1".to_string(),
+            key_salt: None,
+        }];
+
+        let err = salt_for_key(b"password", "key-1", &salts).unwrap_err();
+        assert!(err.to_string().contains("null salt"));
     }
 }

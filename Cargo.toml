@@ -22,12 +22,29 @@ sha2 = "0.10"
 bcrypt = "0.16"
 base64 = "0.22"
 rand = "0.8"
+sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
 
 # Async trait
 async-trait = "0.1"
 
+# Security
+aes-gcm = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+
+# TLS
+rustls = "0.23"
+rustls-pemfile = "2"
+rcgen = "0.13"
+tokio-rustls = "0.26"
+
 # Config + filesystem
 dirs = "5"
+
+# Go-compatible vault (MessagePack + OS keychain)
+rmp-serde = "1"
+serde_bytes = "0.11"
+keyring = "3"
 
 # Password input
 rpassword = "7"

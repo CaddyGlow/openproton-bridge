@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 use crate::api::client::ProtonClient;
-use crate::api::types::{Address, Session};
+use crate::api::error::is_auth_error;
+use crate::api::types::Address;
+use crate::bridge::accounts::{AccountRuntimeError, RuntimeAccountRegistry};
+use crate::bridge::auth_router::AuthRouter;
 use crate::crypto::keys::{self, Keyring};
 
 use super::Result;
@@ -25,8 +27,9 @@ enum State {
 }
 
 pub struct SmtpSessionConfig {
-    pub session: Session,
-    pub bridge_password: String,
+    pub api_base_url: String,
+    pub auth_router: AuthRouter,
+    pub runtime_accounts: Arc<RuntimeAccountRegistry>,
 }
 
 pub struct SmtpSession<R, W> {
@@ -206,22 +209,45 @@ where
         let username = String::from_utf8_lossy(parts[1]);
         let password = String::from_utf8_lossy(parts[2]);
 
-        // Validate credentials
-        let email_ok = username.eq_ignore_ascii_case(&self.config.session.email);
-        let password_ok: bool = password
-            .as_bytes()
-            .ct_eq(self.config.bridge_password.as_bytes())
-            .into();
-
-        if !email_ok || !password_ok {
-            return self.write_line(535, "Authentication failed").await;
-        }
+        let auth_route = match self
+            .config
+            .auth_router
+            .resolve_login(username.as_ref(), password.as_ref())
+        {
+            Some(route) => route,
+            None => return self.write_line(535, "Authentication failed").await,
+        };
+        let mut account_session = match self
+            .config
+            .runtime_accounts
+            .with_valid_access_token(&auth_route.account_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(AccountRuntimeError::AccountUnavailable(_)) => {
+                warn!(
+                    account_id = %auth_route.account_id.0,
+                    "account unavailable during SMTP auth"
+                );
+                return self.write_line(535, "Authentication failed").await;
+            }
+            Err(e) => {
+                warn!(
+                    account_id = %auth_route.account_id.0,
+                    error = %e,
+                    "failed to load account session"
+                );
+                return self
+                    .write_line(454, "Temporary authentication failure")
+                    .await;
+            }
+        };
 
         // Create authenticated ProtonClient
-        let client = match ProtonClient::authenticated(
-            "https://mail-api.proton.me",
-            &self.config.session.uid,
-            &self.config.session.access_token,
+        let mut client = match ProtonClient::authenticated(
+            &self.config.api_base_url,
+            &account_session.uid,
+            &account_session.access_token,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -233,7 +259,7 @@ where
         };
 
         // Unlock keys (same flow as IMAP session)
-        let passphrase_b64 = match &self.config.session.key_passphrase {
+        let passphrase_b64 = match &account_session.key_passphrase {
             Some(p) => p.clone(),
             None => {
                 return self
@@ -254,6 +280,55 @@ where
 
         let user_resp = match crate::api::users::get_user(&client).await {
             Ok(r) => r,
+            Err(e) if is_auth_error(&e) => {
+                let refreshed = match self
+                    .config
+                    .runtime_accounts
+                    .refresh_session_if_stale(
+                        &auth_route.account_id,
+                        Some(&account_session.access_token),
+                    )
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(refresh_err) => {
+                        passphrase.zeroize();
+                        warn!(
+                            account_id = %auth_route.account_id.0,
+                            error = %refresh_err,
+                            "token refresh failed during SMTP auth"
+                        );
+                        return self
+                            .write_line(454, "Temporary authentication failure")
+                            .await;
+                    }
+                };
+                account_session = refreshed;
+                client = match ProtonClient::authenticated(
+                    &self.config.api_base_url,
+                    &account_session.uid,
+                    &account_session.access_token,
+                ) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                        return self
+                            .write_line(454, "Temporary authentication failure")
+                            .await;
+                    }
+                };
+                match crate::api::users::get_user(&client).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to fetch user info after refresh");
+                        return self
+                            .write_line(454, "Temporary authentication failure")
+                            .await;
+                    }
+                }
+            }
             Err(e) => {
                 passphrase.zeroize();
                 warn!(error = %e, "failed to fetch user info");
@@ -276,6 +351,55 @@ where
 
         let addr_resp = match crate::api::users::get_addresses(&client).await {
             Ok(r) => r,
+            Err(e) if is_auth_error(&e) => {
+                let refreshed = match self
+                    .config
+                    .runtime_accounts
+                    .refresh_session_if_stale(
+                        &auth_route.account_id,
+                        Some(&account_session.access_token),
+                    )
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(refresh_err) => {
+                        passphrase.zeroize();
+                        warn!(
+                            account_id = %auth_route.account_id.0,
+                            error = %refresh_err,
+                            "token refresh failed while fetching addresses"
+                        );
+                        return self
+                            .write_line(454, "Temporary authentication failure")
+                            .await;
+                    }
+                };
+                account_session = refreshed;
+                client = match ProtonClient::authenticated(
+                    &self.config.api_base_url,
+                    &account_session.uid,
+                    &account_session.access_token,
+                ) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                        return self
+                            .write_line(454, "Temporary authentication failure")
+                            .await;
+                    }
+                };
+                match crate::api::users::get_addresses(&client).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to fetch addresses after refresh");
+                        return self
+                            .write_line(454, "Temporary authentication failure")
+                            .await;
+                    }
+                }
+            }
             Err(e) => {
                 passphrase.zeroize();
                 warn!(error = %e, "failed to fetch addresses");
@@ -314,7 +438,7 @@ where
         self.addresses = Some(addr_resp.addresses);
         self.state = State::Authenticated;
 
-        info!(email = %self.config.session.email, "SMTP authentication successful");
+        info!(email = %auth_route.primary_email, "SMTP authentication successful");
         self.write_line(235, "Authentication successful").await
     }
 
@@ -493,9 +617,14 @@ fn extract_angle_addr(args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::accounts::AccountHealth;
+    use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
+    use crate::bridge::auth_router::AuthRouter;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_session() -> Session {
-        Session {
+    fn test_session() -> crate::api::types::Session {
+        crate::api::types::Session {
             uid: "test-uid".to_string(),
             access_token: "test-token".to_string(),
             refresh_token: "test-refresh".to_string(),
@@ -507,9 +636,42 @@ mod tests {
     }
 
     fn test_config() -> Arc<SmtpSessionConfig> {
+        let session = test_session();
+        let accounts = AccountRegistry::from_single_session(session.clone());
         Arc::new(SmtpSessionConfig {
-            session: test_session(),
-            bridge_password: "bridge-pass-1234".to_string(),
+            api_base_url: "https://mail-api.proton.me".to_string(),
+            auth_router: AuthRouter::new(accounts),
+            runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
+        })
+    }
+
+    fn multi_account_config(api_base_url: &str) -> Arc<SmtpSessionConfig> {
+        let account_a = crate::api::types::Session {
+            uid: "uid-a".to_string(),
+            access_token: "access-a".to_string(),
+            refresh_token: "refresh-a".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            key_passphrase: Some("dGVzdA==".to_string()),
+            bridge_password: Some("pass-a".to_string()),
+        };
+        let account_b = crate::api::types::Session {
+            uid: "uid-b".to_string(),
+            access_token: "access-b".to_string(),
+            refresh_token: "refresh-b".to_string(),
+            email: "bob@proton.me".to_string(),
+            display_name: "Bob".to_string(),
+            key_passphrase: Some("dGVzdA==".to_string()),
+            bridge_password: Some("pass-b".to_string()),
+        };
+        let accounts = AccountRegistry::from_sessions(vec![account_a.clone(), account_b.clone()]);
+        let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
+            account_a, account_b,
+        ]));
+        Arc::new(SmtpSessionConfig {
+            api_base_url: api_base_url.to_string(),
+            auth_router: AuthRouter::new(accounts),
+            runtime_accounts,
         })
     }
 
@@ -587,6 +749,60 @@ mod tests {
 
         let response = read_response(&mut client_read).await;
         assert!(response.contains("535"));
+    }
+
+    #[tokio::test]
+    async fn test_auth_isolation_unavailable_account_does_not_block_other_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/users"))
+            .and(header("x-pm-uid", "uid-b"))
+            .and(header("Authorization", "Bearer access-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "User": {
+                    "ID": "user-b",
+                    "Name": "bob",
+                    "DisplayName": "Bob",
+                    "Email": "bob@proton.me",
+                    "Keys": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let config = multi_account_config(&server.uri());
+        config
+            .runtime_accounts
+            .set_health(
+                &crate::bridge::types::AccountId("uid-a".to_string()),
+                AccountHealth::Unavailable,
+            )
+            .await
+            .unwrap();
+
+        // Unavailable account should fail immediately.
+        let (mut unavailable_session, mut unavailable_read, _w1) =
+            create_session_pair(config.clone()).await;
+        unavailable_session.state = State::Greeted;
+        let bad = BASE64.encode(b"\0alice@proton.me\0pass-a");
+        unavailable_session
+            .cmd_auth(&format!("PLAIN {}", bad))
+            .await
+            .unwrap();
+        let unavailable_response = read_response(&mut unavailable_read).await;
+        assert!(unavailable_response.contains("535"));
+
+        // Healthy account should continue to per-account processing path.
+        let (mut healthy_session, mut healthy_read, _w2) = create_session_pair(config).await;
+        healthy_session.state = State::Greeted;
+        let good = BASE64.encode(b"\0bob@proton.me\0pass-b");
+        healthy_session
+            .cmd_auth(&format!("PLAIN {}", good))
+            .await
+            .unwrap();
+        let healthy_response = read_response(&mut healthy_read).await;
+        assert!(healthy_response.contains("454"));
     }
 
     #[tokio::test]

@@ -16,6 +16,12 @@ pub struct MailboxStatus {
     pub unseen: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MailboxSnapshot {
+    pub exists: u32,
+    pub mod_seq: u64,
+}
+
 #[async_trait]
 pub trait MessageStore: Send + Sync {
     async fn store_metadata(
@@ -31,6 +37,7 @@ pub trait MessageStore: Send + Sync {
     async fn get_rfc822(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>>;
     async fn list_uids(&self, mailbox: &str) -> Result<Vec<u32>>;
     async fn mailbox_status(&self, mailbox: &str) -> Result<MailboxStatus>;
+    async fn mailbox_snapshot(&self, mailbox: &str) -> Result<MailboxSnapshot>;
     async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()>;
     async fn add_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()>;
     async fn remove_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()>;
@@ -49,6 +56,7 @@ struct MailboxData {
     rfc822: HashMap<u32, Vec<u8>>,
     flags: HashMap<u32, Vec<String>>,
     uid_order: Vec<u32>,
+    mod_seq: u64,
 }
 
 impl MailboxData {
@@ -66,6 +74,7 @@ impl MailboxData {
             rfc822: HashMap::new(),
             flags: HashMap::new(),
             uid_order: Vec::new(),
+            mod_seq: 0,
         }
     }
 }
@@ -97,6 +106,7 @@ impl MessageStore for InMemoryStore {
 
         if let Some(&uid) = mb.proton_to_uid.get(proton_id) {
             mb.metadata.insert(uid, meta);
+            mb.mod_seq = mb.mod_seq.saturating_add(1);
             return Ok(uid);
         }
 
@@ -106,6 +116,7 @@ impl MessageStore for InMemoryStore {
         mb.uid_to_proton.insert(uid, proton_id.to_string());
         mb.uid_order.push(uid);
         mb.metadata.insert(uid, meta);
+        mb.mod_seq = mb.mod_seq.saturating_add(1);
         Ok(uid)
     }
 
@@ -136,6 +147,7 @@ impl MessageStore for InMemoryStore {
             .entry(mailbox.to_string())
             .or_insert_with(MailboxData::new);
         mb.rfc822.insert(uid, data);
+        mb.mod_seq = mb.mod_seq.saturating_add(1);
         Ok(())
     }
 
@@ -188,10 +200,26 @@ impl MessageStore for InMemoryStore {
         }
     }
 
+    async fn mailbox_snapshot(&self, mailbox: &str) -> Result<MailboxSnapshot> {
+        let mailboxes = self.mailboxes.read().await;
+        if let Some(mb) = mailboxes.get(mailbox) {
+            Ok(MailboxSnapshot {
+                exists: mb.uid_order.len() as u32,
+                mod_seq: mb.mod_seq,
+            })
+        } else {
+            Ok(MailboxSnapshot {
+                exists: 0,
+                mod_seq: 0,
+            })
+        }
+    }
+
     async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()> {
         let mut mailboxes = self.mailboxes.write().await;
         if let Some(mb) = mailboxes.get_mut(mailbox) {
             mb.flags.insert(uid, flags);
+            mb.mod_seq = mb.mod_seq.saturating_add(1);
         }
         Ok(())
     }
@@ -200,10 +228,14 @@ impl MessageStore for InMemoryStore {
         let mut mailboxes = self.mailboxes.write().await;
         if let Some(mb) = mailboxes.get_mut(mailbox) {
             let entry = mb.flags.entry(uid).or_default();
+            let before = entry.len();
             for flag in flags {
                 if !entry.contains(flag) {
                     entry.push(flag.clone());
                 }
+            }
+            if entry.len() != before {
+                mb.mod_seq = mb.mod_seq.saturating_add(1);
             }
         }
         Ok(())
@@ -213,7 +245,11 @@ impl MessageStore for InMemoryStore {
         let mut mailboxes = self.mailboxes.write().await;
         if let Some(mb) = mailboxes.get_mut(mailbox) {
             if let Some(current) = mb.flags.get_mut(&uid) {
+                let before = current.len();
                 current.retain(|f| !flags.contains(f));
+                if current.len() != before {
+                    mb.mod_seq = mb.mod_seq.saturating_add(1);
+                }
             }
         }
         Ok(())
@@ -244,6 +280,7 @@ impl MessageStore for InMemoryStore {
             mb.rfc822.remove(&uid);
             mb.flags.remove(&uid);
             mb.uid_order.retain(|&u| u != uid);
+            mb.mod_seq = mb.mod_seq.saturating_add(1);
         }
         Ok(())
     }
@@ -498,5 +535,33 @@ mod tests {
         assert_eq!(status.exists, 0);
         assert_eq!(status.next_uid, 1);
         assert_eq!(status.unseen, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mailbox_snapshot_mod_seq_changes_on_mutation() {
+        let store = InMemoryStore::new();
+        let snapshot0 = store.mailbox_snapshot("INBOX").await.unwrap();
+        assert_eq!(snapshot0.exists, 0);
+
+        store
+            .store_metadata("INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let snapshot1 = store.mailbox_snapshot("INBOX").await.unwrap();
+        assert_eq!(snapshot1.exists, 1);
+        assert!(snapshot1.mod_seq > snapshot0.mod_seq);
+
+        store
+            .set_flags("INBOX", 1, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+        let snapshot2 = store.mailbox_snapshot("INBOX").await.unwrap();
+        assert_eq!(snapshot2.exists, 1);
+        assert!(snapshot2.mod_seq > snapshot1.mod_seq);
+
+        store.remove_message("INBOX", 1).await.unwrap();
+        let snapshot3 = store.mailbox_snapshot("INBOX").await.unwrap();
+        assert_eq!(snapshot3.exists, 0);
+        assert!(snapshot3.mod_seq > snapshot2.mod_seq);
     }
 }

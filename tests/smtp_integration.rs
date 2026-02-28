@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
 use openproton_bridge::api::types::Session;
+use openproton_bridge::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
+use openproton_bridge::bridge::auth_router::AuthRouter;
 use openproton_bridge::smtp::server::run_server;
 use openproton_bridge::smtp::session::SmtpSessionConfig;
 
@@ -28,15 +30,22 @@ async fn find_available_port() -> u16 {
     port
 }
 
+fn test_config() -> Arc<SmtpSessionConfig> {
+    let session = test_session();
+    let accounts = AccountRegistry::from_single_session(session.clone());
+    Arc::new(SmtpSessionConfig {
+        api_base_url: "https://mail-api.proton.me".to_string(),
+        auth_router: AuthRouter::new(accounts),
+        runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
+    })
+}
+
 #[tokio::test]
 async fn test_smtp_connect_ehlo_quit() {
     let port = find_available_port().await;
     let addr = format!("127.0.0.1:{}", port);
 
-    let config = Arc::new(SmtpSessionConfig {
-        session: test_session(),
-        bridge_password: "testbridge1234ab".to_string(),
-    });
+    let config = test_config();
 
     // Start server in background
     let addr_clone = addr.clone();
@@ -95,10 +104,7 @@ async fn test_smtp_auth_failure() {
     let port = find_available_port().await;
     let addr = format!("127.0.0.1:{}", port);
 
-    let config = Arc::new(SmtpSessionConfig {
-        session: test_session(),
-        bridge_password: "testbridge1234ab".to_string(),
-    });
+    let config = test_config();
 
     let addr_clone = addr.clone();
     let server_handle = tokio::spawn(async move {

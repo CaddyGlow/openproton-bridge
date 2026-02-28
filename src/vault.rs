@@ -15,6 +15,7 @@ const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 const VAULT_FILE: &str = "vault.enc";
 const KEY_FILE: &str = "vault.key";
+const DEFAULT_EMAIL_FILE: &str = "default_email";
 const VAULT_VERSION: i32 = 2;
 
 // Keychain constants matching the Go bridge
@@ -37,11 +38,20 @@ pub enum VaultError {
     InvalidKeyLength,
     #[error("not logged in -- run `openproton-bridge login` first")]
     NotLoggedIn,
+    #[error("account not found for email: {0}")]
+    AccountNotFound(String),
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEventCheckpoint {
+    pub last_event_id: String,
+    pub last_event_ts: Option<i64>,
+    pub sync_state: Option<String>,
+}
 
 // ---------------------------------------------------------------------------
 // MsgpackTimestamp: Custom serde for msgpack extension type -1 (timestamp)
@@ -223,6 +233,10 @@ struct UserData {
     sync_status: SyncStatus,
     #[serde(rename = "EventID")]
     event_id: String,
+    #[serde(rename = "LastEventTS", default)]
+    last_event_ts: Option<i64>,
+    #[serde(rename = "SyncState", default)]
+    sync_state: Option<String>,
 
     #[serde(rename = "UIDValidity")]
     uid_validity: HashMap<String, u32>,
@@ -476,6 +490,8 @@ fn session_to_userdata(session: &Session) -> UserData {
         key_pass,
         sync_status: SyncStatus::default(),
         event_id: String::new(),
+        last_event_ts: None,
+        sync_state: None,
         uid_validity: HashMap::new(),
         should_resync: false,
     }
@@ -529,44 +545,32 @@ fn unmarshal_vault(raw: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultData> {
     Ok(data)
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
+fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
 
-pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-
-    let mut key = get_or_create_vault_key(dir)?;
-
-    // Load existing vault data or create default
+fn load_vault_data(dir: &Path) -> Result<Option<VaultData>> {
     let vault_path = dir.join(VAULT_FILE);
-    let mut data = if vault_path.exists() {
-        let raw = std::fs::read(&vault_path)?;
-        unmarshal_vault(&raw, &key).unwrap_or_default()
-    } else {
-        VaultData::default()
-    };
-
-    // Find existing user by email, or append new
-    let ud = session_to_userdata(session);
-    if let Some(existing) = data
-        .users
-        .iter_mut()
-        .find(|u| u.primary_email == session.email)
-    {
-        existing.auth_uid = ud.auth_uid;
-        existing.auth_ref = ud.auth_ref;
-        existing.key_pass = ud.key_pass;
-        existing.bridge_pass = ud.bridge_pass;
-        existing.username = ud.username;
-    } else {
-        data.users.push(ud);
+    if !vault_path.exists() {
+        return Ok(None);
     }
 
-    let encoded = marshal_vault(&data, &key);
+    let raw = std::fs::read(&vault_path)?;
+    let mut key = get_or_create_vault_key(dir)?;
+    let data = unmarshal_vault(&raw, &key);
+    key.zeroize();
+    let data = data?;
+    Ok(Some(data))
+}
+
+fn save_vault_data(dir: &Path, data: &VaultData) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut key = get_or_create_vault_key(dir)?;
+    let encoded = marshal_vault(data, &key);
     key.zeroize();
     let encoded = encoded?;
 
+    let vault_path = dir.join(VAULT_FILE);
     std::fs::write(&vault_path, &encoded)?;
 
     #[cfg(unix)]
@@ -578,62 +582,204 @@ pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn load_session(dir: &Path) -> Result<Session> {
-    let vault_path = dir.join(VAULT_FILE);
-    if !vault_path.exists() {
-        return Err(VaultError::NotLoggedIn);
+fn write_default_email(dir: &Path, email: &str) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(DEFAULT_EMAIL_FILE);
+    std::fs::write(&path, email.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
+    let mut data = load_vault_data(dir)?.unwrap_or_default();
+    let session_email = normalize_email(&session.email);
+
+    // Find existing user by email, or append new
+    let ud = session_to_userdata(session);
+    if let Some(existing) = data
+        .users
+        .iter_mut()
+        .find(|u| normalize_email(&u.primary_email) == session_email)
+    {
+        existing.primary_email = session.email.clone();
+        existing.auth_uid = ud.auth_uid;
+        existing.auth_ref = ud.auth_ref;
+        existing.key_pass = ud.key_pass;
+        existing.bridge_pass = ud.bridge_pass;
+        existing.username = ud.username;
+    } else {
+        data.users.push(ud);
     }
 
-    let raw = std::fs::read(&vault_path)?;
-    let mut key = get_or_create_vault_key(dir)?;
-    let result = unmarshal_vault(&raw, &key);
-    key.zeroize();
-    let data = result?;
+    save_vault_data(dir, &data)?;
+    if get_default_email(dir)?.is_none() {
+        write_default_email(dir, &session.email)?;
+    }
+    Ok(())
+}
 
-    // Return the first user (our bridge stores a single user)
-    let ud = data.users.first().ok_or(VaultError::NotLoggedIn)?;
-    Ok(userdata_to_session(ud))
+pub fn load_session(dir: &Path) -> Result<Session> {
+    if let Some(default_email) = get_default_email(dir)? {
+        if let Ok(session) = load_session_by_email(dir, &default_email) {
+            return Ok(session);
+        }
+    }
+
+    let sessions = list_sessions(dir)?;
+    sessions.into_iter().next().ok_or(VaultError::NotLoggedIn)
 }
 
 /// Load session for a specific email address.
 pub fn load_session_by_email(dir: &Path, email: &str) -> Result<Session> {
-    let vault_path = dir.join(VAULT_FILE);
-    if !vault_path.exists() {
-        return Err(VaultError::NotLoggedIn);
-    }
-
-    let raw = std::fs::read(&vault_path)?;
-    let mut key = get_or_create_vault_key(dir)?;
-    let result = unmarshal_vault(&raw, &key);
-    key.zeroize();
-    let data = result?;
+    let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let email = normalize_email(email);
 
     let ud = data
         .users
         .iter()
-        .find(|u| u.primary_email == email)
-        .ok_or(VaultError::NotLoggedIn)?;
+        .find(|u| normalize_email(&u.primary_email) == email)
+        .ok_or_else(|| VaultError::AccountNotFound(email.clone()))?;
     Ok(userdata_to_session(ud))
+}
+
+/// List all stored sessions.
+pub fn list_sessions(dir: &Path) -> Result<Vec<Session>> {
+    let Some(data) = load_vault_data(dir)? else {
+        return Ok(Vec::new());
+    };
+
+    Ok(data.users.iter().map(userdata_to_session).collect())
+}
+
+/// Get the configured default account email (if any).
+pub fn get_default_email(dir: &Path) -> Result<Option<String>> {
+    let path = dir.join(DEFAULT_EMAIL_FILE);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let email = std::fs::read_to_string(path)?;
+    let email = email.trim();
+    if email.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(email.to_string()))
+}
+
+/// Set the default account email. The email must already exist in the vault.
+pub fn set_default_email(dir: &Path, email: &str) -> Result<()> {
+    let email = normalize_email(email);
+    let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let user = data
+        .users
+        .iter()
+        .find(|u| normalize_email(&u.primary_email) == email)
+        .ok_or_else(|| VaultError::AccountNotFound(email.clone()))?;
+    write_default_email(dir, &user.primary_email)
 }
 
 pub fn session_exists(dir: &Path) -> bool {
     dir.join(VAULT_FILE).exists()
 }
 
+/// Remove a specific account session by email.
+pub fn remove_session_by_email(dir: &Path, email: &str) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let email = normalize_email(email);
+    let original_len = data.users.len();
+    data.users
+        .retain(|u| normalize_email(&u.primary_email) != email);
+
+    if data.users.len() == original_len {
+        return Err(VaultError::AccountNotFound(email));
+    }
+
+    if data.users.is_empty() {
+        return remove_session(dir);
+    }
+
+    save_vault_data(dir, &data)?;
+
+    let default_email = get_default_email(dir)?;
+    let still_valid_default = default_email.is_some_and(|default_email| {
+        data.users
+            .iter()
+            .any(|u| normalize_email(&u.primary_email) == normalize_email(&default_email))
+    });
+    if !still_valid_default {
+        write_default_email(dir, &data.users[0].primary_email)?;
+    }
+
+    Ok(())
+}
+
 pub fn remove_session(dir: &Path) -> Result<()> {
     let vault = dir.join(VAULT_FILE);
     let key_file = dir.join(KEY_FILE);
+    let default_email_file = dir.join(DEFAULT_EMAIL_FILE);
     if vault.exists() {
         std::fs::remove_file(&vault)?;
     }
     if key_file.exists() {
         std::fs::remove_file(&key_file)?;
     }
+    if default_email_file.exists() {
+        std::fs::remove_file(&default_email_file)?;
+    }
     // Also try to remove keychain entry (best-effort)
     if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_SECRET) {
         let _ = entry.delete_credential();
     }
     Ok(())
+}
+
+pub fn load_event_checkpoint_by_account_id(
+    dir: &Path,
+    account_id: &str,
+) -> Result<Option<StoredEventCheckpoint>> {
+    let Some(data) = load_vault_data(dir)? else {
+        return Ok(None);
+    };
+
+    let Some(user) = data.users.iter().find(|u| u.auth_uid == account_id) else {
+        return Ok(None);
+    };
+
+    if user.event_id.is_empty() && user.last_event_ts.is_none() && user.sync_state.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(StoredEventCheckpoint {
+        last_event_id: user.event_id.clone(),
+        last_event_ts: user.last_event_ts,
+        sync_state: user.sync_state.clone(),
+    }))
+}
+
+pub fn save_event_checkpoint_by_account_id(
+    dir: &Path,
+    account_id: &str,
+    checkpoint: &StoredEventCheckpoint,
+) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter_mut().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+
+    user.event_id = checkpoint.last_event_id.clone();
+    user.last_event_ts = checkpoint.last_event_ts;
+    user.sync_state = checkpoint.sync_state.clone();
+
+    save_vault_data(dir, &data)
 }
 
 #[cfg(test)]
@@ -745,6 +891,8 @@ mod tests {
             key_pass: b"rawkeypass".to_vec(),
             sync_status: SyncStatus::default(),
             event_id: String::new(),
+            last_event_ts: None,
+            sync_state: None,
             uid_validity: HashMap::new(),
             should_resync: false,
         });
@@ -789,6 +937,177 @@ mod tests {
         assert_eq!(loaded.display_name, session.display_name);
         assert_eq!(loaded.key_passphrase, session.key_passphrase);
         assert_eq!(loaded.bridge_password, session.bridge_password);
+    }
+
+    #[test]
+    fn test_list_sessions_and_load_by_email() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_a = Session {
+            uid: "uid-a".to_string(),
+            access_token: "access-a".to_string(),
+            refresh_token: "refresh-a".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-a".to_string()),
+        };
+        let session_b = Session {
+            uid: "uid-b".to_string(),
+            access_token: "access-b".to_string(),
+            refresh_token: "refresh-b".to_string(),
+            email: "bob@proton.me".to_string(),
+            display_name: "Bob".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-b".to_string()),
+        };
+
+        save_session(&session_a, tmp.path()).unwrap();
+        save_session(&session_b, tmp.path()).unwrap();
+
+        let sessions = list_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions.iter().any(|s| s.email == "alice@proton.me"));
+        assert!(sessions.iter().any(|s| s.email == "bob@proton.me"));
+
+        let loaded_b = load_session_by_email(tmp.path(), "BOB@PROTON.ME").unwrap();
+        assert_eq!(loaded_b.uid, "uid-b");
+        assert_eq!(loaded_b.email, "bob@proton.me");
+    }
+
+    #[test]
+    fn test_remove_session_by_email_keeps_other_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_a = Session {
+            uid: "uid-a".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-a".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-a".to_string()),
+        };
+        let session_b = Session {
+            uid: "uid-b".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-b".to_string(),
+            email: "bob@proton.me".to_string(),
+            display_name: "Bob".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-b".to_string()),
+        };
+        save_session(&session_a, tmp.path()).unwrap();
+        save_session(&session_b, tmp.path()).unwrap();
+
+        remove_session_by_email(tmp.path(), "alice@proton.me").unwrap();
+        let sessions = list_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].email, "bob@proton.me");
+        assert!(load_session_by_email(tmp.path(), "alice@proton.me").is_err());
+        assert!(session_exists(tmp.path()));
+    }
+
+    #[test]
+    fn test_default_email_roundtrip_and_load_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_a = Session {
+            uid: "uid-a".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-a".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-a".to_string()),
+        };
+        let session_b = Session {
+            uid: "uid-b".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-b".to_string(),
+            email: "bob@proton.me".to_string(),
+            display_name: "Bob".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-b".to_string()),
+        };
+        save_session(&session_a, tmp.path()).unwrap();
+        save_session(&session_b, tmp.path()).unwrap();
+
+        set_default_email(tmp.path(), "bob@proton.me").unwrap();
+        assert_eq!(
+            get_default_email(tmp.path()).unwrap(),
+            Some("bob@proton.me".to_string())
+        );
+
+        let loaded = load_session(tmp.path()).unwrap();
+        assert_eq!(loaded.email, "bob@proton.me");
+    }
+
+    #[test]
+    fn test_event_checkpoint_roundtrip_by_account_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "uid-checkpoint".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-checkpoint".to_string(),
+            email: "checkpoint@proton.me".to_string(),
+            display_name: "Checkpoint".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge".to_string()),
+        };
+        save_session(&session, tmp.path()).unwrap();
+
+        let checkpoint = StoredEventCheckpoint {
+            last_event_id: "event-123".to_string(),
+            last_event_ts: Some(123),
+            sync_state: Some("ok".to_string()),
+        };
+        save_event_checkpoint_by_account_id(tmp.path(), &session.uid, &checkpoint).unwrap();
+
+        let loaded = load_event_checkpoint_by_account_id(tmp.path(), &session.uid)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, checkpoint);
+    }
+
+    #[test]
+    fn test_event_checkpoint_missing_account_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "uid-a".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-a".to_string(),
+            email: "a@proton.me".to_string(),
+            display_name: "A".to_string(),
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        save_session(&session, tmp.path()).unwrap();
+
+        let checkpoint = StoredEventCheckpoint {
+            last_event_id: "event-1".to_string(),
+            last_event_ts: None,
+            sync_state: None,
+        };
+        let err = save_event_checkpoint_by_account_id(tmp.path(), "uid-missing", &checkpoint)
+            .unwrap_err();
+        assert!(matches!(err, VaultError::AccountNotFound(_)));
+    }
+
+    #[test]
+    fn test_load_session_backward_compatible_without_default_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "uid-legacy".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-legacy".to_string(),
+            email: "legacy@proton.me".to_string(),
+            display_name: "Legacy".to_string(),
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        save_session(&session, tmp.path()).unwrap();
+        std::fs::remove_file(tmp.path().join(DEFAULT_EMAIL_FILE)).unwrap();
+
+        let loaded = load_session(tmp.path()).unwrap();
+        assert_eq!(loaded.email, "legacy@proton.me");
     }
 
     #[test]
@@ -892,6 +1211,8 @@ mod tests {
             key_pass: vec![],
             sync_status: SyncStatus::default(),
             event_id: String::new(),
+            last_event_ts: None,
+            sync_state: None,
             uid_validity: HashMap::new(),
             should_resync: false,
         };
@@ -906,6 +1227,8 @@ mod tests {
         assert!(as_str.contains("AuthRef"));
         assert!(as_str.contains("KeyPass"));
         assert!(as_str.contains("EventID"));
+        assert!(as_str.contains("LastEventTS"));
+        assert!(as_str.contains("SyncState"));
         assert!(as_str.contains("UIDValidity"));
         assert!(as_str.contains("ShouldResync"));
     }

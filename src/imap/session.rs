@@ -1,15 +1,19 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine;
-use subtle::ConstantTimeEq;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
 use crate::api::client::ProtonClient;
+use crate::api::error::is_auth_error;
 use crate::api::messages;
-use crate::api::types::{self, MessageFilter, Session};
+use crate::api::types::{self, MessageFilter};
+use crate::bridge::accounts::{AccountRuntimeError, RuntimeAccountRegistry};
+use crate::bridge::auth_router::AuthRouter;
 use crate::crypto::keys::{self, Keyring};
 
 use super::command::{
@@ -30,8 +34,9 @@ enum State {
 }
 
 pub struct SessionConfig {
-    pub session: Session,
-    pub bridge_password: String,
+    pub api_base_url: String,
+    pub auth_router: AuthRouter,
+    pub runtime_accounts: Arc<RuntimeAccountRegistry>,
     pub store: Arc<dyn MessageStore>,
 }
 
@@ -51,6 +56,8 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     user_keyring: Option<Keyring>,
     addr_keyrings: Option<HashMap<String, Keyring>>,
     selected_mailbox: Option<String>,
+    selected_mailbox_mod_seq: Option<u64>,
+    authenticated_account_id: Option<String>,
 }
 
 impl<R, W> ImapSession<R, W>
@@ -68,6 +75,8 @@ where
             user_keyring: None,
             addr_keyrings: None,
             selected_mailbox: None,
+            selected_mailbox_mod_seq: None,
+            authenticated_account_id: None,
         }
     }
 
@@ -130,6 +139,7 @@ where
                 return Ok(SessionAction::Close);
             }
             Command::Noop { ref tag } => self.cmd_noop(tag).await?,
+            Command::Idle { ref tag } => self.cmd_idle(tag).await?,
             Command::StartTls { ref tag } => {
                 self.cmd_starttls(tag).await?;
                 return Ok(SessionAction::StartTls);
@@ -176,9 +186,9 @@ where
 
     async fn cmd_capability(&mut self, tag: &str) -> Result<()> {
         let caps = if self.state == State::NotAuthenticated {
-            "CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN"
+            "CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE"
         } else {
-            "CAPABILITY IMAP4rev1"
+            "CAPABILITY IMAP4rev1 IDLE"
         };
         self.writer.untagged(caps).await?;
         self.writer
@@ -191,25 +201,50 @@ where
             return self.writer.tagged_bad(tag, "already authenticated").await;
         }
 
-        // Validate credentials: username must match email, password must match bridge password
-        // Use constant-time comparison for the password to prevent timing side-channel attacks
-        let email_ok = username.eq_ignore_ascii_case(&self.config.session.email);
-        let password_ok: bool = password
-            .as_bytes()
-            .ct_eq(self.config.bridge_password.as_bytes())
-            .into();
-        if !email_ok || !password_ok {
-            return self
-                .writer
-                .tagged_no(tag, "[AUTHENTICATIONFAILED] invalid credentials")
-                .await;
-        }
+        let auth_route = match self.config.auth_router.resolve_login(username, password) {
+            Some(route) => route,
+            None => {
+                return self
+                    .writer
+                    .tagged_no(tag, "[AUTHENTICATIONFAILED] invalid credentials")
+                    .await;
+            }
+        };
+        let mut account_session = match self
+            .config
+            .runtime_accounts
+            .with_valid_access_token(&auth_route.account_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(AccountRuntimeError::AccountUnavailable(_)) => {
+                warn!(
+                    account_id = %auth_route.account_id.0,
+                    "account unavailable during IMAP login"
+                );
+                return self
+                    .writer
+                    .tagged_no(tag, "[AUTHENTICATIONFAILED] invalid credentials")
+                    .await;
+            }
+            Err(e) => {
+                warn!(
+                    account_id = %auth_route.account_id.0,
+                    error = %e,
+                    "failed to load account session"
+                );
+                return self
+                    .writer
+                    .tagged_no(tag, "failed to load account session")
+                    .await;
+            }
+        };
 
         // Create authenticated ProtonClient
-        let client = match ProtonClient::authenticated(
-            "https://mail-api.proton.me",
-            &self.config.session.uid,
-            &self.config.session.access_token,
+        let mut client = match ProtonClient::authenticated(
+            &self.config.api_base_url,
+            &account_session.uid,
+            &account_session.access_token,
         ) {
             Ok(c) => c,
             Err(e) => {
@@ -222,7 +257,7 @@ where
         };
 
         // Unlock keys
-        let passphrase_b64 = match &self.config.session.key_passphrase {
+        let passphrase_b64 = match &account_session.key_passphrase {
             Some(p) => p.clone(),
             None => {
                 return self
@@ -244,6 +279,59 @@ where
         // Fetch user keys and unlock
         let user_resp = match crate::api::users::get_user(&client).await {
             Ok(r) => r,
+            Err(e) if is_auth_error(&e) => {
+                let refreshed = match self
+                    .config
+                    .runtime_accounts
+                    .refresh_session_if_stale(
+                        &auth_route.account_id,
+                        Some(&account_session.access_token),
+                    )
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(refresh_err) => {
+                        passphrase.zeroize();
+                        warn!(
+                            account_id = %auth_route.account_id.0,
+                            error = %refresh_err,
+                            "token refresh failed during IMAP login"
+                        );
+                        return self
+                            .writer
+                            .tagged_no(tag, "failed to refresh account token")
+                            .await;
+                    }
+                };
+                account_session = refreshed;
+                client = match ProtonClient::authenticated(
+                    &self.config.api_base_url,
+                    &account_session.uid,
+                    &account_session.access_token,
+                ) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                        return self
+                            .writer
+                            .tagged_no(tag, "internal error creating client")
+                            .await;
+                    }
+                };
+
+                match crate::api::users::get_user(&client).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to fetch user info after refresh");
+                        return self
+                            .writer
+                            .tagged_no(tag, "failed to fetch user info")
+                            .await;
+                    }
+                }
+            }
             Err(e) => {
                 passphrase.zeroize();
                 warn!(error = %e, "failed to fetch user info");
@@ -268,6 +356,58 @@ where
 
         let addr_resp = match crate::api::users::get_addresses(&client).await {
             Ok(r) => r,
+            Err(e) if is_auth_error(&e) => {
+                let refreshed = match self
+                    .config
+                    .runtime_accounts
+                    .refresh_session_if_stale(
+                        &auth_route.account_id,
+                        Some(&account_session.access_token),
+                    )
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(refresh_err) => {
+                        passphrase.zeroize();
+                        warn!(
+                            account_id = %auth_route.account_id.0,
+                            error = %refresh_err,
+                            "token refresh failed while fetching addresses"
+                        );
+                        return self
+                            .writer
+                            .tagged_no(tag, "failed to refresh account token")
+                            .await;
+                    }
+                };
+                account_session = refreshed;
+                client = match ProtonClient::authenticated(
+                    &self.config.api_base_url,
+                    &account_session.uid,
+                    &account_session.access_token,
+                ) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                        return self
+                            .writer
+                            .tagged_no(tag, "internal error creating client")
+                            .await;
+                    }
+                };
+                match crate::api::users::get_addresses(&client).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        passphrase.zeroize();
+                        warn!(error = %err, "failed to fetch addresses after refresh");
+                        return self
+                            .writer
+                            .tagged_no(tag, "failed to fetch addresses")
+                            .await;
+                    }
+                }
+            }
             Err(e) => {
                 passphrase.zeroize();
                 warn!(error = %e, "failed to fetch addresses");
@@ -305,20 +445,61 @@ where
         self.client = Some(client);
         self.user_keyring = Some(user_keyring);
         self.addr_keyrings = Some(addr_keyrings);
+        self.authenticated_account_id = Some(auth_route.account_id.0.clone());
         self.state = State::Authenticated;
 
-        info!(email = %self.config.session.email, "IMAP login successful");
+        info!(email = %auth_route.primary_email, "IMAP login successful");
         self.writer.tagged_ok(tag, None, "LOGIN completed").await
     }
 
     async fn cmd_logout(&mut self, tag: &str) -> Result<()> {
         self.writer.untagged("BYE server logging out").await?;
         self.state = State::Logout;
+        self.authenticated_account_id = None;
         self.writer.tagged_ok(tag, None, "LOGOUT completed").await
     }
 
     async fn cmd_noop(&mut self, tag: &str) -> Result<()> {
+        self.emit_selected_mailbox_exists_update().await?;
         self.writer.tagged_ok(tag, None, "NOOP completed").await
+    }
+
+    async fn cmd_idle(&mut self, tag: &str) -> Result<()> {
+        if self.state != State::Selected {
+            return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+
+        self.writer.continuation("idling").await?;
+        self.emit_selected_mailbox_exists_update().await?;
+
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            let mut line = String::new();
+            tokio::select! {
+                _ = ticker.tick() => {
+                    self.emit_selected_mailbox_exists_update().await?;
+                }
+                read = self.reader.read_line(&mut line) => {
+                    let n = read?;
+                    if n == 0 {
+                        return Ok(());
+                    }
+
+                    let trimmed = line.trim_end_matches(['\r', '\n']).trim();
+                    if trimmed.eq_ignore_ascii_case("DONE") {
+                        break;
+                    }
+
+                    if !trimmed.is_empty() {
+                        self.writer.untagged("BAD expected DONE").await?;
+                    }
+                }
+            }
+        }
+
+        self.writer.tagged_ok(tag, None, "IDLE terminated").await
     }
 
     async fn cmd_starttls(&mut self, tag: &str) -> Result<()> {
@@ -331,6 +512,33 @@ where
         self.writer
             .tagged_ok(tag, None, "begin TLS negotiation")
             .await
+    }
+
+    fn scoped_mailbox_name(&self, mailbox: &str) -> String {
+        match &self.authenticated_account_id {
+            Some(account_id) => format!("{account_id}::{mailbox}"),
+            None => mailbox.to_string(),
+        }
+    }
+
+    async fn emit_selected_mailbox_exists_update(&mut self) -> Result<()> {
+        if self.state != State::Selected {
+            return Ok(());
+        }
+        let Some(mailbox) = self.selected_mailbox.clone() else {
+            return Ok(());
+        };
+
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
+        let snapshot = self.config.store.mailbox_snapshot(&scoped_mailbox).await?;
+        let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
+        if snapshot.mod_seq > previous_mod_seq {
+            self.writer
+                .untagged(&format!("{} EXISTS", snapshot.exists))
+                .await?;
+            self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        }
+        Ok(())
     }
 
     async fn cmd_list(&mut self, tag: &str, _reference: &str, pattern: &str) -> Result<()> {
@@ -408,19 +616,21 @@ where
         };
 
         let store = &self.config.store;
+        let scoped_mailbox = self.scoped_mailbox_name(mb.name);
 
         // Populate store with message metadata
         for meta in &meta_resp.messages {
             let uid = store
-                .store_metadata(mb.name, &meta.id, meta.clone())
+                .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
                 .await?;
             // Initialize flags from metadata
             let flags = mailbox::message_flags(meta);
             let flag_strings: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-            store.set_flags(mb.name, uid, flag_strings).await?;
+            store.set_flags(&scoped_mailbox, uid, flag_strings).await?;
         }
 
-        let status = store.mailbox_status(mb.name).await?;
+        let status = store.mailbox_status(&scoped_mailbox).await?;
+        let snapshot = store.mailbox_snapshot(&scoped_mailbox).await?;
 
         self.writer
             .untagged(&format!("{} EXISTS", status.exists))
@@ -440,6 +650,7 @@ where
         }
 
         self.selected_mailbox = Some(mb.name.to_string());
+        self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
         self.state = State::Selected;
 
         info!(
@@ -462,6 +673,7 @@ where
         self.do_expunge(true).await?;
 
         self.selected_mailbox = None;
+        self.selected_mailbox_mod_seq = None;
         self.state = State::Authenticated;
         self.writer.tagged_ok(tag, None, "CLOSE completed").await
     }
@@ -478,8 +690,9 @@ where
         }
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
-        let all_uids = store.list_uids(&mailbox).await?;
+        let all_uids = store.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "FETCH completed").await;
@@ -508,9 +721,9 @@ where
         };
 
         for &uid in &target_uids {
-            let seq = store.uid_to_seq(&mailbox, uid).await?.unwrap_or(0);
-            let meta = store.get_metadata(&mailbox, uid).await?;
-            let flags = store.get_flags(&mailbox, uid).await?;
+            let seq = store.uid_to_seq(&scoped_mailbox, uid).await?.unwrap_or(0);
+            let meta = store.get_metadata(&scoped_mailbox, uid).await?;
+            let flags = store.get_flags(&scoped_mailbox, uid).await?;
 
             let mut parts: Vec<String> = Vec::new();
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -521,11 +734,13 @@ where
 
             let mut rfc822_data = None;
             if needs_body {
-                rfc822_data = store.get_rfc822(&mailbox, uid).await?;
+                rfc822_data = store.get_rfc822(&scoped_mailbox, uid).await?;
                 if rfc822_data.is_none() {
                     // Fetch + decrypt on demand
                     if let Some(ref meta) = meta {
-                        rfc822_data = self.fetch_and_cache_rfc822(&mailbox, uid, &meta.id).await?;
+                        rfc822_data = self
+                            .fetch_and_cache_rfc822(&scoped_mailbox, uid, &meta.id)
+                            .await?;
                     }
                 }
             }
@@ -611,7 +826,7 @@ where
                             // Set \Seen flag
                             if !flags.contains(&"\\Seen".to_string()) {
                                 store
-                                    .add_flags(&mailbox, uid, &["\\Seen".to_string()])
+                                    .add_flags(&scoped_mailbox, uid, &["\\Seen".to_string()])
                                     .await?;
                                 // Mark as read on API
                                 if let Some(ref meta) = meta {
@@ -723,8 +938,9 @@ where
         }
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
-        let all_uids = store.list_uids(&mailbox).await?;
+        let all_uids = store.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "STORE completed").await;
@@ -759,19 +975,23 @@ where
         for &uid in &target_uids {
             match action {
                 StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
-                    store.set_flags(&mailbox, uid, flag_strings.clone()).await?;
+                    store
+                        .set_flags(&scoped_mailbox, uid, flag_strings.clone())
+                        .await?;
                 }
                 StoreAction::AddFlags | StoreAction::AddFlagsSilent => {
-                    store.add_flags(&mailbox, uid, &flag_strings).await?;
+                    store.add_flags(&scoped_mailbox, uid, &flag_strings).await?;
                 }
                 StoreAction::RemoveFlags | StoreAction::RemoveFlagsSilent => {
-                    store.remove_flags(&mailbox, uid, &flag_strings).await?;
+                    store
+                        .remove_flags(&scoped_mailbox, uid, &flag_strings)
+                        .await?;
                 }
             }
 
             // Sync flag changes to Proton API
             if let Some(ref client) = self.client {
-                if let Some(proton_id) = store.get_proton_id(&mailbox, uid).await? {
+                if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
                     let id_ref = proton_id.as_str();
                     for flag in flags {
                         let is_add = matches!(
@@ -813,8 +1033,8 @@ where
             }
 
             if !silent {
-                let seq = store.uid_to_seq(&mailbox, uid).await?.unwrap_or(0);
-                let current_flags = store.get_flags(&mailbox, uid).await?;
+                let seq = store.uid_to_seq(&scoped_mailbox, uid).await?.unwrap_or(0);
+                let current_flags = store.get_flags(&scoped_mailbox, uid).await?;
                 let flag_str = current_flags.join(" ");
                 self.writer
                     .untagged(&format!("{} FETCH (FLAGS ({}))", seq, flag_str))
@@ -836,16 +1056,17 @@ where
         }
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
-        let all_uids = store.list_uids(&mailbox).await?;
+        let all_uids = store.list_uids(&scoped_mailbox).await?;
 
         let mut results = Vec::new();
         let max_uid = all_uids.last().copied().unwrap_or(0);
 
         for (i, &uid) in all_uids.iter().enumerate() {
             let seq = i as u32 + 1;
-            let meta = store.get_metadata(&mailbox, uid).await?;
-            let flags = store.get_flags(&mailbox, uid).await?;
+            let meta = store.get_metadata(&scoped_mailbox, uid).await?;
+            let flags = store.get_flags(&scoped_mailbox, uid).await?;
 
             let matches = criteria
                 .iter()
@@ -885,20 +1106,21 @@ where
             Some(m) => m.clone(),
             None => return Ok(()),
         };
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
-        let all_uids = store.list_uids(&mailbox).await?;
+        let all_uids = store.list_uids(&scoped_mailbox).await?;
 
         let mut expunged_seqs = Vec::new();
         let mut offset = 0u32;
 
         for (i, &uid) in all_uids.iter().enumerate() {
-            let flags = store.get_flags(&mailbox, uid).await?;
+            let flags = store.get_flags(&scoped_mailbox, uid).await?;
             if flags.iter().any(|f| f == "\\Deleted") {
                 let seq = i as u32 + 1 - offset;
 
                 // Move to trash via API
                 if let Some(ref client) = self.client {
-                    if let Some(proton_id) = store.get_proton_id(&mailbox, uid).await? {
+                    if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
                         let _ = messages::label_messages(
                             client,
                             &[proton_id.as_str()],
@@ -908,7 +1130,7 @@ where
                     }
                 }
 
-                store.remove_message(&mailbox, uid).await?;
+                store.remove_message(&scoped_mailbox, uid).await?;
                 expunged_seqs.push(seq);
                 offset += 1;
             }
@@ -948,8 +1170,9 @@ where
         };
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
-        let all_uids = store.list_uids(&mailbox).await?;
+        let all_uids = store.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "COPY completed").await;
@@ -975,7 +1198,7 @@ where
 
         if let Some(ref client) = self.client {
             for &uid in &target_uids {
-                if let Some(proton_id) = store.get_proton_id(&mailbox, uid).await? {
+                if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
                     let _ =
                         messages::label_messages(client, &[proton_id.as_str()], dest_mb.label_id)
                             .await;
@@ -1149,10 +1372,15 @@ fn extract_header_section(data: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::api::types::{EmailAddress, MessageMetadata};
+    use crate::bridge::accounts::AccountHealth;
+    use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
+    use crate::bridge::auth_router::AuthRouter;
     use crate::imap::store::InMemoryStore;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_session() -> Session {
-        Session {
+    fn test_session() -> crate::api::types::Session {
+        crate::api::types::Session {
             uid: "test-uid".to_string(),
             access_token: "test-token".to_string(),
             refresh_token: "test-refresh".to_string(),
@@ -1164,9 +1392,12 @@ mod tests {
     }
 
     fn test_config() -> Arc<SessionConfig> {
+        let session = test_session();
+        let accounts = AccountRegistry::from_single_session(session.clone());
         Arc::new(SessionConfig {
-            session: test_session(),
-            bridge_password: "bridge-pass-1234".to_string(),
+            api_base_url: "https://mail-api.proton.me".to_string(),
+            auth_router: AuthRouter::new(accounts),
+            runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
             store: InMemoryStore::new(),
         })
     }
@@ -1206,6 +1437,37 @@ mod tests {
 
         let session = ImapSession::new(server_read, server_write, config);
         (session, client_read, client_write)
+    }
+
+    fn multi_account_config(api_base_url: &str) -> Arc<SessionConfig> {
+        let account_a = crate::api::types::Session {
+            uid: "uid-a".to_string(),
+            access_token: "access-a".to_string(),
+            refresh_token: "refresh-a".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            key_passphrase: Some("dGVzdA==".to_string()),
+            bridge_password: Some("pass-a".to_string()),
+        };
+        let account_b = crate::api::types::Session {
+            uid: "uid-b".to_string(),
+            access_token: "access-b".to_string(),
+            refresh_token: "refresh-b".to_string(),
+            email: "bob@proton.me".to_string(),
+            display_name: "Bob".to_string(),
+            key_passphrase: Some("dGVzdA==".to_string()),
+            bridge_password: Some("pass-b".to_string()),
+        };
+        let accounts = AccountRegistry::from_sessions(vec![account_a.clone(), account_b.clone()]);
+        let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
+            account_a, account_b,
+        ]));
+        Arc::new(SessionConfig {
+            api_base_url: api_base_url.to_string(),
+            auth_router: AuthRouter::new(accounts),
+            runtime_accounts,
+            store: InMemoryStore::new(),
+        })
     }
 
     #[tokio::test]
@@ -1255,6 +1517,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_noop_selected_emits_exists_on_store_change() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.selected_mailbox_mod_seq = Some(0);
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 NOOP").await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("1 EXISTS"));
+        assert!(response.contains("a001 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_idle_selected_waits_for_done_and_emits_exists() {
+        let config = test_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.selected_mailbox_mod_seq = Some(0);
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        let idle_task =
+            tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"));
+        assert!(response.contains("1 EXISTS"));
+
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
+
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a001 OK IDLE terminated"));
+
+        let action = tokio::time::timeout(Duration::from_secs(1), idle_task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(action, SessionAction::Continue));
+    }
+
+    #[tokio::test]
     async fn test_logout() {
         let config = test_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
@@ -1288,6 +1631,64 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("a001 NO"));
         assert!(response.contains("AUTHENTICATIONFAILED"));
+    }
+
+    #[tokio::test]
+    async fn test_login_isolation_unavailable_account_does_not_block_other_account() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/users"))
+            .and(header("x-pm-uid", "uid-b"))
+            .and(header("Authorization", "Bearer access-b"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "User": {
+                    "ID": "user-b",
+                    "Name": "bob",
+                    "DisplayName": "Bob",
+                    "Email": "bob@proton.me",
+                    "Keys": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let config = multi_account_config(&server.uri());
+        config
+            .runtime_accounts
+            .set_health(
+                &crate::bridge::types::AccountId("uid-a".to_string()),
+                AccountHealth::Unavailable,
+            )
+            .await
+            .unwrap();
+
+        // Unavailable account fails with generic auth failure.
+        let (mut unavailable_session, mut unavailable_read, _w1) =
+            create_session_pair(config.clone()).await;
+        unavailable_session
+            .handle_line("a001 LOGIN alice@proton.me pass-a")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut unavailable_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("AUTHENTICATIONFAILED"));
+
+        // Healthy account still proceeds to account-specific processing path.
+        let (mut healthy_session, mut healthy_read, _w2) = create_session_pair(config).await;
+        healthy_session
+            .handle_line("a001 LOGIN bob@proton.me pass-b")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut healthy_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("failed to unlock user keys"));
     }
 
     #[tokio::test]

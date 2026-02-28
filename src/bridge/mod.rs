@@ -1,2 +1,4 @@
-// Bridge orchestration module -- config, vault, sync engine
-// Implemented in Phase 5
+pub mod accounts;
+pub mod auth_router;
+pub mod events;
+pub mod types;

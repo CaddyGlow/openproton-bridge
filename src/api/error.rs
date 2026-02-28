@@ -31,3 +31,16 @@ pub enum ApiError {
 }
 
 pub type Result<T> = std::result::Result<T, ApiError>;
+
+pub fn is_auth_error(err: &ApiError) -> bool {
+    match err {
+        ApiError::SessionExpired | ApiError::Auth(_) | ApiError::TwoFactorRequired => true,
+        ApiError::Api { code, message } => {
+            *code == 401
+                || *code == 10013
+                || message.to_ascii_lowercase().contains("token")
+                || message.to_ascii_lowercase().contains("auth")
+        }
+        _ => false,
+    }
+}

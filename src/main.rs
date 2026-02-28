@@ -36,10 +36,22 @@ enum Command {
         #[arg(short, long)]
         username: Option<String>,
     },
-    /// Show current session info
+    /// Show account/session info
     Status,
-    /// Log out and clear saved session
-    Logout,
+    /// Log out one account or clear all saved sessions
+    Logout {
+        /// Account email to remove
+        #[arg(long, conflicts_with = "all")]
+        email: Option<String>,
+        /// Remove all accounts
+        #[arg(long)]
+        all: bool,
+    },
+    /// Manage saved accounts
+    Accounts {
+        #[command(subcommand)]
+        command: AccountsCommand,
+    },
     /// Fetch and decrypt inbox messages
     Fetch {
         /// Maximum number of messages to fetch
@@ -63,6 +75,17 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum AccountsCommand {
+    /// List all saved accounts
+    List,
+    /// Set the default account used by fetch/serve
+    Use {
+        /// Account email to set as default
+        email: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -78,7 +101,11 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Login { username } => cmd_login(username, &dir).await,
         Command::Status => cmd_status(&dir),
-        Command::Logout => cmd_logout(&dir),
+        Command::Logout { email, all } => cmd_logout(email.as_deref(), all, &dir),
+        Command::Accounts { command } => match command {
+            AccountsCommand::List => cmd_accounts_list(&dir),
+            AccountsCommand::Use { email } => cmd_accounts_use(&email, &dir),
+        },
         Command::Fetch { limit } => cmd_fetch(limit, &dir).await,
         Command::Serve {
             imap_port,
@@ -156,6 +183,7 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
     };
 
     vault::save_session(&session, dir)?;
+    vault::set_default_email(dir, &session.email)?;
 
     println!("Logged in as {} ({})", user.display_name, user.email);
     if !addr_resp.addresses.is_empty() {
@@ -177,14 +205,34 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
 }
 
 fn cmd_status(dir: &std::path::Path) -> anyhow::Result<()> {
-    let session = vault::load_session(dir).context("failed to load session")?;
-    println!("Logged in as {} ({})", session.display_name, session.email);
-    if session.key_passphrase.is_some() {
+    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
+    if sessions.is_empty() {
+        println!("Not logged in");
+        return Ok(());
+    }
+
+    let default_email = vault::get_default_email(dir).context("failed to load default account")?;
+    println!("Accounts:");
+    for session in &sessions {
+        let is_default = default_email
+            .as_deref()
+            .is_some_and(|email| email.eq_ignore_ascii_case(&session.email));
+        let default_marker = if is_default { " (default)" } else { "" };
+        println!(
+            "  {} ({}){}",
+            session.display_name, session.email, default_marker
+        );
+    }
+    println!();
+
+    let active = vault::load_session(dir).context("failed to load active account")?;
+    println!("Active account: {}", active.email);
+    if active.key_passphrase.is_some() {
         println!("Key passphrase: stored");
     } else {
         println!("Key passphrase: not stored (fetch will not work)");
     }
-    if let Some(ref bp) = session.bridge_password {
+    if let Some(ref bp) = active.bridge_password {
         println!("Bridge password: {}", bp);
     } else {
         println!("Bridge password: not set (re-login to generate)");
@@ -192,13 +240,30 @@ fn cmd_status(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn cmd_logout(dir: &std::path::Path) -> anyhow::Result<()> {
-    if vault::session_exists(dir) {
-        vault::remove_session(dir)?;
-        println!("Logged out");
-    } else {
+fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::Result<()> {
+    if !vault::session_exists(dir) {
         println!("Not logged in");
+        return Ok(());
     }
+
+    if all || email.is_none() {
+        vault::remove_session(dir)?;
+        println!("Logged out all accounts");
+    } else {
+        let email = email.expect("checked is_some");
+        vault::remove_session_by_email(dir, email)?;
+        println!("Removed account: {}", email);
+    }
+    Ok(())
+}
+
+fn cmd_accounts_list(dir: &std::path::Path) -> anyhow::Result<()> {
+    cmd_status(dir)
+}
+
+fn cmd_accounts_use(email: &str, dir: &std::path::Path) -> anyhow::Result<()> {
+    vault::set_default_email(dir, email)?;
+    println!("Default account set to {}", email);
     Ok(())
 }
 
@@ -347,35 +412,102 @@ async fn cmd_serve(
         }
     }
 
-    let mut session = vault::load_session(dir).context("failed to load session")?;
-
-    // If access_token is empty (Go vault format), refresh it
-    if session.access_token.is_empty() {
-        session = refresh_session(session, dir).await?;
+    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
+    if sessions.is_empty() {
+        anyhow::bail!("not logged in -- run `openproton-bridge login` first");
     }
 
-    // Ensure bridge password exists
-    if session.bridge_password.is_none() {
-        let bp = generate_bridge_password();
-        session.bridge_password = Some(bp);
-        vault::save_session(&session, dir)?;
+    let mut active_sessions = Vec::new();
+    for mut session in sessions {
+        if session.access_token.is_empty() {
+            let email = session.email.clone();
+            match refresh_session(session, dir).await {
+                Ok(refreshed) => session = refreshed,
+                Err(e) => {
+                    tracing::warn!(
+                        email = %email,
+                        error = %e,
+                        "skipping account: failed to refresh token"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if session.bridge_password.is_none() {
+            let bridge_password = generate_bridge_password();
+            session.bridge_password = Some(bridge_password);
+            vault::save_session(&session, dir)?;
+        }
+
+        active_sessions.push(session);
     }
 
-    let bridge_password = session.bridge_password.clone().unwrap();
+    if active_sessions.is_empty() {
+        anyhow::bail!("no usable accounts available after token refresh");
+    }
+
+    let mut account_registry =
+        bridge::accounts::AccountRegistry::from_sessions(active_sessions.clone());
+    for session in &active_sessions {
+        let client = match api::client::ProtonClient::authenticated(
+            "https://mail-api.proton.me",
+            &session.uid,
+            &session.access_token,
+        ) {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(
+                    email = %session.email,
+                    error = %e,
+                    "skipping address index refresh for account"
+                );
+                continue;
+            }
+        };
+
+        match api::users::get_addresses(&client).await {
+            Ok(addresses) => {
+                let account_id = bridge::types::AccountId(session.uid.clone());
+                for address in addresses.addresses {
+                    if address.status == 1 {
+                        account_registry.add_address_email(&account_id, &address.email);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    email = %session.email,
+                    error = %e,
+                    "failed to refresh address index for account"
+                );
+            }
+        }
+    }
+    let auth_router = bridge::auth_router::AuthRouter::new(account_registry);
+    let runtime_accounts = Arc::new(bridge::accounts::RuntimeAccountRegistry::new(
+        active_sessions.clone(),
+        dir.to_path_buf(),
+    ));
+    let runtime_snapshot = runtime_accounts.snapshot().await;
+    let api_base_url = "https://mail-api.proton.me".to_string();
 
     let store = imap::store::InMemoryStore::new();
+    let event_store: Arc<dyn imap::store::MessageStore> = store.clone();
 
     let imap_config = imap::session::SessionConfig {
-        session: session.clone(),
-        bridge_password: bridge_password.clone(),
+        api_base_url: api_base_url.clone(),
+        auth_router: auth_router.clone(),
+        runtime_accounts: runtime_accounts.clone(),
         store,
     };
 
     let imap_config = Arc::new(imap_config);
 
     let smtp_config = smtp::session::SmtpSessionConfig {
-        session,
-        bridge_password: bridge_password.clone(),
+        api_base_url: api_base_url.clone(),
+        auth_router: auth_router.clone(),
+        runtime_accounts: runtime_accounts.clone(),
     };
 
     let smtp_config = Arc::new(smtp_config);
@@ -393,25 +525,71 @@ async fn cmd_serve(
     println!("  Server: {}", bind);
     println!("  Port: {}", imap_port);
     println!("  Security: {}", if no_tls { "None" } else { "STARTTLS" });
-    println!("  Username: {}", imap_config.session.email);
-    println!("  Password: {}", bridge_password);
+    println!("  Accounts:");
+    for session in &active_sessions {
+        let password = session
+            .bridge_password
+            .as_deref()
+            .unwrap_or("<missing-bridge-password>");
+        println!("    {} / {}", session.email, password);
+    }
+    println!("  Health:");
+    for info in &runtime_snapshot {
+        println!(
+            "    {} ({}) = {:?}",
+            info.email, info.account_id.0, info.health
+        );
+    }
     println!();
     println!("SMTP server configuration:");
     println!("  Server: {}", bind);
     println!("  Port: {}", smtp_port);
     println!("  Security: {}", if no_tls { "None" } else { "STARTTLS" });
-    println!("  Username: {}", smtp_config.session.email);
-    println!("  Password: {}", bridge_password);
+    println!("  Accounts:");
+    for session in &active_sessions {
+        let password = session
+            .bridge_password
+            .as_deref()
+            .unwrap_or("<missing-bridge-password>");
+        println!("    {} / {}", session.email, password);
+    }
+    println!("  Health:");
+    for info in &runtime_snapshot {
+        println!(
+            "    {} ({}) = {:?}",
+            info.email, info.account_id.0, info.health
+        );
+    }
     println!();
 
-    tokio::select! {
+    let checkpoint_store: bridge::events::SharedCheckpointStore =
+        Arc::new(bridge::events::VaultCheckpointStore::new(dir.to_path_buf()));
+    let event_workers = bridge::events::start_event_worker_group(
+        runtime_accounts.clone(),
+        runtime_snapshot.clone(),
+        api_base_url,
+        auth_router.clone(),
+        event_store,
+        checkpoint_store,
+        std::time::Duration::from_secs(30),
+    );
+
+    let health_task = tokio::spawn(report_runtime_health_periodically(runtime_accounts.clone()));
+
+    let serve_result: anyhow::Result<()> = tokio::select! {
         result = imap::server::run_server(&imap_addr, imap_config) => {
-            result?;
+            result.map_err(anyhow::Error::from)
         }
         result = smtp::server::run_server(&smtp_addr, smtp_config) => {
-            result?;
+            result.map_err(anyhow::Error::from)
         }
-    }
+    };
+
+    health_task.abort();
+    let _ = health_task.await;
+    event_workers.shutdown().await;
+
+    serve_result?;
 
     Ok(())
 }
@@ -521,4 +699,103 @@ fn session_dir(override_dir: Option<&std::path::Path>) -> anyhow::Result<std::pa
         .context("could not determine config directory")?
         .join("openproton-bridge");
     Ok(config_dir)
+}
+
+async fn report_runtime_health_periodically(
+    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
+) {
+    use tokio::time::{interval, Duration, MissedTickBehavior};
+
+    let mut ticker = interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        let snapshot = runtime_accounts.snapshot().await;
+        let mut healthy = 0usize;
+        let mut degraded = 0usize;
+        let mut unavailable = 0usize;
+
+        for info in &snapshot {
+            match info.health {
+                bridge::accounts::AccountHealth::Healthy => healthy += 1,
+                bridge::accounts::AccountHealth::Degraded => degraded += 1,
+                bridge::accounts::AccountHealth::Unavailable => unavailable += 1,
+            }
+        }
+
+        tracing::info!(
+            total_accounts = snapshot.len(),
+            healthy,
+            degraded,
+            unavailable,
+            "runtime account health snapshot"
+        );
+
+        for info in &snapshot {
+            if matches!(info.health, bridge::accounts::AccountHealth::Unavailable) {
+                tracing::warn!(
+                    account_id = %info.account_id.0,
+                    email = %info.email,
+                    health = ?info.health,
+                    "account unavailable while server is running"
+                );
+            } else {
+                tracing::debug!(
+                    account_id = %info.account_id.0,
+                    email = %info.email,
+                    health = ?info.health,
+                    "account runtime health detail"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_logout_email_flag() {
+        let cli =
+            Cli::try_parse_from(["openproton-bridge", "logout", "--email", "alice@proton.me"])
+                .unwrap();
+
+        match cli.command {
+            Command::Logout { email, all } => {
+                assert_eq!(email.as_deref(), Some("alice@proton.me"));
+                assert!(!all);
+            }
+            _ => panic!("expected logout command"),
+        }
+    }
+
+    #[test]
+    fn parse_logout_all_flag() {
+        let cli = Cli::try_parse_from(["openproton-bridge", "logout", "--all"]).unwrap();
+
+        match cli.command {
+            Command::Logout { email, all } => {
+                assert!(email.is_none());
+                assert!(all);
+            }
+            _ => panic!("expected logout command"),
+        }
+    }
+
+    #[test]
+    fn parse_accounts_use_subcommand() {
+        let cli =
+            Cli::try_parse_from(["openproton-bridge", "accounts", "use", "bob@proton.me"]).unwrap();
+
+        match cli.command {
+            Command::Accounts { command } => match command {
+                AccountsCommand::Use { email } => assert_eq!(email, "bob@proton.me"),
+                _ => panic!("expected accounts use subcommand"),
+            },
+            _ => panic!("expected accounts command"),
+        }
+    }
 }

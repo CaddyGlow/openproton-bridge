@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 // System label constants
 pub const INBOX_LABEL: &str = "0";
@@ -251,6 +252,19 @@ pub const DETACHED_SIGNATURE: i32 = 1;
 // Recipient type constants
 pub const RECIPIENT_INTERNAL: i32 = 1;
 pub const RECIPIENT_EXTERNAL: i32 = 2;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct EventsResponse {
+    #[serde(rename = "EventID", default)]
+    pub event_id: String,
+    #[serde(default)]
+    pub more: i32,
+    #[serde(default)]
+    pub refresh: i32,
+    #[serde(default)]
+    pub events: Vec<Value>,
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "PascalCase")]

@@ -16,6 +16,9 @@ pub enum Command {
     Noop {
         tag: String,
     },
+    Idle {
+        tag: String,
+    },
     StartTls {
         tag: String,
     },
@@ -199,6 +202,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "LOGIN" => parse_login(&tag, args),
         "LOGOUT" => Ok(Command::Logout { tag }),
         "NOOP" => Ok(Command::Noop { tag }),
+        "IDLE" => Ok(Command::Idle { tag }),
         "STARTTLS" => Ok(Command::StartTls { tag }),
         "LIST" => parse_list(&tag, args),
         "SELECT" => parse_select(&tag, args),
@@ -651,6 +655,17 @@ mod tests {
         assert_eq!(
             cmd,
             Command::Noop {
+                tag: "a003".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_idle() {
+        let cmd = parse_command("a003 IDLE").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Idle {
                 tag: "a003".to_string()
             }
         );

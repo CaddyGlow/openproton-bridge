@@ -63,8 +63,20 @@
     color_scheme_name: 'system',
   }
 
+  const sections = [
+    { id: 'accounts', label: 'Accounts' },
+    { id: 'mail', label: 'Mail' },
+    { id: 'settings', label: 'Settings' },
+    { id: 'activity', label: 'Activity' },
+  ] as const
+
+  type SectionId = (typeof sections)[number]['id']
+  type ThemeMode = 'system' | 'light' | 'dark'
+
   let stop = $state<(() => void) | undefined>(undefined)
   let stopUi = $state<(() => void) | undefined>(undefined)
+  let activeSection = $state<SectionId>('accounts')
+  let systemPrefersDark = $state(false)
   let configPathInput = $state('')
   let hostname = $state('')
   let users = $state<UserSummary[]>([])
@@ -90,6 +102,48 @@
   let tlsExportDir = $state('')
   let tlsStatus = $state('')
   let toastLog = $state<string[]>([])
+
+  function normalizeThemeMode(value: string | undefined): ThemeMode {
+    if (value === 'light' || value === 'dark') {
+      return value
+    }
+    return 'system'
+  }
+
+  function resolveTheme(mode: ThemeMode): 'light' | 'dark' {
+    if (mode === 'system') {
+      return systemPrefersDark ? 'dark' : 'light'
+    }
+    return mode
+  }
+
+  $effect(() => {
+    if (typeof document === 'undefined') {
+      return
+    }
+    const mode = normalizeThemeMode(colorSchemeNameInput)
+    document.documentElement.dataset.theme = resolveTheme(mode)
+  })
+
+  async function persistThemeMode(nextMode: ThemeMode) {
+    colorSchemeNameInput = nextMode
+    appSettings.color_scheme_name = nextMode
+    try {
+      await setColorSchemeName(nextMode)
+      settingsStatus = `theme set to ${nextMode}`
+    } catch (error) {
+      settingsStatus = `theme update failed: ${String(error)}`
+      logger.error('app', 'set theme mode failed', { error: String(error), mode: nextMode })
+    }
+  }
+
+  function cycleThemeMode() {
+    const modes: ThemeMode[] = ['system', 'light', 'dark']
+    const current = normalizeThemeMode(colorSchemeNameInput)
+    const currentIndex = modes.indexOf(current)
+    const nextMode = modes[(currentIndex + 1) % modes.length]
+    void persistThemeMode(nextMode)
+  }
 
   function pushToast(message: string) {
     toastLog = [`${new Date().toLocaleTimeString()} ${message}`, ...toastLog].slice(0, 24)
@@ -373,6 +427,18 @@
   }
 
   onMount(() => {
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    const handleSystemThemeChange = () => {
+      systemPrefersDark = mediaQuery.matches
+    }
+    handleSystemThemeChange()
+
+    if (typeof mediaQuery.addEventListener === 'function') {
+      mediaQuery.addEventListener('change', handleSystemThemeChange)
+    } else {
+      mediaQuery.addListener(handleSystemThemeChange)
+    }
+
     void (async () => {
       logger.info('app', 'mount start')
       stop = await initBridgeStore()
@@ -384,84 +450,137 @@
 
     return () => {
       logger.info('app', 'unmount cleanup')
+      if (typeof mediaQuery.removeEventListener === 'function') {
+        mediaQuery.removeEventListener('change', handleSystemThemeChange)
+      } else {
+        mediaQuery.removeListener(handleSystemThemeChange)
+      }
       stop?.()
       stopUi?.()
     }
   })
 </script>
 
-<main>
-  <section class="card">
-    <h1>OpenProton Bridge UI</h1>
-    <p class="muted">Tauri + Svelte scaffold with Bun and Rust-side bridge adapter wiring.</p>
-  </section>
+<main class="app-shell">
+  <header class="card app-header">
+    <div>
+      <h1>OpenProton Bridge</h1>
+      <p class="muted">Desktop bridge console for account state, login challenges, and service health.</p>
+    </div>
+    <div class="header-actions">
+      <span class="chip">{$bridgeStatus.connected ? 'Connected' : 'Disconnected'}</span>
+      <span class="chip">Step: {$bridgeStatus.login_step}</span>
+      <button class="secondary" onclick={cycleThemeMode}>
+        Theme: {normalizeThemeMode(colorSchemeNameInput)}
+      </button>
+    </div>
+  </header>
 
-  <section class="grid">
-    <BridgeConnectionCard
-      status={$bridgeStatus}
-      bind:configPathInput
-      onSetPath={(path) => updateConfigPath(path)}
-      onConnect={connectAndLoad}
-      onDisconnect={disconnect}
-    />
+  <section class="workspace">
+    <aside class="left-rail">
+      <article class="card nav-card">
+        <h2>Navigation</h2>
+        <div class="section-nav">
+          {#each sections as section}
+            <button
+              class:active={activeSection === section.id}
+              class="secondary nav-btn"
+              onclick={() => {
+                activeSection = section.id
+              }}
+            >
+              {section.label}
+            </button>
+          {/each}
+        </div>
+      </article>
 
-    <LoginFlowCard
-      loginStep={$bridgeStatus.login_step}
-      bind:loginUsername
-      bind:loginPassword
-      bind:twoFactorCode
-      bind:mailboxPassword
-      bind:fidoAssertionPayload
-      loginStatus={loginStatus}
-      onSubmitCredentials={submitCredentials}
-      onSubmitTwoFactor={submitTwoFactor}
-      onSubmitMailboxPassword={submitMailboxPassword}
-      onSubmitFidoAssertion={submitFidoAssertion}
-      onAbortFidoFlow={abortFidoFlow}
-      onAbortLoginFlow={abortLoginFlow}
-    />
+      <BridgeConnectionCard
+        status={$bridgeStatus}
+        bind:configPathInput
+        onSetPath={(path) => updateConfigPath(path)}
+        onConnect={connectAndLoad}
+        onDisconnect={disconnect}
+      />
 
-    <ErrorStateCard lastError={$bridgeStatus.last_error} onClearError={resetError} />
+      <article class="card">
+        <h2>Host</h2>
+        <p class="muted"><strong>Hostname:</strong> {hostname || '(not loaded)'}</p>
+        <p class="muted"><strong>Users:</strong> {users.length}</p>
+        <p class="muted"><strong>Theme:</strong> {resolveTheme(normalizeThemeMode(colorSchemeNameInput))}</p>
+      </article>
+    </aside>
 
-    <GeneralSettingsCard
-      bind:appSettings
-      bind:diskCachePathInput
-      bind:colorSchemeNameInput
-      settingsStatus={settingsStatus}
-      onApplySettings={applyGeneralSettings}
-    />
+    <section class="main-pane">
+      {#if activeSection === 'accounts'}
+        <LoginFlowCard
+          loginStep={$bridgeStatus.login_step}
+          bind:loginUsername
+          bind:loginPassword
+          bind:twoFactorCode
+          bind:mailboxPassword
+          bind:fidoAssertionPayload
+          loginStatus={loginStatus}
+          onSubmitCredentials={submitCredentials}
+          onSubmitTwoFactor={submitTwoFactor}
+          onSubmitMailboxPassword={submitMailboxPassword}
+          onSubmitFidoAssertion={submitFidoAssertion}
+          onAbortFidoFlow={abortFidoFlow}
+          onAbortLoginFlow={abortLoginFlow}
+        />
 
-    <StreamEventsCard events={$streamLog} />
+        <UsersCard
+          hostname={hostname}
+          usersLoading={usersLoading}
+          users={users}
+          onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
+          onLogout={(userId) => logout(userId)}
+          onRemove={(userId) => remove(userId)}
+        />
+      {:else if activeSection === 'mail'}
+        <MailSettingsCard
+          bind:imapPort
+          bind:smtpPort
+          bind:useSslImap
+          bind:useSslSmtp
+          saveStatus={saveStatus}
+          bind:portToCheck
+          portCheckResult={portCheckResult}
+          onSaveMailSettings={saveMailServerSettings}
+          onCheckPort={checkPort}
+        />
+      {:else if activeSection === 'settings'}
+        <GeneralSettingsCard
+          bind:appSettings
+          bind:diskCachePathInput
+          bind:colorSchemeNameInput
+          settingsStatus={settingsStatus}
+          onApplySettings={applyGeneralSettings}
+        />
 
-    <UsersCard
-      hostname={hostname}
-      usersLoading={usersLoading}
-      users={users}
-      onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
-      onLogout={(userId) => logout(userId)}
-      onRemove={(userId) => remove(userId)}
-    />
+        <TlsSettingsCard
+          tlsInstalled={tlsInstalled}
+          bind:tlsExportDir
+          tlsStatus={tlsStatus}
+          onInstallTls={installTls}
+          onExportTls={exportTls}
+        />
+      {:else}
+        <StreamEventsCard events={$streamLog} />
+      {/if}
+    </section>
 
-    <MailSettingsCard
-      bind:imapPort
-      bind:smtpPort
-      bind:useSslImap
-      bind:useSslSmtp
-      saveStatus={saveStatus}
-      bind:portToCheck
-      portCheckResult={portCheckResult}
-      onSaveMailSettings={saveMailServerSettings}
-      onCheckPort={checkPort}
-    />
+    <aside class="status-rail">
+      <article class="card">
+        <h2>Status Rail</h2>
+        <p class="muted"><strong>Stream:</strong> {$bridgeStatus.stream_running ? 'running' : 'stopped'}</p>
+        <p class="muted"><strong>Login:</strong> {$bridgeStatus.login_step}</p>
+        <p class="muted"><strong>TLS:</strong> {tlsInstalled === null ? 'unknown' : tlsInstalled ? 'installed' : 'missing'}</p>
+      </article>
 
-    <TlsSettingsCard
-      tlsInstalled={tlsInstalled}
-      bind:tlsExportDir
-      tlsStatus={tlsStatus}
-      onInstallTls={installTls}
-      onExportTls={exportTls}
-    />
-
-    <EventToastsCard toasts={toastLog} />
+      <ErrorStateCard lastError={$bridgeStatus.last_error} onClearError={resetError} />
+      <EventToastsCard toasts={toastLog} />
+      <StreamEventsCard events={$streamLog.slice(0, 10)} />
+    </aside>
   </section>
 </main>

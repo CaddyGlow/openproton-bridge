@@ -1,0 +1,60 @@
+name: Bridge UI Desktop Build
+
+on:
+  pull_request:
+    paths:
+      - "apps/bridge-ui/**"
+      - ".github/workflows/bridge-ui-desktop-build.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/bridge-ui/**"
+      - ".github/workflows/bridge-ui-desktop-build.yml"
+  workflow_dispatch:
+
+jobs:
+  desktop-build:
+    name: "${{ matrix.os }} desktop build"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - macos-latest
+
+    defaults:
+      run:
+        working-directory: apps/bridge-ui
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.9"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      - name: Frontend typecheck
+        run: bun run check
+
+      - name: Frontend tests
+        run: bun run test:run
+
+      - name: Tauri Rust tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Tauri desktop compile
+        run: bun run tauri:build --debug --no-bundle --ci

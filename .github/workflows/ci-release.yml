@@ -1,0 +1,165 @@
+name: CI and Release
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: "Git ref to build/test (branch, tag, or full commit SHA)"
+        type: string
+        required: false
+        default: ""
+      build_artifacts:
+        description: "Build and upload release archives (without publishing release)"
+        type: boolean
+        required: true
+        default: false
+      publish_release:
+        description: "Build and publish release artifacts (requires a tag)"
+        type: boolean
+        required: true
+        default: false
+      release_tag:
+        description: "Tag to build/publish (example: v0.1.0)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ref || github.ref }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+  build-release-artifacts:
+    name: Build release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && (inputs.build_artifacts || inputs.publish_release))
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_os: linux-x86_64
+            archive_ext: tar.gz
+            bin_ext: ""
+          - os: macos-latest
+            archive_os: macos-x86_64
+            archive_ext: tar.gz
+            bin_ext: ""
+          - os: windows-latest
+            archive_os: windows-x86_64
+            archive_ext: zip
+            bin_ext: ".exe"
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ref || github.ref }}
+
+      - name: Validate manual release inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ inputs.publish_release }}" = "true" ] && [ -z "${{ inputs.release_tag }}" ]; then
+            echo "release_tag is required when publish_release=true"
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Protoc
+        uses: arduino/setup-protoc@v3
+
+      - name: Install Linux Tauri dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libwebkit2gtk-4.1-dev \
+            libsoup-3.0-dev \
+            patchelf
+
+      - name: Build bridge binary
+        run: cargo build --release --locked
+
+      - name: Build Tauri binary
+        run: cargo build --manifest-path apps/bridge-ui/src-tauri/Cargo.toml --release --locked
+
+      - name: Create package directory
+        run: |
+          mkdir -p dist/package
+          cp "target/release/openproton-bridge${{ matrix.bin_ext }}" dist/package/
+          cp "target/release/bridge-ui-tauri${{ matrix.bin_ext }}" dist/package/
+
+      - name: Archive package (unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          LABEL="${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}"
+          if [ -z "$LABEL" ]; then
+            LABEL="${GITHUB_SHA::7}"
+          fi
+          archive="openproton-bridge-${LABEL}-${{ matrix.archive_os }}.${{ matrix.archive_ext }}"
+          tar -C dist/package -czf "dist/${archive}" .
+          echo "ARCHIVE_PATH=dist/${archive}" >> "$GITHUB_ENV"
+
+      - name: Archive package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $label = "${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}"
+          if ([string]::IsNullOrWhiteSpace($label)) {
+            $label = $env:GITHUB_SHA.Substring(0, 7)
+          }
+          $archive = "openproton-bridge-$label-${{ matrix.archive_os }}.${{ matrix.archive_ext }}"
+          Compress-Archive -Path "dist/package/*" -DestinationPath "dist/$archive"
+          "ARCHIVE_PATH=dist/$archive" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.archive_os }}
+          path: ${{ env.ARCHIVE_PATH }}
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
+    needs: build-release-artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-artifacts
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+          target_commitish: ${{ github.event_name == 'workflow_dispatch' && inputs.build_ref || github.sha }}
+          generate_release_notes: true
+          files: release-artifacts/*

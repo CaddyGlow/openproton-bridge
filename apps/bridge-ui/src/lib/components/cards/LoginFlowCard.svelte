@@ -28,11 +28,67 @@
     onAbortFidoFlow?: () => void
     onAbortLoginFlow?: () => void
   } = $props()
+
+  const flowSteps = ['credentials', '2fa_or_fido', 'mailbox_password', 'done'] as const
+  type FlowStep = (typeof flowSteps)[number]
+
+  function normalizeFlowStep(step: string): FlowStep {
+    if (step === '2fa' || step === 'fido' || step === 'fido_touch' || step === 'fido_pin') {
+      return '2fa_or_fido'
+    }
+    if (step === 'mailbox_password') {
+      return 'mailbox_password'
+    }
+    if (step === 'done') {
+      return 'done'
+    }
+    return 'credentials'
+  }
+
+  function flowStepLabel(step: FlowStep): string {
+    if (step === '2fa_or_fido') {
+      return 'Verify'
+    }
+    if (step === 'mailbox_password') {
+      return 'Unlock'
+    }
+    if (step === 'done') {
+      return 'Ready'
+    }
+    return 'Sign In'
+  }
+
+  function flowHint(step: string): string {
+    if (step === 'fido_touch') {
+      return 'Touch your security key to continue.'
+    }
+    if (step === 'fido_pin') {
+      return 'Enter your security key PIN.'
+    }
+    if (step === '2fa' || step === '2fa_or_fido' || step === 'fido') {
+      return 'Complete account verification with 2FA code or FIDO assertion.'
+    }
+    if (step === 'mailbox_password') {
+      return 'Provide mailbox password to unlock encrypted mail access.'
+    }
+    if (step === 'done') {
+      return 'Authentication finished.'
+    }
+    return 'Enter Proton account credentials to start the login flow.'
+  }
 </script>
 
 <article class="card">
   <h2>Login Flow</h2>
   <p class="muted"><strong>Current step:</strong> {loginStep}</p>
+  <ol class="flow-stepper">
+    {#each flowSteps as step}
+      <li class:active={flowSteps.indexOf(step) === flowSteps.indexOf(normalizeFlowStep(loginStep))}>
+        {flowStepLabel(step)}
+      </li>
+    {/each}
+  </ol>
+  <p class="muted flow-hint">{flowHint(loginStep)}</p>
 
   <div class="row wrap">
     <label>

@@ -918,3 +918,85 @@ fn unix_timestamp_string() -> String {
 
     format!("[{now}]")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn login_stream_event(event: pb::login_event::Event) -> pb::StreamEvent {
+        pb::StreamEvent {
+            event: Some(pb::stream_event::Event::Login(pb::LoginEvent {
+                event: Some(event),
+            })),
+        }
+    }
+
+    #[test]
+    fn stream_state_patch_maps_tfa_or_fido_step() {
+        let event = login_stream_event(pb::login_event::Event::TfaOrFidoRequested(
+            pb::LoginTfaOrFidoRequestedEvent {
+                username: "alice".to_string(),
+            },
+        ));
+
+        let (step, last_error) = stream_state_patch(&event);
+        assert_eq!(step.as_deref(), Some("2fa_or_fido"));
+        assert_eq!(last_error, Some(None));
+    }
+
+    #[test]
+    fn stream_state_patch_maps_fido_touch_step() {
+        let event = login_stream_event(pb::login_event::Event::LoginFidoTouchRequested(
+            pb::LoginFidoTouchEvent {
+                username: "alice".to_string(),
+            },
+        ));
+
+        let (step, last_error) = stream_state_patch(&event);
+        assert_eq!(step.as_deref(), Some("fido_touch"));
+        assert_eq!(last_error, Some(None));
+    }
+
+    #[test]
+    fn stream_ui_event_emits_fido_pin_required() {
+        let event = login_stream_event(pb::login_event::Event::LoginFidoPinRequired(
+            pb::LoginFidoPinRequired {
+                username: "alice".to_string(),
+            },
+        ));
+
+        let ui_event = stream_ui_event(&event);
+        assert!(ui_event.is_some(), "expected a ui event");
+        let ui_event = ui_event.unwrap_or_else(|| UiEvent {
+            level: String::new(),
+            code: String::new(),
+            message: String::new(),
+            refresh_hints: vec![],
+        });
+
+        assert_eq!(ui_event.level, "info");
+        assert_eq!(ui_event.code, "fido_pin_required");
+        assert_eq!(ui_event.message, "FIDO PIN required");
+    }
+
+    #[test]
+    fn stream_ui_event_emits_login_error_message() {
+        let event = login_stream_event(pb::login_event::Event::Error(pb::LoginErrorEvent {
+            r#type: pb::LoginErrorType::FidoError as i32,
+            message: "bad fido assertion".to_string(),
+        }));
+
+        let ui_event = stream_ui_event(&event);
+        assert!(ui_event.is_some(), "expected a ui event");
+        let ui_event = ui_event.unwrap_or_else(|| UiEvent {
+            level: String::new(),
+            code: String::new(),
+            message: String::new(),
+            refresh_hints: vec![],
+        });
+
+        assert_eq!(ui_event.level, "error");
+        assert_eq!(ui_event.code, "login_error");
+        assert_eq!(ui_event.message, "bad fido assertion");
+    }
+}

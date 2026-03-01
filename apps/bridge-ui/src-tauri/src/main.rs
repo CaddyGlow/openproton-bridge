@@ -5,7 +5,7 @@ mod tray;
 use crate::grpc::adapter::{AppSettings, GrpcAdapter, MailSettings, UserSummary};
 use crate::state::{AppState, BridgeSnapshot};
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -28,6 +28,102 @@ impl FrontendLogState {
         }
     }
 }
+
+const CAPTCHA_WINDOW_LABEL: &str = "captcha";
+
+const CAPTCHA_WINDOW_INIT_SCRIPT: &str = r#"
+(() => {
+  if (window.__openProtonCaptchaHookInstalled) {
+    return;
+  }
+  window.__openProtonCaptchaHookInstalled = true;
+
+  function parseToken(payload) {
+    let value = payload;
+    if (typeof value === 'string') {
+      try {
+        value = JSON.parse(value);
+      } catch {
+        return null;
+      }
+    }
+
+    if (!value || typeof value !== 'object') {
+      return null;
+    }
+
+    const token =
+      value.type === 'pm_captcha' && typeof value.token === 'string' && value.token.length > 0
+        ? value.token
+        : (
+            value.type === 'HUMAN_VERIFICATION_SUCCESS' &&
+            value.payload &&
+            typeof value.payload === 'object' &&
+            value.payload.type === 'captcha' &&
+            typeof value.payload.token === 'string' &&
+            value.payload.token.length > 0
+          )
+          ? value.payload.token
+          : null;
+
+    if (!token) {
+      return null;
+    }
+
+    return { type: value.type, token };
+  }
+
+  function emitToken(token) {
+    if (window.__openProtonCaptchaTokenSent) {
+      return;
+    }
+    window.__openProtonCaptchaTokenSent = true;
+
+    const invoke = window.__TAURI_INTERNALS__ && window.__TAURI_INTERNALS__.invoke;
+    if (typeof invoke === 'function') {
+      invoke('bridge_captcha_token_captured', { token }).catch(() => {
+        window.__openProtonCaptchaTokenSent = false;
+      });
+    }
+  }
+
+  let fallbackToken = null;
+  let fallbackTimer = null;
+
+  window.addEventListener('message', (event) => {
+    if (event.origin !== 'https://verify.proton.me' && event.origin !== 'https://verify-api.proton.me') {
+      return;
+    }
+
+    const parsed = parseToken(event.data);
+    if (!parsed) {
+      return;
+    }
+
+    if (parsed.type === 'pm_captcha') {
+      // Keep pm_captcha as a fallback, but prefer HUMAN_VERIFICATION_SUCCESS
+      // which indicates Proton finished verification and prevents premature retries.
+      fallbackToken = parsed.token;
+      if (!fallbackTimer) {
+        fallbackTimer = setTimeout(() => {
+          if (fallbackToken) {
+            emitToken(fallbackToken);
+          }
+        }, 2000);
+      }
+      return;
+    }
+
+    if (parsed.type === 'HUMAN_VERIFICATION_SUCCESS') {
+      if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
+      emitToken(parsed.token);
+    }
+  });
+})();
+"#;
 
 fn emit_state(app: &AppHandle, snapshot: &BridgeSnapshot) {
     let _ = app.emit("bridge://state-changed", snapshot);
@@ -252,7 +348,7 @@ async fn bridge_fetch_users(
 #[tauri::command]
 #[tracing::instrument(
     level = "debug",
-    skip(state, adapter_state, password),
+    skip(state, adapter_state, password, human_verification_token),
     fields(username = %username, use_hv_details = ?use_hv_details)
 )]
 async fn bridge_login(
@@ -261,11 +357,68 @@ async fn bridge_login(
     username: String,
     password: String,
     use_hv_details: Option<bool>,
+    human_verification_token: Option<String>,
 ) -> Result<(), String> {
     let adapter = adapter_state.adapter.lock().await;
     adapter
-        .login(state.inner(), &username, &password, use_hv_details)
+        .login(
+            state.inner(),
+            &username,
+            &password,
+            use_hv_details,
+            human_verification_token.as_deref(),
+        )
         .await
+}
+
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip(app), fields(url = %url))]
+async fn bridge_open_captcha_window(app: AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with("https://verify.proton.me/") {
+        return Err("captcha url must start with https://verify.proton.me/".to_string());
+    }
+
+    let parsed = Url::parse(&url).map_err(|err| format!("invalid captcha url: {err}"))?;
+
+    if let Some(existing) = app.get_webview_window(CAPTCHA_WINDOW_LABEL) {
+        let _ = existing.close();
+    }
+
+    WebviewWindowBuilder::new(&app, CAPTCHA_WINDOW_LABEL, WebviewUrl::External(parsed))
+        .title("Proton CAPTCHA Verification")
+        .inner_size(520.0, 760.0)
+        .resizable(true)
+        .initialization_script(CAPTCHA_WINDOW_INIT_SCRIPT)
+        .build()
+        .map_err(|err| format!("failed to create captcha window: {err}"))?;
+
+    Ok(())
+}
+
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip(app))]
+async fn bridge_close_captcha_window(app: AppHandle) -> Result<(), String> {
+    if let Some(existing) = app.get_webview_window(CAPTCHA_WINDOW_LABEL) {
+        let _ = existing.close();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip(app, token), fields(token_len = token.len()))]
+async fn bridge_captcha_token_captured(app: AppHandle, token: String) -> Result<(), String> {
+    if token.trim().is_empty() {
+        return Err("captcha token is empty".to_string());
+    }
+
+    app.emit("bridge://captcha-token", token)
+        .map_err(|err| format!("failed to emit captcha token event: {err}"))?;
+
+    if let Some(existing) = app.get_webview_window(CAPTCHA_WINDOW_LABEL) {
+        let _ = existing.close();
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -578,6 +731,9 @@ fn main() {
             bridge_frontend_log,
             bridge_fetch_users,
             bridge_login,
+            bridge_open_captcha_window,
+            bridge_close_captcha_window,
+            bridge_captcha_token_captured,
             bridge_login_2fa,
             bridge_login_2passwords,
             bridge_login_abort,

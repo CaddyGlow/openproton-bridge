@@ -1185,6 +1185,9 @@ impl pb::bridge_server::Bridge for BridgeService {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    _ = out_tx.closed() => {
+                        break;
+                    }
                     changed = stop_rx.changed() => {
                         if changed.is_err() || *stop_rx.borrow() {
                             break;

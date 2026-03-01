@@ -76,8 +76,24 @@ export async function login(
   username: string,
   password: string,
   useHvDetails?: boolean,
+  humanVerificationToken?: string,
 ): Promise<void> {
-  return invoke<void>('bridge_login', { username, password, use_hv_details: useHvDetails })
+  return invoke<void>('bridge_login', {
+    username,
+    password,
+    use_hv_details: useHvDetails,
+    useHvDetails,
+    human_verification_token: humanVerificationToken,
+    humanVerificationToken,
+  })
+}
+
+export async function openCaptchaWindow(url: string): Promise<void> {
+  return invoke<void>('bridge_open_captcha_window', { url })
+}
+
+export async function closeCaptchaWindow(): Promise<void> {
+  return invoke<void>('bridge_close_captcha_window')
 }
 
 export async function login2fa(username: string, code: string): Promise<void> {
@@ -88,6 +104,7 @@ export async function login2passwords(username: string, mailboxPassword: string)
   return invoke<void>('bridge_login_2passwords', {
     username,
     mailbox_password: mailboxPassword,
+    mailboxPassword,
   })
 }
 
@@ -99,6 +116,7 @@ export async function loginFido(username: string, assertionPayload: string): Pro
   return invoke<void>('bridge_login_fido', {
     username,
     assertion_payload: assertionPayload,
+    assertionPayload,
   })
 }
 
@@ -188,4 +206,8 @@ export async function onStreamTick(handler: (tick: StreamTickEvent) => void): Pr
 
 export async function onBridgeUiEvent(handler: (event: BridgeUiEvent) => void): Promise<UnlistenFn> {
   return listen<BridgeUiEvent>('bridge://ui-event', (event) => handler(event.payload))
+}
+
+export async function onCaptchaToken(handler: (token: string) => void): Promise<UnlistenFn> {
+  return listen<string>('bridge://captcha-token', (event) => handler(event.payload))
 }

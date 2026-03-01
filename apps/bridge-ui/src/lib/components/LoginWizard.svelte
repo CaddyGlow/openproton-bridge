@@ -12,7 +12,10 @@
     mailboxPassword = $bindable(''),
     fidoAssertionPayload = $bindable(''),
     hvVerificationUrl = '',
+    hvCaptchaToken = $bindable(''),
     onSubmitCredentials = () => {},
+    onOpenCaptchaWindow = () => {},
+    onCloseCaptchaWindow = () => {},
     onRetryCaptcha = () => {},
     onSubmitTwoFactor = () => {},
     onSubmitMailboxPassword = () => {},
@@ -30,7 +33,10 @@
     mailboxPassword?: string
     fidoAssertionPayload?: string
     hvVerificationUrl?: string
+    hvCaptchaToken?: string
     onSubmitCredentials?: () => void
+    onOpenCaptchaWindow?: () => void
+    onCloseCaptchaWindow?: () => void
     onRetryCaptcha?: () => void
     onSubmitTwoFactor?: () => void
     onSubmitMailboxPassword?: () => void
@@ -196,9 +202,29 @@
               {#if hvVerificationUrl}
                 <div class="wizard-awaiting">
                   <p>Human verification required.</p>
-                  <p class="muted">Open this link, complete CAPTCHA, then retry login.</p>
+                  <p class="muted">Complete CAPTCHA in the verification window, then retry login.</p>
                   <p class="muted break-anywhere">{hvVerificationUrl}</p>
-                  <button onclick={onRetryCaptcha}>Retry CAPTCHA</button>
+                  <div class="wizard-actions">
+                    <button onclick={onOpenCaptchaWindow}>Open CAPTCHA Window</button>
+                    <button class="secondary" onclick={onCloseCaptchaWindow}>Close CAPTCHA Window</button>
+                    <a class="button-like secondary" href={hvVerificationUrl} target="_blank" rel="noreferrer">
+                      Open in Browser
+                    </a>
+                    <button onclick={onRetryCaptcha} disabled={!hvCaptchaToken}>Retry CAPTCHA</button>
+                  </div>
+                  <label class="wizard-token-field">
+                    CAPTCHA token (optional)
+                    <textarea
+                      bind:value={hvCaptchaToken}
+                      rows="3"
+                      placeholder="Paste token here if webview capture is blocked"
+                    ></textarea>
+                  </label>
+                  {#if hvCaptchaToken}
+                    <p class="muted">CAPTCHA token captured ({hvCaptchaToken.length} chars).</p>
+                  {:else}
+                    <p class="muted">Waiting for `pm_captcha` token from verification window.</p>
+                  {/if}
                 </div>
               {/if}
             {/if}
@@ -429,6 +455,27 @@
   .wizard-awaiting p {
     margin: 0;
     font-size: 0.84rem;
+  }
+
+  .wizard-actions {
+    margin-top: 8px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .wizard-token-field {
+    margin-top: 8px;
+    display: grid;
+    gap: 6px;
+    font-size: 0.84rem;
+  }
+
+  .button-like {
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
   }
 
   .break-anywhere {

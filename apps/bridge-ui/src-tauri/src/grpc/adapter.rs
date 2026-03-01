@@ -6,6 +6,7 @@ use std::path::Path;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio::time::Duration;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
@@ -93,9 +94,17 @@ pub struct GrpcAdapter {
 
 impl GrpcAdapter {
     pub async fn connect(&mut self, app: AppHandle, state: AppState) -> Result<(), String> {
-        if self.stream_task.is_some() {
-            debug!("connect ignored because stream task is already running");
-            return Ok(());
+        if let Some(handle) = self.stream_task.as_ref() {
+            if handle.is_finished() {
+                debug!("cleaning up finished stream task before reconnect");
+                if let Some(handle) = self.stream_task.take() {
+                    let _ = handle.await;
+                }
+                self.stop_tx = None;
+            } else {
+                debug!("connect ignored because stream task is already running");
+                return Ok(());
+            }
         }
 
         let explicit_path = state.snapshot().await.config_path;
@@ -109,11 +118,22 @@ impl GrpcAdapter {
         let request = pb::EventStreamRequest {
             client_platform: client_platform_name(),
         };
-        let mut stream = client
-            .run_event_stream(Request::new(request))
-            .await
-            .map_err(|err| format!("RunEventStream failed: {err}"))?
-            .into_inner();
+        let mut stream = match client.run_event_stream(Request::new(request.clone())).await {
+            Ok(response) => response.into_inner(),
+            Err(err) if err.code() == tonic::Code::AlreadyExists => {
+                info!("grpc stream already exists on server, requesting stop before reconnect");
+                let _ = client.stop_event_stream(()).await;
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                client
+                    .run_event_stream(Request::new(request))
+                    .await
+                    .map_err(|retry_err| format!("RunEventStream failed after stop retry: {retry_err}"))?
+                    .into_inner()
+            }
+            Err(err) => {
+                return Err(format!("RunEventStream failed: {err}"));
+            }
+        };
 
         state
             .update(|snapshot| {
@@ -244,6 +264,7 @@ impl GrpcAdapter {
         username: &str,
         secret: &str,
         use_hv_details: Option<bool>,
+        human_verification_token: Option<&str>,
     ) -> Result<(), String> {
         let config = self.resolve_server_config(state).await?;
         let mut client = connect_client(&config).await?;
@@ -252,6 +273,7 @@ impl GrpcAdapter {
                 username: username.to_string(),
                 password: secret.as_bytes().to_vec(),
                 use_hv_details,
+                human_verification_token: human_verification_token.map(str::to_string),
             })
             .await
             .map_err(|err| format!("Login failed: {err}"))?;
@@ -271,6 +293,7 @@ impl GrpcAdapter {
                 username: username.to_string(),
                 password: code.as_bytes().to_vec(),
                 use_hv_details: None,
+                human_verification_token: None,
             })
             .await
             .map_err(|err| format!("Login2FA failed: {err}"))?;
@@ -290,6 +313,7 @@ impl GrpcAdapter {
                 username: username.to_string(),
                 password: mailbox_password.as_bytes().to_vec(),
                 use_hv_details: None,
+                human_verification_token: None,
             })
             .await
             .map_err(|err| format!("Login2Passwords failed: {err}"))?;
@@ -321,6 +345,7 @@ impl GrpcAdapter {
                 username: username.to_string(),
                 password: assertion_payload.to_vec(),
                 use_hv_details: None,
+                human_verification_token: None,
             })
             .await
             .map_err(|err| format!("LoginFido failed: {err}"))?;
@@ -709,9 +734,11 @@ pub fn stream_state_patch(event: &pb::StreamEvent) -> (Option<String>, Option<Op
             Some(pb::login_event::Event::LoginFidoPinRequired(_)) => {
                 (Some("fido_pin".to_string()), Some(None))
             }
-            Some(pb::login_event::Event::TwoPasswordRequested(_))
-            | Some(pb::login_event::Event::HvRequested(_)) => {
+            Some(pb::login_event::Event::TwoPasswordRequested(_)) => {
                 (Some("mailbox_password".to_string()), Some(None))
+            }
+            Some(pb::login_event::Event::HvRequested(_)) => {
+                (Some("credentials".to_string()), Some(None))
             }
             Some(pb::login_event::Event::Finished(_))
             | Some(pb::login_event::Event::AlreadyLoggedIn(_)) => {
@@ -774,6 +801,12 @@ fn stream_ui_event(event: &pb::StreamEvent) -> Option<UiEvent> {
                 code: "login_finished".to_string(),
                 message: "Login completed".to_string(),
                 refresh_hints: vec!["users".to_string()],
+            }),
+            Some(pb::login_event::Event::TfaRequested(_)) => Some(UiEvent {
+                level: "info".to_string(),
+                code: "tfa_requested".to_string(),
+                message: "2FA code required".to_string(),
+                refresh_hints: vec![],
             }),
             Some(pb::login_event::Event::FidoRequested(_)) => Some(UiEvent {
                 level: "info".to_string(),
@@ -977,6 +1010,28 @@ mod tests {
         assert_eq!(ui_event.level, "info");
         assert_eq!(ui_event.code, "fido_pin_required");
         assert_eq!(ui_event.message, "FIDO PIN required");
+    }
+
+    #[test]
+    fn stream_ui_event_emits_tfa_requested() {
+        let event = login_stream_event(pb::login_event::Event::TfaRequested(
+            pb::LoginTfaRequestedEvent {
+                username: "alice".to_string(),
+            },
+        ));
+
+        let ui_event = stream_ui_event(&event);
+        assert!(ui_event.is_some(), "expected a ui event");
+        let ui_event = ui_event.unwrap_or_else(|| UiEvent {
+            level: String::new(),
+            code: String::new(),
+            message: String::new(),
+            refresh_hints: vec![],
+        });
+
+        assert_eq!(ui_event.level, "info");
+        assert_eq!(ui_event.code, "tfa_requested");
+        assert_eq!(ui_event.message, "2FA code required");
     }
 
     #[test]

@@ -13,6 +13,7 @@
   } from './lib/stores/bridge'
   import {
     onBridgeUiEvent,
+    onCaptchaToken,
     exportTlsCertificates,
     fetchUsers,
     getAppSettings,
@@ -26,6 +27,8 @@
     login2fa,
     login2passwords,
     loginAbort,
+    openCaptchaWindow,
+    closeCaptchaWindow,
     fidoAssertionAbort,
     logoutUser,
     removeUser,
@@ -76,6 +79,7 @@
 
   let stop = $state<(() => void) | undefined>(undefined)
   let stopUi = $state<(() => void) | undefined>(undefined)
+  let stopCaptchaToken = $state<(() => void) | undefined>(undefined)
   let activeSection = $state<SectionId>('accounts')
   let loginWizardOpen = $state(false)
   let lastLoginStepSeen = $state('credentials')
@@ -103,6 +107,7 @@
   let mailboxPassword = $state('')
   let fidoAssertionPayload = $state('')
   let hvVerificationUrl = $state('')
+  let hvCaptchaToken = $state('')
   let loginStatus = $state('')
   let tlsInstalled = $state<boolean | null>(null)
   let tlsExportDir = $state('')
@@ -118,6 +123,30 @@
 
   function formatLoginStep(step: string): string {
     return step.replaceAll('_', ' ')
+  }
+
+  function syncLoginStatusWithStep(step: string, force = false) {
+    if (!force && step === lastLoginStepSeen) {
+      return
+    }
+    lastLoginStepSeen = step
+
+    if (step !== 'credentials') {
+      activeSection = 'accounts'
+      loginWizardOpen = true
+    }
+
+    if (step === '2fa') {
+      loginStatus = 'CAPTCHA accepted. Enter your 2FA code.'
+    } else if (step === '2fa_or_fido') {
+      loginStatus = 'CAPTCHA accepted. Complete 2FA or security key verification.'
+    } else if (step === 'fido' || step === 'fido_touch' || step === 'fido_pin') {
+      loginStatus = 'CAPTCHA accepted. Complete security key verification.'
+    } else if (step === 'mailbox_password') {
+      loginStatus = 'Account verified. Enter mailbox password to unlock.'
+    } else if (step === 'done') {
+      loginStatus = 'Login completed.'
+    }
   }
 
   function resolveTheme(mode: ThemeMode): 'light' | 'dark' {
@@ -165,14 +194,7 @@
   }
 
   $effect(() => {
-    const step = $bridgeStatus.login_step
-    if (step !== lastLoginStepSeen) {
-      lastLoginStepSeen = step
-      if (step !== 'credentials') {
-        activeSection = 'accounts'
-        loginWizardOpen = true
-      }
-    }
+    syncLoginStatusWithStep($bridgeStatus.login_step)
   })
 
   function pushToast(message: string) {
@@ -185,6 +207,27 @@
       return null
     }
     return match[0].replace(/[),.;]+$/, '')
+  }
+
+  async function openCaptchaVerificationWindow() {
+    if (!hvVerificationUrl) {
+      return
+    }
+    try {
+      await openCaptchaWindow(hvVerificationUrl)
+      loginStatus = 'complete CAPTCHA in the verification window, then click Retry CAPTCHA'
+    } catch (error) {
+      logger.error('app', 'open captcha window failed', { error: String(error) })
+      loginStatus = `failed to open verification window: ${String(error)}`
+    }
+  }
+
+  async function closeCaptchaVerificationWindow() {
+    try {
+      await closeCaptchaWindow()
+    } catch (error) {
+      logger.error('app', 'close captcha window failed', { error: String(error) })
+    }
   }
 
   async function refreshUsersData() {
@@ -282,8 +325,15 @@
   async function submitCredentials() {
     logger.info('app', 'submit credentials requested', { username: loginUsername })
     loginStatus = 'submitting credentials...'
+    lastLoginStepSeen = ''
     hvVerificationUrl = ''
+    hvCaptchaToken = ''
+    await closeCaptchaVerificationWindow()
     try {
+      if (!get(bridgeStatus).stream_running) {
+        logger.info('app', 'bridge stream not running, connecting before login')
+        await connect()
+      }
       await login(loginUsername, loginPassword)
       loginStatus = 'credentials submitted'
     } catch (error) {
@@ -292,7 +342,7 @@
       const hvUrl = extractHvUrl(message)
       if (hvUrl) {
         hvVerificationUrl = hvUrl
-        loginStatus = 'human verification required: open the link, complete CAPTCHA, then click Retry CAPTCHA'
+        await openCaptchaVerificationWindow()
       } else {
         loginStatus = `login failed: ${message}`
       }
@@ -301,16 +351,30 @@
 
   async function retryCaptchaLogin() {
     logger.info('app', 'retry captcha login requested', { username: loginUsername })
+    if (!hvCaptchaToken) {
+      loginStatus = 'complete CAPTCHA in the verification window first'
+      return
+    }
     loginStatus = 'retrying login with human verification token...'
+    lastLoginStepSeen = ''
     try {
-      await login(loginUsername, loginPassword, true)
-      loginStatus = 'captcha retry submitted'
+      if (!get(bridgeStatus).stream_running) {
+        logger.info('app', 'bridge stream not running, reconnecting before captcha retry')
+        await connect()
+      }
+      await login(loginUsername, loginPassword, true, hvCaptchaToken)
+      const step = get(bridgeStatus).login_step
+      syncLoginStatusWithStep(step, true)
+      if (step === 'credentials' || step === 'idle') {
+        loginStatus = 'CAPTCHA retry submitted. Waiting for next login step...'
+      }
     } catch (error) {
       const message = String(error)
       logger.error('app', 'retry captcha login failed', { error: message })
       const hvUrl = extractHvUrl(message)
       if (hvUrl) {
         hvVerificationUrl = hvUrl
+        await openCaptchaVerificationWindow()
       }
       loginStatus = `captcha retry failed: ${message}`
     }
@@ -458,11 +522,14 @@
     }
     if (event.code === 'login_finished') {
       hvVerificationUrl = ''
+      hvCaptchaToken = ''
+      void closeCaptchaVerificationWindow()
     }
     if (event.code === 'autostart_saved' || event.code === 'disk_cache_saved') {
       settingsStatus = 'saved (stream confirmed)'
     }
     if (
+      event.code === 'tfa_requested' ||
       event.code === 'fido_requested' ||
       event.code === 'tfa_or_fido_requested' ||
       event.code === 'fido_touch_requested' ||
@@ -477,6 +544,7 @@
         const hvUrl = extractHvUrl(event.message)
         if (hvUrl) {
           hvVerificationUrl = hvUrl
+          void openCaptchaVerificationWindow()
         }
         loginStatus = event.message
       }
@@ -515,11 +583,17 @@
       mediaQuery.addListener(handleSystemThemeChange)
       motionQuery.addListener(handleMotionChange)
     }
-
     void (async () => {
       logger.info('app', 'mount start')
       stop = await initBridgeStore()
       stopUi = await onBridgeUiEvent((event) => handleUiEvent(event))
+      stopCaptchaToken = await onCaptchaToken((token) => {
+        hvCaptchaToken = token
+        loginStatus = 'CAPTCHA token captured. Click Retry CAPTCHA to continue.'
+        logger.info('app', 'captured captcha token from verification window', {
+          token_len: token.length,
+        })
+      })
       configPathInput = get(bridgeStatus).config_path ?? ''
       await refreshBridgeData()
       logger.info('app', 'mount completed')
@@ -536,6 +610,8 @@
       }
       stop?.()
       stopUi?.()
+      stopCaptchaToken?.()
+      void closeCaptchaVerificationWindow()
     }
   })
 </script>
@@ -684,8 +760,11 @@
     bind:mailboxPassword
     bind:fidoAssertionPayload
     hvVerificationUrl={hvVerificationUrl}
+    bind:hvCaptchaToken
     loginStatus={loginStatus}
     onSubmitCredentials={submitCredentials}
+    onOpenCaptchaWindow={openCaptchaVerificationWindow}
+    onCloseCaptchaWindow={closeCaptchaVerificationWindow}
     onRetryCaptcha={retryCaptchaLogin}
     onSubmitTwoFactor={submitTwoFactor}
     onSubmitMailboxPassword={submitMailboxPassword}

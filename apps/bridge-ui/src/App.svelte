@@ -44,7 +44,7 @@
   } from './lib/api/bridge'
   import { logger } from './lib/logging/logger'
   import BridgeConnectionCard from './lib/components/cards/BridgeConnectionCard.svelte'
-  import LoginFlowCard from './lib/components/cards/LoginFlowCard.svelte'
+  import LoginWizard from './lib/components/LoginWizard.svelte'
   import ErrorStateCard from './lib/components/cards/ErrorStateCard.svelte'
   import GeneralSettingsCard from './lib/components/cards/GeneralSettingsCard.svelte'
   import StreamEventsCard from './lib/components/cards/StreamEventsCard.svelte'
@@ -76,6 +76,8 @@
   let stop = $state<(() => void) | undefined>(undefined)
   let stopUi = $state<(() => void) | undefined>(undefined)
   let activeSection = $state<SectionId>('accounts')
+  let loginWizardOpen = $state(false)
+  let lastLoginStepSeen = $state('credentials')
   let systemPrefersDark = $state(false)
   let configPathInput = $state('')
   let hostname = $state('')
@@ -144,6 +146,26 @@
     const nextMode = modes[(currentIndex + 1) % modes.length]
     void persistThemeMode(nextMode)
   }
+
+  function openLoginWizard() {
+    activeSection = 'accounts'
+    loginWizardOpen = true
+  }
+
+  function closeLoginWizard() {
+    loginWizardOpen = false
+  }
+
+  $effect(() => {
+    const step = $bridgeStatus.login_step
+    if (step !== lastLoginStepSeen) {
+      lastLoginStepSeen = step
+      if (step !== 'credentials') {
+        activeSection = 'accounts'
+        loginWizardOpen = true
+      }
+    }
+  })
 
   function pushToast(message: string) {
     toastLog = [`${new Date().toLocaleTimeString()} ${message}`, ...toastLog].slice(0, 24)
@@ -513,21 +535,17 @@
 
     <section class="main-pane">
       {#if activeSection === 'accounts'}
-        <LoginFlowCard
-          loginStep={$bridgeStatus.login_step}
-          bind:loginUsername
-          bind:loginPassword
-          bind:twoFactorCode
-          bind:mailboxPassword
-          bind:fidoAssertionPayload
-          loginStatus={loginStatus}
-          onSubmitCredentials={submitCredentials}
-          onSubmitTwoFactor={submitTwoFactor}
-          onSubmitMailboxPassword={submitMailboxPassword}
-          onSubmitFidoAssertion={submitFidoAssertion}
-          onAbortFidoFlow={abortFidoFlow}
-          onAbortLoginFlow={abortLoginFlow}
-        />
+        <article class="card">
+          <h2>Account Access</h2>
+          <p class="muted">
+            Use the sign-in wizard for Proton authentication. Current login step:
+            <strong> {$bridgeStatus.login_step}</strong>
+          </p>
+          <div class="row">
+            <button onclick={openLoginWizard}>Open Sign-In Wizard</button>
+            <button class="secondary" onclick={closeLoginWizard}>Hide Wizard</button>
+          </div>
+        </article>
 
         <UsersCard
           hostname={hostname}
@@ -583,4 +601,22 @@
       <StreamEventsCard events={$streamLog.slice(0, 10)} />
     </aside>
   </section>
+
+  <LoginWizard
+    open={loginWizardOpen}
+    loginStep={$bridgeStatus.login_step}
+    bind:loginUsername
+    bind:loginPassword
+    bind:twoFactorCode
+    bind:mailboxPassword
+    bind:fidoAssertionPayload
+    loginStatus={loginStatus}
+    onSubmitCredentials={submitCredentials}
+    onSubmitTwoFactor={submitTwoFactor}
+    onSubmitMailboxPassword={submitMailboxPassword}
+    onSubmitFidoAssertion={submitFidoAssertion}
+    onAbortFidoFlow={abortFidoFlow}
+    onAbortLoginFlow={abortLoginFlow}
+    onClose={closeLoginWizard}
+  />
 </main>

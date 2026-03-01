@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/svelte'
 import { describe, expect, it, vi } from 'vitest'
-import BridgeConnectionCard from '../BridgeConnectionCard.svelte'
+import BridgeConnectionCard from './BridgeConnectionCard.svelte'
 
 const status = {
   connected: false,

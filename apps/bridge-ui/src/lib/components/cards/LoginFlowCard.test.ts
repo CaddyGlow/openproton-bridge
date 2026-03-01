@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/svelte'
 import { describe, expect, it, vi } from 'vitest'
-import LoginFlowCard from '../LoginFlowCard.svelte'
+import LoginFlowCard from './LoginFlowCard.svelte'
 
 describe('LoginFlowCard', () => {
   it('renders both 2FA and FIDO inputs for the mixed step', () => {

@@ -52,18 +52,25 @@ pub fn is_auth_error(err: &ApiError) -> bool {
 }
 
 pub fn human_verification_details(err: &ApiError) -> Option<HumanVerificationDetails> {
-    let ApiError::Api {
-        code,
-        details: Some(details),
-        ..
-    } = err
-    else {
+    let ApiError::Api { code, .. } = err else {
         return None;
     };
 
     if *code != 9001 {
         return None;
     }
+
+    any_human_verification_details(err)
+}
+
+pub fn any_human_verification_details(err: &ApiError) -> Option<HumanVerificationDetails> {
+    let ApiError::Api {
+        details: Some(details),
+        ..
+    } = err
+    else {
+        return None;
+    };
 
     let parsed: HumanVerificationDetails = serde_json::from_value(details.clone()).ok()?;
     parsed.is_usable().then_some(parsed)
@@ -99,5 +106,20 @@ mod tests {
             })),
         };
         assert!(human_verification_details(&err).is_none());
+    }
+
+    #[test]
+    fn any_human_verification_details_parses_details_for_non_9001_code() {
+        let err = ApiError::Api {
+            code: 12087,
+            message: "CAPTCHA validation failed".to_string(),
+            details: Some(serde_json::json!({
+                "HumanVerificationMethods": ["captcha"],
+                "HumanVerificationToken": "token-456"
+            })),
+        };
+        let hv = any_human_verification_details(&err).expect("expected HV details");
+        assert_eq!(hv.human_verification_methods, vec!["captcha"]);
+        assert_eq!(hv.human_verification_token, "token-456");
     }
 }

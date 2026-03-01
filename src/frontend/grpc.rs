@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::api;
 use crate::api::client::ProtonClient;
-use crate::api::error::{human_verification_details, ApiError};
+use crate::api::error::{any_human_verification_details, human_verification_details, ApiError};
 use crate::api::types::{HumanVerificationDetails, Session};
 use crate::vault;
 
@@ -609,31 +609,73 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("password is required"));
         }
 
-        let use_hv_details = req.use_hv_details.unwrap_or(false);
-        let hv_details = if use_hv_details {
+        let request_use_hv_details = req.use_hv_details.unwrap_or(false);
+        let request_hv_token_override = req
+            .human_verification_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+        let mut hv_details = None;
+        {
             let hv_guard = self.state.pending_hv.lock().await;
-            let Some(pending_hv) = hv_guard.as_ref() else {
+            if let Some(pending_hv) = hv_guard.as_ref() {
+                if !username.eq_ignore_ascii_case(&pending_hv.username) {
+                    if request_use_hv_details {
+                        return Err(Status::invalid_argument(
+                            "username does not match pending human verification",
+                        ));
+                    }
+                } else {
+                    hv_details = Some(pending_hv.details.clone());
+                    if !request_use_hv_details {
+                        info!(
+                            username = %username,
+                            "auto-reusing pending human verification details for login retry"
+                        );
+                    }
+                }
+            } else if request_use_hv_details {
                 return Err(Status::failed_precondition(
                     "no pending human verification challenge",
                 ));
-            };
-            if !username.eq_ignore_ascii_case(&pending_hv.username) {
-                return Err(Status::invalid_argument(
-                    "username does not match pending human verification",
-                ));
             }
-            Some(pending_hv.details.clone())
-        } else {
-            None
-        };
+        }
+
+        if let Some(token_override) = request_hv_token_override {
+            let Some(details) = hv_details.as_mut() else {
+                return Err(Status::failed_precondition(
+                    "no pending human verification challenge for provided human verification token",
+                ));
+            };
+            details.human_verification_token = token_override;
+            info!(
+                username = %username,
+                token_len = details.human_verification_token.len(),
+                "using explicit human verification token override for login"
+            );
+        }
+
+        info!(
+            username = %username,
+            request_use_hv_details,
+            using_hv_details = hv_details.is_some(),
+            "starting grpc login attempt"
+        );
 
         let mut client = ProtonClient::new().map_err(status_from_api_error)?;
-        client.set_human_verification(hv_details.as_ref());
-        let auth = match api::auth::login(&mut client, &username, &password).await {
+        let auth = match api::auth::login(&mut client, &username, &password, hv_details.as_ref())
+            .await
+        {
             Ok(auth) => auth,
             Err(err) => {
                 if let Some(hv) = human_verification_details(&err) {
                     let hv_url = hv.challenge_url();
+                    info!(
+                        username = %username,
+                        methods = ?hv.human_verification_methods,
+                        "received human verification challenge from Proton"
+                    );
                     let mut pending_hv = self.state.pending_hv.lock().await;
                     *pending_hv = Some(PendingHumanVerification {
                         username: username.clone(),
@@ -643,11 +685,33 @@ impl pb::bridge_server::Bridge for BridgeService {
                         "human verification required; open {hv_url}, complete CAPTCHA, then retry login"
                     ));
                 } else {
-                    self.emit_login_error(err.to_string());
+                    if matches!(&err, ApiError::Api { code: 12087, .. }) {
+                        if let Some(hv) = any_human_verification_details(&err) {
+                            let hv_url = hv.challenge_url();
+                            let mut pending_hv = self.state.pending_hv.lock().await;
+                            *pending_hv = Some(PendingHumanVerification {
+                                username: username.clone(),
+                                details: hv,
+                            });
+                            self.emit_login_error(format!(
+                                "captcha validation failed; open {hv_url}, complete CAPTCHA again, then retry login. \
+                                 If your client can provide the `pm_captcha` token, send it as `humanVerificationToken`."
+                            ));
+                        } else {
+                            *self.state.pending_hv.lock().await = None;
+                            self.emit_login_error(
+                                "captcha validation failed; start login again to get a fresh challenge",
+                            );
+                        }
+                    } else {
+                        self.emit_login_error(err.to_string());
+                    }
+                    warn!(username = %username, error = %err, "grpc login failed");
                 }
                 return Err(status_from_api_error(err));
             }
         };
+        info!(username = %username, "grpc login auth phase completed");
         *self.state.pending_hv.lock().await = None;
 
         if auth.two_factor.requires_second_factor() {
@@ -691,6 +755,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         let code = String::from_utf8(req.password)
             .map_err(|_| Status::invalid_argument("2FA code must be valid utf-8"))?;
 
+        info!(username = %username, "starting grpc 2FA submission");
+
         let mut pending_guard = self.state.pending_login.lock().await;
         let Some(pending) = pending_guard.take() else {
             return Err(Status::failed_precondition("no pending login for 2FA"));
@@ -706,8 +772,10 @@ impl pb::bridge_server::Bridge for BridgeService {
         if let Err(err) = api::auth::submit_2fa(&pending.client, code.trim()).await {
             *pending_guard = Some(pending);
             self.emit_login_error(err.to_string());
+            warn!(username = %username, error = %err, "grpc 2FA submission failed");
             return Err(status_from_api_error(err));
         }
+        info!(username = %username, "grpc 2FA submission accepted");
 
         drop(pending_guard);
 
@@ -720,6 +788,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             pending.password,
         )
         .await?;
+        info!(username = %username, "grpc 2FA login flow completed");
         Ok(Response::new(()))
     }
 
@@ -1278,6 +1347,23 @@ If you cannot complete it, update Proton Bridge or contact support: {CAPTCHA_APP
 (api error {code}: {message})"
                 ))
             }
+            12087 => {
+                let hv_url = details
+                    .as_ref()
+                    .and_then(|details| {
+                        serde_json::from_value::<HumanVerificationDetails>(details.clone()).ok()
+                    })
+                    .filter(HumanVerificationDetails::is_usable)
+                    .map(|details| details.challenge_url());
+                let details_hint = hv_url
+                    .map(|url| format!(" Open this URL and complete CAPTCHA again: {url}."))
+                    .unwrap_or_default();
+                Status::failed_precondition(format!(
+                    "captcha validation failed; complete CAPTCHA again, then retry login (or restart login for a new challenge).{details_hint} \
+If your client captures the `pm_captcha` token, send it as `humanVerificationToken`. \
+(api error {code}: {message})"
+                ))
+            }
             401 | 8002 | 10013 => Status::unauthenticated(format!("api error {code}: {message}")),
             _ => Status::internal(format!("api error {code}: {message}")),
         },
@@ -1498,6 +1584,7 @@ mod tests {
                 username: username.to_string(),
                 password: payload.to_vec(),
                 use_hv_details: None,
+                human_verification_token: None,
             }),
         )
         .await
@@ -1531,6 +1618,17 @@ mod tests {
             details: None,
         });
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn status_from_api_error_maps_captcha_validation_failed_to_failed_precondition() {
+        let status = status_from_api_error(ApiError::Api {
+            code: 12087,
+            message: "CAPTCHA validation failed".to_string(),
+            details: None,
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().to_ascii_lowercase().contains("captcha"));
     }
 
     #[test]

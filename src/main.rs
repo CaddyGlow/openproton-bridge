@@ -198,22 +198,55 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
 
     let mut client = api::client::ProtonClient::new()?;
 
-    // SRP authentication (with optional human verification retry).
-    let auth = match api::auth::login(&mut client, &username, &password).await {
-        Ok(auth) => auth,
-        Err(err) => {
-            if let Some(hv) = api::error::human_verification_details(&err) {
-                eprintln!("Human verification required by Proton.");
-                eprintln!("Open this URL in your browser and complete the challenge:");
-                eprintln!("{}", hv.challenge_url());
-                eprint!("Press ENTER once verification is complete...");
-                let mut line = String::new();
-                std::io::stdin()
-                    .read_line(&mut line)
-                    .context("failed to read human verification confirmation")?;
-                client.set_human_verification(Some(&hv));
-                api::auth::login(&mut client, &username, &password).await?
-            } else {
+    // SRP authentication with optional human-verification retries.
+    let mut hv_details: Option<api::types::HumanVerificationDetails> = None;
+    let auth = loop {
+        match api::auth::login(&mut client, &username, &password, hv_details.as_ref()).await {
+            Ok(auth) => break auth,
+            Err(err) => {
+                let needs_hv = api::error::human_verification_details(&err).or_else(|| {
+                    if matches!(&err, api::error::ApiError::Api { code: 12087, .. }) {
+                        api::error::any_human_verification_details(&err)
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(hv) = needs_hv {
+                    let mut hv = hv;
+                    if matches!(&err, api::error::ApiError::Api { code: 12087, .. }) {
+                        eprintln!(
+                            "CAPTCHA validation failed; please complete the challenge again."
+                        );
+                        eprintln!(
+                            "If it still fails, capture the `pm_captcha` token from browser DevTools \
+                             and paste it below."
+                        );
+                    } else {
+                        eprintln!("Human verification required by Proton.");
+                    }
+                    eprintln!("Open this URL in your browser and complete the challenge:");
+                    eprintln!("{}", hv.challenge_url());
+                    eprint!("Press ENTER once verification is complete...");
+                    let mut line = String::new();
+                    std::io::stdin()
+                        .read_line(&mut line)
+                        .context("failed to read human verification confirmation")?;
+                    eprint!(
+                        "Paste CAPTCHA token from browser (optional, press ENTER to reuse URL token): "
+                    );
+                    line.clear();
+                    std::io::stdin()
+                        .read_line(&mut line)
+                        .context("failed to read optional human verification token")?;
+                    let token_override = line.trim();
+                    if !token_override.is_empty() {
+                        hv.human_verification_token = token_override.to_string();
+                    }
+                    hv_details = Some(hv);
+                    continue;
+                }
+
                 return Err(err.into());
             }
         }

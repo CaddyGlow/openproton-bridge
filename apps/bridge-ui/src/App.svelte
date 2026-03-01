@@ -556,7 +556,6 @@
       </div>
     </div>
     <div class="header-actions">
-      <button class="secondary" onclick={openLoginWizard}>Sign In Wizard</button>
       <button class="secondary" onclick={() => void refreshBridgeData()}>Refresh Data</button>
       <button class="secondary" onclick={cycleThemeMode}>
         Theme: {normalizeThemeMode(colorSchemeNameInput)}
@@ -593,15 +592,6 @@
       />
 
       <article class="card">
-        <h2>Quick Actions</h2>
-        <div class="row wrap">
-          <button class="secondary" onclick={() => void connectAndLoad()}>Reconnect</button>
-          <button class="secondary" onclick={() => void refreshBridgeData()}>Reload Data</button>
-          <button class="secondary" onclick={openLoginWizard}>Login Wizard</button>
-        </div>
-      </article>
-
-      <article class="card">
         <h2>Host</h2>
         <p class="muted"><strong>Hostname:</strong> {hostname || '(not loaded)'}</p>
         <p class="muted"><strong>Users:</strong> {users.length}</p>
@@ -625,7 +615,6 @@
               </p>
               <div class="row">
                 <button onclick={openLoginWizard}>Open Sign-In Wizard</button>
-                <button class="secondary" onclick={closeLoginWizard}>Hide Wizard</button>
               </div>
             </article>
 

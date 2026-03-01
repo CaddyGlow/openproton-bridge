@@ -106,6 +106,7 @@ message LoginRequest {
   string username = 1;
   bytes password = 2;
   optional bool useHvDetails = 3;
+  optional string humanVerificationToken = 4;
 }
 
 message LoginAbortRequest {

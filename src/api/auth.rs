@@ -10,7 +10,26 @@ use tracing::{debug, info};
 use super::client::{check_api_response, ProtonClient};
 use super::error::Result;
 use super::srp;
-use super::types::{AuthInfoResponse, AuthResponse, RefreshResponse, TwoFactorResponse};
+use super::types::{
+    AuthInfoResponse, AuthResponse, HumanVerificationDetails, RefreshResponse, TwoFactorResponse,
+};
+
+const HV_TOKEN_HEADER: &str = "x-pm-human-verification-token";
+const HV_TOKEN_TYPE_HEADER: &str = "x-pm-human-verification-token-type";
+
+fn with_hv_headers(
+    req: reqwest::RequestBuilder,
+    hv_details: Option<&HumanVerificationDetails>,
+) -> reqwest::RequestBuilder {
+    let Some(hv) = hv_details.filter(|hv| hv.is_usable()) else {
+        return req;
+    };
+    req.header(HV_TOKEN_HEADER, &hv.human_verification_token)
+        .header(
+            HV_TOKEN_TYPE_HEADER,
+            hv.human_verification_methods.join(","),
+        )
+}
 
 /// Perform SRP login against the Proton API.
 ///
@@ -20,6 +39,7 @@ pub async fn login(
     client: &mut ProtonClient,
     username: &str,
     password: &str,
+    hv_details: Option<&HumanVerificationDetails>,
 ) -> Result<AuthResponse> {
     // Step 1: Get auth info (salt, server ephemeral, modulus)
     info!(username = ?username, "fetching auth info");
@@ -39,7 +59,15 @@ pub async fn login(
         srp::compute_srp_proof(&hashed, &auth_info.server_ephemeral, &modulus)?;
 
     // Step 3: Submit auth request
-    info!("submitting SRP auth");
+    if let Some(hv) = hv_details.filter(|hv| hv.is_usable()) {
+        info!(
+            methods = ?hv.human_verification_methods,
+            token_len = hv.human_verification_token.len(),
+            "submitting SRP auth with human verification headers"
+        );
+    } else {
+        info!("submitting SRP auth");
+    }
     let auth_body = json!({
         "Username": username,
         "ClientEphemeral": client_ephemeral,
@@ -47,7 +75,10 @@ pub async fn login(
         "SRPSession": auth_info.srp_session,
     });
 
-    let auth_resp = client.post("/auth/v4").json(&auth_body).send().await?;
+    let auth_resp = with_hv_headers(client.post("/auth/v4"), hv_details)
+        .json(&auth_body)
+        .send()
+        .await?;
     let auth_json: serde_json::Value = auth_resp.json().await?;
     check_api_response(&auth_json)?;
 

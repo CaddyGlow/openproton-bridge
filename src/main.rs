@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 mod api;
 mod bridge;
 mod crypto;
+mod frontend;
 mod imap;
 mod smtp;
 mod vault;
@@ -76,6 +77,12 @@ enum Command {
         #[arg(long, default_value = "30")]
         event_poll_secs: u64,
     },
+    /// Start the gRPC frontend control service
+    Grpc {
+        /// Address to bind to (port is assigned automatically)
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -117,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             no_tls,
             event_poll_secs,
         } => cmd_serve(imap_port, smtp_port, &bind, no_tls, event_poll_secs, &dir).await,
+        Command::Grpc { bind } => cmd_grpc(&bind, &dir).await,
     }
 }
 
@@ -599,6 +607,10 @@ async fn cmd_serve(
     serve_result?;
 
     Ok(())
+}
+
+async fn cmd_grpc(bind: &str, dir: &std::path::Path) -> anyhow::Result<()> {
+    frontend::grpc::run_server(dir.to_path_buf(), bind.to_string()).await
 }
 
 fn generate_bridge_password() -> String {

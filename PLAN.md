@@ -18,6 +18,11 @@
 - Progress update (2026-02-28): README operator runbook/troubleshooting section added with concrete multi-account commands and runtime behavior checks.
 - Progress update (2026-02-28): event workers now apply deterministic per-account initial poll staggering (bounded) to reduce startup API burst for high account counts.
 - Progress update (2026-02-28): label events now trigger bounded account resync (`label_resync`) so label-topology changes don't leave stale mailbox projections.
+- Progress update (2026-02-28): added coverage ensuring `Refresh + Labels` coalesces to a single bounded resync pass (no duplicate startup/poll API amplification).
+- Progress update (2026-02-28): IMAP system mailbox catalog is now static (no per-call `Vec` allocation), reducing hot-path overhead in session/event loops.
+- Progress update (2026-02-28): event parser now accepts scalar message IDs in `Messages` arrays with parent `Action` fallback to handle additional payload variants.
+- Progress update (2026-02-28): high-account startup spread tuning now uses a wider bounded initial poll stagger window (2s cap) with deterministic distribution guard tests.
+- Progress update (2026-02-28): restart continuity worker test now waits on checkpoint predicates (instead of fixed sleeps) to stay stable with staggered startups.
 
 ## Context
 

@@ -76,8 +76,10 @@ Then configure your email client:
 - Event poll interval defaults to 30s and can be changed with `--event-poll-secs`.
 - Event workers apply incremental updates to account-scoped IMAP store data.
 - Checkpoints and sync state are persisted in encrypted vault records, so workers resume from the saved cursor after restart.
+- Label topology events trigger bounded account resync and persist checkpoint state as `label_resync`.
 - Failures are isolated per account; one unavailable account does not stop healthy accounts.
 - Workers expose structured health/failure logs (`auth`/`transient`/`permanent`) with retry backoff + jitter.
+- Worker startup polls are deterministically staggered per account (bounded) to reduce burst load on large account sets.
 
 ## Operator Runbook
 

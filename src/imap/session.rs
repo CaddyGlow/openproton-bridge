@@ -551,7 +551,7 @@ where
             self.writer.untagged("LIST (\\Noselect) \"/\" \"\"").await?;
         } else {
             let mailboxes = mailbox::system_mailboxes();
-            for mb in &mailboxes {
+            for mb in mailboxes {
                 // Simple pattern matching: "*" matches everything, "%" matches one level
                 if pattern == "*" || pattern == "%" || mb.name.eq_ignore_ascii_case(pattern) {
                     let mut attrs = Vec::new();

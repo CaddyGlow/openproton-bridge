@@ -204,7 +204,7 @@ const RESYNC_PAGE_SIZE: i32 = 150;
 const RESYNC_MAX_PAGES_PER_MAILBOX: usize = 4;
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_STATS_LOG_EVERY_ATTEMPTS: u64 = 20;
-const MAX_INITIAL_POLL_STAGGER_MS: u64 = 250;
+const MAX_INITIAL_POLL_STAGGER_MS: u64 = 2_000;
 
 pub struct EventWorkerGroup {
     shutdown_tx: watch::Sender<bool>,
@@ -397,6 +397,11 @@ fn scoped_mailbox_name(account_id: &AccountId, mailbox_name: &str) -> String {
 fn extract_message_id(value: &serde_json::Value, fallback_key: Option<&str>) -> Option<String> {
     if let Some(id) = value.get("ID").and_then(|v| v.as_str()) {
         return Some(id.to_string());
+    }
+    if fallback_key.is_none() {
+        if let Some(id) = value.as_str() {
+            return Some(id.to_string());
+        }
     }
     fallback_key.map(str::to_string)
 }
@@ -1154,6 +1159,30 @@ mod tests {
     }
 
     #[test]
+    fn compute_initial_poll_stagger_spreads_high_account_counts() {
+        let mut bucket_counts: HashMap<u64, usize> = HashMap::new();
+        let poll = Duration::from_secs(30);
+
+        for i in 0..500 {
+            let account_id = AccountId(format!("uid-{i}"));
+            let bucket = compute_initial_poll_stagger(&account_id, poll).as_millis() as u64;
+            *bucket_counts.entry(bucket).or_insert(0) += 1;
+        }
+
+        let unique_buckets = bucket_counts.len();
+        let max_bucket_load = bucket_counts.values().copied().max().unwrap_or(0);
+
+        assert!(
+            unique_buckets >= 380,
+            "expected broad startup spread, got only {unique_buckets} unique buckets"
+        );
+        assert!(
+            max_bucket_load <= 4,
+            "expected low bucket concentration, got {max_bucket_load}"
+        );
+    }
+
+    #[test]
     fn classify_worker_error_health_mapping() {
         let auth_error = EventWorkerError::Api(ApiError::SessionExpired);
         assert_eq!(
@@ -1297,6 +1326,37 @@ mod tests {
 
         let deltas = parse_event_deltas(&payload);
         assert!(deltas.contains(&EventDelta::LabelsChanged));
+    }
+
+    #[test]
+    fn parse_event_deltas_supports_scalar_array_messages_with_parent_action() {
+        let payload = serde_json::json!({
+            "Action": 0,
+            "Messages": ["msg-a", "msg-b"]
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(
+            deltas,
+            vec![
+                EventDelta::MessageDelete("msg-a".to_string()),
+                EventDelta::MessageDelete("msg-b".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_event_deltas_supports_scalar_array_messages_with_remove_action_name() {
+        let payload = serde_json::json!({
+            "Action": "remove",
+            "Messages": ["msg-a"]
+        });
+
+        let deltas = parse_event_deltas(&payload);
+        assert_eq!(
+            deltas,
+            vec![EventDelta::MessageDelete("msg-a".to_string()),]
+        );
     }
 
     #[test]
@@ -1695,6 +1755,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_refresh_and_label_event_resyncs_once() {
+        let server = MockServer::start().await;
+        let selectable_mailboxes = mailbox::system_mailboxes()
+            .iter()
+            .filter(|mb| mb.selectable)
+            .count();
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 2
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-refresh-label-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .expect(selectable_mailboxes as u64)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            store
+                .get_uid("uid-1::INBOX", "msg-refresh-label-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_message_and_label_batch_sets_label_resync_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Messages": [{"ID": "msg-1", "Action": 1}],
+                    "Labels": [{"ID": "label-custom-1", "Action": 2}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mail/v4/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message_json(
+                "msg-1",
+                &["0"],
+                1,
+            )))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Event Subject",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            store.get_uid("uid-1::INBOX", "msg-1").await.unwrap(),
+            Some(1)
+        );
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("label_resync"));
+    }
+
+    #[tokio::test]
     async fn start_event_workers_starts_one_task_per_account() {
         let accounts = vec![
             RuntimeAccountInfo {
@@ -1914,14 +2158,16 @@ mod tests {
             Duration::from_secs(3600),
             shutdown_rx,
         ));
-        tokio::time::sleep(Duration::from_millis(320)).await;
+        let checkpoint = wait_for_checkpoint(
+            checkpoints.as_ref(),
+            &AccountId("uid-1".to_string()),
+            Duration::from_secs(4),
+        )
+        .await
+        .expect("first run should persist a checkpoint");
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
 
-        let checkpoint = checkpoints
-            .load_checkpoint(&AccountId("uid-1".to_string()))
-            .unwrap()
-            .unwrap();
         assert_eq!(checkpoint.last_event_id, "event-1");
 
         Mock::given(method("GET"))
@@ -1960,14 +2206,54 @@ mod tests {
             Duration::from_secs(3600),
             shutdown_rx_2,
         ));
-        tokio::time::sleep(Duration::from_millis(320)).await;
+        let checkpoint_after_restart = wait_for_checkpoint_event_id(
+            checkpoints_after_restart.as_ref(),
+            &AccountId("uid-1".to_string()),
+            "event-2",
+            Duration::from_secs(4),
+        )
+        .await
+        .expect("second run should advance checkpoint");
         let _ = shutdown_tx_2.send(true);
         let _ = handle_2.await;
 
-        let checkpoint_after_restart = checkpoints_after_restart
-            .load_checkpoint(&AccountId("uid-1".to_string()))
-            .unwrap()
-            .unwrap();
         assert_eq!(checkpoint_after_restart.last_event_id, "event-2");
+    }
+
+    async fn wait_for_checkpoint(
+        checkpoints: &dyn EventCheckpointStore<Error = ()>,
+        account_id: &AccountId,
+        timeout: Duration,
+    ) -> Option<EventCheckpoint> {
+        let start = tokio::time::Instant::now();
+        loop {
+            if let Ok(Some(cp)) = checkpoints.load_checkpoint(account_id) {
+                return Some(cp);
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_checkpoint_event_id(
+        checkpoints: &dyn EventCheckpointStore<Error = ()>,
+        account_id: &AccountId,
+        expected_event_id: &str,
+        timeout: Duration,
+    ) -> Option<EventCheckpoint> {
+        let start = tokio::time::Instant::now();
+        loop {
+            if let Ok(Some(cp)) = checkpoints.load_checkpoint(account_id) {
+                if cp.last_event_id == expected_event_id {
+                    return Some(cp);
+                }
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 }

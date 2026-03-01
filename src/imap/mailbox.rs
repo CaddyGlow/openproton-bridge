@@ -1,5 +1,6 @@
 use crate::api::types::{self, MessageMetadata, ALL_DRAFTS_LABEL, DRAFTS_LABEL, STARRED_LABEL};
 
+#[derive(Clone, Copy)]
 pub struct ImapMailbox {
     pub name: &'static str,
     pub label_id: &'static str,
@@ -7,62 +8,65 @@ pub struct ImapMailbox {
     pub selectable: bool,
 }
 
-pub fn system_mailboxes() -> Vec<ImapMailbox> {
-    vec![
-        ImapMailbox {
-            name: "INBOX",
-            label_id: types::INBOX_LABEL,
-            special_use: None,
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "Sent",
-            label_id: types::SENT_LABEL,
-            special_use: Some("\\Sent"),
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "Drafts",
-            label_id: types::DRAFTS_LABEL,
-            special_use: Some("\\Drafts"),
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "Trash",
-            label_id: types::TRASH_LABEL,
-            special_use: Some("\\Trash"),
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "Spam",
-            label_id: types::SPAM_LABEL,
-            special_use: Some("\\Junk"),
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "Archive",
-            label_id: types::ARCHIVE_LABEL,
-            special_use: Some("\\Archive"),
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "Starred",
-            label_id: types::STARRED_LABEL,
-            special_use: Some("\\Flagged"),
-            selectable: true,
-        },
-        ImapMailbox {
-            name: "All Mail",
-            label_id: types::ALL_MAIL_LABEL,
-            special_use: None,
-            selectable: false,
-        },
-    ]
+const SYSTEM_MAILBOXES: [ImapMailbox; 8] = [
+    ImapMailbox {
+        name: "INBOX",
+        label_id: types::INBOX_LABEL,
+        special_use: None,
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "Sent",
+        label_id: types::SENT_LABEL,
+        special_use: Some("\\Sent"),
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "Drafts",
+        label_id: types::DRAFTS_LABEL,
+        special_use: Some("\\Drafts"),
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "Trash",
+        label_id: types::TRASH_LABEL,
+        special_use: Some("\\Trash"),
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "Spam",
+        label_id: types::SPAM_LABEL,
+        special_use: Some("\\Junk"),
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "Archive",
+        label_id: types::ARCHIVE_LABEL,
+        special_use: Some("\\Archive"),
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "Starred",
+        label_id: types::STARRED_LABEL,
+        special_use: Some("\\Flagged"),
+        selectable: true,
+    },
+    ImapMailbox {
+        name: "All Mail",
+        label_id: types::ALL_MAIL_LABEL,
+        special_use: None,
+        selectable: false,
+    },
+];
+
+pub fn system_mailboxes() -> &'static [ImapMailbox] {
+    &SYSTEM_MAILBOXES
 }
 
 pub fn find_mailbox(name: &str) -> Option<ImapMailbox> {
     system_mailboxes()
-        .into_iter()
+        .iter()
+        .copied()
         .find(|m| m.name.eq_ignore_ascii_case(name))
 }
 

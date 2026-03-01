@@ -1,0 +1,155 @@
+syntax = "proto3";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/wrappers.proto";
+
+package grpc;
+
+service Bridge {
+  rpc CheckTokens(google.protobuf.StringValue) returns (google.protobuf.StringValue);
+
+  rpc Login(LoginRequest) returns (google.protobuf.Empty);
+  rpc Login2FA(LoginRequest) returns (google.protobuf.Empty);
+  rpc Login2Passwords(LoginRequest) returns (google.protobuf.Empty);
+  rpc LoginAbort(LoginAbortRequest) returns (google.protobuf.Empty);
+
+  rpc GetUserList(google.protobuf.Empty) returns (UserListResponse);
+  rpc GetUser(google.protobuf.StringValue) returns (User);
+  rpc LogoutUser(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc RemoveUser(google.protobuf.StringValue) returns (google.protobuf.Empty);
+
+  rpc MailServerSettings(google.protobuf.Empty) returns (ImapSmtpSettings);
+  rpc SetMailServerSettings(ImapSmtpSettings) returns (google.protobuf.Empty);
+  rpc Hostname(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc IsPortFree(google.protobuf.Int32Value) returns (google.protobuf.BoolValue);
+
+  rpc IsTLSCertificateInstalled(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+  rpc InstallTLSCertificate(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc ExportTLSCertificates(google.protobuf.StringValue) returns (google.protobuf.Empty);
+
+  rpc RunEventStream(EventStreamRequest) returns (stream StreamEvent);
+  rpc StopEventStream(google.protobuf.Empty) returns (google.protobuf.Empty);
+
+  rpc Version(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc GoOs(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc Quit(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
+message LoginRequest {
+  string username = 1;
+  bytes password = 2;
+  optional bool useHvDetails = 3;
+}
+
+message LoginAbortRequest {
+  string username = 1;
+}
+
+enum UserState {
+  SIGNED_OUT = 0;
+  LOCKED = 1;
+  CONNECTED = 2;
+}
+
+message User {
+  string id = 1;
+  string username = 2;
+  string avatarText = 3;
+  UserState state = 4;
+  bool splitMode = 5;
+  int64 usedBytes = 6;
+  int64 totalBytes = 7;
+  bytes password = 8;
+  repeated string addresses = 9;
+}
+
+message UserListResponse {
+  repeated User users = 1;
+}
+
+message ImapSmtpSettings {
+  int32 imapPort = 1;
+  int32 smtpPort = 2;
+  bool useSSLForImap = 3;
+  bool useSSLForSmtp = 4;
+}
+
+message EventStreamRequest {
+  string ClientPlatform = 1;
+}
+
+message StreamEvent {
+  oneof event {
+    AppEvent app = 1;
+    LoginEvent login = 2;
+    MailServerSettingsEvent mailServerSettings = 3;
+    UserEvent user = 4;
+    GenericErrorEvent genericError = 5;
+  }
+}
+
+message AppEvent {
+  oneof event {
+    ShowMainWindowEvent showMainWindow = 1;
+  }
+}
+
+message ShowMainWindowEvent {}
+
+message LoginEvent {
+  oneof event {
+    LoginErrorEvent error = 1;
+    LoginTfaRequestedEvent tfaRequested = 2;
+    LoginFinishedEvent finished = 3;
+  }
+}
+
+message LoginErrorEvent {
+  string message = 1;
+}
+
+message LoginTfaRequestedEvent {
+  string username = 1;
+}
+
+message LoginFinishedEvent {
+  string userID = 1;
+  bool wasSignedOut = 2;
+}
+
+message MailServerSettingsEvent {
+  oneof event {
+    MailServerSettingsErrorEvent error = 1;
+    MailServerSettingsChangedEvent mailServerSettingsChanged = 2;
+    ChangeMailServerSettingsFinishedEvent changeMailServerSettingsFinished = 3;
+  }
+}
+
+message MailServerSettingsErrorEvent {
+  string message = 1;
+}
+
+message MailServerSettingsChangedEvent {
+  ImapSmtpSettings settings = 1;
+}
+
+message ChangeMailServerSettingsFinishedEvent {}
+
+message UserEvent {
+  oneof event {
+    UserChangedEvent userChanged = 1;
+    UserDisconnectedEvent userDisconnected = 2;
+  }
+}
+
+message UserChangedEvent {
+  string userID = 1;
+}
+
+message UserDisconnectedEvent {
+  string username = 1;
+}
+
+message GenericErrorEvent {
+  string message = 1;
+}

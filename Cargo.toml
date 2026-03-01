@@ -49,6 +49,11 @@ keyring = "3"
 
 # Password input
 rpassword = "7"
+tonic = { version = "0.12", features = ["tls", "transport"] }
+prost = "0.13"
+prost-types = "0.13"
+tokio-stream = { version = "0.1", features = ["net"] }
+async-stream = "0.3"
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -56,3 +61,7 @@ tempfile = "3"
 assert_matches = "1"
 tokio-test = "0.4"
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "tokio1"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"

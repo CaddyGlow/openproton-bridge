@@ -62,15 +62,15 @@ body {
 .app-shell {
   max-width: 1520px;
   margin: 0 auto;
-  padding: 16px;
+  padding: 12px;
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(250px, 290px) minmax(620px, 1fr) minmax(280px, 330px);
-  gap: 12px;
+  grid-template-columns: minmax(240px, 272px) minmax(620px, 1fr) minmax(260px, 310px);
+  gap: 10px;
   align-items: start;
 }
 
@@ -78,7 +78,7 @@ body {
 .main-pane,
 .status-rail {
   display: grid;
-  gap: 12px;
+  gap: 10px;
 }
 
 .left-rail,
@@ -91,7 +91,7 @@ body {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   background:
     linear-gradient(100deg, var(--panel) 0%, color-mix(in oklab, var(--panel) 80%, var(--brand-soft)) 100%);
 }
@@ -99,7 +99,7 @@ body {
 .header-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   justify-content: flex-end;
 }
 
@@ -108,8 +108,8 @@ body {
   background: var(--brand-soft);
   color: var(--text);
   border-radius: 999px;
-  padding: 6px 10px;
-  font-size: 0.82rem;
+  padding: 5px 8px;
+  font-size: 0.78rem;
   font-weight: 600;
 }
 
@@ -119,14 +119,14 @@ body {
 
 .section-nav {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .nav-btn {
   width: 100%;
   justify-content: flex-start;
   text-align: left;
-  font-size: 0.9rem;
+  font-size: 0.84rem;
 }
 
 .nav-btn.active {
@@ -138,8 +138,8 @@ body {
 .card {
   background: var(--panel);
   border: 1px solid var(--panel-border);
-  border-radius: 16px;
-  padding: 12px;
+  border-radius: 14px;
+  padding: 10px;
   backdrop-filter: blur(4px);
 }
 
@@ -155,13 +155,13 @@ h2 {
 }
 
 h1 {
-  font-size: 1.36rem;
+  font-size: 1.22rem;
 }
 
 h2 {
-  font-size: 0.95rem;
+  font-size: 0.84rem;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.06em;
   color: var(--text-muted);
   font-weight: 700;
 }
@@ -172,12 +172,12 @@ h2 {
 }
 
 .flow-stepper {
-  margin: 8px 0 0;
+  margin: 6px 0 0;
   padding: 0;
   list-style: none;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
+  gap: 6px;
 }
 
 .flow-stepper li {
@@ -186,10 +186,10 @@ h2 {
   border-radius: 999px;
   background: var(--surface);
   color: var(--text-muted);
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   font-weight: 600;
   text-align: center;
-  padding: 6px 8px;
+  padding: 5px 6px;
 }
 
 .flow-stepper li.active {
@@ -199,18 +199,19 @@ h2 {
 }
 
 .flow-hint {
-  margin-top: 8px;
+  margin-top: 6px;
+  font-size: 0.82rem;
 }
 
 .status-block p {
   margin: 4px 0;
-  font-size: 0.9rem;
+  font-size: 0.84rem;
 }
 
 .row {
-  margin-top: 10px;
+  margin-top: 8px;
   display: flex;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
 }
 
@@ -221,25 +222,26 @@ h2 {
 label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
   color: var(--text);
-  font-size: 0.86rem;
+  font-size: 0.82rem;
 }
 
 input,
 select {
-  border-radius: 10px;
+  border-radius: 8px;
   border: 1px solid var(--input-border);
   background: var(--input-bg);
   color: var(--text);
-  padding: 7px 10px;
+  padding: 6px 8px;
   min-width: 120px;
+  font-size: 0.84rem;
 }
 
 .checkbox {
   flex-direction: row;
   align-items: center;
-  margin-top: 10px;
+  margin-top: 8px;
 }
 
 .grow {
@@ -249,16 +251,16 @@ select {
 table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: 8px;
+  margin-top: 6px;
 }
 
 th,
 td {
   border-bottom: 1px solid var(--table-sep);
   text-align: left;
-  padding: 7px 8px;
+  padding: 5px 6px;
   vertical-align: top;
-  font-size: 0.88rem;
+  font-size: 0.82rem;
 }
 
 tbody tr:hover {
@@ -273,10 +275,11 @@ button {
   border: 1px solid var(--brand-2);
   background: var(--brand);
   color: #fff;
-  border-radius: 10px;
-  padding: 7px 11px;
+  border-radius: 8px;
+  padding: 6px 9px;
   cursor: pointer;
   font-weight: 600;
+  font-size: 0.82rem;
   transition: transform 120ms ease, filter 120ms ease, background 120ms ease;
 }
 
@@ -303,14 +306,14 @@ button:active {
 ul {
   margin: 0;
   padding-left: 18px;
-  max-height: 240px;
+  max-height: 220px;
   overflow: auto;
 }
 
 li {
   margin-bottom: 5px;
   color: var(--text);
-  font-size: 0.86rem;
+  font-size: 0.82rem;
 }
 
 .error {

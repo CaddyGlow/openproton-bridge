@@ -25,8 +25,10 @@ use crate::vault;
 
 const SERVER_CONFIG_FILE: &str = "grpcServerConfig.json";
 const MAIL_SETTINGS_FILE: &str = "grpc_mail_settings.json";
+const APP_SETTINGS_FILE: &str = "grpc_app_settings.json";
 const SERVER_TOKEN_METADATA_KEY: &str = "server-token";
 
+#[allow(clippy::all)]
 pub mod pb {
     tonic::include_proto!("grpc");
 }
@@ -68,6 +70,41 @@ impl Default for StoredMailSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredAppSettings {
+    show_on_startup: bool,
+    is_autostart_on: bool,
+    is_beta_enabled: bool,
+    is_all_mail_visible: bool,
+    is_telemetry_disabled: bool,
+    disk_cache_path: String,
+    is_doh_enabled: bool,
+    color_scheme_name: String,
+    is_automatic_update_on: bool,
+    current_keychain: String,
+    main_executable: String,
+    forced_launcher: String,
+}
+
+impl StoredAppSettings {
+    fn with_defaults_for(vault_dir: &Path) -> Self {
+        Self {
+            show_on_startup: true,
+            is_autostart_on: false,
+            is_beta_enabled: false,
+            is_all_mail_visible: true,
+            is_telemetry_disabled: false,
+            disk_cache_path: vault_dir.join("cache").display().to_string(),
+            is_doh_enabled: true,
+            color_scheme_name: "system".to_string(),
+            is_automatic_update_on: true,
+            current_keychain: "keyring".to_string(),
+            main_executable: String::new(),
+            forced_launcher: String::new(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct PendingLogin {
     username: String,
@@ -76,6 +113,7 @@ struct PendingLogin {
     access_token: String,
     refresh_token: String,
     client: ProtonClient,
+    fido_authentication_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug)]
@@ -87,6 +125,7 @@ struct GrpcState {
     pending_login: Mutex<Option<PendingLogin>>,
     shutdown_tx: watch::Sender<bool>,
     mail_settings: Mutex<StoredMailSettings>,
+    app_settings: Mutex<StoredAppSettings>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +150,14 @@ impl BridgeService {
             event: Some(pb::login_event::Event::Error(pb::LoginErrorEvent {
                 message: message.into(),
             })),
+        }));
+    }
+
+    fn emit_show_main_window(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::ShowMainWindow(
+                pb::ShowMainWindowEvent {},
+            )),
         }));
     }
 
@@ -272,6 +319,275 @@ impl pb::bridge_server::Bridge for BridgeService {
         Ok(Response::new(cfg.token))
     }
 
+    async fn add_log_entry(
+        &self,
+        request: Request<pb::AddLogEntryRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let level = pb::LogLevel::try_from(req.level).unwrap_or(pb::LogLevel::LogInfo);
+        match level {
+            pb::LogLevel::LogPanic | pb::LogLevel::LogFatal | pb::LogLevel::LogError => {
+                tracing::error!(target = req.r#package.as_str(), "{}", req.message);
+            }
+            pb::LogLevel::LogWarn => {
+                tracing::warn!(target = req.r#package.as_str(), "{}", req.message);
+            }
+            pb::LogLevel::LogInfo => {
+                tracing::info!(target = req.r#package.as_str(), "{}", req.message);
+            }
+            pb::LogLevel::LogDebug => {
+                tracing::debug!(target = req.r#package.as_str(), "{}", req.message);
+            }
+            pb::LogLevel::LogTrace => {
+                tracing::trace!(target = req.r#package.as_str(), "{}", req.message);
+            }
+        }
+        Ok(Response::new(()))
+    }
+
+    async fn gui_ready(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<pb::GuiReadyResponse>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        self.emit_show_main_window();
+        Ok(Response::new(pb::GuiReadyResponse {
+            show_splash_screen: settings.show_on_startup,
+        }))
+    }
+
+    async fn restart(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        self.emit_show_main_window();
+        let _ = self.state.shutdown_tx.send(true);
+        Ok(Response::new(()))
+    }
+
+    async fn trigger_repair(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        self.emit_show_main_window();
+        Ok(Response::new(()))
+    }
+
+    async fn trigger_reset(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        vault::remove_session(&self.state.vault_dir).map_err(status_from_vault_error)?;
+        let _ = tokio::fs::remove_file(self.state.vault_dir.join(MAIL_SETTINGS_FILE)).await;
+        let _ = tokio::fs::remove_file(self.state.vault_dir.join(APP_SETTINGS_FILE)).await;
+        Ok(Response::new(()))
+    }
+
+    async fn show_on_startup(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.show_on_startup))
+    }
+
+    async fn set_is_autostart_on(&self, request: Request<bool>) -> Result<Response<()>, Status> {
+        let mut settings = self.state.app_settings.lock().await;
+        settings.is_autostart_on = request.into_inner();
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn is_autostart_on(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.is_autostart_on))
+    }
+
+    async fn set_is_beta_enabled(&self, request: Request<bool>) -> Result<Response<()>, Status> {
+        let mut settings = self.state.app_settings.lock().await;
+        settings.is_beta_enabled = request.into_inner();
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn is_beta_enabled(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.is_beta_enabled))
+    }
+
+    async fn set_is_all_mail_visible(
+        &self,
+        request: Request<bool>,
+    ) -> Result<Response<()>, Status> {
+        let mut settings = self.state.app_settings.lock().await;
+        settings.is_all_mail_visible = request.into_inner();
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn is_all_mail_visible(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.is_all_mail_visible))
+    }
+
+    async fn set_is_telemetry_disabled(
+        &self,
+        request: Request<bool>,
+    ) -> Result<Response<()>, Status> {
+        let mut settings = self.state.app_settings.lock().await;
+        settings.is_telemetry_disabled = request.into_inner();
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn is_telemetry_disabled(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.is_telemetry_disabled))
+    }
+
+    async fn disk_cache_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.disk_cache_path.clone()))
+    }
+
+    async fn set_disk_cache_path(&self, request: Request<String>) -> Result<Response<()>, Status> {
+        let path = request.into_inner();
+        if path.trim().is_empty() {
+            return Err(Status::invalid_argument("disk cache path is empty"));
+        }
+        let target = PathBuf::from(path.clone());
+        tokio::fs::create_dir_all(&target)
+            .await
+            .map_err(|e| Status::internal(format!("failed to create disk cache path: {e}")))?;
+
+        let mut settings = self.state.app_settings.lock().await;
+        settings.disk_cache_path = path;
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn set_is_do_h_enabled(&self, request: Request<bool>) -> Result<Response<()>, Status> {
+        let mut settings = self.state.app_settings.lock().await;
+        settings.is_doh_enabled = request.into_inner();
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn is_do_h_enabled(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.is_doh_enabled))
+    }
+
+    async fn set_color_scheme_name(
+        &self,
+        request: Request<String>,
+    ) -> Result<Response<()>, Status> {
+        let name = request.into_inner();
+        if name.trim().is_empty() {
+            return Err(Status::invalid_argument("color scheme name is empty"));
+        }
+        let mut settings = self.state.app_settings.lock().await;
+        settings.color_scheme_name = name;
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn color_scheme_name(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.color_scheme_name.clone()))
+    }
+
+    async fn current_email_client(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<String>, Status> {
+        Ok(Response::new("openproton-bridge".to_string()))
+    }
+
+    async fn logs_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        let path = self.state.vault_dir.join("logs");
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|e| Status::internal(format!("failed to create logs directory: {e}")))?;
+        Ok(Response::new(path.display().to_string()))
+    }
+
+    async fn license_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        Ok(Response::new(
+            self.state.vault_dir.join("LICENSE").display().to_string(),
+        ))
+    }
+
+    async fn release_notes_page_link(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<String>, Status> {
+        Ok(Response::new(
+            "https://github.com/ProtonMail/proton-bridge/releases".to_string(),
+        ))
+    }
+
+    async fn dependency_licenses_link(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<String>, Status> {
+        Ok(Response::new(
+            "https://github.com/ProtonMail/proton-bridge/blob/master/COPYING_NOTES.md".to_string(),
+        ))
+    }
+
+    async fn landing_page_link(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        Ok(Response::new("https://proton.me/mail/bridge".to_string()))
+    }
+
+    async fn report_bug(
+        &self,
+        request: Request<pb::ReportBugRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        tracing::warn!(
+            title = %req.title,
+            os_type = %req.os_type,
+            os_version = %req.os_version,
+            include_logs = req.include_logs,
+            "bug report requested via grpc"
+        );
+        Ok(Response::new(()))
+    }
+
+    async fn force_launcher(&self, request: Request<String>) -> Result<Response<()>, Status> {
+        let launcher = request.into_inner();
+        let mut settings = self.state.app_settings.lock().await;
+        settings.forced_launcher = launcher;
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn set_main_executable(&self, request: Request<String>) -> Result<Response<()>, Status> {
+        let executable = request.into_inner();
+        let mut settings = self.state.app_settings.lock().await;
+        settings.main_executable = executable;
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn request_knowledge_base_suggestions(
+        &self,
+        request: Request<String>,
+    ) -> Result<Response<()>, Status> {
+        tracing::info!(
+            query = %request.into_inner(),
+            "knowledge base suggestion request received"
+        );
+        Ok(Response::new(()))
+    }
+
     async fn login(&self, request: Request<pb::LoginRequest>) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let username = req.username.trim().to_string();
@@ -294,7 +610,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             }
         };
 
-        if auth.two_factor.totp_required() {
+        if auth.two_factor.requires_second_factor() {
             let pending = PendingLogin {
                 username: username.clone(),
                 password,
@@ -302,9 +618,16 @@ impl pb::bridge_server::Bridge for BridgeService {
                 access_token: auth.access_token,
                 refresh_token: auth.refresh_token,
                 client,
+                fido_authentication_options: auth.two_factor.fido_authentication_options(),
             };
             *self.state.pending_login.lock().await = Some(pending);
-            self.emit_login_tfa_requested(&username);
+            if auth.two_factor.totp_required() {
+                self.emit_login_tfa_requested(&username);
+            } else if auth.two_factor.fido_supported() {
+                self.emit_login_error("security key authentication required; call LoginFido");
+            } else {
+                self.emit_login_error("second-factor authentication required");
+            }
             return Ok(Response::new(()));
         }
 
@@ -341,6 +664,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
 
         if let Err(err) = api::auth::submit_2fa(&pending.client, code.trim()).await {
+            *pending_guard = Some(pending);
             self.emit_login_error(err.to_string());
             return Err(status_from_api_error(err));
         }
@@ -366,6 +690,58 @@ impl pb::bridge_server::Bridge for BridgeService {
         self.login(request).await
     }
 
+    async fn login_fido(&self, request: Request<pb::LoginRequest>) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let username = req.username.trim().to_string();
+        if req.password.is_empty() {
+            return Err(Status::invalid_argument(
+                "FIDO assertion payload must not be empty",
+            ));
+        }
+
+        let mut pending_guard = self.state.pending_login.lock().await;
+        let Some(pending) = pending_guard.take() else {
+            return Err(Status::failed_precondition("no pending login for FIDO"));
+        };
+
+        if !username.is_empty() && !username.eq_ignore_ascii_case(&pending.username) {
+            *pending_guard = Some(pending);
+            return Err(Status::invalid_argument(
+                "username does not match pending login",
+            ));
+        }
+
+        let Some(authentication_options) = pending.fido_authentication_options.clone() else {
+            *pending_guard = Some(pending);
+            return Err(Status::failed_precondition(
+                "pending login has no FIDO challenge",
+            ));
+        };
+
+        if let Err(err) =
+            api::auth::submit_fido_2fa(&pending.client, &authentication_options, &req.password)
+                .await
+        {
+            *pending_guard = Some(pending);
+            self.emit_login_error(err.to_string());
+            return Err(status_from_api_error(err));
+        }
+
+        drop(pending_guard);
+
+        self.complete_login(
+            pending.client,
+            pending.uid,
+            pending.access_token,
+            pending.refresh_token,
+            pending.username,
+            pending.password,
+        )
+        .await?;
+
+        Ok(Response::new(()))
+    }
+
     async fn login_abort(
         &self,
         request: Request<pb::LoginAbortRequest>,
@@ -380,6 +756,13 @@ impl pb::bridge_server::Bridge for BridgeService {
             *pending = None;
             self.emit_login_error("login aborted");
         }
+        Ok(Response::new(()))
+    }
+
+    async fn fido_assertion_abort(
+        &self,
+        _request: Request<pb::LoginAbortRequest>,
+    ) -> Result<Response<()>, Status> {
         Ok(Response::new(()))
     }
 
@@ -404,6 +787,32 @@ impl pb::bridge_server::Bridge for BridgeService {
         Ok(Response::new(session_to_user(session)))
     }
 
+    async fn set_user_split_mode(
+        &self,
+        request: Request<pb::UserSplitModeRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            user_id = %req.user_id,
+            active = req.active,
+            "set user split mode requested"
+        );
+        Ok(Response::new(()))
+    }
+
+    async fn send_bad_event_user_feedback(
+        &self,
+        request: Request<pb::UserBadEventFeedbackRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        tracing::warn!(
+            user_id = %req.user_id,
+            do_resync = req.do_resync,
+            "user bad event feedback received"
+        );
+        Ok(Response::new(()))
+    }
+
     async fn logout_user(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let value = request.into_inner();
         let sessions =
@@ -421,6 +830,76 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn remove_user(&self, request: Request<String>) -> Result<Response<()>, Status> {
         self.logout_user(request).await
+    }
+
+    async fn configure_user_apple_mail(
+        &self,
+        request: Request<pb::ConfigureAppleMailRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        tracing::info!(
+            user_id = %req.user_id,
+            address = %req.address,
+            "configure user apple mail requested; not yet integrated with system mail setup"
+        );
+        Ok(Response::new(()))
+    }
+
+    async fn check_update(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        Ok(Response::new(()))
+    }
+
+    async fn install_update(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        tracing::info!("install update requested; triggering controlled shutdown");
+        let _ = self.state.shutdown_tx.send(true);
+        Ok(Response::new(()))
+    }
+
+    async fn set_is_automatic_update_on(
+        &self,
+        request: Request<bool>,
+    ) -> Result<Response<()>, Status> {
+        let mut settings = self.state.app_settings.lock().await;
+        settings.is_automatic_update_on = request.into_inner();
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn is_automatic_update_on(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<bool>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.is_automatic_update_on))
+    }
+
+    async fn available_keychains(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<pb::AvailableKeychainsResponse>, Status> {
+        Ok(Response::new(pb::AvailableKeychainsResponse {
+            keychains: vec!["keyring".to_string(), "file".to_string()],
+        }))
+    }
+
+    async fn set_current_keychain(&self, request: Request<String>) -> Result<Response<()>, Status> {
+        let keychain = request.into_inner();
+        if keychain.trim().is_empty() {
+            return Err(Status::invalid_argument("keychain name is empty"));
+        }
+        let mut settings = self.state.app_settings.lock().await;
+        settings.current_keychain = keychain;
+        save_app_settings(&self.state.vault_dir, &settings)
+            .await
+            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn current_keychain(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        let settings = self.state.app_settings.lock().await;
+        Ok(Response::new(settings.current_keychain.clone()))
     }
 
     async fn mail_server_settings(
@@ -634,6 +1113,7 @@ pub async fn run_server(vault_dir: PathBuf, bind_host: String) -> anyhow::Result
     .await?;
 
     let settings = load_mail_settings(&vault_dir).await?;
+    let app_settings = load_app_settings(&vault_dir).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, _) = broadcast::channel(128);
     let state = Arc::new(GrpcState {
@@ -644,6 +1124,7 @@ pub async fn run_server(vault_dir: PathBuf, bind_host: String) -> anyhow::Result
         pending_login: Mutex::new(None),
         shutdown_tx: shutdown_tx.clone(),
         mail_settings: Mutex::new(settings),
+        app_settings: Mutex::new(app_settings),
     });
 
     let service = BridgeService::new(state);
@@ -823,6 +1304,31 @@ async fn save_mail_settings(dir: &Path, settings: &StoredMailSettings) -> anyhow
     Ok(())
 }
 
+async fn load_app_settings(dir: &Path) -> anyhow::Result<StoredAppSettings> {
+    let path = dir.join(APP_SETTINGS_FILE);
+    if !path.exists() {
+        return Ok(StoredAppSettings::with_defaults_for(dir));
+    }
+
+    let payload = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&payload).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+async fn save_app_settings(dir: &Path, settings: &StoredAppSettings) -> anyhow::Result<()> {
+    let path = dir.join(APP_SETTINGS_FILE);
+    let tmp_path = dir.join(format!("{APP_SETTINGS_FILE}.tmp"));
+    let payload = serde_json::to_vec_pretty(settings).context("failed to encode app settings")?;
+    tokio::fs::write(&tmp_path, payload)
+        .await
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, &path)
+        .await
+        .with_context(|| format!("failed to rename settings file {}", path.display()))?;
+    Ok(())
+}
+
 fn mail_cert_paths(vault_dir: &Path) -> (PathBuf, PathBuf) {
     let cert_dir = vault_dir.join("tls");
     (cert_dir.join("cert.pem"), cert_dir.join("key.pem"))
@@ -857,6 +1363,41 @@ async fn ensure_mail_tls_certificate(vault_dir: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn build_test_service(vault_dir: PathBuf) -> BridgeService {
+        let (event_tx, _) = broadcast::channel(16);
+        let (shutdown_tx, _) = watch::channel(false);
+        let state = Arc::new(GrpcState {
+            vault_dir: vault_dir.clone(),
+            bind_host: "127.0.0.1".to_string(),
+            event_tx,
+            active_stream_stop: Mutex::new(None),
+            pending_login: Mutex::new(None),
+            shutdown_tx,
+            mail_settings: Mutex::new(StoredMailSettings::default()),
+            app_settings: Mutex::new(StoredAppSettings::with_defaults_for(&vault_dir)),
+        });
+        BridgeService::new(state)
+    }
+
+    async fn call_login_fido(
+        service: &BridgeService,
+        username: &str,
+        payload: &[u8],
+    ) -> Result<Response<()>, Status> {
+        <BridgeService as pb::bridge_server::Bridge>::login_fido(
+            service,
+            Request::new(pb::LoginRequest {
+                username: username.to_string(),
+                password: payload.to_vec(),
+                use_hv_details: None,
+            }),
+        )
+        .await
+    }
 
     #[test]
     fn validate_server_token_works() {
@@ -881,5 +1422,159 @@ mod tests {
         assert_eq!(loaded.smtp_port, 1026);
         assert!(loaded.use_ssl_for_imap);
         assert!(loaded.use_ssl_for_smtp);
+    }
+
+    #[tokio::test]
+    async fn app_settings_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = StoredAppSettings {
+            show_on_startup: false,
+            is_autostart_on: true,
+            is_beta_enabled: true,
+            is_all_mail_visible: false,
+            is_telemetry_disabled: true,
+            disk_cache_path: dir.path().join("disk").display().to_string(),
+            is_doh_enabled: false,
+            color_scheme_name: "light".to_string(),
+            is_automatic_update_on: false,
+            current_keychain: "file".to_string(),
+            main_executable: "/tmp/bridge-bin".to_string(),
+            forced_launcher: "thunderbird".to_string(),
+        };
+        save_app_settings(dir.path(), &settings).await.unwrap();
+        let loaded = load_app_settings(dir.path()).await.unwrap();
+        assert!(!loaded.show_on_startup);
+        assert!(loaded.is_autostart_on);
+        assert!(loaded.is_beta_enabled);
+        assert!(!loaded.is_all_mail_visible);
+        assert!(loaded.is_telemetry_disabled);
+        assert!(!loaded.is_doh_enabled);
+        assert_eq!(loaded.color_scheme_name, "light");
+        assert!(!loaded.is_automatic_update_on);
+        assert_eq!(loaded.current_keychain, "file");
+        assert_eq!(loaded.main_executable, "/tmp/bridge-bin");
+        assert_eq!(loaded.forced_launcher, "thunderbird");
+    }
+
+    #[tokio::test]
+    async fn login_fido_requires_pending_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let result = call_login_fido(&service, "alice@example.com", br#"{}"#).await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("no pending login"));
+    }
+
+    #[tokio::test]
+    async fn login_fido_preserves_pending_state_on_invalid_assertion_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let client = ProtonClient::with_base_url("http://127.0.0.1:1").unwrap();
+        let pending = PendingLogin {
+            username: "alice@example.com".to_string(),
+            password: "mailbox-password".to_string(),
+            uid: "uid-1".to_string(),
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            client,
+            fido_authentication_options: Some(json!({
+                "publicKey": { "challenge": [1, 2, 3] }
+            })),
+        };
+        *service.state.pending_login.lock().await = Some(pending);
+
+        let result = call_login_fido(&service, "alice@example.com", b"not-json").await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+        assert!(status.message().contains("invalid FIDO assertion payload"));
+        assert!(service.state.pending_login.lock().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn login_fido_success_completes_login_and_clears_pending_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v4/2fa"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .and(body_partial_json(json!({
+                "FIDO2": {
+                    "CredentialID": [1, 2, 3]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "Scopes": ["mail"]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/users"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "User": {
+                    "ID": "uid-1",
+                    "Name": "alice",
+                    "DisplayName": "Alice",
+                    "Email": "alice@example.com",
+                    "Keys": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/keys/salts"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "KeySalts": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = ProtonClient::with_base_url(&server.uri()).unwrap();
+        client.set_auth("uid-1", "access-1");
+        let pending = PendingLogin {
+            username: "alice@example.com".to_string(),
+            password: "mailbox-password".to_string(),
+            uid: "uid-1".to_string(),
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            client,
+            fido_authentication_options: Some(json!({
+                "publicKey": { "challenge": [1, 2, 3] }
+            })),
+        };
+        *service.state.pending_login.lock().await = Some(pending);
+
+        let payload = br#"{
+            "rawId":"AQID",
+            "response":{
+                "clientDataJSON":"BAUG",
+                "authenticatorData":"BwgJ",
+                "signature":"CgsM"
+            }
+        }"#;
+        call_login_fido(&service, "alice@example.com", payload)
+            .await
+            .unwrap();
+
+        assert!(service.state.pending_login.lock().await.is_none());
+        let sessions = vault::list_sessions(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].uid, "uid-1");
+        assert_eq!(sessions[0].email, "alice@example.com");
+        assert!(sessions[0].bridge_password.is_some());
     }
 }

@@ -7,16 +7,63 @@ package grpc;
 
 service Bridge {
   rpc CheckTokens(google.protobuf.StringValue) returns (google.protobuf.StringValue);
+  rpc AddLogEntry(AddLogEntryRequest) returns (google.protobuf.Empty);
+
+  rpc GuiReady(google.protobuf.Empty) returns (GuiReadyResponse);
+  rpc Restart(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc TriggerRepair(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc TriggerReset(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc ShowOnStartup(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+
+  rpc SetIsAutostartOn(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+  rpc IsAutostartOn(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+  rpc SetIsBetaEnabled(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+  rpc IsBetaEnabled(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+  rpc SetIsAllMailVisible(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+  rpc IsAllMailVisible(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+  rpc SetIsTelemetryDisabled(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+  rpc IsTelemetryDisabled(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+
+  rpc DiskCachePath(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc SetDiskCachePath(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc SetIsDoHEnabled(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+  rpc IsDoHEnabled(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+  rpc SetColorSchemeName(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc ColorSchemeName(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc CurrentEmailClient(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc LogsPath(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc LicensePath(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc ReleaseNotesPageLink(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc DependencyLicensesLink(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc LandingPageLink(google.protobuf.Empty) returns (google.protobuf.StringValue);
+  rpc ReportBug(ReportBugRequest) returns (google.protobuf.Empty);
+  rpc ForceLauncher(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc SetMainExecutable(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc RequestKnowledgeBaseSuggestions(google.protobuf.StringValue) returns (google.protobuf.Empty);
 
   rpc Login(LoginRequest) returns (google.protobuf.Empty);
   rpc Login2FA(LoginRequest) returns (google.protobuf.Empty);
+  rpc LoginFido(LoginRequest) returns (google.protobuf.Empty);
   rpc Login2Passwords(LoginRequest) returns (google.protobuf.Empty);
   rpc LoginAbort(LoginAbortRequest) returns (google.protobuf.Empty);
+  rpc FidoAssertionAbort(LoginAbortRequest) returns (google.protobuf.Empty);
 
   rpc GetUserList(google.protobuf.Empty) returns (UserListResponse);
   rpc GetUser(google.protobuf.StringValue) returns (User);
+  rpc SetUserSplitMode(UserSplitModeRequest) returns (google.protobuf.Empty);
+  rpc SendBadEventUserFeedback(UserBadEventFeedbackRequest) returns (google.protobuf.Empty);
   rpc LogoutUser(google.protobuf.StringValue) returns (google.protobuf.Empty);
   rpc RemoveUser(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc ConfigureUserAppleMail(ConfigureAppleMailRequest) returns (google.protobuf.Empty);
+
+  rpc CheckUpdate(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc InstallUpdate(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc SetIsAutomaticUpdateOn(google.protobuf.BoolValue) returns (google.protobuf.Empty);
+  rpc IsAutomaticUpdateOn(google.protobuf.Empty) returns (google.protobuf.BoolValue);
+
+  rpc AvailableKeychains(google.protobuf.Empty) returns (AvailableKeychainsResponse);
+  rpc SetCurrentKeychain(google.protobuf.StringValue) returns (google.protobuf.Empty);
+  rpc CurrentKeychain(google.protobuf.Empty) returns (google.protobuf.StringValue);
 
   rpc MailServerSettings(google.protobuf.Empty) returns (ImapSmtpSettings);
   rpc SetMailServerSettings(ImapSmtpSettings) returns (google.protobuf.Empty);
@@ -35,6 +82,26 @@ service Bridge {
   rpc Quit(google.protobuf.Empty) returns (google.protobuf.Empty);
 }
 
+message GuiReadyResponse {
+  bool showSplashScreen = 1;
+}
+
+enum LogLevel {
+  LOG_PANIC = 0;
+  LOG_FATAL = 1;
+  LOG_ERROR = 2;
+  LOG_WARN = 3;
+  LOG_INFO = 4;
+  LOG_DEBUG = 5;
+  LOG_TRACE = 6;
+}
+
+message AddLogEntryRequest {
+  LogLevel level = 1;
+  string package = 2;
+  string message = 3;
+}
+
 message LoginRequest {
   string username = 1;
   bytes password = 2;
@@ -43,6 +110,16 @@ message LoginRequest {
 
 message LoginAbortRequest {
   string username = 1;
+}
+
+message ReportBugRequest {
+  string osType = 1;
+  string osVersion = 2;
+  string title = 3;
+  string description = 4;
+  string address = 5;
+  string emailClient = 6;
+  bool includeLogs = 7;
 }
 
 enum UserState {
@@ -65,6 +142,25 @@ message User {
 
 message UserListResponse {
   repeated User users = 1;
+}
+
+message UserSplitModeRequest {
+  string userID = 1;
+  bool active = 2;
+}
+
+message UserBadEventFeedbackRequest {
+  string userID = 1;
+  bool doResync = 2;
+}
+
+message ConfigureAppleMailRequest {
+  string userID = 1;
+  string address = 2;
+}
+
+message AvailableKeychainsResponse {
+  repeated string keychains = 1;
 }
 
 message ImapSmtpSettings {

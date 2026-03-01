@@ -5,26 +5,388 @@
     bridgeStatus,
     connect,
     disconnect,
-    fail,
     initBridgeStore,
     resetError,
     streamLog,
     updateConfigPath,
-    updateLoginStep,
   } from './lib/stores/bridge'
+  import {
+    onBridgeUiEvent,
+    exportTlsCertificates,
+    fetchUsers,
+    getAppSettings,
+    getHostname,
+    getMailSettings,
+    installTlsCertificate,
+    isPortFree,
+    isTlsCertificateInstalled,
+    loginFido,
+    login,
+    login2fa,
+    login2passwords,
+    loginAbort,
+    fidoAssertionAbort,
+    logoutUser,
+    removeUser,
+    setColorSchemeName,
+    setDiskCachePath,
+    setIsAllMailVisible,
+    setIsAutostartOn,
+    setIsBetaEnabled,
+    setIsDohEnabled,
+    setIsTelemetryDisabled,
+    setUserSplitMode,
+    setMailSettings,
+    type AppSettings,
+    type BridgeUiEvent,
+    type MailSettings,
+    type UserSummary,
+  } from './lib/api/bridge'
+  import { logger } from './lib/logging/logger'
+  import BridgeConnectionCard from './lib/components/cards/BridgeConnectionCard.svelte'
+  import LoginFlowCard from './lib/components/cards/LoginFlowCard.svelte'
+  import ErrorStateCard from './lib/components/cards/ErrorStateCard.svelte'
+  import GeneralSettingsCard from './lib/components/cards/GeneralSettingsCard.svelte'
+  import StreamEventsCard from './lib/components/cards/StreamEventsCard.svelte'
+  import UsersCard from './lib/components/cards/UsersCard.svelte'
+  import MailSettingsCard from './lib/components/cards/MailSettingsCard.svelte'
+  import TlsSettingsCard from './lib/components/cards/TlsSettingsCard.svelte'
+  import EventToastsCard from './lib/components/cards/EventToastsCard.svelte'
 
-  const steps = ['idle', 'credentials', '2fa', 'mailbox_password', 'done']
+  const defaultAppSettings: AppSettings = {
+    is_autostart_on: false,
+    is_beta_enabled: false,
+    is_all_mail_visible: true,
+    is_telemetry_disabled: false,
+    disk_cache_path: '',
+    is_doh_enabled: true,
+    color_scheme_name: 'system',
+  }
 
-  let stop: (() => void) | undefined
-  let configPathInput = ''
+  let stop = $state<(() => void) | undefined>(undefined)
+  let stopUi = $state<(() => void) | undefined>(undefined)
+  let configPathInput = $state('')
+  let hostname = $state('')
+  let users = $state<UserSummary[]>([])
+  let usersLoading = $state(false)
+  let appSettings = $state<AppSettings>({ ...defaultAppSettings })
+  let settingsStatus = $state('')
+  let diskCachePathInput = $state('')
+  let colorSchemeNameInput = $state('system')
+  let imapPort = $state('1143')
+  let smtpPort = $state('1025')
+  let useSslImap = $state(false)
+  let useSslSmtp = $state(false)
+  let saveStatus = $state('')
+  let portToCheck = $state('1143')
+  let portCheckResult = $state('')
+  let loginUsername = $state('')
+  let loginPassword = $state('')
+  let twoFactorCode = $state('')
+  let mailboxPassword = $state('')
+  let fidoAssertionPayload = $state('')
+  let loginStatus = $state('')
+  let tlsInstalled = $state<boolean | null>(null)
+  let tlsExportDir = $state('')
+  let tlsStatus = $state('')
+  let toastLog = $state<string[]>([])
+
+  function pushToast(message: string) {
+    toastLog = [`${new Date().toLocaleTimeString()} ${message}`, ...toastLog].slice(0, 24)
+  }
+
+  async function refreshUsersData() {
+    hostname = await getHostname()
+    users = await fetchUsers()
+  }
+
+  async function refreshMailServerSettings() {
+    const settings: MailSettings = await getMailSettings()
+    imapPort = String(settings.imap_port)
+    smtpPort = String(settings.smtp_port)
+    useSslImap = settings.use_ssl_for_imap
+    useSslSmtp = settings.use_ssl_for_smtp
+  }
+
+  async function refreshGeneralSettings() {
+    appSettings = await getAppSettings()
+    diskCachePathInput = appSettings.disk_cache_path
+    colorSchemeNameInput = appSettings.color_scheme_name
+  }
+
+  async function refreshTlsSettings() {
+    tlsInstalled = await isTlsCertificateInstalled()
+  }
+
+  async function refreshBridgeData() {
+    logger.debug('app', 'refresh bridge data started')
+    usersLoading = true
+    saveStatus = ''
+    tlsStatus = ''
+    settingsStatus = ''
+    try {
+      await Promise.all([
+        refreshUsersData(),
+        refreshMailServerSettings(),
+        refreshGeneralSettings(),
+        refreshTlsSettings(),
+      ])
+    } catch (error) {
+      logger.error('app', 'refresh bridge data failed', { error: String(error) })
+      saveStatus = `refresh failed: ${String(error)}`
+    } finally {
+      usersLoading = false
+      logger.debug('app', 'refresh bridge data completed')
+    }
+  }
+
+  async function connectAndLoad() {
+    logger.info('app', 'connect and load requested')
+    try {
+      await connect()
+      await refreshBridgeData()
+      logger.info('app', 'connect and load completed')
+    } catch (error) {
+      logger.error('app', 'connect and load failed', { error: String(error) })
+      throw error
+    }
+  }
+
+  async function saveMailServerSettings() {
+    logger.info('app', 'save mail settings requested', {
+      imapPort,
+      smtpPort,
+      useSslImap,
+      useSslSmtp,
+    })
+    saveStatus = 'saving...'
+    try {
+      await setMailSettings({
+        imap_port: Number(imapPort),
+        smtp_port: Number(smtpPort),
+        use_ssl_for_imap: useSslImap,
+        use_ssl_for_smtp: useSslSmtp,
+      })
+      saveStatus = 'saved (awaiting stream confirmation)'
+      await refreshMailServerSettings()
+    } catch (error) {
+      logger.error('app', 'save mail settings failed', { error: String(error) })
+      saveStatus = `save failed: ${String(error)}`
+    }
+  }
+
+  async function checkPort() {
+    logger.debug('app', 'port check requested', { portToCheck })
+    portCheckResult = 'checking...'
+    try {
+      const free = await isPortFree(Number(portToCheck))
+      portCheckResult = free ? 'free' : 'occupied'
+    } catch (error) {
+      logger.error('app', 'port check failed', { error: String(error) })
+      portCheckResult = `error: ${String(error)}`
+    }
+  }
+
+  async function submitCredentials() {
+    logger.info('app', 'submit credentials requested', { username: loginUsername })
+    loginStatus = 'submitting credentials...'
+    try {
+      await login(loginUsername, loginPassword)
+      loginStatus = 'credentials submitted'
+    } catch (error) {
+      logger.error('app', 'submit credentials failed', { error: String(error) })
+      loginStatus = `login failed: ${String(error)}`
+    }
+  }
+
+  async function submitTwoFactor() {
+    logger.info('app', 'submit 2FA requested', { username: loginUsername })
+    loginStatus = 'submitting 2FA...'
+    try {
+      await login2fa(loginUsername, twoFactorCode)
+      loginStatus = '2FA submitted (awaiting stream)'
+    } catch (error) {
+      logger.error('app', 'submit 2FA failed', { error: String(error) })
+      loginStatus = `2FA failed: ${String(error)}`
+    }
+  }
+
+  async function submitMailboxPassword() {
+    logger.info('app', 'submit mailbox password requested', { username: loginUsername })
+    loginStatus = 'submitting mailbox password...'
+    try {
+      await login2passwords(loginUsername, mailboxPassword)
+      loginStatus = 'mailbox password submitted (awaiting stream)'
+    } catch (error) {
+      logger.error('app', 'submit mailbox password failed', { error: String(error) })
+      loginStatus = `mailbox password failed: ${String(error)}`
+    }
+  }
+
+  async function submitFidoAssertion() {
+    logger.info('app', 'submit FIDO assertion requested', { username: loginUsername })
+    loginStatus = 'submitting FIDO assertion...'
+    try {
+      await loginFido(loginUsername, fidoAssertionPayload)
+      loginStatus = 'FIDO assertion submitted (awaiting stream)'
+    } catch (error) {
+      logger.error('app', 'submit FIDO assertion failed', { error: String(error) })
+      loginStatus = `FIDO failed: ${String(error)}`
+    }
+  }
+
+  async function abortFidoFlow() {
+    logger.info('app', 'abort FIDO assertion requested', { username: loginUsername })
+    loginStatus = 'aborting FIDO assertion...'
+    try {
+      await fidoAssertionAbort(loginUsername)
+      loginStatus = 'FIDO assertion aborted'
+    } catch (error) {
+      logger.error('app', 'abort FIDO assertion failed', { error: String(error) })
+      loginStatus = `FIDO abort failed: ${String(error)}`
+    }
+  }
+
+  async function abortLoginFlow() {
+    logger.info('app', 'abort login requested', { username: loginUsername })
+    loginStatus = 'aborting login...'
+    try {
+      await loginAbort(loginUsername)
+      loginStatus = 'login aborted'
+    } catch (error) {
+      logger.error('app', 'abort login failed', { error: String(error) })
+      loginStatus = `abort failed: ${String(error)}`
+    }
+  }
+
+  async function logout(userId: string) {
+    logger.info('app', 'logout user requested', { userId })
+    await logoutUser(userId)
+    await refreshBridgeData()
+  }
+
+  async function remove(userId: string) {
+    logger.info('app', 'remove user requested', { userId })
+    await removeUser(userId)
+    await refreshBridgeData()
+  }
+
+  async function toggleSplitMode(userId: string, current: boolean) {
+    logger.info('app', 'toggle split mode requested', { userId, next: !current })
+    await setUserSplitMode(userId, !current)
+    await refreshUsersData()
+  }
+
+  async function installTls() {
+    logger.info('app', 'install tls requested')
+    tlsStatus = 'installing certificate...'
+    try {
+      await installTlsCertificate()
+      tlsInstalled = await isTlsCertificateInstalled()
+      tlsStatus = 'certificate installed'
+    } catch (error) {
+      logger.error('app', 'install tls failed', { error: String(error) })
+      tlsStatus = `install failed: ${String(error)}`
+    }
+  }
+
+  async function exportTls() {
+    logger.info('app', 'export tls requested', { output: tlsExportDir })
+    tlsStatus = 'exporting certificate...'
+    try {
+      await exportTlsCertificates(tlsExportDir)
+      tlsStatus = 'export completed'
+    } catch (error) {
+      logger.error('app', 'export tls failed', { error: String(error) })
+      tlsStatus = `export failed: ${String(error)}`
+    }
+  }
+
+  async function applyGeneralSettings() {
+    logger.info('app', 'apply general settings requested', {
+      is_autostart_on: appSettings.is_autostart_on,
+      is_beta_enabled: appSettings.is_beta_enabled,
+      is_all_mail_visible: appSettings.is_all_mail_visible,
+      is_telemetry_disabled: appSettings.is_telemetry_disabled,
+      is_doh_enabled: appSettings.is_doh_enabled,
+      disk_cache_path: diskCachePathInput,
+      color_scheme_name: colorSchemeNameInput,
+    })
+    settingsStatus = 'saving...'
+    try {
+      await setIsAutostartOn(appSettings.is_autostart_on)
+      await setIsBetaEnabled(appSettings.is_beta_enabled)
+      await setIsAllMailVisible(appSettings.is_all_mail_visible)
+      await setIsTelemetryDisabled(appSettings.is_telemetry_disabled)
+      await setIsDohEnabled(appSettings.is_doh_enabled)
+      await setDiskCachePath(diskCachePathInput)
+      await setColorSchemeName(colorSchemeNameInput)
+
+      appSettings.disk_cache_path = diskCachePathInput
+      appSettings.color_scheme_name = colorSchemeNameInput
+      settingsStatus = 'saved'
+    } catch (error) {
+      logger.error('app', 'apply general settings failed', { error: String(error) })
+      settingsStatus = `save failed: ${String(error)}`
+    }
+  }
+
+  function handleUiEvent(event: BridgeUiEvent) {
+    logger.debug('app', 'ui event received', event)
+    const message = `${event.level.toUpperCase()}: ${event.message}`
+    pushToast(message)
+
+    if (event.code === 'mail_settings_saved') {
+      saveStatus = 'saved (stream confirmed)'
+    }
+    if (event.code === 'autostart_saved' || event.code === 'disk_cache_saved') {
+      settingsStatus = 'saved (stream confirmed)'
+    }
+    if (
+      event.code === 'fido_requested' ||
+      event.code === 'tfa_or_fido_requested' ||
+      event.code === 'fido_touch_requested' ||
+      event.code === 'fido_touch_completed' ||
+      event.code === 'fido_pin_required'
+    ) {
+      loginStatus = event.message
+    }
+    if (event.level === 'error') {
+      settingsStatus = event.message
+      if (event.code === 'login_error') {
+        loginStatus = event.message
+      }
+    }
+
+    if (event.refresh_hints.includes('users')) {
+      void refreshUsersData()
+    }
+    if (event.refresh_hints.includes('mail_settings')) {
+      void refreshMailServerSettings()
+    }
+    if (event.refresh_hints.includes('app_settings')) {
+      void refreshGeneralSettings()
+    }
+    if (event.refresh_hints.includes('tls')) {
+      void refreshTlsSettings()
+    }
+  }
 
   onMount(() => {
     void (async () => {
+      logger.info('app', 'mount start')
       stop = await initBridgeStore()
+      stopUi = await onBridgeUiEvent((event) => handleUiEvent(event))
       configPathInput = get(bridgeStatus).config_path ?? ''
+      await refreshBridgeData()
+      logger.info('app', 'mount completed')
     })()
 
-    return () => stop?.()
+    return () => {
+      logger.info('app', 'unmount cleanup')
+      stop?.()
+      stopUi?.()
+    }
   })
 </script>
 
@@ -35,60 +397,71 @@
   </section>
 
   <section class="grid">
-    <article class="card">
-      <h2>Bridge Connection</h2>
-      <div class="status-block">
-        <p><strong>Connected:</strong> {$bridgeStatus.connected ? 'yes' : 'no'}</p>
-        <p><strong>Stream:</strong> {$bridgeStatus.stream_running ? 'running' : 'stopped'}</p>
-        <p><strong>Login Step:</strong> {$bridgeStatus.login_step}</p>
-        <p><strong>Config Path:</strong> {$bridgeStatus.config_path ?? '(auto-resolve)'}</p>
-      </div>
+    <BridgeConnectionCard
+      status={$bridgeStatus}
+      bind:configPathInput
+      onSetPath={(path) => updateConfigPath(path)}
+      onConnect={connectAndLoad}
+      onDisconnect={disconnect}
+    />
 
-      <div class="row config-row">
-        <input bind:value={configPathInput} placeholder="grpcServerConfig.json path (optional)" />
-        <button class="secondary" on:click={() => updateConfigPath(configPathInput)}>Set Path</button>
-      </div>
+    <LoginFlowCard
+      loginStep={$bridgeStatus.login_step}
+      bind:loginUsername
+      bind:loginPassword
+      bind:twoFactorCode
+      bind:mailboxPassword
+      bind:fidoAssertionPayload
+      loginStatus={loginStatus}
+      onSubmitCredentials={submitCredentials}
+      onSubmitTwoFactor={submitTwoFactor}
+      onSubmitMailboxPassword={submitMailboxPassword}
+      onSubmitFidoAssertion={submitFidoAssertion}
+      onAbortFidoFlow={abortFidoFlow}
+      onAbortLoginFlow={abortLoginFlow}
+    />
 
-      <div class="row">
-        <button on:click={() => connect()}>Connect</button>
-        <button class="secondary" on:click={() => disconnect()}>Disconnect</button>
-      </div>
-    </article>
+    <ErrorStateCard lastError={$bridgeStatus.last_error} onClearError={resetError} />
 
-    <article class="card">
-      <h2>Login Flow Mock</h2>
-      <div class="row wrap">
-        {#each steps as step}
-          <button class="secondary" on:click={() => updateLoginStep(step)}>{step}</button>
-        {/each}
-      </div>
-    </article>
+    <GeneralSettingsCard
+      bind:appSettings
+      bind:diskCachePathInput
+      bind:colorSchemeNameInput
+      settingsStatus={settingsStatus}
+      onApplySettings={applyGeneralSettings}
+    />
 
-    <article class="card">
-      <h2>Error State</h2>
-      {#if $bridgeStatus.last_error}
-        <p class="error">{$bridgeStatus.last_error}</p>
-      {:else}
-        <p class="muted">No active error.</p>
-      {/if}
+    <StreamEventsCard events={$streamLog} />
 
-      <div class="row">
-        <button class="danger" on:click={() => fail('Simulated gRPC failure')}>Push Error</button>
-        <button class="secondary" on:click={() => resetError()}>Clear Error</button>
-      </div>
-    </article>
+    <UsersCard
+      hostname={hostname}
+      usersLoading={usersLoading}
+      users={users}
+      onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
+      onLogout={(userId) => logout(userId)}
+      onRemove={(userId) => remove(userId)}
+    />
 
-    <article class="card span-2">
-      <h2>Stream Events</h2>
-      {#if $streamLog.length === 0}
-        <p class="muted">No stream events yet. Click Connect to start mock ticks.</p>
-      {:else}
-        <ul>
-          {#each $streamLog as item}
-            <li>{item}</li>
-          {/each}
-        </ul>
-      {/if}
-    </article>
+    <MailSettingsCard
+      bind:imapPort
+      bind:smtpPort
+      bind:useSslImap
+      bind:useSslSmtp
+      saveStatus={saveStatus}
+      bind:portToCheck
+      portCheckResult={portCheckResult}
+      onSaveMailSettings={saveMailServerSettings}
+      onCheckPort={checkPort}
+    />
+
+    <TlsSettingsCard
+      tlsInstalled={tlsInstalled}
+      bind:tlsExportDir
+      tlsStatus={tlsStatus}
+      onInstallTls={installTls}
+      onExportTls={exportTls}
+    />
+
+    <EventToastsCard toasts={toastLog} />
   </section>
 </main>

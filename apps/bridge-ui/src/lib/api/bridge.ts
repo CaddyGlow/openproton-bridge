@@ -14,6 +14,40 @@ export type StreamTickEvent = {
   message: string
 }
 
+export type UserSummary = {
+  id: string
+  username: string
+  state: number
+  split_mode: boolean
+  addresses: string[]
+  used_bytes: number
+  total_bytes: number
+}
+
+export type MailSettings = {
+  imap_port: number
+  smtp_port: number
+  use_ssl_for_imap: boolean
+  use_ssl_for_smtp: boolean
+}
+
+export type AppSettings = {
+  is_autostart_on: boolean
+  is_beta_enabled: boolean
+  is_all_mail_visible: boolean
+  is_telemetry_disabled: boolean
+  disk_cache_path: string
+  is_doh_enabled: boolean
+  color_scheme_name: string
+}
+
+export type BridgeUiEvent = {
+  level: string
+  code: string
+  message: string
+  refresh_hints: string[]
+}
+
 export async function getBridgeStatus(): Promise<BridgeSnapshot> {
   return invoke<BridgeSnapshot>('bridge_status')
 }
@@ -30,16 +64,118 @@ export async function disconnectBridge(): Promise<BridgeSnapshot> {
   return invoke<BridgeSnapshot>('bridge_disconnect')
 }
 
-export async function setLoginStep(step: string): Promise<BridgeSnapshot> {
-  return invoke<BridgeSnapshot>('bridge_set_login_step', { step })
-}
-
-export async function pushMockError(message: string): Promise<BridgeSnapshot> {
-  return invoke<BridgeSnapshot>('bridge_push_mock_error', { message })
-}
-
 export async function clearError(): Promise<BridgeSnapshot> {
   return invoke<BridgeSnapshot>('bridge_clear_error')
+}
+
+export async function fetchUsers(): Promise<UserSummary[]> {
+  return invoke<UserSummary[]>('bridge_fetch_users')
+}
+
+export async function login(
+  username: string,
+  password: string,
+  useHvDetails?: boolean,
+): Promise<void> {
+  return invoke<void>('bridge_login', { username, password, use_hv_details: useHvDetails })
+}
+
+export async function login2fa(username: string, code: string): Promise<void> {
+  return invoke<void>('bridge_login_2fa', { username, code })
+}
+
+export async function login2passwords(username: string, mailboxPassword: string): Promise<void> {
+  return invoke<void>('bridge_login_2passwords', {
+    username,
+    mailbox_password: mailboxPassword,
+  })
+}
+
+export async function loginAbort(username: string): Promise<void> {
+  return invoke<void>('bridge_login_abort', { username })
+}
+
+export async function loginFido(username: string, assertionPayload: string): Promise<void> {
+  return invoke<void>('bridge_login_fido', {
+    username,
+    assertion_payload: assertionPayload,
+  })
+}
+
+export async function fidoAssertionAbort(username: string): Promise<void> {
+  return invoke<void>('bridge_fido_assertion_abort', { username })
+}
+
+export async function getHostname(): Promise<string> {
+  return invoke<string>('bridge_get_hostname')
+}
+
+export async function getMailSettings(): Promise<MailSettings> {
+  return invoke<MailSettings>('bridge_get_mail_settings')
+}
+
+export async function setMailSettings(settings: MailSettings): Promise<void> {
+  return invoke<void>('bridge_set_mail_settings', { settings })
+}
+
+export async function isPortFree(port: number): Promise<boolean> {
+  return invoke<boolean>('bridge_is_port_free', { port })
+}
+
+export async function logoutUser(userId: string): Promise<void> {
+  return invoke<void>('bridge_logout_user', { user_id: userId })
+}
+
+export async function removeUser(userId: string): Promise<void> {
+  return invoke<void>('bridge_remove_user', { user_id: userId })
+}
+
+export async function setUserSplitMode(userId: string, active: boolean): Promise<void> {
+  return invoke<void>('bridge_set_user_split_mode', { user_id: userId, active })
+}
+
+export async function isTlsCertificateInstalled(): Promise<boolean> {
+  return invoke<boolean>('bridge_is_tls_certificate_installed')
+}
+
+export async function installTlsCertificate(): Promise<void> {
+  return invoke<void>('bridge_install_tls_certificate')
+}
+
+export async function exportTlsCertificates(outputDir: string): Promise<void> {
+  return invoke<void>('bridge_export_tls_certificates', { output_dir: outputDir })
+}
+
+export async function getAppSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>('bridge_get_app_settings')
+}
+
+export async function setIsAutostartOn(enabled: boolean): Promise<void> {
+  return invoke<void>('bridge_set_is_autostart_on', { enabled })
+}
+
+export async function setIsBetaEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>('bridge_set_is_beta_enabled', { enabled })
+}
+
+export async function setIsAllMailVisible(enabled: boolean): Promise<void> {
+  return invoke<void>('bridge_set_is_all_mail_visible', { enabled })
+}
+
+export async function setIsTelemetryDisabled(disabled: boolean): Promise<void> {
+  return invoke<void>('bridge_set_is_telemetry_disabled', { disabled })
+}
+
+export async function setDiskCachePath(path: string): Promise<void> {
+  return invoke<void>('bridge_set_disk_cache_path', { path })
+}
+
+export async function setIsDohEnabled(enabled: boolean): Promise<void> {
+  return invoke<void>('bridge_set_is_doh_enabled', { enabled })
+}
+
+export async function setColorSchemeName(name: string): Promise<void> {
+  return invoke<void>('bridge_set_color_scheme_name', { name })
 }
 
 export async function onBridgeStateChanged(handler: (snapshot: BridgeSnapshot) => void): Promise<UnlistenFn> {
@@ -48,4 +184,8 @@ export async function onBridgeStateChanged(handler: (snapshot: BridgeSnapshot) =
 
 export async function onStreamTick(handler: (tick: StreamTickEvent) => void): Promise<UnlistenFn> {
   return listen<StreamTickEvent>('bridge://stream-tick', (event) => handler(event.payload))
+}
+
+export async function onBridgeUiEvent(handler: (event: BridgeUiEvent) => void): Promise<UnlistenFn> {
+  return listen<BridgeUiEvent>('bridge://ui-event', (event) => handler(event.payload))
 }

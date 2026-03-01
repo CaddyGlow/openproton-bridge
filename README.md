@@ -45,7 +45,7 @@ openproton-bridge login --username other@proton.me
 openproton-bridge status
 openproton-bridge accounts list
 
-# Set default account used by fetch/serve
+# Set default account used by fetch/status
 openproton-bridge accounts use other@proton.me
 
 # Start the bridge daemon (IMAP on 1143, SMTP on 1025)

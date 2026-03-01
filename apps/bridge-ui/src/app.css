@@ -70,11 +70,56 @@ h2 {
 
 .config-row input {
   flex: 1;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: #dbe5ea;
+  font-size: 0.9rem;
+}
+
+input {
   border-radius: 8px;
   border: 1px solid #4f6775;
   background: #18242d;
   color: #e6eef3;
   padding: 8px 10px;
+  min-width: 120px;
+}
+
+select {
+  border-radius: 8px;
+  border: 1px solid #4f6775;
+  background: #18242d;
+  color: #e6eef3;
+  padding: 8px 10px;
+  min-width: 120px;
+}
+
+.checkbox {
+  flex-direction: row;
+  align-items: center;
+  margin-top: 10px;
+}
+
+.grow {
+  flex: 1;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+
+th,
+td {
+  border-bottom: 1px solid rgba(177, 199, 210, 0.2);
+  text-align: left;
+  padding: 8px;
+  vertical-align: top;
 }
 
 .wrap {

@@ -56,11 +56,33 @@ pub struct TwoFactorInfo {
     pub enabled: i32,
     #[serde(rename = "TOTP")]
     pub totp: i32,
+    #[serde(rename = "FIDO2", default)]
+    pub fido2: Option<Fido2Info>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct Fido2Info {
+    pub authentication_options: Value,
 }
 
 impl TwoFactorInfo {
+    pub fn requires_second_factor(&self) -> bool {
+        self.enabled != 0
+    }
+
     pub fn totp_required(&self) -> bool {
         self.enabled != 0 && self.totp != 0
+    }
+
+    pub fn fido_supported(&self) -> bool {
+        self.enabled == 2 || self.enabled == 3
+    }
+
+    pub fn fido_authentication_options(&self) -> Option<Value> {
+        self.fido2
+            .as_ref()
+            .map(|f| f.authentication_options.clone())
     }
 }
 
@@ -389,7 +411,8 @@ mod tests {
             "ServerProof": "proof-b64",
             "2FA": {
                 "Enabled": 0,
-                "TOTP": 0
+                "TOTP": 0,
+                "FIDO2": null
             },
             "Scopes": ["mail", "calendar"]
         });
@@ -423,20 +446,42 @@ mod tests {
         let info = TwoFactorInfo {
             enabled: 1,
             totp: 1,
+            fido2: None,
         };
         assert!(info.totp_required());
+        assert!(info.requires_second_factor());
+        assert!(!info.fido_supported());
 
         let info = TwoFactorInfo {
             enabled: 0,
             totp: 1,
+            fido2: None,
         };
         assert!(!info.totp_required());
+        assert!(!info.requires_second_factor());
 
         let info = TwoFactorInfo {
             enabled: 1,
             totp: 0,
+            fido2: None,
         };
         assert!(!info.totp_required());
+    }
+
+    #[test]
+    fn test_two_factor_info_fido_supported() {
+        let info = TwoFactorInfo {
+            enabled: 2,
+            totp: 0,
+            fido2: Some(Fido2Info {
+                authentication_options: serde_json::json!({
+                    "publicKey": { "challenge": [1, 2, 3] }
+                }),
+            }),
+        };
+        assert!(info.requires_second_factor());
+        assert!(info.fido_supported());
+        assert!(info.fido_authentication_options().is_some());
     }
 
     #[test]

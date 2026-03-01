@@ -1,11 +1,17 @@
 #![allow(dead_code)]
 
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{
+    STANDARD as BASE64, STANDARD_NO_PAD as BASE64_NO_PAD, URL_SAFE as BASE64_URL,
+    URL_SAFE_NO_PAD as BASE64_URL_NO_PAD,
+};
 use base64::Engine;
 use clap::{Parser, Subcommand};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 mod api;
 mod bridge;
@@ -36,6 +42,27 @@ enum Command {
         /// Proton Mail username or email
         #[arg(short, long)]
         username: Option<String>,
+    },
+    /// Generate FIDO assertion JSON using a hardware security key
+    FidoAssert {
+        /// FIDO authentication options JSON payload
+        #[arg(long, conflicts_with = "auth_options_file")]
+        auth_options_json: Option<String>,
+        /// Path to a file containing FIDO authentication options JSON
+        #[arg(long, conflicts_with = "auth_options_json")]
+        auth_options_file: Option<std::path::PathBuf>,
+        /// FIDO device path (for example /dev/hidraw0)
+        #[arg(long)]
+        device: Option<String>,
+        /// Output file for the generated assertion JSON
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Security key PIN (if required)
+        #[arg(long)]
+        pin: Option<String>,
+        /// FIDO provider path: auto, hardware, or os
+        #[arg(long, default_value = "auto")]
+        provider: FidoProvider,
     },
     /// Show account/session info
     Status,
@@ -85,11 +112,18 @@ enum Command {
     },
 }
 
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum FidoProvider {
+    Auto,
+    Hardware,
+    Os,
+}
+
 #[derive(Subcommand)]
 enum AccountsCommand {
     /// List all saved accounts
     List,
-    /// Set the default account used by fetch/serve
+    /// Set the default account used by fetch/status
     Use {
         /// Account email to set as default
         email: String,
@@ -110,6 +144,21 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Login { username } => cmd_login(username, &dir).await,
+        Command::FidoAssert {
+            auth_options_json,
+            auth_options_file,
+            device,
+            output,
+            pin,
+            provider,
+        } => cmd_fido_assert(
+            auth_options_json,
+            auth_options_file,
+            device,
+            output,
+            pin,
+            provider,
+        ),
         Command::Status => cmd_status(&dir),
         Command::Logout { email, all } => cmd_logout(email.as_deref(), all, &dir),
         Command::Accounts { command } => match command {
@@ -152,11 +201,7 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
     // SRP authentication
     let auth = api::auth::login(&mut client, &username, &password).await?;
 
-    // Handle 2FA if required
-    if auth.two_factor.totp_required() {
-        let code = rpassword::prompt_password("2FA code: ").context("failed to read 2FA code")?;
-        api::auth::submit_2fa(&client, code.trim()).await?;
-    }
+    complete_cli_second_factor(&client, &auth).await?;
 
     // Fetch user info
     let user_resp = api::users::get_user(&client).await?;
@@ -214,6 +259,560 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
     println!("Use this password to connect your email client.");
 
     Ok(())
+}
+
+async fn complete_cli_second_factor(
+    client: &api::client::ProtonClient,
+    auth: &api::types::AuthResponse,
+) -> anyhow::Result<()> {
+    if !auth.two_factor.requires_second_factor() {
+        return Ok(());
+    }
+
+    if auth.two_factor.totp_required() {
+        let code = rpassword::prompt_password("2FA code: ").context("failed to read 2FA code")?;
+        api::auth::submit_2fa(client, code.trim()).await?;
+        return Ok(());
+    }
+
+    if auth.two_factor.fido_supported() {
+        let auth_options = auth
+            .two_factor
+            .fido_authentication_options()
+            .context("FIDO authentication options missing in auth response")?;
+        let assertion_payload = read_cli_fido_assertion_payload(&auth_options)?;
+        api::auth::submit_fido_2fa(client, &auth_options, assertion_payload.as_bytes()).await?;
+        return Ok(());
+    }
+
+    anyhow::bail!("unsupported second-factor mode returned by API");
+}
+
+fn cmd_fido_assert(
+    auth_options_json: Option<String>,
+    auth_options_file: Option<std::path::PathBuf>,
+    device: Option<String>,
+    output: Option<std::path::PathBuf>,
+    pin: Option<String>,
+    provider: FidoProvider,
+) -> anyhow::Result<()> {
+    let auth_options = load_fido_authentication_options(auth_options_json, auth_options_file)?;
+    let assertion = generate_fido_assertion_with_provider(
+        &auth_options,
+        provider,
+        device.as_deref(),
+        pin.as_deref(),
+    )?;
+    let pretty = serde_json::to_string_pretty(
+        &serde_json::from_str::<Value>(&assertion).context("generated invalid assertion JSON")?,
+    )
+    .context("failed to format assertion JSON")?;
+
+    if let Some(path) = output {
+        std::fs::write(&path, format!("{pretty}\n"))
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        println!("Wrote FIDO assertion JSON to {}", path.display());
+    } else {
+        println!("{pretty}");
+    }
+
+    Ok(())
+}
+
+fn load_fido_authentication_options(
+    auth_options_json: Option<String>,
+    auth_options_file: Option<std::path::PathBuf>,
+) -> anyhow::Result<Value> {
+    if let Some(raw) = auth_options_json {
+        return serde_json::from_str(raw.trim()).context("invalid --auth-options-json payload");
+    }
+
+    if let Some(path) = auth_options_file {
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        return serde_json::from_str(raw.trim())
+            .with_context(|| format!("invalid JSON in {}", path.display()));
+    }
+
+    eprintln!("Provide FIDO authentication options JSON (from login flow).");
+    eprint!("Options JSON file path (leave empty to paste JSON): ");
+    let mut path_input = String::new();
+    std::io::stdin()
+        .read_line(&mut path_input)
+        .context("failed to read options file path")?;
+    let path_input = path_input.trim();
+    if !path_input.is_empty() {
+        let raw = std::fs::read_to_string(path_input)
+            .with_context(|| format!("failed to read {path_input}"))?;
+        return serde_json::from_str(raw.trim())
+            .with_context(|| format!("invalid JSON in {path_input}"));
+    }
+
+    eprint!("Paste authentication options JSON (single line): ");
+    let mut payload = String::new();
+    std::io::stdin()
+        .read_line(&mut payload)
+        .context("failed to read authentication options JSON")?;
+    serde_json::from_str(payload.trim()).context("invalid pasted authentication options JSON")
+}
+
+fn read_cli_fido_assertion_payload(authentication_options: &Value) -> anyhow::Result<String> {
+    if let Ok(raw) = std::env::var("OPENPROTON_FIDO_ASSERTION_JSON") {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    if let Ok(path) = std::env::var("OPENPROTON_FIDO_ASSERTION_FILE") {
+        let payload = std::fs::read_to_string(&path).with_context(|| {
+            format!("failed to read OPENPROTON_FIDO_ASSERTION_FILE from {path}")
+        })?;
+        let trimmed = payload.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    let pin_env = std::env::var("OPENPROTON_FIDO_PIN").ok();
+    let provider = provider_from_env().unwrap_or(FidoProvider::Auto);
+    let device_env = std::env::var("OPENPROTON_FIDO_DEVICE").ok();
+
+    if let Ok(raw) = std::env::var("OPENPROTON_FIDO_OS_ASSERTION_JSON") {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(trimmed);
+        }
+    }
+
+    if device_env
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || matches!(provider, FidoProvider::Auto | FidoProvider::Os)
+    {
+        let device = device_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty());
+        if let Ok(assertion) = generate_fido_assertion_with_provider(
+            authentication_options,
+            provider.clone(),
+            device,
+            pin_env.as_deref(),
+        ) {
+            return Ok(assertion);
+        }
+    }
+
+    eprintln!("Security key authentication required (FIDO2).");
+    eprintln!(
+        "Set OPENPROTON_FIDO_PROVIDER (auto|hardware|os), OPENPROTON_FIDO_DEVICE, OPENPROTON_FIDO_ASSERTION_JSON, or OPENPROTON_FIDO_ASSERTION_FILE."
+    );
+    eprint!("Provider [auto/hardware/os] (default auto): ");
+    let mut provider_input = String::new();
+    std::io::stdin()
+        .read_line(&mut provider_input)
+        .context("failed to read provider")?;
+    let provider = parse_provider_input(provider_input.trim()).unwrap_or(FidoProvider::Auto);
+
+    eprint!("Security key device path for generation (empty to continue without device): ");
+    let mut device = String::new();
+    std::io::stdin()
+        .read_line(&mut device)
+        .context("failed to read FIDO device path")?;
+    let device = device.trim();
+    if !device.is_empty() || matches!(provider, FidoProvider::Auto | FidoProvider::Os) {
+        let device = if device.is_empty() {
+            None
+        } else {
+            Some(device)
+        };
+        if let Ok(assertion) = generate_fido_assertion_with_provider(
+            authentication_options,
+            provider,
+            device,
+            pin_env.as_deref(),
+        ) {
+            return Ok(assertion);
+        }
+    }
+
+    eprint!("FIDO assertion JSON file path (leave empty to paste JSON): ");
+    let mut path_input = String::new();
+    std::io::stdin()
+        .read_line(&mut path_input)
+        .context("failed to read assertion file path")?;
+    let path_input = path_input.trim();
+    if !path_input.is_empty() {
+        let payload = std::fs::read_to_string(path_input)
+            .with_context(|| format!("failed to read FIDO assertion file {path_input}"))?;
+        let trimmed = payload.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("FIDO assertion file is empty");
+        }
+        return Ok(trimmed);
+    }
+
+    eprint!("Paste FIDO assertion JSON (single line): ");
+    let mut payload = String::new();
+    std::io::stdin()
+        .read_line(&mut payload)
+        .context("failed to read FIDO assertion JSON")?;
+    let payload = payload.trim().to_string();
+    if payload.is_empty() {
+        anyhow::bail!("FIDO assertion payload is required");
+    }
+
+    Ok(payload)
+}
+
+#[derive(Debug)]
+struct FidoAssertionInput {
+    rp_id: String,
+    credential_id: Vec<u8>,
+    client_data_json: Vec<u8>,
+    client_data_hash: Vec<u8>,
+}
+
+fn provider_from_env() -> Option<FidoProvider> {
+    std::env::var("OPENPROTON_FIDO_PROVIDER")
+        .ok()
+        .and_then(|raw| parse_provider_input(raw.trim()))
+}
+
+fn parse_provider_input(input: &str) -> Option<FidoProvider> {
+    match input.to_ascii_lowercase().as_str() {
+        "" => None,
+        "auto" => Some(FidoProvider::Auto),
+        "hardware" | "hw" | "libfido2" => Some(FidoProvider::Hardware),
+        "os" | "platform" | "native" => Some(FidoProvider::Os),
+        _ => None,
+    }
+}
+
+fn generate_fido_assertion_with_provider(
+    authentication_options: &Value,
+    provider: FidoProvider,
+    device: Option<&str>,
+    pin: Option<&str>,
+) -> anyhow::Result<String> {
+    match provider {
+        FidoProvider::Auto => {
+            #[cfg(target_os = "windows")]
+            {
+                if let Ok(assertion) = generate_fido_assertion_json_os(authentication_options, pin)
+                {
+                    return Ok(assertion);
+                }
+            }
+            let device = resolve_fido_device_for_hardware(device)?;
+            generate_fido_assertion_json_hardware(authentication_options, &device, pin)
+        }
+        FidoProvider::Hardware => {
+            let device = resolve_fido_device_for_hardware(device)?;
+            generate_fido_assertion_json_hardware(authentication_options, &device, pin)
+        }
+        FidoProvider::Os => generate_fido_assertion_json_os(authentication_options, pin),
+    }
+}
+
+fn resolve_fido_device_for_hardware(device: Option<&str>) -> anyhow::Result<String> {
+    if let Some(device) = device.map(str::trim).filter(|value| !value.is_empty()) {
+        return Ok(device.to_string());
+    }
+
+    if let Some(device) = auto_detect_fido_device() {
+        eprintln!("Using detected FIDO device: {device}");
+        return Ok(device);
+    }
+
+    eprint!("FIDO device path (for example /dev/hidraw0): ");
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .context("failed to read FIDO device path")?;
+    let resolved = input.trim().to_string();
+    if resolved.is_empty() {
+        anyhow::bail!("FIDO device path is required for hardware provider");
+    }
+    Ok(resolved)
+}
+
+fn auto_detect_fido_device() -> Option<String> {
+    auto_detect_fido_device_os()
+}
+
+#[cfg(target_os = "linux")]
+fn auto_detect_fido_device_os() -> Option<String> {
+    let names = std::fs::read_dir("/dev")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    let selected = pick_first_hidraw_device_name(names)?;
+    Some(format!("/dev/{selected}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn auto_detect_fido_device_os() -> Option<String> {
+    None
+}
+
+fn pick_first_hidraw_device_name<I, S>(names: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut candidates = names
+        .into_iter()
+        .filter_map(|name| {
+            let name = name.as_ref();
+            if !name.starts_with("hidraw") {
+                return None;
+            }
+
+            let suffix = name.trim_start_matches("hidraw");
+            let idx = suffix.parse::<u32>().ok().unwrap_or(u32::MAX);
+            Some((idx, name.to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    candidates.sort_by_key(|(idx, _)| *idx);
+    candidates.into_iter().next().map(|(_, name)| name)
+}
+
+fn generate_fido_assertion_json_hardware(
+    authentication_options: &Value,
+    device: &str,
+    pin: Option<&str>,
+) -> anyhow::Result<String> {
+    let input = build_fido_assertion_input(authentication_options)?;
+    let command_input = format!(
+        "{}\n{}\n{}\n",
+        BASE64.encode(&input.client_data_hash),
+        input.rp_id,
+        BASE64.encode(&input.credential_id)
+    );
+
+    let temp_file = std::env::temp_dir().join(format!(
+        "openproton-fido-assert-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&temp_file, command_input)
+        .with_context(|| format!("failed to write {}", temp_file.display()))?;
+
+    let mut command = ProcessCommand::new("fido2-assert");
+    command
+        .arg("-G")
+        .arg("-v")
+        .arg("-i")
+        .arg(&temp_file)
+        .arg(device);
+    if let Some(pin) = pin.filter(|pin| !pin.trim().is_empty()) {
+        command.arg("-p").arg(pin.trim());
+    }
+
+    let output = command.output().context(
+        "failed to execute fido2-assert; install libfido2 tools and ensure `fido2-assert` is in PATH",
+    )?;
+    let _ = std::fs::remove_file(&temp_file);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        anyhow::bail!(
+            "fido2-assert failed (exit {}): {}{}",
+            output.status,
+            stderr.trim(),
+            if stdout.trim().is_empty() {
+                String::new()
+            } else {
+                format!("; stdout: {}", stdout.trim())
+            }
+        );
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("fido2-assert returned non-utf8 output")?;
+    let lines: Vec<String> = stdout
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.len() < 4 {
+        anyhow::bail!(
+            "unexpected fido2-assert output format (expected at least 4 lines, got {})",
+            lines.len()
+        );
+    }
+
+    let authenticator_data = lines[2].clone();
+    let signature = lines[3].clone();
+    let assertion = json!({
+        "rawId": BASE64.encode(&input.credential_id),
+        "response": {
+            "clientDataJSON": BASE64.encode(&input.client_data_json),
+            "authenticatorData": authenticator_data,
+            "signature": signature
+        }
+    });
+
+    serde_json::to_string(&assertion).context("failed to encode assertion JSON")
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn generate_fido_assertion_json_os(
+    authentication_options: &Value,
+    pin: Option<&str>,
+) -> anyhow::Result<String> {
+    let helper = std::env::var("OPENPROTON_FIDO_OS_HELPER")
+        .unwrap_or_else(|_| "openproton-fido-os-assert".to_string());
+    let options_payload =
+        serde_json::to_string(authentication_options).context("failed to encode auth options")?;
+
+    let mut cmd = ProcessCommand::new(&helper);
+    cmd.arg("--auth-options-json").arg(options_payload);
+    if let Some(pin) = pin.filter(|pin| !pin.trim().is_empty()) {
+        cmd.arg("--pin").arg(pin.trim());
+    }
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let output = cmd.output().with_context(|| {
+        format!(
+            "failed to execute OS passkey helper `{helper}`; set OPENPROTON_FIDO_OS_HELPER to your provider bridge command"
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "OS passkey helper `{helper}` failed (exit {}): {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("OS helper returned non-utf8 output")?;
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("OS passkey helper returned empty assertion payload");
+    }
+    serde_json::from_str::<Value>(trimmed).context("OS passkey helper returned invalid JSON")?;
+    Ok(trimmed.to_string())
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn generate_fido_assertion_json_os(
+    _authentication_options: &Value,
+    _pin: Option<&str>,
+) -> anyhow::Result<String> {
+    anyhow::bail!(
+        "OS passkey provider is currently available only on Windows/macOS; use --provider hardware or provide OPENPROTON_FIDO_ASSERTION_JSON"
+    )
+}
+
+fn build_fido_assertion_input(
+    authentication_options: &Value,
+) -> anyhow::Result<FidoAssertionInput> {
+    let auth_options = normalize_fido_auth_options(authentication_options)?;
+    let public_key = auth_options
+        .get("publicKey")
+        .and_then(Value::as_object)
+        .context("FIDO authentication options are missing publicKey")?;
+    let rp_id = public_key
+        .get("rpId")
+        .and_then(Value::as_str)
+        .context("FIDO authentication options are missing publicKey.rpId")?
+        .to_string();
+    let challenge = decode_fido_bytes(
+        public_key
+            .get("challenge")
+            .context("FIDO authentication options are missing publicKey.challenge")?,
+        "publicKey.challenge",
+    )?;
+    let allow_credentials = public_key
+        .get("allowCredentials")
+        .and_then(Value::as_array)
+        .context("FIDO authentication options are missing publicKey.allowCredentials")?;
+    let credential_entry = allow_credentials
+        .first()
+        .context("FIDO authentication options contain no allowed credentials")?;
+    let credential_id = decode_fido_bytes(
+        credential_entry
+            .get("id")
+            .context("FIDO authentication options are missing allowCredentials[0].id")?,
+        "allowCredentials[0].id",
+    )?;
+
+    let client_data_json = serde_json::to_vec(&json!({
+        "type": "webauthn.get",
+        "challenge": BASE64_URL_NO_PAD.encode(challenge),
+        "origin": format!("https://{rp_id}")
+    }))
+    .context("failed to encode clientDataJSON")?;
+    let client_data_hash = Sha256::digest(&client_data_json).to_vec();
+
+    Ok(FidoAssertionInput {
+        rp_id,
+        credential_id,
+        client_data_json,
+        client_data_hash,
+    })
+}
+
+fn normalize_fido_auth_options(value: &Value) -> anyhow::Result<Value> {
+    if value.get("publicKey").is_some() {
+        return Ok(value.clone());
+    }
+
+    if let Some(options) = value.get("AuthenticationOptions") {
+        if options.get("publicKey").is_some() {
+            return Ok(options.clone());
+        }
+    }
+
+    if let Some(options) = value
+        .get("FIDO2")
+        .and_then(|fido| fido.get("AuthenticationOptions"))
+    {
+        if options.get("publicKey").is_some() {
+            return Ok(options.clone());
+        }
+    }
+
+    anyhow::bail!("could not locate FIDO authentication options publicKey object")
+}
+
+fn decode_fido_bytes(value: &Value, field_name: &str) -> anyhow::Result<Vec<u8>> {
+    match value {
+        Value::String(raw) => decode_base64_flexible(raw)
+            .with_context(|| format!("invalid base64 value for {field_name}")),
+        Value::Array(values) => values
+            .iter()
+            .map(|item| {
+                let number = item
+                    .as_u64()
+                    .with_context(|| format!("non-integer value in byte array for {field_name}"))?;
+                u8::try_from(number)
+                    .with_context(|| format!("byte out of range in {field_name}: {number}"))
+            })
+            .collect(),
+        _ => anyhow::bail!("unsupported value type for {field_name}"),
+    }
+}
+
+fn decode_base64_flexible(input: &str) -> anyhow::Result<Vec<u8>> {
+    BASE64
+        .decode(input)
+        .or_else(|_| BASE64_URL_NO_PAD.decode(input))
+        .or_else(|_| BASE64_URL.decode(input))
+        .or_else(|_| BASE64_NO_PAD.decode(input))
+        .context("invalid base64 encoding")
 }
 
 fn cmd_status(dir: &std::path::Path) -> anyhow::Result<()> {
@@ -775,6 +1374,7 @@ async fn report_runtime_health_periodically(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_logout_email_flag() {
@@ -829,5 +1429,104 @@ mod tests {
             } => assert_eq!(event_poll_secs, 10),
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn parse_fido_assert_subcommand() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "fido-assert",
+            "--auth-options-json",
+            r#"{"publicKey":{"rpId":"proton.me","challenge":[1,2,3],"allowCredentials":[{"id":[4,5,6]}]}}"#,
+            "--device",
+            "/dev/hidraw0",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::FidoAssert {
+                auth_options_json,
+                auth_options_file,
+                device,
+                output,
+                pin,
+                provider,
+            } => {
+                assert!(auth_options_json.is_some());
+                assert!(auth_options_file.is_none());
+                assert_eq!(device.as_deref(), Some("/dev/hidraw0"));
+                assert!(output.is_none());
+                assert!(pin.is_none());
+                assert_eq!(provider, FidoProvider::Auto);
+            }
+            _ => panic!("expected fido-assert command"),
+        }
+    }
+
+    #[test]
+    fn parse_fido_assert_provider_flag() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "fido-assert",
+            "--auth-options-json",
+            r#"{"publicKey":{"rpId":"proton.me","challenge":[1,2,3],"allowCredentials":[{"id":[4,5,6]}]}}"#,
+            "--provider",
+            "os",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::FidoAssert { provider, .. } => assert_eq!(provider, FidoProvider::Os),
+            _ => panic!("expected fido-assert command"),
+        }
+    }
+
+    #[test]
+    fn build_fido_assertion_input_from_authentication_options() {
+        let options = json!({
+            "publicKey": {
+                "rpId": "proton.me",
+                "challenge": [1, 2, 3],
+                "allowCredentials": [
+                    {"id": [4, 5, 6]}
+                ]
+            }
+        });
+        let input = build_fido_assertion_input(&options).unwrap();
+        assert_eq!(input.rp_id, "proton.me");
+        assert_eq!(input.credential_id, vec![4, 5, 6]);
+        assert!(!input.client_data_json.is_empty());
+        assert_eq!(input.client_data_hash.len(), 32);
+    }
+
+    #[test]
+    fn normalize_fido_auth_options_from_nested_shape() {
+        let wrapped = json!({
+            "FIDO2": {
+                "AuthenticationOptions": {
+                    "publicKey": {
+                        "rpId": "proton.me",
+                        "challenge": [1, 2, 3],
+                        "allowCredentials": [{"id": [4, 5, 6]}]
+                    }
+                }
+            }
+        });
+        let normalized = normalize_fido_auth_options(&wrapped).unwrap();
+        assert!(normalized.get("publicKey").is_some());
+    }
+
+    #[test]
+    fn pick_first_hidraw_device_name_extracts_first_numeric_device() {
+        let names = vec!["tty1", "hidraw2", "hidraw10", "hidraw3"];
+        let parsed = pick_first_hidraw_device_name(names);
+        assert_eq!(parsed.as_deref(), Some("hidraw2"));
+    }
+
+    #[test]
+    fn pick_first_hidraw_device_name_returns_none_when_absent() {
+        let names = vec!["tty1", "usb0", "kbd0"];
+        let parsed = pick_first_hidraw_device_name(names);
+        assert!(parsed.is_none());
     }
 }

@@ -19,14 +19,15 @@ use tracing::{debug, info, warn};
 
 use crate::api;
 use crate::api::client::ProtonClient;
-use crate::api::error::ApiError;
-use crate::api::types::Session;
+use crate::api::error::{human_verification_details, ApiError};
+use crate::api::types::{HumanVerificationDetails, Session};
 use crate::vault;
 
 const SERVER_CONFIG_FILE: &str = "grpcServerConfig.json";
 const MAIL_SETTINGS_FILE: &str = "grpc_mail_settings.json";
 const APP_SETTINGS_FILE: &str = "grpc_app_settings.json";
 const SERVER_TOKEN_METADATA_KEY: &str = "server-token";
+const CAPTCHA_APPEAL_URL: &str = "https://proton.me/support/appeal-abuse";
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -117,12 +118,19 @@ struct PendingLogin {
 }
 
 #[derive(Debug)]
+struct PendingHumanVerification {
+    username: String,
+    details: HumanVerificationDetails,
+}
+
+#[derive(Debug)]
 struct GrpcState {
     vault_dir: PathBuf,
     bind_host: String,
     event_tx: broadcast::Sender<pb::StreamEvent>,
     active_stream_stop: Mutex<Option<watch::Sender<bool>>>,
     pending_login: Mutex<Option<PendingLogin>>,
+    pending_hv: Mutex<Option<PendingHumanVerification>>,
     shutdown_tx: watch::Sender<bool>,
     mail_settings: Mutex<StoredMailSettings>,
     app_settings: Mutex<StoredAppSettings>,
@@ -601,14 +609,46 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("password is required"));
         }
 
+        let use_hv_details = req.use_hv_details.unwrap_or(false);
+        let hv_details = if use_hv_details {
+            let hv_guard = self.state.pending_hv.lock().await;
+            let Some(pending_hv) = hv_guard.as_ref() else {
+                return Err(Status::failed_precondition(
+                    "no pending human verification challenge",
+                ));
+            };
+            if !username.eq_ignore_ascii_case(&pending_hv.username) {
+                return Err(Status::invalid_argument(
+                    "username does not match pending human verification",
+                ));
+            }
+            Some(pending_hv.details.clone())
+        } else {
+            None
+        };
+
         let mut client = ProtonClient::new().map_err(status_from_api_error)?;
+        client.set_human_verification(hv_details.as_ref());
         let auth = match api::auth::login(&mut client, &username, &password).await {
             Ok(auth) => auth,
             Err(err) => {
-                self.emit_login_error(err.to_string());
+                if let Some(hv) = human_verification_details(&err) {
+                    let hv_url = hv.challenge_url();
+                    let mut pending_hv = self.state.pending_hv.lock().await;
+                    *pending_hv = Some(PendingHumanVerification {
+                        username: username.clone(),
+                        details: hv,
+                    });
+                    self.emit_login_error(format!(
+                        "human verification required; open {hv_url}, complete CAPTCHA, then retry login"
+                    ));
+                } else {
+                    self.emit_login_error(err.to_string());
+                }
                 return Err(status_from_api_error(err));
             }
         };
+        *self.state.pending_hv.lock().await = None;
 
         if auth.two_factor.requires_second_factor() {
             let pending = PendingLogin {
@@ -756,6 +796,19 @@ impl pb::bridge_server::Bridge for BridgeService {
             *pending = None;
             self.emit_login_error("login aborted");
         }
+        drop(pending);
+        if username.is_empty() {
+            *self.state.pending_hv.lock().await = None;
+        } else {
+            let mut pending_hv = self.state.pending_hv.lock().await;
+            if pending_hv
+                .as_ref()
+                .map(|item| item.username.eq_ignore_ascii_case(&username))
+                .unwrap_or(false)
+            {
+                *pending_hv = None;
+            }
+        }
         Ok(Response::new(()))
     }
 
@@ -772,7 +825,17 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<pb::UserListResponse>, Status> {
         let sessions =
             vault::list_sessions(&self.state.vault_dir).map_err(status_from_vault_error)?;
-        let users = sessions.iter().map(session_to_user).collect();
+        let users = sessions
+            .iter()
+            .map(|session| {
+                let split_mode =
+                    vault::load_split_mode_by_account_id(&self.state.vault_dir, &session.uid)
+                        .ok()
+                        .flatten()
+                        .unwrap_or(false);
+                session_to_user(session, split_mode)
+            })
+            .collect();
         Ok(Response::new(pb::UserListResponse { users }))
     }
 
@@ -784,7 +847,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             .iter()
             .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(&lookup))
             .ok_or_else(|| Status::not_found("user not found"))?;
-        Ok(Response::new(session_to_user(session)))
+        let split_mode = vault::load_split_mode_by_account_id(&self.state.vault_dir, &session.uid)
+            .ok()
+            .flatten()
+            .unwrap_or(false);
+        Ok(Response::new(session_to_user(session, split_mode)))
     }
 
     async fn set_user_split_mode(
@@ -792,10 +859,21 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::UserSplitModeRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        let sessions =
+            vault::list_sessions(&self.state.vault_dir).map_err(status_from_vault_error)?;
+        let account_id = sessions
+            .iter()
+            .find(|s| s.uid == req.user_id || s.email.eq_ignore_ascii_case(&req.user_id))
+            .map(|s| s.uid.clone())
+            .ok_or_else(|| Status::not_found("user not found"))?;
+
+        vault::save_split_mode_by_account_id(&self.state.vault_dir, &account_id, req.active)
+            .map_err(status_from_vault_error)?;
+        self.emit_user_changed(&account_id);
         tracing::info!(
-            user_id = %req.user_id,
+            user_id = %account_id,
             active = req.active,
-            "set user split mode requested"
+            "set user split mode applied"
         );
         Ok(Response::new(()))
     }
@@ -1122,6 +1200,7 @@ pub async fn run_server(vault_dir: PathBuf, bind_host: String) -> anyhow::Result
         event_tx,
         active_stream_stop: Mutex::new(None),
         pending_login: Mutex::new(None),
+        pending_hv: Mutex::new(None),
         shutdown_tx: shutdown_tx.clone(),
         mail_settings: Mutex::new(settings),
         app_settings: Mutex::new(app_settings),
@@ -1177,7 +1256,31 @@ fn status_from_api_error(err: ApiError) -> Status {
         ApiError::NotLoggedIn => Status::unauthenticated("not logged in"),
         ApiError::SessionExpired => Status::unauthenticated("session expired"),
         ApiError::Auth(message) => Status::unauthenticated(message),
-        ApiError::Api { code, message } => Status::internal(format!("api error {code}: {message}")),
+        ApiError::Api {
+            code,
+            message,
+            details,
+        } => match code {
+            9001 => {
+                let hv_url = details
+                    .as_ref()
+                    .and_then(|details| {
+                        serde_json::from_value::<HumanVerificationDetails>(details.clone()).ok()
+                    })
+                    .filter(HumanVerificationDetails::is_usable)
+                    .map(|details| details.challenge_url());
+                let details_hint = hv_url
+                    .map(|url| format!(" Open this URL to complete verification: {url}."))
+                    .unwrap_or_default();
+                Status::failed_precondition(format!(
+                    "captcha required by Proton; complete CAPTCHA in Proton web/app, then retry login.{details_hint} \
+If you cannot complete it, update Proton Bridge or contact support: {CAPTCHA_APPEAL_URL} \
+(api error {code}: {message})"
+                ))
+            }
+            401 | 8002 | 10013 => Status::unauthenticated(format!("api error {code}: {message}")),
+            _ => Status::internal(format!("api error {code}: {message}")),
+        },
         ApiError::Http(err) => Status::unavailable(format!("http error: {err}")),
         ApiError::Json(err) => Status::internal(format!("json error: {err}")),
         ApiError::Io(err) => Status::internal(format!("io error: {err}")),
@@ -1189,7 +1292,7 @@ fn status_from_vault_error(err: vault::VaultError) -> Status {
     Status::internal(format!("vault error: {err}"))
 }
 
-fn session_to_user(session: &Session) -> pb::User {
+fn session_to_user(session: &Session, split_mode: bool) -> pb::User {
     let avatar_text = session
         .email
         .chars()
@@ -1202,7 +1305,7 @@ fn session_to_user(session: &Session) -> pb::User {
         username: session.email.clone(),
         avatar_text,
         state: pb::UserState::Connected as i32,
-        split_mode: false,
+        split_mode,
         used_bytes: 0,
         total_bytes: 0,
         password: session
@@ -1376,6 +1479,7 @@ mod tests {
             event_tx,
             active_stream_stop: Mutex::new(None),
             pending_login: Mutex::new(None),
+            pending_hv: Mutex::new(None),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
             app_settings: Mutex::new(StoredAppSettings::with_defaults_for(&vault_dir)),
@@ -1405,6 +1509,44 @@ mod tests {
         meta.insert(SERVER_TOKEN_METADATA_KEY, "abc123".parse().unwrap());
         assert!(validate_server_token(&meta, "abc123").is_none());
         assert!(validate_server_token(&meta, "wrong").is_some());
+    }
+
+    #[test]
+    fn status_from_api_error_maps_captcha_to_failed_precondition() {
+        let status = status_from_api_error(ApiError::Api {
+            code: 9001,
+            message: "For security reasons, please complete CAPTCHA".to_string(),
+            details: None,
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().to_ascii_lowercase().contains("captcha"));
+        assert!(status.message().contains(CAPTCHA_APPEAL_URL));
+    }
+
+    #[test]
+    fn status_from_api_error_maps_invalid_credentials_to_unauthenticated() {
+        let status = status_from_api_error(ApiError::Api {
+            code: 8002,
+            message: "Invalid credentials".to_string(),
+            details: None,
+        });
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn status_from_api_error_maps_captcha_details_to_verify_url() {
+        let status = status_from_api_error(ApiError::Api {
+            code: 9001,
+            message: "Human verification required".to_string(),
+            details: Some(json!({
+                "HumanVerificationMethods": ["captcha"],
+                "HumanVerificationToken": "token-123"
+            })),
+        });
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status
+            .message()
+            .contains("https://verify.proton.me/?methods=captcha&token=token-123"));
     }
 
     #[tokio::test]

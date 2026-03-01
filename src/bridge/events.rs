@@ -1563,6 +1563,7 @@ mod tests {
             "pass-a",
         ));
         let auth_router = AuthRouter::new(registry);
+        let _ = auth_router.set_account_split_mode(&AccountId("uid-1".to_string()), true);
         let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
         let store = InMemoryStore::new();
 

@@ -28,3 +28,7 @@ bun.lockb
 
 # Tauri
 src-tauri/target
+
+# Playwright
+playwright-report
+test-results

@@ -2,6 +2,7 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client;
 
 use super::error::{ApiError, Result};
+use super::types::HumanVerificationDetails;
 
 const BASE_URL: &str = "https://mail-api.proton.me";
 const APP_VERSION: &str = "web-mail@5.0.103.3";
@@ -14,6 +15,8 @@ pub struct ProtonClient {
     base_url: String,
     uid: Option<String>,
     access_token: Option<String>,
+    hv_token: Option<String>,
+    hv_methods: Option<String>,
 }
 
 impl ProtonClient {
@@ -38,6 +41,8 @@ impl ProtonClient {
             base_url: base_url.to_string(),
             uid: None,
             access_token: None,
+            hv_token: None,
+            hv_methods: None,
         })
     }
 
@@ -52,6 +57,19 @@ impl ProtonClient {
     pub fn set_auth(&mut self, uid: &str, access_token: &str) {
         self.uid = Some(uid.to_string());
         self.access_token = Some(access_token.to_string());
+    }
+
+    /// Set or clear human verification headers used for CAPTCHA challenges.
+    pub fn set_human_verification(&mut self, details: Option<&HumanVerificationDetails>) {
+        if let Some(details) = details {
+            if details.is_usable() {
+                self.hv_token = Some(details.human_verification_token.clone());
+                self.hv_methods = Some(details.human_verification_methods.join(","));
+                return;
+            }
+        }
+        self.hv_token = None;
+        self.hv_methods = None;
     }
 
     /// Build a GET request with auth headers.
@@ -93,6 +111,12 @@ impl ProtonClient {
         if let Some(token) = &self.access_token {
             req = req.header("Authorization", format!("Bearer {}", token));
         }
+        if let Some(hv_token) = &self.hv_token {
+            req = req.header("x-pm-human-verification-token", hv_token);
+        }
+        if let Some(hv_methods) = &self.hv_methods {
+            req = req.header("x-pm-human-verification-token-type", hv_methods);
+        }
         req
     }
 }
@@ -107,7 +131,12 @@ pub fn check_api_response(json: &serde_json::Value) -> Result<()> {
                 .and_then(|e| e.as_str())
                 .unwrap_or("Unknown API error")
                 .to_string();
-            return Err(ApiError::Api { code, message });
+            let details = json.get("Details").cloned();
+            return Err(ApiError::Api {
+                code,
+                message,
+                details,
+            });
         }
     }
     Ok(())
@@ -128,9 +157,14 @@ mod tests {
         let json = serde_json::json!({"Code": 8002, "Error": "Invalid credentials"});
         let err = check_api_response(&json).unwrap_err();
         match err {
-            ApiError::Api { code, message } => {
+            ApiError::Api {
+                code,
+                message,
+                details,
+            } => {
                 assert_eq!(code, 8002);
                 assert_eq!(message, "Invalid credentials");
+                assert_eq!(details, None);
             }
             _ => panic!("expected ApiError::Api"),
         }
@@ -141,9 +175,39 @@ mod tests {
         let json = serde_json::json!({"Code": 9999});
         let err = check_api_response(&json).unwrap_err();
         match err {
-            ApiError::Api { code, message } => {
+            ApiError::Api {
+                code,
+                message,
+                details,
+            } => {
                 assert_eq!(code, 9999);
                 assert_eq!(message, "Unknown API error");
+                assert_eq!(details, None);
+            }
+            _ => panic!("expected ApiError::Api"),
+        }
+    }
+
+    #[test]
+    fn test_check_api_response_error_with_details() {
+        let json = serde_json::json!({
+            "Code": 9001,
+            "Error": "Human verification required",
+            "Details": {
+                "HumanVerificationMethods": ["captcha"],
+                "HumanVerificationToken": "token-123"
+            }
+        });
+        let err = check_api_response(&json).unwrap_err();
+        match err {
+            ApiError::Api {
+                code,
+                message,
+                details,
+            } => {
+                assert_eq!(code, 9001);
+                assert_eq!(message, "Human verification required");
+                assert!(details.is_some());
             }
             _ => panic!("expected ApiError::Api"),
         }

@@ -17,6 +17,8 @@ const VAULT_FILE: &str = "vault.enc";
 const KEY_FILE: &str = "vault.key";
 const DEFAULT_EMAIL_FILE: &str = "default_email";
 const VAULT_VERSION: i32 = 2;
+const ADDRESS_MODE_COMBINED: i32 = 0;
+const ADDRESS_MODE_SPLIT: i32 = 1;
 
 // Keychain constants matching the Go bridge
 const KEYCHAIN_SERVICE: &str = "protonmail/bridge-v3/users";
@@ -549,6 +551,18 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
 }
 
+fn address_mode_to_split(mode: i32) -> bool {
+    mode == ADDRESS_MODE_SPLIT
+}
+
+fn split_to_address_mode(enabled: bool) -> i32 {
+    if enabled {
+        ADDRESS_MODE_SPLIT
+    } else {
+        ADDRESS_MODE_COMBINED
+    }
+}
+
 fn load_vault_data(dir: &Path) -> Result<Option<VaultData>> {
     let vault_path = dir.join(VAULT_FILE);
     if !vault_path.exists() {
@@ -779,6 +793,25 @@ pub fn save_event_checkpoint_by_account_id(
     user.last_event_ts = checkpoint.last_event_ts;
     user.sync_state = checkpoint.sync_state.clone();
 
+    save_vault_data(dir, &data)
+}
+
+pub fn load_split_mode_by_account_id(dir: &Path, account_id: &str) -> Result<Option<bool>> {
+    let Some(data) = load_vault_data(dir)? else {
+        return Ok(None);
+    };
+    let Some(user) = data.users.iter().find(|u| u.auth_uid == account_id) else {
+        return Ok(None);
+    };
+    Ok(Some(address_mode_to_split(user.address_mode)))
+}
+
+pub fn save_split_mode_by_account_id(dir: &Path, account_id: &str, enabled: bool) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter_mut().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+    user.address_mode = split_to_address_mode(enabled);
     save_vault_data(dir, &data)
 }
 
@@ -1038,6 +1071,38 @@ mod tests {
 
         let loaded = load_session(tmp.path()).unwrap();
         assert_eq!(loaded.email, "bob@proton.me");
+    }
+
+    #[test]
+    fn test_split_mode_roundtrip_by_account_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "uid-split".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-split".to_string(),
+            email: "split@proton.me".to_string(),
+            display_name: "Split".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge".to_string()),
+        };
+        save_session(&session, tmp.path()).unwrap();
+
+        assert_eq!(
+            load_split_mode_by_account_id(tmp.path(), &session.uid).unwrap(),
+            Some(false)
+        );
+
+        save_split_mode_by_account_id(tmp.path(), &session.uid, true).unwrap();
+        assert_eq!(
+            load_split_mode_by_account_id(tmp.path(), &session.uid).unwrap(),
+            Some(true)
+        );
+
+        save_split_mode_by_account_id(tmp.path(), &session.uid, false).unwrap();
+        assert_eq!(
+            load_split_mode_by_account_id(tmp.path(), &session.uid).unwrap(),
+            Some(false)
+        );
     }
 
     #[test]

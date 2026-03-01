@@ -40,6 +40,30 @@ pub struct AuthResponse {
     pub scopes: Vec<String>,
 }
 
+/// Human verification metadata returned by Proton in error `Code: 9001`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "PascalCase")]
+pub struct HumanVerificationDetails {
+    #[serde(default)]
+    pub human_verification_methods: Vec<String>,
+    #[serde(default)]
+    pub human_verification_token: String,
+}
+
+impl HumanVerificationDetails {
+    pub fn is_usable(&self) -> bool {
+        !self.human_verification_token.is_empty() && !self.human_verification_methods.is_empty()
+    }
+
+    pub fn challenge_url(&self) -> String {
+        format!(
+            "https://verify.proton.me/?methods={}&token={}",
+            self.human_verification_methods.join(","),
+            self.human_verification_token
+        )
+    }
+}
+
 /// API response from POST /auth/v4/refresh
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -493,6 +517,20 @@ mod tests {
 
         let resp: TwoFactorResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.scopes, vec!["mail", "self"]);
+    }
+
+    #[test]
+    fn test_human_verification_details_deserialize_and_format_url() {
+        let json = serde_json::json!({
+            "HumanVerificationMethods": ["captcha", "ownership-email"],
+            "HumanVerificationToken": "token-123"
+        });
+        let hv: HumanVerificationDetails = serde_json::from_value(json).unwrap();
+        assert!(hv.is_usable());
+        assert_eq!(
+            hv.challenge_url(),
+            "https://verify.proton.me/?methods=captcha,ownership-email&token=token-123"
+        );
     }
 
     #[test]

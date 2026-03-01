@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import { fade, fly } from 'svelte/transition'
   import { get } from 'svelte/store'
   import {
     bridgeStatus,
@@ -79,6 +80,8 @@
   let loginWizardOpen = $state(false)
   let lastLoginStepSeen = $state('credentials')
   let systemPrefersDark = $state(false)
+  let prefersReducedMotion = $state(false)
+  let sectionTransitionDuration = $derived(prefersReducedMotion ? 0 : 220)
   let configPathInput = $state('')
   let hostname = $state('')
   let users = $state<UserSummary[]>([])
@@ -99,6 +102,7 @@
   let twoFactorCode = $state('')
   let mailboxPassword = $state('')
   let fidoAssertionPayload = $state('')
+  let hvVerificationUrl = $state('')
   let loginStatus = $state('')
   let tlsInstalled = $state<boolean | null>(null)
   let tlsExportDir = $state('')
@@ -110,6 +114,10 @@
       return value
     }
     return 'system'
+  }
+
+  function formatLoginStep(step: string): string {
+    return step.replaceAll('_', ' ')
   }
 
   function resolveTheme(mode: ThemeMode): 'light' | 'dark' {
@@ -169,6 +177,14 @@
 
   function pushToast(message: string) {
     toastLog = [`${new Date().toLocaleTimeString()} ${message}`, ...toastLog].slice(0, 24)
+  }
+
+  function extractHvUrl(text: string): string | null {
+    const match = text.match(/https:\/\/verify\.proton\.me\/\S+/i)
+    if (!match) {
+      return null
+    }
+    return match[0].replace(/[),.;]+$/, '')
   }
 
   async function refreshUsersData() {
@@ -266,12 +282,37 @@
   async function submitCredentials() {
     logger.info('app', 'submit credentials requested', { username: loginUsername })
     loginStatus = 'submitting credentials...'
+    hvVerificationUrl = ''
     try {
       await login(loginUsername, loginPassword)
       loginStatus = 'credentials submitted'
     } catch (error) {
+      const message = String(error)
       logger.error('app', 'submit credentials failed', { error: String(error) })
-      loginStatus = `login failed: ${String(error)}`
+      const hvUrl = extractHvUrl(message)
+      if (hvUrl) {
+        hvVerificationUrl = hvUrl
+        loginStatus = 'human verification required: open the link, complete CAPTCHA, then click Retry CAPTCHA'
+      } else {
+        loginStatus = `login failed: ${message}`
+      }
+    }
+  }
+
+  async function retryCaptchaLogin() {
+    logger.info('app', 'retry captcha login requested', { username: loginUsername })
+    loginStatus = 'retrying login with human verification token...'
+    try {
+      await login(loginUsername, loginPassword, true)
+      loginStatus = 'captcha retry submitted'
+    } catch (error) {
+      const message = String(error)
+      logger.error('app', 'retry captcha login failed', { error: message })
+      const hvUrl = extractHvUrl(message)
+      if (hvUrl) {
+        hvVerificationUrl = hvUrl
+      }
+      loginStatus = `captcha retry failed: ${message}`
     }
   }
 
@@ -415,6 +456,9 @@
     if (event.code === 'mail_settings_saved') {
       saveStatus = 'saved (stream confirmed)'
     }
+    if (event.code === 'login_finished') {
+      hvVerificationUrl = ''
+    }
     if (event.code === 'autostart_saved' || event.code === 'disk_cache_saved') {
       settingsStatus = 'saved (stream confirmed)'
     }
@@ -430,6 +474,10 @@
     if (event.level === 'error') {
       settingsStatus = event.message
       if (event.code === 'login_error') {
+        const hvUrl = extractHvUrl(event.message)
+        if (hvUrl) {
+          hvVerificationUrl = hvUrl
+        }
         loginStatus = event.message
       }
     }
@@ -450,15 +498,22 @@
 
   onMount(() => {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
+    const motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
     const handleSystemThemeChange = () => {
       systemPrefersDark = mediaQuery.matches
     }
+    const handleMotionChange = () => {
+      prefersReducedMotion = motionQuery.matches
+    }
     handleSystemThemeChange()
+    handleMotionChange()
 
     if (typeof mediaQuery.addEventListener === 'function') {
       mediaQuery.addEventListener('change', handleSystemThemeChange)
+      motionQuery.addEventListener('change', handleMotionChange)
     } else {
       mediaQuery.addListener(handleSystemThemeChange)
+      motionQuery.addListener(handleMotionChange)
     }
 
     void (async () => {
@@ -474,8 +529,10 @@
       logger.info('app', 'unmount cleanup')
       if (typeof mediaQuery.removeEventListener === 'function') {
         mediaQuery.removeEventListener('change', handleSystemThemeChange)
+        motionQuery.removeEventListener('change', handleMotionChange)
       } else {
         mediaQuery.removeListener(handleSystemThemeChange)
+        motionQuery.removeListener(handleMotionChange)
       }
       stop?.()
       stopUi?.()
@@ -487,11 +544,20 @@
   <header class="card app-header">
     <div>
       <h1>OpenProton Bridge</h1>
-      <p class="muted">Desktop bridge console for account state, login challenges, and service health.</p>
+      <p class="muted">Desktop console for Proton account sessions, mail transport, and bridge health.</p>
+      <div class="header-metrics">
+        <span class={`status-pill ${$bridgeStatus.connected ? 'good' : 'danger'}`}>
+          {$bridgeStatus.connected ? 'Bridge Connected' : 'Bridge Offline'}
+        </span>
+        <span class="status-pill muted">Step: {formatLoginStep($bridgeStatus.login_step)}</span>
+        <span class={`status-pill ${$bridgeStatus.stream_running ? 'good' : 'muted'}`}>
+          Stream {$bridgeStatus.stream_running ? 'Running' : 'Stopped'}
+        </span>
+      </div>
     </div>
     <div class="header-actions">
-      <span class="chip">{$bridgeStatus.connected ? 'Connected' : 'Disconnected'}</span>
-      <span class="chip">Step: {$bridgeStatus.login_step}</span>
+      <button class="secondary" onclick={openLoginWizard}>Sign In Wizard</button>
+      <button class="secondary" onclick={() => void refreshBridgeData()}>Refresh Data</button>
       <button class="secondary" onclick={cycleThemeMode}>
         Theme: {normalizeThemeMode(colorSchemeNameInput)}
       </button>
@@ -502,6 +568,7 @@
     <aside class="left-rail">
       <article class="card nav-card">
         <h2>Navigation</h2>
+        <p class="muted">Switch between account, mail, settings, and live activity views.</p>
         <div class="section-nav">
           {#each sections as section}
             <button
@@ -526,6 +593,15 @@
       />
 
       <article class="card">
+        <h2>Quick Actions</h2>
+        <div class="row wrap">
+          <button class="secondary" onclick={() => void connectAndLoad()}>Reconnect</button>
+          <button class="secondary" onclick={() => void refreshBridgeData()}>Reload Data</button>
+          <button class="secondary" onclick={openLoginWizard}>Login Wizard</button>
+        </div>
+      </article>
+
+      <article class="card">
         <h2>Host</h2>
         <p class="muted"><strong>Hostname:</strong> {hostname || '(not loaded)'}</p>
         <p class="muted"><strong>Users:</strong> {users.length}</p>
@@ -534,58 +610,66 @@
     </aside>
 
     <section class="main-pane">
-      {#if activeSection === 'accounts'}
-        <article class="card">
-          <h2>Account Access</h2>
-          <p class="muted">
-            Use the sign-in wizard for Proton authentication. Current login step:
-            <strong> {$bridgeStatus.login_step}</strong>
-          </p>
-          <div class="row">
-            <button onclick={openLoginWizard}>Open Sign-In Wizard</button>
-            <button class="secondary" onclick={closeLoginWizard}>Hide Wizard</button>
-          </div>
-        </article>
+      {#key activeSection}
+        <div
+          class="section-stage"
+          in:fly={{ y: 8, duration: sectionTransitionDuration, opacity: 0.65 }}
+          out:fade={{ duration: Math.max(sectionTransitionDuration - 40, 0) }}
+        >
+          {#if activeSection === 'accounts'}
+            <article class="card">
+              <h2>Account Access</h2>
+              <p class="muted">
+                Use the sign-in wizard for Proton authentication. Current login step:
+                <strong> {formatLoginStep($bridgeStatus.login_step)}</strong>
+              </p>
+              <div class="row">
+                <button onclick={openLoginWizard}>Open Sign-In Wizard</button>
+                <button class="secondary" onclick={closeLoginWizard}>Hide Wizard</button>
+              </div>
+            </article>
 
-        <UsersCard
-          hostname={hostname}
-          usersLoading={usersLoading}
-          users={users}
-          onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
-          onLogout={(userId) => logout(userId)}
-          onRemove={(userId) => remove(userId)}
-        />
-      {:else if activeSection === 'mail'}
-        <MailSettingsCard
-          bind:imapPort
-          bind:smtpPort
-          bind:useSslImap
-          bind:useSslSmtp
-          saveStatus={saveStatus}
-          bind:portToCheck
-          portCheckResult={portCheckResult}
-          onSaveMailSettings={saveMailServerSettings}
-          onCheckPort={checkPort}
-        />
-      {:else if activeSection === 'settings'}
-        <GeneralSettingsCard
-          bind:appSettings
-          bind:diskCachePathInput
-          bind:colorSchemeNameInput
-          settingsStatus={settingsStatus}
-          onApplySettings={applyGeneralSettings}
-        />
+            <UsersCard
+              hostname={hostname}
+              usersLoading={usersLoading}
+              users={users}
+              onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
+              onLogout={(userId) => logout(userId)}
+              onRemove={(userId) => remove(userId)}
+            />
+          {:else if activeSection === 'mail'}
+            <MailSettingsCard
+              bind:imapPort
+              bind:smtpPort
+              bind:useSslImap
+              bind:useSslSmtp
+              saveStatus={saveStatus}
+              bind:portToCheck
+              portCheckResult={portCheckResult}
+              onSaveMailSettings={saveMailServerSettings}
+              onCheckPort={checkPort}
+            />
+          {:else if activeSection === 'settings'}
+            <GeneralSettingsCard
+              bind:appSettings
+              bind:diskCachePathInput
+              bind:colorSchemeNameInput
+              settingsStatus={settingsStatus}
+              onApplySettings={applyGeneralSettings}
+            />
 
-        <TlsSettingsCard
-          tlsInstalled={tlsInstalled}
-          bind:tlsExportDir
-          tlsStatus={tlsStatus}
-          onInstallTls={installTls}
-          onExportTls={exportTls}
-        />
-      {:else}
-        <StreamEventsCard events={$streamLog} />
-      {/if}
+            <TlsSettingsCard
+              tlsInstalled={tlsInstalled}
+              bind:tlsExportDir
+              tlsStatus={tlsStatus}
+              onInstallTls={installTls}
+              onExportTls={exportTls}
+            />
+          {:else}
+            <StreamEventsCard events={$streamLog} />
+          {/if}
+        </div>
+      {/key}
     </section>
 
     <aside class="status-rail">
@@ -610,8 +694,10 @@
     bind:twoFactorCode
     bind:mailboxPassword
     bind:fidoAssertionPayload
+    hvVerificationUrl={hvVerificationUrl}
     loginStatus={loginStatus}
     onSubmitCredentials={submitCredentials}
+    onRetryCaptcha={retryCaptchaLogin}
     onSubmitTwoFactor={submitTwoFactor}
     onSubmitMailboxPassword={submitMailboxPassword}
     onSubmitFidoAssertion={submitFidoAssertion}

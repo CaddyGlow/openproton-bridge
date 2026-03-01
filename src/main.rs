@@ -198,8 +198,26 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
 
     let mut client = api::client::ProtonClient::new()?;
 
-    // SRP authentication
-    let auth = api::auth::login(&mut client, &username, &password).await?;
+    // SRP authentication (with optional human verification retry).
+    let auth = match api::auth::login(&mut client, &username, &password).await {
+        Ok(auth) => auth,
+        Err(err) => {
+            if let Some(hv) = api::error::human_verification_details(&err) {
+                eprintln!("Human verification required by Proton.");
+                eprintln!("Open this URL in your browser and complete the challenge:");
+                eprintln!("{}", hv.challenge_url());
+                eprint!("Press ENTER once verification is complete...");
+                let mut line = String::new();
+                std::io::stdin()
+                    .read_line(&mut line)
+                    .context("failed to read human verification confirmation")?;
+                client.set_human_verification(Some(&hv));
+                api::auth::login(&mut client, &username, &password).await?
+            } else {
+                return Err(err.into());
+            }
+        }
+    };
 
     complete_cli_second_factor(&client, &auth).await?;
 
@@ -1064,6 +1082,21 @@ async fn cmd_serve(
     let mut account_registry =
         bridge::accounts::AccountRegistry::from_sessions(active_sessions.clone());
     for session in &active_sessions {
+        let account_id = bridge::types::AccountId(session.uid.clone());
+        let split_mode = match vault::load_split_mode_by_account_id(dir, &session.uid) {
+            Ok(Some(enabled)) => enabled,
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(
+                    email = %session.email,
+                    error = %e,
+                    "failed to load split mode setting, defaulting to combined"
+                );
+                false
+            }
+        };
+        let _ = account_registry.set_split_mode(&account_id, split_mode);
+
         let client = match api::client::ProtonClient::authenticated(
             "https://mail-api.proton.me",
             &session.uid,
@@ -1082,7 +1115,6 @@ async fn cmd_serve(
 
         match api::users::get_addresses(&client).await {
             Ok(addresses) => {
-                let account_id = bridge::types::AccountId(session.uid.clone());
                 for address in addresses.addresses {
                     if address.status == 1 {
                         account_registry.add_address_email(&account_id, &address.email);

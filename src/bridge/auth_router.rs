@@ -54,6 +54,13 @@ impl AuthRouter {
         true
     }
 
+    pub fn set_account_split_mode(&self, account_id: &AccountId, split_mode: bool) -> bool {
+        let Ok(mut registry) = self.registry.write() else {
+            return false;
+        };
+        registry.set_split_mode(account_id, split_mode)
+    }
+
     pub fn account_count(&self) -> usize {
         self.registry
             .read()
@@ -129,6 +136,9 @@ mod tests {
             vec!["alias@proton.me".to_string()],
         );
         assert!(updated);
+
+        assert!(router.resolve_login("alias@proton.me", "secret").is_none());
+        assert!(router.set_account_split_mode(&AccountId("uid-1".to_string()), true));
 
         let route = router.resolve_login("alias@proton.me", "secret").unwrap();
         assert_eq!(route.account_id, AccountId("uid-1".to_string()));

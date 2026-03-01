@@ -16,6 +16,17 @@
     onLogout?: (userId: string) => void
     onRemove?: (userId: string) => void
   } = $props()
+
+  function stateTone(state: string | number): string {
+    const lower = String(state).toLowerCase()
+    if (lower.includes('connected') || lower.includes('active') || lower.includes('ready') || lower.includes('ok')) {
+      return 'good'
+    }
+    if (lower.includes('error') || lower.includes('locked') || lower.includes('failed')) {
+      return 'danger'
+    }
+    return 'muted'
+  }
 </script>
 
 <article class="card span-2">
@@ -39,11 +50,20 @@
       <tbody>
         {#each users as user}
           <tr>
-            <td>{user.username}</td>
-            <td>{user.state}</td>
-            <td>{user.split_mode ? 'on' : 'off'}</td>
-            <td>{user.addresses.join(', ')}</td>
+            <td class="user-col">
+              <div class="user-primary">{user.username}</div>
+              <div class="user-secondary">{user.addresses[0] || 'no address'}</div>
+            </td>
             <td>
+              <span class={`status-pill ${stateTone(user.state)}`}>{String(user.state)}</span>
+            </td>
+            <td>
+              <span class={`status-pill ${user.split_mode ? 'good' : 'muted'}`}>
+                {user.split_mode ? 'enabled' : 'disabled'}
+              </span>
+            </td>
+            <td>{user.addresses.join(', ')}</td>
+            <td class="user-actions">
               <div class="row">
                 <button class="secondary" onclick={() => onToggleSplitMode(user.id, user.split_mode)}>
                   {user.split_mode ? 'Disable Split' : 'Enable Split'}

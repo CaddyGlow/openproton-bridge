@@ -14,7 +14,7 @@ describe('LoginWizard', () => {
     })
 
     expect(screen.getByText('Sign In Wizard')).toBeInTheDocument()
-    expect(screen.getByText('Account Credentials')).toBeInTheDocument()
+    expect(screen.getAllByText('Account Credentials').length).toBeGreaterThan(0)
     await fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     expect(onSubmitCredentials).toHaveBeenCalledTimes(1)
   })
@@ -29,7 +29,7 @@ describe('LoginWizard', () => {
       },
     })
 
-    expect(screen.getByText('Verify Account')).toBeInTheDocument()
+    expect(screen.getAllByText('Verify Account').length).toBeGreaterThan(0)
     expect(screen.getAllByText('Touch your security key to continue.').length).toBeGreaterThan(0)
     await fireEvent.click(screen.getByRole('button', { name: 'Abort Login' }))
     expect(onAbortLoginFlow).toHaveBeenCalledTimes(1)

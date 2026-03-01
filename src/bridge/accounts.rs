@@ -24,6 +24,7 @@ pub struct AccountState {
     pub account_id: AccountId,
     pub primary_email: String,
     pub address_emails: Vec<String>,
+    pub split_mode: bool,
     pub session: Session,
     pub health: AccountHealth,
 }
@@ -85,6 +86,7 @@ impl AccountRegistry {
             account_id: account_id.clone(),
             primary_email: session.email.clone(),
             address_emails: vec![session.email.clone()],
+            split_mode: false,
             session: session.clone(),
             health: AccountHealth::Healthy,
         };
@@ -129,7 +131,9 @@ impl AccountRegistry {
             state.address_emails.push(email.to_string());
         }
 
-        self.email_index.insert(normalized, account_id.clone());
+        if state.split_mode || normalize_email(&state.primary_email) == normalized {
+            self.email_index.insert(normalized, account_id.clone());
+        }
     }
 
     pub fn set_address_emails(&mut self, account_id: &AccountId, emails: Vec<String>) -> bool {
@@ -162,9 +166,33 @@ impl AccountRegistry {
         }
 
         state.address_emails = dedup;
+        self.email_index
+            .insert(normalize_email(&state.primary_email), account_id.clone());
+        if state.split_mode {
+            for email in &state.address_emails {
+                self.email_index
+                    .insert(normalize_email(email), account_id.clone());
+            }
+        }
+        true
+    }
+
+    pub fn set_split_mode(&mut self, account_id: &AccountId, split_mode: bool) -> bool {
+        let Some(state) = self.accounts.get_mut(account_id) else {
+            return false;
+        };
+        state.split_mode = split_mode;
+
         for email in &state.address_emails {
-            self.email_index
-                .insert(normalize_email(email), account_id.clone());
+            self.email_index.remove(&normalize_email(email));
+        }
+        self.email_index
+            .insert(normalize_email(&state.primary_email), account_id.clone());
+        if split_mode {
+            for email in &state.address_emails {
+                self.email_index
+                    .insert(normalize_email(email), account_id.clone());
+            }
         }
         true
     }
@@ -420,9 +448,11 @@ mod tests {
     }
 
     #[test]
-    fn resolves_alias_addresses() {
+    fn resolves_alias_addresses_when_split_mode_enabled() {
         let mut registry =
             AccountRegistry::from_single_session(session("uid-1", "alice@proton.me"));
+        let account_id = AccountId("uid-1".to_string());
+        assert!(registry.set_split_mode(&account_id, true));
         registry.add_address_email(&AccountId("uid-1".to_string()), "alias@proton.me");
 
         let account = registry.resolve_by_email("ALIAS@PROTON.ME").unwrap();
@@ -438,6 +468,7 @@ mod tests {
         let mut registry =
             AccountRegistry::from_single_session(session("uid-1", "alice@proton.me"));
         let account_id = AccountId("uid-1".to_string());
+        assert!(registry.set_split_mode(&account_id, true));
         registry.add_address_email(&account_id, "old@proton.me");
         assert!(registry.resolve_by_email("old@proton.me").is_some());
 
@@ -448,6 +479,22 @@ mod tests {
         assert!(updated);
         assert!(registry.resolve_by_email("old@proton.me").is_none());
         assert!(registry.resolve_by_email("new@proton.me").is_some());
+        assert!(registry.resolve_by_email("alice@proton.me").is_some());
+    }
+
+    #[test]
+    fn split_mode_disabled_hides_alias_logins() {
+        let mut registry =
+            AccountRegistry::from_single_session(session("uid-1", "alice@proton.me"));
+        let account_id = AccountId("uid-1".to_string());
+        registry.add_address_email(&account_id, "alias@proton.me");
+        assert!(registry.resolve_by_email("alias@proton.me").is_none());
+
+        assert!(registry.set_split_mode(&account_id, true));
+        assert!(registry.resolve_by_email("alias@proton.me").is_some());
+
+        assert!(registry.set_split_mode(&account_id, false));
+        assert!(registry.resolve_by_email("alias@proton.me").is_none());
         assert!(registry.resolve_by_email("alice@proton.me").is_some());
     }
 

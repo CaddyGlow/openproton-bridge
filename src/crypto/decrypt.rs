@@ -8,6 +8,13 @@ use super::Result;
 ///
 /// Reference: go-proton-api/message_types.go Message.Decrypt
 pub fn decrypt_message_body(keyring: &Keyring, armored_body: &str) -> Result<Vec<u8>> {
+    let trimmed = armored_body.trim_start();
+    if !trimmed.starts_with("-----BEGIN PGP MESSAGE-----") {
+        // Proton can return clear/plain message bodies for non-E2E content.
+        // In that case there is nothing to decrypt.
+        return Ok(armored_body.as_bytes().to_vec());
+    }
+
     keyring.decrypt_armored(armored_body)
 }
 
@@ -123,6 +130,15 @@ mod tests {
 
         let result = decrypt_message_body(&wrong_keyring, &armored);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_decrypt_message_body_passthrough_cleartext() {
+        let (_, keyring) = make_test_keyring();
+        let clear = "Hello from a non-encrypted message body.";
+
+        let decrypted = decrypt_message_body(&keyring, clear).unwrap();
+        assert_eq!(decrypted, clear.as_bytes());
     }
 
     #[test]

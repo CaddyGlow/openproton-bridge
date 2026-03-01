@@ -23,7 +23,7 @@ sha2 = "0.10"
 bcrypt = "0.16"
 base64 = "0.22"
 rand = "0.8"
-sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
+sequoia-openpgp = { version = "1", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto", "compression-deflate"] }
 
 # Async trait
 async-trait = "0.1"

@@ -385,7 +385,12 @@
     loginStatus = 'submitting 2FA...'
     try {
       await login2fa(loginUsername, twoFactorCode)
-      loginStatus = '2FA submitted (awaiting stream)'
+      loginStatus = '2FA accepted. Loading account data...'
+      await refreshBridgeData()
+      hvVerificationUrl = ''
+      hvCaptchaToken = ''
+      await closeCaptchaVerificationWindow()
+      loginStatus = 'Login completed.'
     } catch (error) {
       logger.error('app', 'submit 2FA failed', { error: String(error) })
       loginStatus = `2FA failed: ${String(error)}`
@@ -397,7 +402,9 @@
     loginStatus = 'submitting mailbox password...'
     try {
       await login2passwords(loginUsername, mailboxPassword)
-      loginStatus = 'mailbox password submitted (awaiting stream)'
+      loginStatus = 'Mailbox password accepted. Loading account data...'
+      await refreshBridgeData()
+      loginStatus = 'Login completed.'
     } catch (error) {
       logger.error('app', 'submit mailbox password failed', { error: String(error) })
       loginStatus = `mailbox password failed: ${String(error)}`
@@ -409,7 +416,9 @@
     loginStatus = 'submitting FIDO assertion...'
     try {
       await loginFido(loginUsername, fidoAssertionPayload)
-      loginStatus = 'FIDO assertion submitted (awaiting stream)'
+      loginStatus = 'FIDO accepted. Loading account data...'
+      await refreshBridgeData()
+      loginStatus = 'Login completed.'
     } catch (error) {
       logger.error('app', 'submit FIDO assertion failed', { error: String(error) })
       loginStatus = `FIDO failed: ${String(error)}`

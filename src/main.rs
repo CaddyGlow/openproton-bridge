@@ -263,17 +263,23 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
 
     // Derive mailbox passphrase from salts
     let salts_resp = api::users::get_salts(&client).await?;
-    let key_passphrase = if let Some(primary_key) = user.keys.iter().find(|k| k.active == 1) {
-        match api::srp::salt_for_key(password.as_bytes(), &primary_key.id, &salts_resp.key_salts) {
-            Ok(passphrase) => Some(BASE64.encode(&passphrase)),
-            Err(e) => {
-                tracing::warn!(error = %e, "could not derive key passphrase (non-fatal)");
-                None
+    let key_passphrase = {
+        let mut derived = None;
+        for key in user.keys.iter().filter(|k| k.active == 1) {
+            match api::srp::salt_for_key(password.as_bytes(), &key.id, &salts_resp.key_salts) {
+                Ok(passphrase) => {
+                    derived = Some(BASE64.encode(&passphrase));
+                    break;
+                }
+                Err(e) => {
+                    tracing::debug!(key_id = %key.id, error = %e, "key passphrase derivation attempt failed");
+                }
             }
         }
-    } else {
-        tracing::warn!("no active user key found for passphrase derivation");
-        None
+        if derived.is_none() {
+            tracing::warn!("could not derive key passphrase from any active user key (non-fatal)");
+        }
+        derived
     };
 
     // Generate bridge password
@@ -982,6 +988,30 @@ async fn cmd_fetch(limit: usize, dir: &std::path::Path) -> anyhow::Result<()> {
         anyhow::bail!("could not unlock any address keys");
     }
 
+    for addr in &addr_resp.addresses {
+        if let Some(kr) = addr_keyrings.get(&addr.id) {
+            let policy = sequoia_openpgp::policy::StandardPolicy::new();
+            let mut ids = Vec::new();
+            for unlocked in &kr.keys {
+                for ka in unlocked
+                    .cert
+                    .keys()
+                    .with_policy(&policy, None)
+                    .supported()
+                    .secret()
+                {
+                    ids.push(ka.keyid().to_string());
+                }
+            }
+            tracing::debug!(
+                address = %addr.email,
+                address_id = %addr.id,
+                key_ids = ?ids,
+                "available unlocked key ids for address"
+            );
+        }
+    }
+
     // Fetch inbox message metadata
     let filter = api::types::MessageFilter {
         label_id: Some(api::types::INBOX_LABEL.to_string()),
@@ -1009,6 +1039,12 @@ async fn cmd_fetch(limit: usize, dir: &std::path::Path) -> anyhow::Result<()> {
         };
 
         let msg = &msg_resp.message;
+        tracing::debug!(
+            message_id = %msg.metadata.id,
+            address_id = %msg.metadata.address_id,
+            subject = %msg.metadata.subject,
+            "attempting message body decryption"
+        );
 
         // Find address keyring
         let keyring = match addr_keyrings.get(&msg.metadata.address_id) {
@@ -1040,14 +1076,16 @@ async fn cmd_fetch(limit: usize, dir: &std::path::Path) -> anyhow::Result<()> {
 
         let unread_marker = if msg.metadata.unread != 0 { " *" } else { "" };
         let time = chrono_format(msg.metadata.time);
+        let to_display = format_email_addresses(&msg.metadata.to_list);
 
         println!(
-            "{}. {}{}\n   From: {} <{}>\n   Date: {}\n   Attachments: {}\n   ---\n   {}\n",
+            "{}. {}{}\n   From: {} <{}>\n   To: {}\n   Date: {}\n   Attachments: {}\n   ---\n   {}\n",
             i + 1,
             msg.metadata.subject,
             unread_marker,
             msg.metadata.sender.name,
             msg.metadata.sender.address,
+            to_display,
             time,
             msg.metadata.num_attachments,
             body_preview,
@@ -1287,6 +1325,24 @@ fn generate_bridge_password() -> String {
             CHARSET[idx] as char
         })
         .collect()
+}
+
+fn format_email_addresses(addrs: &[api::types::EmailAddress]) -> String {
+    if addrs.is_empty() {
+        return "(none)".to_string();
+    }
+
+    addrs
+        .iter()
+        .map(|addr| {
+            if addr.name.is_empty() {
+                addr.address.clone()
+            } else {
+                format!("{} <{}>", addr.name, addr.address)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn chrono_format(unix_timestamp: i64) -> String {

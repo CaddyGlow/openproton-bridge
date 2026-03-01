@@ -267,20 +267,24 @@ impl BridgeService {
             .await
             .map_err(status_from_api_error)?;
 
-        let key_passphrase = if let Some(primary_key) = user.keys.iter().find(|k| k.active == 1) {
-            match api::srp::salt_for_key(
-                password.as_bytes(),
-                &primary_key.id,
-                &salts_resp.key_salts,
-            ) {
-                Ok(passphrase) => Some(BASE64.encode(&passphrase)),
-                Err(err) => {
-                    warn!(error = %err, "could not derive key passphrase");
-                    None
+        let key_passphrase = {
+            let mut derived = None;
+            for key in user.keys.iter().filter(|k| k.active == 1) {
+                match api::srp::salt_for_key(password.as_bytes(), &key.id, &salts_resp.key_salts) {
+                    Ok(passphrase) => {
+                        derived = Some(BASE64.encode(&passphrase));
+                        break;
+                    }
+                    Err(err) => {
+                        debug!(key_id = %key.id, error = %err, "key passphrase derivation attempt failed");
+                    }
                 }
             }
-        } else {
-            None
+
+            if derived.is_none() {
+                warn!("could not derive key passphrase from any active user key");
+            }
+            derived
         };
 
         let bridge_password = generate_bridge_password();

@@ -343,23 +343,40 @@ impl DecryptionHelper for KeyringHelper<'_> {
                     .with_policy(&policy, None)
                     .supported()
                     .secret()
-                    .for_transport_encryption()
-                    .for_storage_encryption()
                 {
-                    let secret = ka.key().clone().parts_into_secret()?;
+                    tracing::debug!(keyid = %ka.keyid(), "trying secret key for message decryption");
+                    let secret = match ka.key().clone().parts_into_secret() {
+                        Ok(secret) => secret,
+                        Err(e) => {
+                            tracing::debug!(keyid = %ka.keyid(), error = %e, "parts_into_secret failed");
+                            continue;
+                        }
+                    };
 
                     // Decrypt the secret key material with our stored password.
                     let decrypted = match secret.decrypt_secret(&unlocked_key.password) {
                         Ok(d) => d,
-                        Err(_) => continue,
+                        Err(e) => {
+                            tracing::debug!(keyid = %ka.keyid(), error = %e, "decrypt_secret failed");
+                            continue;
+                        }
                     };
 
-                    let mut keypair = decrypted.into_keypair()?;
+                    let mut keypair = match decrypted.into_keypair() {
+                        Ok(keypair) => keypair,
+                        Err(e) => {
+                            tracing::debug!(keyid = %ka.keyid(), error = %e, "into_keypair failed");
+                            continue;
+                        }
+                    };
 
                     if let Some((algo, sk)) = pkesk.decrypt(&mut keypair, sym_algo) {
+                        tracing::debug!(keyid = %ka.keyid(), sym_algo = ?algo, "pkesk decrypted, testing session key");
                         if decrypt(algo, &sk) {
+                            tracing::debug!(keyid = %ka.keyid(), "session key accepted");
                             return Ok(Some(ka.fingerprint()));
                         }
+                        tracing::debug!(keyid = %ka.keyid(), "session key rejected");
                     }
                 }
             }

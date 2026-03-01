@@ -83,7 +83,7 @@
 
 {#if open}
   <div class="wizard-backdrop" role="presentation">
-    <section class="wizard-panel card" role="dialog" aria-modal="true" aria-label="Proton login wizard">
+    <div class="wizard-panel card" role="dialog" aria-modal="true" aria-label="Proton login wizard">
       <header class="wizard-header">
         <div>
           <h2>Sign In Wizard</h2>
@@ -173,7 +173,7 @@
           <button class="secondary" onclick={onAbortLoginFlow}>Abort Login</button>
         </footer>
       {/if}
-    </section>
+    </div>
   </div>
 {/if}
 

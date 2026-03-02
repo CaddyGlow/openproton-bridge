@@ -18,6 +18,7 @@ mod bridge;
 mod crypto;
 mod frontend;
 mod imap;
+mod paths;
 mod smtp;
 mod vault;
 
@@ -27,7 +28,7 @@ mod vault;
     about = "Proton Mail bridge for free accounts"
 )]
 struct Cli {
-    /// Vault directory (default: ~/.config/openproton-bridge)
+    /// Runtime settings directory override (default: Proton Bridge path)
     #[arg(long, global = true)]
     vault_dir: Option<std::path::PathBuf>,
 
@@ -140,7 +141,8 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let dir = session_dir(cli.vault_dir.as_deref())?;
+    let runtime_paths = runtime_paths(cli.vault_dir.as_deref())?;
+    let dir = runtime_paths.settings_dir().to_path_buf();
 
     match cli.command {
         Command::Login { username } => cmd_login(username, &dir).await,
@@ -173,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             no_tls,
             event_poll_secs,
         } => cmd_serve(imap_port, smtp_port, &bind, no_tls, event_poll_secs, &dir).await,
-        Command::Grpc { bind } => cmd_grpc(&bind, &dir).await,
+        Command::Grpc { bind } => cmd_grpc(&bind, &runtime_paths).await,
     }
 }
 
@@ -1311,8 +1313,8 @@ async fn cmd_serve(
     Ok(())
 }
 
-async fn cmd_grpc(bind: &str, dir: &std::path::Path) -> anyhow::Result<()> {
-    frontend::grpc::run_server(dir.to_path_buf(), bind.to_string()).await
+async fn cmd_grpc(bind: &str, runtime_paths: &paths::RuntimePaths) -> anyhow::Result<()> {
+    frontend::grpc::run_server(runtime_paths.clone(), bind.to_string()).await
 }
 
 fn generate_bridge_password() -> String {
@@ -1430,14 +1432,12 @@ async fn refresh_session(
     Ok(refreshed)
 }
 
+fn runtime_paths(override_dir: Option<&std::path::Path>) -> anyhow::Result<paths::RuntimePaths> {
+    paths::RuntimePaths::resolve(override_dir)
+}
+
 fn session_dir(override_dir: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
-    if let Some(dir) = override_dir {
-        return Ok(dir.to_path_buf());
-    }
-    let config_dir = dirs::config_dir()
-        .context("could not determine config directory")?
-        .join("openproton-bridge");
-    Ok(config_dir)
+    Ok(runtime_paths(override_dir)?.settings_dir().to_path_buf())
 }
 
 async fn report_runtime_health_periodically(
@@ -1600,6 +1600,19 @@ mod tests {
             Command::FidoAssert { provider, .. } => assert_eq!(provider, FidoProvider::Os),
             _ => panic!("expected fido-assert command"),
         }
+    }
+
+    #[test]
+    fn session_dir_default_uses_proton_vendor_path() {
+        let dir = session_dir(None).unwrap();
+        let expected_suffix = std::path::Path::new("protonmail").join("bridge-v3");
+        assert!(dir.ends_with(expected_suffix));
+    }
+
+    #[test]
+    fn session_dir_default_does_not_use_legacy_openproton_suffix() {
+        let dir = session_dir(None).unwrap();
+        assert!(!dir.ends_with(std::path::Path::new("openproton-bridge")));
     }
 
     #[test]

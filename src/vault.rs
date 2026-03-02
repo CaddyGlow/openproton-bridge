@@ -973,6 +973,54 @@ mod tests {
     }
 
     #[test]
+    fn test_load_session_from_proton_style_vault_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x11u8; KEY_LEN];
+
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "user-fixture".to_string(),
+                username: "Fixture User".to_string(),
+                primary_email: "fixture@proton.me".to_string(),
+                gluon_key: vec![7u8; 32],
+                gluon_ids: HashMap::new(),
+                bridge_pass: b"fixture-bridge-password".to_vec(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                auth_uid: "uid-fixture".to_string(),
+                auth_ref: "refresh-fixture".to_string(),
+                key_pass: b"fixture-key-passphrase".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+            }],
+            ..VaultData::default()
+        };
+
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        std::fs::write(tmp.path().join(DEFAULT_EMAIL_FILE), b"fixture@proton.me").unwrap();
+
+        let session = load_session(tmp.path()).unwrap();
+        assert_eq!(session.uid, "uid-fixture");
+        assert_eq!(session.access_token, "");
+        assert_eq!(session.refresh_token, "refresh-fixture");
+        assert_eq!(session.email, "fixture@proton.me");
+        assert_eq!(session.display_name, "Fixture User");
+        assert_eq!(
+            session.key_passphrase,
+            Some(BASE64.encode(b"fixture-key-passphrase"))
+        );
+        assert_eq!(
+            session.bridge_password,
+            Some("fixture-bridge-password".to_string())
+        );
+    }
+
+    #[test]
     fn test_list_sessions_and_load_by_email() {
         let tmp = tempfile::tempdir().unwrap();
         let session_a = Session {

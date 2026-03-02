@@ -21,6 +21,7 @@ use crate::api;
 use crate::api::client::ProtonClient;
 use crate::api::error::{any_human_verification_details, human_verification_details, ApiError};
 use crate::api::types::{HumanVerificationDetails, Session};
+use crate::paths::RuntimePaths;
 use crate::vault;
 
 const SERVER_CONFIG_FILE: &str = "grpcServerConfig.json";
@@ -88,14 +89,14 @@ struct StoredAppSettings {
 }
 
 impl StoredAppSettings {
-    fn with_defaults_for(vault_dir: &Path) -> Self {
+    fn with_defaults_for(disk_cache_dir: &Path) -> Self {
         Self {
             show_on_startup: true,
             is_autostart_on: false,
             is_beta_enabled: false,
             is_all_mail_visible: true,
             is_telemetry_disabled: false,
-            disk_cache_path: vault_dir.join("cache").display().to_string(),
+            disk_cache_path: disk_cache_dir.display().to_string(),
             is_doh_enabled: true,
             color_scheme_name: "system".to_string(),
             is_automatic_update_on: true,
@@ -125,7 +126,7 @@ struct PendingHumanVerification {
 
 #[derive(Debug)]
 struct GrpcState {
-    vault_dir: PathBuf,
+    runtime_paths: RuntimePaths,
     bind_host: String,
     event_tx: broadcast::Sender<pb::StreamEvent>,
     active_stream_stop: Mutex<Option<watch::Sender<bool>>>,
@@ -144,6 +145,22 @@ struct BridgeService {
 impl BridgeService {
     fn new(state: Arc<GrpcState>) -> Self {
         Self { state }
+    }
+
+    fn settings_dir(&self) -> &Path {
+        self.state.runtime_paths.settings_dir()
+    }
+
+    fn logs_dir(&self) -> PathBuf {
+        self.state.runtime_paths.logs_dir()
+    }
+
+    fn grpc_mail_settings_path(&self) -> PathBuf {
+        self.state.runtime_paths.grpc_mail_settings_path()
+    }
+
+    fn grpc_app_settings_path(&self) -> PathBuf {
+        self.state.runtime_paths.grpc_app_settings_path()
     }
 
     fn emit_event(&self, event: pb::stream_event::Event) {
@@ -286,9 +303,11 @@ impl BridgeService {
 
     fn emit_disk_cache_error(&self, error_type: pb::DiskCacheErrorType) {
         self.emit_event(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
-            event: Some(pb::disk_cache_event::Event::Error(pb::DiskCacheErrorEvent {
-                r#type: error_type as i32,
-            })),
+            event: Some(pb::disk_cache_event::Event::Error(
+                pb::DiskCacheErrorEvent {
+                    r#type: error_type as i32,
+                },
+            )),
         }));
     }
 
@@ -345,8 +364,8 @@ impl BridgeService {
             bridge_password: Some(bridge_password),
         };
 
-        vault::save_session(&session, &self.state.vault_dir).map_err(status_from_vault_error)?;
-        vault::set_default_email(&self.state.vault_dir, &session.email)
+        vault::save_session(&session, self.settings_dir()).map_err(status_from_vault_error)?;
+        vault::set_default_email(self.settings_dir(), &session.email)
             .map_err(status_from_vault_error)?;
 
         client.set_auth(&session.uid, &session.access_token);
@@ -424,9 +443,9 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn trigger_reset(&self, _request: Request<()>) -> Result<Response<()>, Status> {
-        vault::remove_session(&self.state.vault_dir).map_err(status_from_vault_error)?;
-        let _ = tokio::fs::remove_file(self.state.vault_dir.join(MAIL_SETTINGS_FILE)).await;
-        let _ = tokio::fs::remove_file(self.state.vault_dir.join(APP_SETTINGS_FILE)).await;
+        vault::remove_session(self.settings_dir()).map_err(status_from_vault_error)?;
+        let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
+        let _ = tokio::fs::remove_file(self.grpc_app_settings_path()).await;
         Ok(Response::new(()))
     }
 
@@ -438,7 +457,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn set_is_autostart_on(&self, request: Request<bool>) -> Result<Response<()>, Status> {
         let mut settings = self.state.app_settings.lock().await;
         settings.is_autostart_on = request.into_inner();
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         self.emit_toggle_autostart_finished();
@@ -453,7 +472,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn set_is_beta_enabled(&self, request: Request<bool>) -> Result<Response<()>, Status> {
         let mut settings = self.state.app_settings.lock().await;
         settings.is_beta_enabled = request.into_inner();
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -470,7 +489,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<()>, Status> {
         let mut settings = self.state.app_settings.lock().await;
         settings.is_all_mail_visible = request.into_inner();
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -487,7 +506,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<()>, Status> {
         let mut settings = self.state.app_settings.lock().await;
         settings.is_telemetry_disabled = request.into_inner();
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -509,9 +528,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("disk cache path is empty"));
         }
         let target = PathBuf::from(path.clone());
-        if let Err(err) = tokio::fs::create_dir_all(&target)
-            .await
-        {
+        if let Err(err) = tokio::fs::create_dir_all(&target).await {
             self.emit_disk_cache_error(pb::DiskCacheErrorType::CantMoveDiskCacheError);
             return Err(Status::internal(format!(
                 "failed to create disk cache path: {err}"
@@ -520,7 +537,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         let mut settings = self.state.app_settings.lock().await;
         settings.disk_cache_path = path;
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         self.emit_disk_cache_path_changed(&settings.disk_cache_path);
@@ -531,7 +548,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn set_is_do_h_enabled(&self, request: Request<bool>) -> Result<Response<()>, Status> {
         let mut settings = self.state.app_settings.lock().await;
         settings.is_doh_enabled = request.into_inner();
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -552,7 +569,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
         let mut settings = self.state.app_settings.lock().await;
         settings.color_scheme_name = name;
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -571,7 +588,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn logs_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
-        let path = self.state.vault_dir.join("logs");
+        let path = self.logs_dir();
         tokio::fs::create_dir_all(&path)
             .await
             .map_err(|e| Status::internal(format!("failed to create logs directory: {e}")))?;
@@ -580,7 +597,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn license_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
         Ok(Response::new(
-            self.state.vault_dir.join("LICENSE").display().to_string(),
+            self.settings_dir().join("LICENSE").display().to_string(),
         ))
     }
 
@@ -625,7 +642,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         let launcher = request.into_inner();
         let mut settings = self.state.app_settings.lock().await;
         settings.forced_launcher = launcher;
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -635,7 +652,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         let executable = request.into_inner();
         let mut settings = self.state.app_settings.lock().await;
         settings.main_executable = executable;
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -949,12 +966,12 @@ impl pb::bridge_server::Bridge for BridgeService {
         _request: Request<()>,
     ) -> Result<Response<pb::UserListResponse>, Status> {
         let sessions =
-            vault::list_sessions(&self.state.vault_dir).map_err(status_from_vault_error)?;
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
         let users = sessions
             .iter()
             .map(|session| {
                 let split_mode =
-                    vault::load_split_mode_by_account_id(&self.state.vault_dir, &session.uid)
+                    vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
                         .ok()
                         .flatten()
                         .unwrap_or(false);
@@ -967,12 +984,12 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn get_user(&self, request: Request<String>) -> Result<Response<pb::User>, Status> {
         let lookup = request.into_inner();
         let sessions =
-            vault::list_sessions(&self.state.vault_dir).map_err(status_from_vault_error)?;
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
         let session = sessions
             .iter()
             .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(&lookup))
             .ok_or_else(|| Status::not_found("user not found"))?;
-        let split_mode = vault::load_split_mode_by_account_id(&self.state.vault_dir, &session.uid)
+        let split_mode = vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
             .ok()
             .flatten()
             .unwrap_or(false);
@@ -985,14 +1002,14 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let sessions =
-            vault::list_sessions(&self.state.vault_dir).map_err(status_from_vault_error)?;
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
         let account_id = sessions
             .iter()
             .find(|s| s.uid == req.user_id || s.email.eq_ignore_ascii_case(&req.user_id))
             .map(|s| s.uid.clone())
             .ok_or_else(|| Status::not_found("user not found"))?;
 
-        vault::save_split_mode_by_account_id(&self.state.vault_dir, &account_id, req.active)
+        vault::save_split_mode_by_account_id(self.settings_dir(), &account_id, req.active)
             .map_err(status_from_vault_error)?;
         self.emit_user_changed(&account_id);
         tracing::info!(
@@ -1019,13 +1036,13 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn logout_user(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let value = request.into_inner();
         let sessions =
-            vault::list_sessions(&self.state.vault_dir).map_err(status_from_vault_error)?;
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
         let session = sessions
             .into_iter()
             .find(|s| s.uid == value || s.email.eq_ignore_ascii_case(&value))
             .ok_or_else(|| Status::not_found("user not found"))?;
 
-        vault::remove_session_by_email(&self.state.vault_dir, &session.email)
+        vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(status_from_vault_error)?;
         self.emit_user_disconnected(&session.email);
         Ok(Response::new(()))
@@ -1064,7 +1081,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<()>, Status> {
         let mut settings = self.state.app_settings.lock().await;
         settings.is_automatic_update_on = request.into_inner();
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -1094,7 +1111,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
         let mut settings = self.state.app_settings.lock().await;
         settings.current_keychain = keychain;
-        save_app_settings(&self.state.vault_dir, &settings)
+        save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
         Ok(Response::new(()))
@@ -1144,7 +1161,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         settings.smtp_port = incoming.smtp_port;
         settings.use_ssl_for_imap = incoming.use_ssl_for_imap;
         settings.use_ssl_for_smtp = incoming.use_ssl_for_smtp;
-        save_mail_settings(&self.state.vault_dir, &settings)
+        save_mail_settings(&self.grpc_mail_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save mail settings: {e}")))?;
 
@@ -1172,12 +1189,12 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<bool>, Status> {
-        let (cert_path, key_path) = mail_cert_paths(&self.state.vault_dir);
+        let (cert_path, key_path) = mail_cert_paths(self.settings_dir());
         Ok(Response::new(cert_path.exists() && key_path.exists()))
     }
 
     async fn install_tls_certificate(&self, _request: Request<()>) -> Result<Response<()>, Status> {
-        ensure_mail_tls_certificate(&self.state.vault_dir)
+        ensure_mail_tls_certificate(self.settings_dir())
             .await
             .map_err(|e| Status::internal(format!("failed to install TLS certificate: {e}")))?;
         Ok(Response::new(()))
@@ -1192,11 +1209,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("output folder is required"));
         }
 
-        ensure_mail_tls_certificate(&self.state.vault_dir)
+        ensure_mail_tls_certificate(self.settings_dir())
             .await
             .map_err(|e| Status::internal(format!("failed to ensure TLS certificate: {e}")))?;
 
-        let (cert_path, key_path) = mail_cert_paths(&self.state.vault_dir);
+        let (cert_path, key_path) = mail_cert_paths(self.settings_dir());
         let cert_bytes = tokio::fs::read(cert_path)
             .await
             .map_err(|e| Status::internal(format!("failed to read cert: {e}")))?;
@@ -1292,10 +1309,15 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 }
 
-pub async fn run_server(vault_dir: PathBuf, bind_host: String) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(&vault_dir)
+pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyhow::Result<()> {
+    tokio::fs::create_dir_all(runtime_paths.settings_dir())
         .await
-        .with_context(|| format!("failed to create vault dir {}", vault_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to create settings dir {}",
+                runtime_paths.settings_dir().display()
+            )
+        })?;
 
     let listener = TcpListener::bind(format!("{bind_host}:0"))
         .await
@@ -1305,10 +1327,15 @@ pub async fn run_server(vault_dir: PathBuf, bind_host: String) -> anyhow::Result
         .context("failed to read listener local address")?
         .port();
 
+    let grpc_server_config_path = runtime_paths.grpc_server_config_path();
+    let grpc_mail_settings_path = runtime_paths.grpc_mail_settings_path();
+    let grpc_app_settings_path = runtime_paths.grpc_app_settings_path();
+    let disk_cache_dir = runtime_paths.disk_cache_dir();
+
     let token = generate_server_token();
     let (cert_pem, key_pem) = generate_ephemeral_tls_cert()?;
     write_server_config(
-        &vault_dir,
+        &grpc_server_config_path,
         &GrpcServerConfig {
             port,
             cert: cert_pem.clone(),
@@ -1318,12 +1345,12 @@ pub async fn run_server(vault_dir: PathBuf, bind_host: String) -> anyhow::Result
     )
     .await?;
 
-    let settings = load_mail_settings(&vault_dir).await?;
-    let app_settings = load_app_settings(&vault_dir).await?;
+    let settings = load_mail_settings(&grpc_mail_settings_path).await?;
+    let app_settings = load_app_settings(&grpc_app_settings_path, &disk_cache_dir).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, _) = broadcast::channel(128);
     let state = Arc::new(GrpcState {
-        vault_dir: vault_dir.clone(),
+        runtime_paths: runtime_paths.clone(),
         bind_host,
         event_tx,
         active_stream_stop: Mutex::new(None),
@@ -1514,22 +1541,20 @@ fn generate_ephemeral_tls_cert() -> anyhow::Result<(String, String)> {
     Ok((cert.cert.pem(), cert.key_pair.serialize_pem()))
 }
 
-async fn write_server_config(dir: &Path, cfg: &GrpcServerConfig) -> anyhow::Result<()> {
-    let path = dir.join(SERVER_CONFIG_FILE);
-    let tmp_path = dir.join(format!("{SERVER_CONFIG_FILE}.tmp"));
+async fn write_server_config(path: &Path, cfg: &GrpcServerConfig) -> anyhow::Result<()> {
+    let tmp_path = path.with_file_name(format!("{SERVER_CONFIG_FILE}.tmp"));
     let payload = serde_json::to_vec_pretty(cfg).context("failed to encode server config")?;
     tokio::fs::write(&tmp_path, payload)
         .await
         .with_context(|| format!("failed to write temp server config {}", tmp_path.display()))?;
-    tokio::fs::rename(&tmp_path, &path)
+    tokio::fs::rename(&tmp_path, path)
         .await
         .with_context(|| format!("failed to rename server config to {}", path.display()))?;
     info!(path = %path.display(), "saved grpc server config");
     Ok(())
 }
 
-async fn load_mail_settings(dir: &Path) -> anyhow::Result<StoredMailSettings> {
-    let path = dir.join(MAIL_SETTINGS_FILE);
+async fn load_mail_settings(path: &Path) -> anyhow::Result<StoredMailSettings> {
     if !path.exists() {
         return Ok(StoredMailSettings::default());
     }
@@ -1539,23 +1564,24 @@ async fn load_mail_settings(dir: &Path) -> anyhow::Result<StoredMailSettings> {
     serde_json::from_slice(&payload).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-async fn save_mail_settings(dir: &Path, settings: &StoredMailSettings) -> anyhow::Result<()> {
-    let path = dir.join(MAIL_SETTINGS_FILE);
-    let tmp_path = dir.join(format!("{MAIL_SETTINGS_FILE}.tmp"));
+async fn save_mail_settings(path: &Path, settings: &StoredMailSettings) -> anyhow::Result<()> {
+    let tmp_path = path.with_file_name(format!("{MAIL_SETTINGS_FILE}.tmp"));
     let payload = serde_json::to_vec_pretty(settings).context("failed to encode mail settings")?;
     tokio::fs::write(&tmp_path, payload)
         .await
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    tokio::fs::rename(&tmp_path, &path)
+    tokio::fs::rename(&tmp_path, path)
         .await
         .with_context(|| format!("failed to rename settings file {}", path.display()))?;
     Ok(())
 }
 
-async fn load_app_settings(dir: &Path) -> anyhow::Result<StoredAppSettings> {
-    let path = dir.join(APP_SETTINGS_FILE);
+async fn load_app_settings(
+    path: &Path,
+    disk_cache_dir: &Path,
+) -> anyhow::Result<StoredAppSettings> {
     if !path.exists() {
-        return Ok(StoredAppSettings::with_defaults_for(dir));
+        return Ok(StoredAppSettings::with_defaults_for(disk_cache_dir));
     }
 
     let payload = tokio::fs::read(&path)
@@ -1564,14 +1590,13 @@ async fn load_app_settings(dir: &Path) -> anyhow::Result<StoredAppSettings> {
     serde_json::from_slice(&payload).with_context(|| format!("failed to parse {}", path.display()))
 }
 
-async fn save_app_settings(dir: &Path, settings: &StoredAppSettings) -> anyhow::Result<()> {
-    let path = dir.join(APP_SETTINGS_FILE);
-    let tmp_path = dir.join(format!("{APP_SETTINGS_FILE}.tmp"));
+async fn save_app_settings(path: &Path, settings: &StoredAppSettings) -> anyhow::Result<()> {
+    let tmp_path = path.with_file_name(format!("{APP_SETTINGS_FILE}.tmp"));
     let payload = serde_json::to_vec_pretty(settings).context("failed to encode app settings")?;
     tokio::fs::write(&tmp_path, payload)
         .await
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
-    tokio::fs::rename(&tmp_path, &path)
+    tokio::fs::rename(&tmp_path, path)
         .await
         .with_context(|| format!("failed to rename settings file {}", path.display()))?;
     Ok(())
@@ -1615,11 +1640,14 @@ mod tests {
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn build_test_service(vault_dir: PathBuf) -> BridgeService {
+    fn build_test_service_with_paths(runtime_paths: RuntimePaths) -> BridgeService {
         let (event_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = watch::channel(false);
         let state = Arc::new(GrpcState {
-            vault_dir: vault_dir.clone(),
+            app_settings: Mutex::new(StoredAppSettings::with_defaults_for(
+                &runtime_paths.disk_cache_dir(),
+            )),
+            runtime_paths,
             bind_host: "127.0.0.1".to_string(),
             event_tx,
             active_stream_stop: Mutex::new(None),
@@ -1627,9 +1655,13 @@ mod tests {
             pending_hv: Mutex::new(None),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
-            app_settings: Mutex::new(StoredAppSettings::with_defaults_for(&vault_dir)),
         });
         BridgeService::new(state)
+    }
+
+    fn build_test_service(vault_dir: PathBuf) -> BridgeService {
+        let runtime_paths = RuntimePaths::resolve(Some(&vault_dir)).unwrap();
+        build_test_service_with_paths(runtime_paths)
     }
 
     async fn call_login_fido(
@@ -1709,14 +1741,15 @@ mod tests {
     #[tokio::test]
     async fn mail_settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MAIL_SETTINGS_FILE);
         let settings = StoredMailSettings {
             imap_port: 1144,
             smtp_port: 1026,
             use_ssl_for_imap: true,
             use_ssl_for_smtp: true,
         };
-        save_mail_settings(dir.path(), &settings).await.unwrap();
-        let loaded = load_mail_settings(dir.path()).await.unwrap();
+        save_mail_settings(&path, &settings).await.unwrap();
+        let loaded = load_mail_settings(&path).await.unwrap();
         assert_eq!(loaded.imap_port, 1144);
         assert_eq!(loaded.smtp_port, 1026);
         assert!(loaded.use_ssl_for_imap);
@@ -1726,13 +1759,15 @@ mod tests {
     #[tokio::test]
     async fn app_settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APP_SETTINGS_FILE);
+        let disk_cache_dir = dir.path().join("disk");
         let settings = StoredAppSettings {
             show_on_startup: false,
             is_autostart_on: true,
             is_beta_enabled: true,
             is_all_mail_visible: false,
             is_telemetry_disabled: true,
-            disk_cache_path: dir.path().join("disk").display().to_string(),
+            disk_cache_path: disk_cache_dir.display().to_string(),
             is_doh_enabled: false,
             color_scheme_name: "light".to_string(),
             is_automatic_update_on: false,
@@ -1740,8 +1775,8 @@ mod tests {
             main_executable: "/tmp/bridge-bin".to_string(),
             forced_launcher: "thunderbird".to_string(),
         };
-        save_app_settings(dir.path(), &settings).await.unwrap();
-        let loaded = load_app_settings(dir.path()).await.unwrap();
+        save_app_settings(&path, &settings).await.unwrap();
+        let loaded = load_app_settings(&path, &disk_cache_dir).await.unwrap();
         assert!(!loaded.show_on_startup);
         assert!(loaded.is_autostart_on);
         assert!(loaded.is_beta_enabled);
@@ -1753,6 +1788,39 @@ mod tests {
         assert_eq!(loaded.current_keychain, "file");
         assert_eq!(loaded.main_executable, "/tmp/bridge-bin");
         assert_eq!(loaded.forced_launcher, "thunderbird");
+    }
+
+    #[tokio::test]
+    async fn app_settings_defaults_use_provided_runtime_disk_cache_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(APP_SETTINGS_FILE);
+        let disk_cache_dir = dir.path().join("runtime-cache");
+
+        let loaded = load_app_settings(&path, &disk_cache_dir).await.unwrap();
+        assert_eq!(loaded.disk_cache_path, disk_cache_dir.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn logs_path_uses_runtime_logs_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_paths = RuntimePaths::from_bases(
+            root.path().join("cfg"),
+            root.path().join("data"),
+            root.path().join("cache"),
+        );
+        let expected_logs_dir = runtime_paths.logs_dir();
+        let settings_logs_dir = runtime_paths.settings_dir().join("logs");
+        let service = build_test_service_with_paths(runtime_paths);
+
+        let response =
+            <BridgeService as pb::bridge_server::Bridge>::logs_path(&service, Request::new(()))
+                .await
+                .unwrap();
+
+        let logs_path = PathBuf::from(response.into_inner());
+        assert_eq!(logs_path, expected_logs_dir);
+        assert!(expected_logs_dir.exists());
+        assert!(!settings_logs_dir.exists());
     }
 
     #[tokio::test]

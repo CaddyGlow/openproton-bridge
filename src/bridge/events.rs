@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
 use tokio::sync::watch;
@@ -206,6 +206,24 @@ const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_STATS_LOG_EVERY_ATTEMPTS: u64 = 20;
 const MAX_INITIAL_POLL_STAGGER_MS: u64 = 2_000;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SyncProgressUpdate {
+    Started {
+        user_id: String,
+    },
+    Progress {
+        user_id: String,
+        progress: f64,
+        elapsed_ms: i64,
+        remaining_ms: i64,
+    },
+    Finished {
+        user_id: String,
+    },
+}
+
+pub type SyncProgressCallback = Arc<dyn Fn(SyncProgressUpdate) + Send + Sync>;
+
 pub struct EventWorkerGroup {
     shutdown_tx: watch::Sender<bool>,
     handles: Vec<JoinHandle<()>>,
@@ -348,6 +366,7 @@ pub struct EventWorkerConfig {
     pub auth_router: AuthRouter,
     pub store: Arc<dyn MessageStore>,
     pub checkpoint_store: SharedCheckpointStore,
+    pub sync_progress_callback: Option<SyncProgressCallback>,
 }
 
 impl EventWorkerConfig {
@@ -369,7 +388,13 @@ impl EventWorkerConfig {
             auth_router,
             store,
             checkpoint_store,
+            sync_progress_callback: None,
         }
+    }
+
+    pub fn with_sync_progress_callback(mut self, callback: SyncProgressCallback) -> Self {
+        self.sync_progress_callback = Some(callback);
+        self
     }
 }
 
@@ -671,6 +696,20 @@ async fn bounded_resync_account(
     session: &mut Session,
     client: &mut ProtonClient,
 ) -> Result<(), EventWorkerError> {
+    if let Some(callback) = config.sync_progress_callback.as_ref() {
+        callback(SyncProgressUpdate::Started {
+            user_id: config.account_id.0.clone(),
+        });
+    }
+
+    let resync_started_at = Instant::now();
+    let total_steps = mailbox::system_mailboxes()
+        .iter()
+        .filter(|mb| mb.selectable)
+        .count()
+        .saturating_mul(RESYNC_MAX_PAGES_PER_MAILBOX)
+        .max(1);
+    let mut completed_steps = 0usize;
     let mut synced_message_ids = HashSet::new();
     let mut total_applied = 0usize;
 
@@ -694,6 +733,13 @@ async fn bounded_resync_account(
                 RESYNC_PAGE_SIZE,
             )
             .await?;
+            completed_steps = completed_steps.saturating_add(1);
+            emit_sync_progress(
+                config,
+                completed_steps,
+                total_steps,
+                resync_started_at.elapsed(),
+            );
             if messages.is_empty() {
                 break;
             }
@@ -719,7 +765,48 @@ async fn bounded_resync_account(
         "completed bounded refresh resync"
     );
 
+    emit_sync_progress(
+        config,
+        total_steps,
+        total_steps,
+        resync_started_at.elapsed(),
+    );
+    if let Some(callback) = config.sync_progress_callback.as_ref() {
+        callback(SyncProgressUpdate::Finished {
+            user_id: config.account_id.0.clone(),
+        });
+    }
+
     Ok(())
+}
+
+fn emit_sync_progress(
+    config: &EventWorkerConfig,
+    completed_steps: usize,
+    total_steps: usize,
+    elapsed: Duration,
+) {
+    let Some(callback) = config.sync_progress_callback.as_ref() else {
+        return;
+    };
+
+    let total = total_steps.max(1) as f64;
+    let progress = (completed_steps as f64 / total).clamp(0.0, 1.0);
+    let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
+    let remaining_ms = if progress > 0.0 && progress < 1.0 {
+        ((elapsed_ms as f64) * ((1.0 - progress) / progress))
+            .round()
+            .clamp(0.0, i64::MAX as f64) as i64
+    } else {
+        0
+    };
+
+    callback(SyncProgressUpdate::Progress {
+        user_id: config.account_id.0.clone(),
+        progress,
+        elapsed_ms,
+        remaining_ms,
+    });
 }
 
 async fn apply_message_delete(
@@ -1048,6 +1135,7 @@ pub fn start_event_workers(
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::sync::Mutex as StdMutex;
 
     use super::*;
     use crate::api::types::Session;
@@ -1670,6 +1758,125 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_refresh_emits_sync_lifecycle_progress_events() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-refresh-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+        let progress_events = Arc::new(StdMutex::new(Vec::new()));
+        let progress_events_sink = progress_events.clone();
+        let callback: SyncProgressCallback = Arc::new(move |event| {
+            progress_events_sink.lock().unwrap().push(event);
+        });
+
+        let config = event_worker_config(&server.uri(), runtime, auth_router, store, checkpoints)
+            .with_sync_progress_callback(callback);
+
+        let _ = poll_account_once(&config, "event-0").await.unwrap();
+
+        let events = progress_events.lock().unwrap().clone();
+        assert!(matches!(
+            events.first(),
+            Some(SyncProgressUpdate::Started { user_id }) if user_id == "uid-1"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(SyncProgressUpdate::Finished { user_id }) if user_id == "uid-1"
+        ));
+
+        let progress_values: Vec<(f64, i64, i64)> = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncProgressUpdate::Progress {
+                    progress,
+                    elapsed_ms,
+                    remaining_ms,
+                    ..
+                } => Some((*progress, *elapsed_ms, *remaining_ms)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !progress_values.is_empty(),
+            "expected at least one progress event"
+        );
+        for (progress, elapsed_ms, remaining_ms) in &progress_values {
+            assert!((*progress >= 0.0) && (*progress <= 1.0));
+            assert!(*elapsed_ms >= 0);
+            assert!(*remaining_ms >= 0);
+        }
+        for pair in progress_values.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "expected non-decreasing progress, got {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let last_progress = progress_values.last().unwrap().0;
+        assert_eq!(last_progress, 1.0);
     }
 
     #[tokio::test]

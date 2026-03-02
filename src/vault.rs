@@ -577,6 +577,101 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     Ok(key)
 }
 
+fn read_vault_key_file(path: &Path) -> Result<Option<[u8; KEY_LEN]>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read(path)?;
+    if data.len() != KEY_LEN {
+        return Err(VaultError::InvalidKeyLength);
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&data);
+    Ok(Some(key))
+}
+
+fn write_vault_key_file(path: &Path, key: &[u8; KEY_LEN]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn resolve_key_material_with_keychain_ops<FG>(
+    dir: &Path,
+    mut keychain_get: FG,
+) -> Result<[u8; KEY_LEN]>
+where
+    FG: FnMut() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error>,
+{
+    let key_path = dir.join(KEY_FILE);
+    if let Some(key) = read_vault_key_file(&key_path)? {
+        return Ok(key);
+    }
+    let vault_exists = dir.join(VAULT_FILE).exists();
+    if let Some(key) = resolve_keychain_key(keychain_get(), vault_exists)? {
+        return Ok(key);
+    }
+
+    let mut key = [0u8; KEY_LEN];
+    use rand::RngCore;
+    OsRng.fill_bytes(&mut key);
+    Ok(key)
+}
+
+fn sync_vault_key_to_backend_with_ops<FG, FS>(
+    dir: &Path,
+    backend: &str,
+    keychain_get: FG,
+    mut keychain_set: FS,
+) -> Result<()>
+where
+    FG: FnMut() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error>,
+    FS: FnMut(&[u8; KEY_LEN]) -> std::result::Result<(), keyring::Error>,
+{
+    let backend = backend.trim();
+    let known_backend = matches!(backend, KEYCHAIN_BACKEND_FILE | KEYCHAIN_BACKEND_KEYRING);
+    if !known_backend {
+        return Err(VaultError::KeychainAccess(format!(
+            "unknown backend: {backend}"
+        )));
+    }
+
+    let key = resolve_key_material_with_keychain_ops(dir, keychain_get)?;
+    let key_path = dir.join(KEY_FILE);
+
+    if backend == KEYCHAIN_BACKEND_FILE {
+        write_vault_key_file(&key_path, &key)?;
+        return Ok(());
+    }
+
+    match keychain_set(&key) {
+        Ok(()) => {
+            write_vault_key_file(&key_path, &key)?;
+            Ok(())
+        }
+        Err(err) => {
+            let kind = classify_keychain_failure(&err);
+            record_keychain_failure("write", dir.join(VAULT_FILE).exists(), true, &err);
+            Err(VaultError::KeychainAccess(format!(
+                "{}: {}",
+                kind.as_str(),
+                err
+            )))
+        }
+    }
+}
+
+pub fn sync_vault_key_to_backend(dir: &Path, backend: &str) -> Result<()> {
+    sync_vault_key_to_backend_with_ops(dir, backend, try_keychain_get, try_keychain_set)
+}
+
 fn resolve_keychain_key(
     key_result: std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error>,
     vault_exists: bool,
@@ -1163,6 +1258,89 @@ mod tests {
             ))),
             KeychainFailureKind::NoStorageAccess
         );
+    }
+
+    #[test]
+    fn test_sync_vault_key_to_file_backend_creates_key_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        sync_vault_key_to_backend_with_ops(
+            tmp.path(),
+            KEYCHAIN_BACKEND_FILE,
+            || {
+                Err(keyring::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("locked"),
+                )))
+            },
+            |_key| Ok(()),
+        )
+        .unwrap();
+
+        let key = std::fs::read(tmp.path().join(KEY_FILE)).unwrap();
+        assert_eq!(key.len(), KEY_LEN);
+    }
+
+    #[test]
+    fn test_sync_vault_key_to_file_backend_existing_vault_without_key_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), b"dummy-vault").unwrap();
+
+        let err = sync_vault_key_to_backend_with_ops(
+            tmp.path(),
+            KEYCHAIN_BACKEND_FILE,
+            || Ok(None),
+            |_key| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, VaultError::MissingVaultKey));
+    }
+
+    #[test]
+    fn test_sync_vault_key_to_keyring_backend_writes_keychain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0xAB; KEY_LEN];
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        let called = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let called_set = called.clone();
+
+        sync_vault_key_to_backend_with_ops(
+            tmp.path(),
+            KEYCHAIN_BACKEND_KEYRING,
+            || Ok(None),
+            move |incoming| {
+                assert_eq!(*incoming, key);
+                *called_set.lock().unwrap() = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(*called.lock().unwrap());
+    }
+
+    #[test]
+    fn test_sync_vault_key_to_keyring_backend_propagates_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), [0xAB; KEY_LEN]).unwrap();
+
+        let err = sync_vault_key_to_backend_with_ops(
+            tmp.path(),
+            KEYCHAIN_BACKEND_KEYRING,
+            || Ok(None),
+            |_incoming| {
+                Err(keyring::Error::NoStorageAccess(Box::new(
+                    std::io::Error::other("denied"),
+                )))
+            },
+        )
+        .unwrap_err();
+
+        match err {
+            VaultError::KeychainAccess(message) => {
+                assert!(message.contains("no_storage_access"));
+            }
+            other => panic!("expected keychain access error, got {other:?}"),
+        }
     }
 
     #[test]

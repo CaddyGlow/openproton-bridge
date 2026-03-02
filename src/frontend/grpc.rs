@@ -250,6 +250,8 @@ impl BridgeService {
                     "keychain backend unavailable on this host: {keychain}"
                 )));
             }
+            vault::sync_vault_key_to_backend(self.settings_dir(), keychain)
+                .map_err(|err| self.status_from_vault_error_with_events(err))?;
             let mut settings = self.state.app_settings.lock().await;
             settings.current_keychain = keychain.to_string();
             save_app_settings(&self.grpc_app_settings_path(), &settings)
@@ -2722,10 +2724,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
         let mut events = service.state.event_tx.subscribe();
-        let selected = vault::discover_available_keychains()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| vault::KEYCHAIN_BACKEND_FILE.to_string());
+        let selected = vault::KEYCHAIN_BACKEND_FILE.to_string();
 
         <BridgeService as pb::bridge_server::Bridge>::set_current_keychain(
             &service,
@@ -2742,6 +2741,7 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(current, selected);
+        assert!(service.settings_dir().join("vault.key").exists());
 
         let event = events.recv().await.unwrap();
         match event.event {

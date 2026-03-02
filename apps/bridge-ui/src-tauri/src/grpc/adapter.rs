@@ -4,17 +4,23 @@ use super::config::{
 };
 use super::pb;
 use crate::state::AppState;
+#[cfg(unix)]
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter};
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri};
 use tonic::{Request, Status};
+#[cfg(unix)]
+use tower::service_fn;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -704,21 +710,47 @@ impl GrpcAdapter {
 }
 
 async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, String> {
-    let port = match config.port {
-        Some(port) => port,
-        None => {
-            if let Some(socket_path) = &config.file_socket_path {
-                return Err(format!(
-                    "grpc unix socket is not implemented yet in this UI adapter ({socket_path})"
-                ));
+    let socket_path = config
+        .file_socket_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    #[cfg(unix)]
+    if let Some(socket_path) = socket_path {
+        match connect_client_via_unix_socket(config, socket_path).await {
+            Ok(client) => return Ok(client),
+            Err(unix_err) => {
+                if let Some(port) = config.port {
+                    debug!(
+                        socket_path,
+                        port,
+                        error = %unix_err,
+                        "grpc unix socket connection failed; falling back to tcp"
+                    );
+                    return connect_client_via_tcp(config, port)
+                        .await
+                        .map_err(|tcp_err| format!("{unix_err} | tcp fallback failed: {tcp_err}"));
+                }
+                return Err(unix_err);
             }
-
-            return Err("grpc config is missing both port and fileSocketPath".to_string());
         }
-    };
+    }
 
+    #[cfg(not(unix))]
+    if socket_path.is_some() && config.port.is_some() {
+        debug!("grpc unix socket configured but unsupported on this platform; using tcp");
+    }
+
+    if let Some(port) = config.port {
+        return connect_client_via_tcp(config, port).await;
+    }
+
+    Err("grpc config is missing both port and fileSocketPath".to_string())
+}
+
+async fn connect_client_via_tcp(config: &GrpcServerConfig, port: u16) -> Result<BridgeClient, String> {
     let endpoint_url = format!("https://127.0.0.1:{port}");
-
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(config.cert.clone()))
         .domain_name("127.0.0.1");
@@ -734,6 +766,43 @@ async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, Strin
         .connect()
         .await
         .map_err(|err| format!("failed to connect grpc channel: {err}"))?;
+
+    let interceptor = TokenInterceptor::new(&config.token)?;
+
+    Ok(pb::bridge_client::BridgeClient::with_interceptor(
+        channel,
+        interceptor,
+    ))
+}
+
+#[cfg(unix)]
+async fn connect_client_via_unix_socket(
+    config: &GrpcServerConfig,
+    socket_path: &str,
+) -> Result<BridgeClient, String> {
+    let socket_path = PathBuf::from(socket_path);
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(config.cert.clone()))
+        .domain_name("127.0.0.1");
+
+    let endpoint = Endpoint::from_static("https://127.0.0.1")
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(30))
+        .tls_config(tls)
+        .map_err(|err| format!("failed to configure grpc tls: {err}"))?;
+
+    let connector = service_fn(move |_: Uri| {
+        let socket_path = socket_path.clone();
+        async move {
+            let stream = UnixStream::connect(socket_path).await?;
+            Ok::<_, std::io::Error>(TokioIo::new(stream))
+        }
+    });
+
+    let channel = endpoint
+        .connect_with_connector(connector)
+        .await
+        .map_err(|err| format!("failed to connect grpc unix socket channel: {err}"))?;
 
     let interceptor = TokenInterceptor::new(&config.token)?;
 

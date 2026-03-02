@@ -45,7 +45,7 @@ Notes:
 | `ReportBug` | Partial | Async handling emits `reportBugSuccess`/`reportBugError` then `reportBugFinished`; still no upstream ticket submission flow. |
 | `ForceLauncher` | Exact | Persists launcher setting. |
 | `SetMainExecutable` | Exact | Persists executable setting. |
-| `RequestKnowledgeBaseSuggestions` | Partial | Emits `knowledgeBaseSuggestions` with derived support-search suggestion; no upstream KB backend. |
+| `RequestKnowledgeBaseSuggestions` | Partial | Async event dispatch emits `knowledgeBaseSuggestions` with derived support-search suggestion; no upstream KB backend. |
 | `Login` | Exact | Full auth flow + vault session persistence + sync worker lifecycle refresh. |
 | `Login2FA` | Exact | Completes pending 2FA flow. |
 | `LoginFido` | Exact | Completes pending auth via FIDO assertion payload. |

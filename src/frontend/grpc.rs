@@ -903,16 +903,19 @@ impl pb::bridge_server::Bridge for BridgeService {
             query = %query,
             "knowledge base suggestion request received"
         );
-        let trimmed = query.trim();
-        if !trimmed.is_empty() {
-            let encoded = trimmed.replace(' ', "+");
-            self.emit_knowledge_base_suggestions(vec![pb::KnowledgeBaseSuggestion {
-                url: format!("https://proton.me/support/search?q={encoded}"),
-                title: format!("Search Proton support for \"{trimmed}\""),
-            }]);
-        } else {
-            self.emit_knowledge_base_suggestions(Vec::new());
-        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let trimmed = query.trim().to_string();
+            if !trimmed.is_empty() {
+                let encoded = trimmed.replace(' ', "+");
+                service.emit_knowledge_base_suggestions(vec![pb::KnowledgeBaseSuggestion {
+                    url: format!("https://proton.me/support/search?q={encoded}"),
+                    title: format!("Search Proton support for \"{trimmed}\""),
+                }]);
+            } else {
+                service.emit_knowledge_base_suggestions(Vec::new());
+            }
+        });
         Ok(Response::new(()))
     }
 
@@ -2582,6 +2585,30 @@ mod tests {
                 assert!(suggestion.url.contains("proton.me/support/search"));
                 assert!(suggestion.url.contains("imap+login+failure"));
                 assert!(suggestion.title.contains("imap login failure"));
+            }
+            other => panic!("unexpected knowledge base suggestion event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_knowledge_base_suggestions_empty_query_emits_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        <BridgeService as pb::bridge_server::Bridge>::request_knowledge_base_suggestions(
+            &service,
+            Request::new("   ".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::KnowledgeBaseSuggestions(event)),
+            })) => {
+                assert!(event.suggestions.is_empty());
             }
             other => panic!("unexpected knowledge base suggestion event: {other:?}"),
         }

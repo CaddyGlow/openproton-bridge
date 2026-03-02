@@ -24,9 +24,63 @@ const ADDRESS_MODE_SPLIT: i32 = 1;
 pub const KEYCHAIN_BACKEND_KEYRING: &str = "keyring";
 pub const KEYCHAIN_BACKEND_FILE: &str = "file";
 
-// Keychain constants matching the Go bridge
-const KEYCHAIN_SERVICE: &str = "protonmail/bridge-v3/users";
+// Keychain constants matching the Go bridge.
+const KEYCHAIN_NAME: &str = "bridge-v3";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
+
+#[cfg(target_os = "macos")]
+fn title_case_keychain_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut new_word = true;
+    for ch in raw.chars() {
+        if new_word && ch.is_ascii_alphabetic() {
+            out.push(ch.to_ascii_uppercase());
+        } else {
+            out.push(ch);
+        }
+        new_word = !ch.is_ascii_alphanumeric();
+    }
+    out
+}
+
+fn default_non_macos_keychain_service() -> String {
+    format!("protonmail/{KEYCHAIN_NAME}/users")
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_services() -> Vec<String> {
+    let title_name = title_case_keychain_name(KEYCHAIN_NAME);
+    let executable_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(ToString::to_string))
+        .unwrap_or_default();
+
+    // Match Proton Bridge hostURL selection on macOS:
+    // - in-app updates: ProtonMailBridge-V3Service
+    // - standard launch: Proton Mail Bridge-V3
+    let preferred = if executable_path.contains("ProtonMail Bridge") {
+        format!("ProtonMail{title_name}Service")
+    } else {
+        format!("Proton Mail {title_name}")
+    };
+    let alternate = if preferred.starts_with("ProtonMail") {
+        format!("Proton Mail {title_name}")
+    } else {
+        format!("ProtonMail{title_name}Service")
+    };
+
+    let mut services = vec![preferred];
+    if services[0] != alternate {
+        services.push(alternate);
+    }
+    services.push(default_non_macos_keychain_service());
+    services
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_services() -> Vec<String> {
+    vec![default_non_macos_keychain_service()]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeychainFailureKind {
@@ -507,7 +561,11 @@ where
 
 fn keyring_backend_available() -> bool {
     let probe_account = format!("{}-probe-{}", KEYCHAIN_SECRET, rand::random::<u64>());
-    let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, &probe_account) {
+    let probe_service = keychain_services()
+        .into_iter()
+        .next()
+        .unwrap_or_else(default_non_macos_keychain_service);
+    let entry = match keyring::Entry::new(&probe_service, &probe_account) {
         Ok(entry) => entry,
         Err(err) => {
             record_keychain_failure("probe", false, false, &err);
@@ -738,30 +796,57 @@ fn resolve_keychain_key(
 /// Try to read the vault key from the OS keychain.
 /// Returns Ok(Some(key)) if found, Ok(None) if not found, Err on failure.
 fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_SECRET)?;
-    match entry.get_password() {
-        Ok(encoded) => {
-            let decoded = BASE64
-                .decode(&encoded)
-                .map_err(|e| keyring::Error::Invalid(e.to_string(), encoded.clone()))?;
-            if decoded.len() != KEY_LEN {
-                return Err(keyring::Error::Invalid(
-                    "wrong key length".to_string(),
-                    encoded,
-                ));
+    let mut first_non_missing_error: Option<keyring::Error> = None;
+
+    for service in keychain_services() {
+        let entry = match keyring::Entry::new(&service, KEYCHAIN_SECRET) {
+            Ok(entry) => entry,
+            Err(err) => {
+                if first_non_missing_error.is_none() {
+                    first_non_missing_error = Some(err);
+                }
+                continue;
             }
-            let mut key = [0u8; KEY_LEN];
-            key.copy_from_slice(&decoded);
-            Ok(Some(key))
+        };
+
+        match entry.get_password() {
+            Ok(encoded) => {
+                let decoded = BASE64
+                    .decode(&encoded)
+                    .map_err(|e| keyring::Error::Invalid(e.to_string(), encoded.clone()))?;
+                if decoded.len() != KEY_LEN {
+                    return Err(keyring::Error::Invalid(
+                        "wrong key length".to_string(),
+                        encoded,
+                    ));
+                }
+                let mut key = [0u8; KEY_LEN];
+                key.copy_from_slice(&decoded);
+                return Ok(Some(key));
+            }
+            Err(keyring::Error::NoEntry) => {}
+            Err(err) => {
+                if first_non_missing_error.is_none() {
+                    first_non_missing_error = Some(err);
+                }
+            }
         }
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e),
+    }
+
+    if let Some(err) = first_non_missing_error {
+        Err(err)
+    } else {
+        Ok(None)
     }
 }
 
 /// Try to store the vault key in the OS keychain (base64-encoded, like Go bridge).
 fn try_keychain_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Error> {
-    let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_SECRET)?;
+    let service = keychain_services()
+        .into_iter()
+        .next()
+        .unwrap_or_else(default_non_macos_keychain_service);
+    let entry = keyring::Entry::new(&service, KEYCHAIN_SECRET)?;
     let encoded = BASE64.encode(key);
     entry.set_password(&encoded)
 }
@@ -1060,9 +1145,11 @@ pub fn remove_session(dir: &Path) -> Result<()> {
     if default_email_file.exists() {
         std::fs::remove_file(&default_email_file)?;
     }
-    // Also try to remove keychain entry (best-effort)
-    if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_SECRET) {
-        let _ = entry.delete_credential();
+    // Also try to remove keychain entry (best-effort) from all known service names.
+    for service in keychain_services() {
+        if let Ok(entry) = keyring::Entry::new(&service, KEYCHAIN_SECRET) {
+            let _ = entry.delete_credential();
+        }
     }
     Ok(())
 }

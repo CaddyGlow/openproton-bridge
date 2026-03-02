@@ -2280,6 +2280,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stop_event_stream_closes_stream_and_late_sync_events_are_not_delivered() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut stream = <BridgeService as pb::bridge_server::Bridge>::run_event_stream(
+            &service,
+            Request::new(pb::EventStreamRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        service.emit_sync_started("uid-1");
+        service.emit_sync_progress("uid-1", 0.5, 50, 50);
+
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected first stream event: {other:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+                assert!((event.progress - 0.5).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected second stream event: {other:?}"),
+        }
+
+        <BridgeService as pb::bridge_server::Bridge>::stop_event_stream(&service, Request::new(()))
+            .await
+            .unwrap();
+
+        let closed = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap();
+        assert!(
+            closed.is_none(),
+            "stream should terminate after stop_event_stream"
+        );
+
+        service.emit_sync_finished("uid-1");
+
+        let still_closed = tokio::time::timeout(Duration::from_millis(200), stream.next())
+            .await
+            .unwrap();
+        assert!(
+            still_closed.is_none(),
+            "late sync events should not be delivered after stream termination"
+        );
+    }
+
+    #[tokio::test]
     async fn set_disk_cache_path_moves_payload_and_updates_effective_path() {
         let root = tempfile::tempdir().unwrap();
         let runtime_paths = RuntimePaths::from_bases(

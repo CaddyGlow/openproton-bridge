@@ -19,6 +19,7 @@ mod crypto;
 mod frontend;
 mod imap;
 mod paths;
+mod single_instance;
 mod smtp;
 mod vault;
 
@@ -143,6 +144,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let runtime_paths = runtime_paths(cli.vault_dir.as_deref())?;
     let dir = runtime_paths.settings_dir().to_path_buf();
+    let _instance_lock = match &cli.command {
+        Command::Serve { .. } | Command::Grpc { .. } => {
+            let lock = single_instance::acquire_bridge_instance_lock(&runtime_paths)?;
+            tracing::info!(path = %lock.path().display(), "acquired bridge instance lock");
+            Some(lock)
+        }
+        _ => None,
+    };
 
     match cli.command {
         Command::Login { username } => cmd_login(username, &dir).await,

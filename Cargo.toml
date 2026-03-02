@@ -41,6 +41,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 
 # Config + filesystem
 dirs = "5"
+fs2 = "0.4"
 
 # Go-compatible vault (MessagePack + OS keychain)
 rmp-serde = "1"

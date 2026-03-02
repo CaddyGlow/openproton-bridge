@@ -6,12 +6,12 @@ use super::types::EventsResponse;
 
 /// Fetch incremental user events from Proton.
 ///
-/// If `last_event_id` is empty, Proton returns a baseline cursor.
+/// If `last_event_id` is empty, Proton returns a baseline cursor from `/latest`.
 pub async fn get_events(client: &ProtonClient, last_event_id: &str) -> Result<EventsResponse> {
     info!(last_event_id = %last_event_id, "fetching events");
 
     let path = if last_event_id.trim().is_empty() {
-        "/core/v4/events".to_string()
+        "/core/v4/events/latest".to_string()
     } else {
         format!("/core/v4/events/{}", last_event_id)
     };
@@ -61,7 +61,7 @@ mod tests {
         let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
 
         Mock::given(method("GET"))
-            .and(path("/core/v4/events"))
+            .and(path("/core/v4/events/latest"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "EventID": "event-1",

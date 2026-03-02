@@ -240,14 +240,24 @@ impl EventWorkerGroup {
 
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
-        for mut handle in self.handles {
-            tokio::select! {
-                _ = &mut handle => {}
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    handle.abort();
-                    let _ = handle.await;
-                }
+        let shutdown_deadline = Instant::now() + Duration::from_secs(2);
+        let handles = self.handles;
+
+        while Instant::now() < shutdown_deadline {
+            if handles.iter().all(|handle| handle.is_finished()) {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for handle in &handles {
+            if !handle.is_finished() {
+                handle.abort();
+            }
+        }
+
+        for handle in handles {
+            let _ = handle.await;
         }
     }
 }
@@ -2027,7 +2037,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/core/v4/events"))
+            .and(path("/core/v4/events/latest"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "EventID": "event-2",
@@ -2428,7 +2438,7 @@ mod tests {
     async fn worker_group_isolates_unavailable_account_from_healthy_account() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/core/v4/events"))
+            .and(path("/core/v4/events/latest"))
             .and(header("x-pm-uid", "uid-2"))
             .and(header("Authorization", "Bearer access-uid-2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2526,7 +2536,7 @@ mod tests {
     async fn worker_group_sync_progress_callback_is_propagated() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/core/v4/events"))
+            .and(path("/core/v4/events/latest"))
             .and(header("x-pm-uid", "uid-1"))
             .and(header("Authorization", "Bearer access-uid-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2654,7 +2664,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/core/v4/events"))
+            .and(path("/core/v4/events/latest"))
             .and(header("x-pm-uid", "uid-1"))
             .and(header("Authorization", "Bearer access-uid-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2789,7 +2799,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/core/v4/events"))
+            .and(path("/core/v4/events/latest"))
             .and(header("x-pm-uid", "uid-1"))
             .and(header("Authorization", "Bearer access-uid-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

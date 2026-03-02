@@ -2572,6 +2572,109 @@ mod tests {
         assert_eq!(checkpoint_after_restart.last_event_id, "event-2");
     }
 
+    #[tokio::test]
+    async fn vault_checkpoint_restart_recovers_from_stale_cursor() {
+        let tmp = tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/stale-event"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 2011,
+                "Error": "Invalid event ID"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-stale-recovery-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered from stale cursor",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-2",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let checkpoint_store = VaultCheckpointStore::new(tmp.path().to_path_buf());
+        checkpoint_store
+            .save_checkpoint(
+                &AccountId("uid-1".to_string()),
+                &EventCheckpoint {
+                    last_event_id: "stale-event".to_string(),
+                    last_event_ts: Some(unix_now()),
+                    sync_state: Some("ok".to_string()),
+                },
+            )
+            .unwrap();
+
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session.clone()]));
+        let auth_router = AuthRouter::new(AccountRegistry::from_single_session(session));
+        let store = InMemoryStore::new();
+        let checkpoints: SharedCheckpointStore =
+            Arc::new(VaultCheckpointStore::new(tmp.path().to_path_buf()));
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store,
+            checkpoints.clone(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_event_worker_with_shutdown(
+            config,
+            Duration::from_secs(3600),
+            shutdown_rx,
+        ));
+        let checkpoint_after_recovery = wait_for_checkpoint_event_id(
+            checkpoints.as_ref(),
+            &AccountId("uid-1".to_string()),
+            "event-2",
+            Duration::from_secs(6),
+        )
+        .await
+        .expect("stale cursor recovery should converge to fresh event id");
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+
+        assert_eq!(checkpoint_after_recovery.last_event_id, "event-2");
+        assert_eq!(
+            checkpoint_after_recovery.sync_state.as_deref(),
+            Some("cursor_reset_resync")
+        );
+    }
+
     async fn wait_for_checkpoint(
         checkpoints: &dyn EventCheckpointStore<Error = ()>,
         account_id: &AccountId,

@@ -191,16 +191,27 @@ struct VaultFile {
 
 /// Inner decrypted data matching Go's vault.Data.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct VaultData {
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     settings: Settings,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     users: Vec<UserData>,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default
+    )]
     cookies: Vec<u8>,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     certs: VaultCerts,
     migrated: bool,
     /// UUID as 16 raw bytes (google/uuid.UUID uses BinaryMarshaler -> 16 bytes).
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default = "default_feature_flag_sticky_key"
+    )]
     feature_flag_sticky_key: Vec<u8>,
 }
 
@@ -217,28 +228,42 @@ impl Default for VaultData {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase", default)]
 struct UserData {
     #[serde(rename = "UserID")]
     user_id: String,
     username: String,
     primary_email: String,
 
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default
+    )]
     gluon_key: Vec<u8>,
     #[serde(rename = "GluonIDs")]
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     gluon_ids: HashMap<String, String>,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default
+    )]
     bridge_pass: Vec<u8>,
     address_mode: i32,
 
     #[serde(rename = "AuthUID")]
     auth_uid: String,
     auth_ref: String,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default
+    )]
     key_pass: Vec<u8>,
 
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     sync_status: SyncStatus,
     #[serde(rename = "EventID")]
     event_id: String,
@@ -248,24 +273,26 @@ struct UserData {
     sync_state: Option<String>,
 
     #[serde(rename = "UIDValidity")]
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     uid_validity: HashMap<String, u32>,
 
     should_resync: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct SyncStatus {
     has_labels: bool,
     has_messages: bool,
     #[serde(rename = "LastMessageID")]
     last_message_id: String,
     #[serde(rename = "FailedMessageIDs")]
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     failed_message_ids: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct Settings {
     gluon_dir: String,
 
@@ -294,8 +321,10 @@ struct Settings {
     max_sync_memory: u64,
 
     last_user_agent: String,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     last_heartbeat_sent: MsgpackTimestamp,
 
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     password_archive: PasswordArchive,
 
     sync_workers: i32,
@@ -331,26 +360,64 @@ impl Default for Settings {
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct PasswordArchive {
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     archive: HashMap<String, serde_bytes::ByteBuf>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct VaultCerts {
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     bridge: VaultCert,
     custom_cert_path: String,
     custom_key_path: String,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase", default)]
 struct VaultCert {
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default
+    )]
     cert: Vec<u8>,
-    #[serde(with = "serde_bytes")]
+    #[serde(
+        serialize_with = "serialize_bytes",
+        deserialize_with = "deserialize_nullable_bytes",
+        default
+    )]
     key: Vec<u8>,
+}
+
+fn serialize_bytes<S>(value: &Vec<u8>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_bytes(value)
+}
+
+fn deserialize_nullable_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_nullable_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<serde_bytes::ByteBuf>::deserialize(deserializer)?
+        .map(|bytes| bytes.into_vec())
+        .unwrap_or_default())
+}
+
+fn default_feature_flag_sticky_key() -> Vec<u8> {
+    vec![0u8; 16]
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +945,23 @@ pub fn save_split_mode_by_account_id(dir: &Path, account_id: &str, enabled: bool
 mod tests {
     use super::*;
 
+    const PROTON_GOLDEN_VAULT_ENC: &[u8] =
+        include_bytes!("../tests/fixtures/proton_profile_golden/vault.enc");
+    const PROTON_GOLDEN_VAULT_KEY: &[u8; KEY_LEN] =
+        include_bytes!("../tests/fixtures/proton_profile_golden/vault.key");
+    const PROTON_GOLDEN_DEFAULT_EMAIL: &str =
+        include_str!("../tests/fixtures/proton_profile_golden/default_email");
+
+    fn write_proton_golden_fixture(dir: &Path) {
+        std::fs::write(dir.join(VAULT_FILE), PROTON_GOLDEN_VAULT_ENC).unwrap();
+        std::fs::write(dir.join(KEY_FILE), PROTON_GOLDEN_VAULT_KEY).unwrap();
+        std::fs::write(
+            dir.join(DEFAULT_EMAIL_FILE),
+            PROTON_GOLDEN_DEFAULT_EMAIL.as_bytes(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [0x42u8; KEY_LEN];
@@ -1130,6 +1214,47 @@ mod tests {
             session.bridge_password,
             Some("fixture-bridge-password".to_string())
         );
+    }
+
+    #[test]
+    fn test_load_session_from_proton_profile_golden_fixture_uses_default_email() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_proton_golden_fixture(tmp.path());
+
+        let session = load_session(tmp.path()).unwrap();
+        assert_eq!(session.uid, "uid-beta");
+        assert_eq!(session.access_token, "");
+        assert_eq!(session.refresh_token, "refresh-beta");
+        assert_eq!(session.email, "beta@proton.me");
+        assert_eq!(session.display_name, "Beta Display");
+        assert_eq!(
+            session.key_passphrase,
+            Some(BASE64.encode(b"beta-key-pass"))
+        );
+        assert_eq!(
+            session.bridge_password,
+            Some("beta-bridge-pass".to_string())
+        );
+    }
+
+    #[test]
+    fn test_list_sessions_from_proton_profile_golden_fixture_loads_all_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_proton_golden_fixture(tmp.path());
+
+        let sessions = list_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert!(sessions
+            .iter()
+            .any(|session| session.email == "alpha@proton.me" && session.uid == "uid-alpha"));
+        assert!(sessions
+            .iter()
+            .any(|session| session.email == "beta@proton.me" && session.uid == "uid-beta"));
+
+        let alpha = load_session_by_email(tmp.path(), "alpha@proton.me").unwrap();
+        assert_eq!(alpha.refresh_token, "refresh-alpha");
+        assert_eq!(alpha.key_passphrase, Some(BASE64.encode(b"alpha-key-pass")));
+        assert_eq!(alpha.bridge_password, Some("alpha-bridge-pass".to_string()));
     }
 
     #[test]

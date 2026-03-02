@@ -64,7 +64,7 @@ Notes:
 | `SetMailServerSettings` | Exact | Validates, persists, and emits change/finish/error events. |
 | `Hostname` | Exact | Returns configured bind host. |
 | `IsPortFree` | Exact | Checks local bind availability. |
-| `AvailableKeychains` | Partial | Static keychain list (`keyring`, `file`). |
+| `AvailableKeychains` | Partial | Runtime-discovered keychain backends with deterministic ordering; still missing full helper/OS parity semantics. |
 | `SetCurrentKeychain` | Exact | Persists selected keychain setting. |
 | `CurrentKeychain` | Exact | Returns selected keychain setting. |
 | `GetUserList` | Exact | Lists persisted sessions as users. |
@@ -104,4 +104,4 @@ Notes:
 - Updater workflow RPCs (`CheckUpdate`, `InstallUpdate`) are placeholders.
 - Bug reporting and KB suggestions remain reduced stubs.
 - Apple Mail auto-configuration remains unimplemented (validation + safe SMTP SSL side effect wired).
-- Keychain discovery now reflects runtime-available backends, but full Proton-profile fixture interop coverage is still pending.
+- Keychain helper/OS integration semantics are still simplified compared to upstream Proton Bridge.

@@ -89,7 +89,7 @@ test.describe('bridge-ui parity runtime flows', () => {
 
     await expect(page.getByRole('button', { name: 'A alice@proton.me Ready' })).toBeVisible()
     await closeLoginWizardIfOpen(page)
-    await page.getByRole('button', { name: 'Configure Email Client' }).click()
+    await page.getByRole('button', { name: 'Configure email client', exact: true }).click()
 
     const clientConfigDialog = page.getByRole('dialog', { name: 'Client configuration wizard' })
     await expect(clientConfigDialog.getByTestId('client-config-selector')).toBeVisible()
@@ -124,16 +124,14 @@ test.describe('bridge-ui parity runtime flows', () => {
       message: 'Synchronization started',
       refresh_hints: ['sync_user:u1', 'sync_username:alice@proton.me'],
     })
-    const syncBanner = page.getByTestId('users-sync-progress')
-    await expect(syncBanner).toBeVisible()
-    await expect(syncBanner.getByText(/Synchronizing\s*\(0%\)/)).toBeVisible()
+    await expect(page.getByTestId('active-user-sync-status')).toHaveText('Synchronizing (0%)...')
 
     await emitBridgeUiEvent(page, {
       code: 'sync_finished',
       message: 'Synchronization complete',
       refresh_hints: ['sync_user:u1', 'sync_username:alice@proton.me'],
     })
-    await expect(page.getByText('Synchronizing (100%)')).toBeVisible()
+    await expect(page.getByTestId('active-user-sync-status')).toHaveText('Connected')
   })
 
   test('cache move status updates in settings after apply and disk-cache ui events', async ({ page }) => {

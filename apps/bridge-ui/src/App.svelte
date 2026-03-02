@@ -147,10 +147,6 @@
     return 'system'
   }
 
-  function formatLoginStep(step: string): string {
-    return step.replaceAll('_', ' ')
-  }
-
   function syncLoginStatusWithStep(step: string, force = false) {
     if (!force && step === lastLoginStepSeen) {
       return
@@ -1178,28 +1174,19 @@
           out:fade={{ duration: Math.max(sectionTransitionDuration - 40, 0) }}
         >
           {#if activeSection === 'accounts'}
-            <article class="card">
-              <h2>Account Access</h2>
-              <p class="muted">
-                Use the sign-in wizard for Proton authentication. Current login step:
-                <strong> {formatLoginStep(parityState.snapshot.login_step)}</strong>
-              </p>
-              <div class="row">
-                <button onclick={openLoginWizard}>Open Sign-In Wizard</button>
-                <button class="secondary" onclick={() => openClientConfigWizard()} disabled={users.length === 0}>
-                  Configure Email Client
-                </button>
-              </div>
-            </article>
-
             <UsersCard
               hostname={hostname}
               usersLoading={usersLoading}
               users={users}
+              activeUserId={clientConfigUserId}
               userParityById={userParityById}
               syncPhase={parityState.sync.phase}
               syncProgressPercent={parityState.sync.progress_percent}
-              syncMessage={parityState.sync.message}
+              imapPort={imapPort}
+              smtpPort={smtpPort}
+              useSslImap={useSslImap}
+              useSslSmtp={useSslSmtp}
+              clientPassword={resolveClientConfigPassword()}
               onConfigureClient={(userId) => openClientConfigWizard(userId)}
               onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
               onLogout={(userId) => logout(userId)}

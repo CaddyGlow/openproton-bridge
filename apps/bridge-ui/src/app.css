@@ -478,6 +478,194 @@ td {
   margin-top: 0;
 }
 
+.user-view-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.user-view-header {
+  padding: 16px;
+  border-bottom: 1px solid var(--table-sep);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.user-view-identity {
+  display: flex;
+  gap: 10px;
+  min-width: 0;
+}
+
+.user-view-identity-text {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.user-view-username {
+  margin: 0;
+  font-size: 2rem;
+  line-height: 1.1;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.user-view-sync-status {
+  margin: 0;
+  font-size: 0.96rem;
+  color: var(--text-muted);
+}
+
+.user-view-sync-track {
+  margin-top: 2px;
+  width: min(260px, 100%);
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--panel-border) 70%, transparent);
+  overflow: hidden;
+}
+
+.user-view-sync-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--brand), var(--brand-2));
+}
+
+.user-view-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-only {
+  width: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  font-size: 1rem;
+}
+
+.user-view-row {
+  padding: 16px;
+  border-bottom: 1px solid var(--table-sep);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.user-view-row .muted {
+  margin: 2px 0 0;
+}
+
+.user-view-row-title {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 650;
+}
+
+.switch {
+  width: 46px;
+  min-width: 46px;
+  min-height: 28px;
+  border-radius: 999px;
+  border: 1px solid var(--input-border);
+  background: var(--panel-muted);
+  padding: 2px;
+  display: inline-flex;
+  justify-content: flex-start;
+  align-items: center;
+}
+
+.switch.active {
+  background: color-mix(in oklab, var(--brand-soft) 70%, transparent);
+  border-color: color-mix(in oklab, var(--brand) 55%, var(--input-border));
+}
+
+.switch-knob {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: color-mix(in oklab, #fff 85%, var(--surface));
+  transition: transform 140ms ease;
+}
+
+.switch.active .switch-knob {
+  transform: translateX(18px);
+}
+
+.mailbox-section {
+  padding: 16px;
+  background: color-mix(in oklab, var(--surface) 52%, transparent);
+}
+
+.mailbox-section h3 {
+  margin: 0 0 12px;
+  font-size: 1.9rem;
+  line-height: 1.1;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.mailbox-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.mailbox-card {
+  background: color-mix(in oklab, var(--panel) 88%, #000 12%);
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  padding: 14px;
+}
+
+.mailbox-card h4 {
+  margin: 0 0 10px;
+  font-size: 1.6rem;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.mailbox-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--table-sep);
+}
+
+.mailbox-label {
+  margin: 0;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.mailbox-value {
+  margin: 2px 0 0;
+  font-size: 1.1rem;
+  line-height: 1.2;
+}
+
+.copy-btn {
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  border: 1px solid var(--input-border);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 8px;
+}
+
+.clipboard-notice {
+  margin: 10px 0 0;
+}
+
 .users-sync-banner {
   margin-top: 8px;
   border: 1px solid var(--panel-border);
@@ -658,6 +846,22 @@ li {
 
   .settings-title-row h1 {
     font-size: 2.2rem;
+  }
+
+  .user-view-username {
+    font-size: 1.5rem;
+  }
+
+  .mailbox-section h3 {
+    font-size: 1.4rem;
+  }
+
+  .mailbox-card h4 {
+    font-size: 1.2rem;
+  }
+
+  .mailbox-grid {
+    grid-template-columns: 1fr;
   }
 }
 

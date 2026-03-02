@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ const MAIL_SETTINGS_FILE: &str = "grpc_mail_settings.json";
 const APP_SETTINGS_FILE: &str = "grpc_app_settings.json";
 const SERVER_TOKEN_METADATA_KEY: &str = "server-token";
 const CAPTCHA_APPEAL_URL: &str = "https://proton.me/support/appeal-abuse";
+const MAX_BUFFERED_STREAM_EVENTS: usize = 256;
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -131,6 +133,7 @@ struct GrpcState {
     bind_host: String,
     active_disk_cache_path: Mutex<PathBuf>,
     event_tx: broadcast::Sender<pb::StreamEvent>,
+    event_backlog: std::sync::Mutex<VecDeque<pb::StreamEvent>>,
     active_stream_stop: Mutex<Option<watch::Sender<bool>>>,
     pending_login: Mutex<Option<PendingLogin>>,
     pending_hv: Mutex<Option<PendingHumanVerification>>,
@@ -166,10 +169,14 @@ impl BridgeService {
     }
 
     fn emit_event(&self, event: pb::stream_event::Event) {
-        let _ = self
-            .state
-            .event_tx
-            .send(pb::StreamEvent { event: Some(event) });
+        let stream_event = pb::StreamEvent { event: Some(event) };
+        if let Ok(mut backlog) = self.state.event_backlog.lock() {
+            backlog.push_back(stream_event.clone());
+            while backlog.len() > MAX_BUFFERED_STREAM_EVENTS {
+                let _ = backlog.pop_front();
+            }
+        }
+        let _ = self.state.event_tx.send(stream_event);
     }
 
     fn emit_login_error(&self, message: impl Into<String>) {
@@ -1296,11 +1303,27 @@ impl pb::bridge_server::Bridge for BridgeService {
         *active = Some(stop_tx);
         drop(active);
 
-        let mut rx = self.state.event_tx.subscribe();
+        let (mut rx, buffered_events) = {
+            let backlog = self
+                .state
+                .event_backlog
+                .lock()
+                .map_err(|_| Status::internal("event backlog lock poisoned"))?;
+            let buffered = backlog.iter().cloned().collect::<Vec<_>>();
+            let rx = self.state.event_tx.subscribe();
+            (rx, buffered)
+        };
         let (out_tx, out_rx) = mpsc::channel::<Result<pb::StreamEvent, Status>>(32);
         let state = self.state.clone();
 
         tokio::spawn(async move {
+            for buffered in buffered_events {
+                if out_tx.send(Ok(buffered)).await.is_err() {
+                    let mut active = state.active_stream_stop.lock().await;
+                    *active = None;
+                    return;
+                }
+            }
             loop {
                 tokio::select! {
                     _ = out_tx.closed() => {
@@ -1410,6 +1433,7 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         bind_host,
         active_disk_cache_path: Mutex::new(active_disk_cache_path),
         event_tx,
+        event_backlog: std::sync::Mutex::new(VecDeque::new()),
         active_stream_stop: Mutex::new(None),
         pending_login: Mutex::new(None),
         pending_hv: Mutex::new(None),
@@ -1889,6 +1913,8 @@ async fn ensure_mail_tls_certificate(vault_dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio_stream::StreamExt;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1903,6 +1929,7 @@ mod tests {
             bind_host: "127.0.0.1".to_string(),
             active_disk_cache_path: Mutex::new(active_disk_cache_path),
             event_tx,
+            event_backlog: std::sync::Mutex::new(VecDeque::new()),
             active_stream_stop: Mutex::new(None),
             pending_login: Mutex::new(None),
             pending_hv: Mutex::new(None),
@@ -2129,6 +2156,127 @@ mod tests {
             }
             other => panic!("unexpected third sync event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn run_event_stream_replays_buffered_sync_events_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        service.emit_sync_started("uid-1");
+        service.emit_sync_progress("uid-1", 0.42, 210, 290);
+        service.emit_sync_finished("uid-1");
+
+        let mut stream = <BridgeService as pb::bridge_server::Bridge>::run_event_stream(
+            &service,
+            Request::new(pb::EventStreamRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected first stream event: {other:?}"),
+        }
+
+        let second = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+                assert!((event.progress - 0.42).abs() < f64::EPSILON);
+                assert_eq!(event.elapsed_ms, 210);
+                assert_eq!(event.remaining_ms, 290);
+            }
+            other => panic!("unexpected second stream event: {other:?}"),
+        }
+
+        let third = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match third.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected third stream event: {other:?}"),
+        }
+
+        <BridgeService as pb::bridge_server::Bridge>::stop_event_stream(&service, Request::new(()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_event_stream_rejects_second_stream_but_first_receives_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let mut stream = <BridgeService as pb::bridge_server::Bridge>::run_event_stream(
+            &service,
+            Request::new(pb::EventStreamRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let second = <BridgeService as pb::bridge_server::Bridge>::run_event_stream(
+            &service,
+            Request::new(pb::EventStreamRequest::default()),
+        )
+        .await;
+        let status = match second {
+            Ok(_) => panic!("second stream should be rejected"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), tonic::Code::AlreadyExists);
+        assert!(status.message().contains("already streaming"));
+
+        service.emit_sync_started("uid-1");
+        let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected event for primary stream: {other:?}"),
+        }
+
+        <BridgeService as pb::bridge_server::Bridge>::stop_event_stream(&service, Request::new(()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_event_stream_without_active_stream_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::stop_event_stream(
+            &service,
+            Request::new(()),
+        )
+        .await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("not streaming"));
     }
 
     #[tokio::test]

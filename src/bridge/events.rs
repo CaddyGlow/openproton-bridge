@@ -534,6 +534,21 @@ fn parse_event_deltas(payload: &serde_json::Value) -> Vec<EventDelta> {
     out
 }
 
+fn is_invalid_event_cursor_error(error: &ApiError) -> bool {
+    let ApiError::Api { message, .. } = error else {
+        return false;
+    };
+
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("event")
+        && normalized.contains("id")
+        && (normalized.contains("invalid")
+            || normalized.contains("not found")
+            || normalized.contains("unknown")
+            || normalized.contains("gone")
+            || normalized.contains("expired"))
+}
+
 async fn build_client_with_retry(
     config: &EventWorkerConfig,
     session: &mut Session,
@@ -857,12 +872,32 @@ pub async fn poll_account_once(
             break;
         }
 
-        let response = fetch_events_with_retry(config, &mut session, &mut client, &cursor).await?;
+        let mut forced_sync_state: Option<&str> = None;
+        let response =
+            match fetch_events_with_retry(config, &mut session, &mut client, &cursor).await {
+                Ok(response) => response,
+                Err(EventWorkerError::Api(error))
+                    if !cursor.trim().is_empty() && is_invalid_event_cursor_error(&error) =>
+                {
+                    warn!(
+                        account_id = %config.account_id.0,
+                        account_email = %config.account_email,
+                        cursor = %cursor,
+                        error = %error,
+                        "detected stale event cursor; resetting to baseline after bounded resync"
+                    );
+                    bounded_resync_account(config, &mut session, &mut client).await?;
+                    forced_sync_state = Some("cursor_reset_resync");
+                    cursor.clear();
+                    fetch_events_with_retry(config, &mut session, &mut client, &cursor).await?
+                }
+                Err(error) => return Err(error),
+            };
 
         let mut address_changed = response.refresh != 0;
         let mut labels_changed = false;
         let mut resync_state: Option<&str> = None;
-        if response.refresh != 0 {
+        if response.refresh != 0 && forced_sync_state.is_none() {
             bounded_resync_account(config, &mut session, &mut client).await?;
             resync_state = Some("refresh_resync");
         }
@@ -904,7 +939,9 @@ pub async fn poll_account_once(
             let checkpoint = EventCheckpoint {
                 last_event_id: next_event_id.clone(),
                 last_event_ts: Some(unix_now()),
-                sync_state: Some(if let Some(state) = resync_state {
+                sync_state: Some(if let Some(state) = forced_sync_state {
+                    state.to_string()
+                } else if let Some(state) = resync_state {
                     state.to_string()
                 } else if response.refresh != 0 {
                     "refresh".to_string()
@@ -1448,6 +1485,30 @@ mod tests {
     }
 
     #[test]
+    fn invalid_event_cursor_error_detection_uses_message_shape() {
+        let invalid = ApiError::Api {
+            code: 9999,
+            message: "Invalid event ID".to_string(),
+            details: None,
+        };
+        assert!(is_invalid_event_cursor_error(&invalid));
+
+        let not_found = ApiError::Api {
+            code: 9999,
+            message: "Event ID not found".to_string(),
+            details: None,
+        };
+        assert!(is_invalid_event_cursor_error(&not_found));
+
+        let unrelated = ApiError::Api {
+            code: 8002,
+            message: "Invalid credentials".to_string(),
+            details: None,
+        };
+        assert!(!is_invalid_event_cursor_error(&unrelated));
+    }
+
+    #[test]
     fn file_checkpoint_store_roundtrip() {
         let tmp = tempdir().unwrap();
         let checkpoint_path = tmp.path().join("event_checkpoints.json");
@@ -1877,6 +1938,89 @@ mod tests {
         }
         let last_progress = progress_values.last().unwrap().0;
         assert_eq!(last_progress, 1.0);
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_invalid_cursor_resets_to_baseline_and_resyncs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/stale-event"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 2011,
+                "Error": "Invalid event ID"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-resync-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered from stale cursor",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-2",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "stale-event").await.unwrap();
+        assert_eq!(next, "event-2");
+        assert_eq!(
+            store.get_uid("uid-1::INBOX", "msg-resync-1").await.unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-2");
+        assert_eq!(
+            checkpoint.sync_state.as_deref(),
+            Some("cursor_reset_resync")
+        );
     }
 
     #[tokio::test]

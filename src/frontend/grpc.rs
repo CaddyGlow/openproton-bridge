@@ -1461,7 +1461,15 @@ If your client captures the `pm_captcha` token, send it as `humanVerificationTok
 }
 
 fn status_from_vault_error(err: vault::VaultError) -> Status {
-    Status::internal(format!("vault error: {err}"))
+    match err {
+        vault::VaultError::MissingVaultKey => Status::failed_precondition(
+            "vault key is missing for an existing vault; restore keychain entry or vault.key",
+        ),
+        vault::VaultError::KeychainAccess(message) => Status::failed_precondition(format!(
+            "keychain access failed while loading existing vault: {message}"
+        )),
+        other => Status::internal(format!("vault error: {other}")),
+    }
 }
 
 fn session_to_user(session: &Session, split_mode: bool) -> pb::User {
@@ -1736,6 +1744,17 @@ mod tests {
         assert!(status
             .message()
             .contains("https://verify.proton.me/?methods=captcha&token=token-123"));
+    }
+
+    #[test]
+    fn status_from_vault_error_maps_keychain_failures_to_failed_precondition() {
+        let missing_key_status = status_from_vault_error(vault::VaultError::MissingVaultKey);
+        assert_eq!(missing_key_status.code(), tonic::Code::FailedPrecondition);
+
+        let keychain_status =
+            status_from_vault_error(vault::VaultError::KeychainAccess("denied".to_string()));
+        assert_eq!(keychain_status.code(), tonic::Code::FailedPrecondition);
+        assert!(keychain_status.message().contains("denied"));
     }
 
     #[tokio::test]

@@ -44,6 +44,10 @@ pub enum VaultError {
     AccountNotFound(String),
     #[error("base64 decode error: {0}")]
     Base64(#[from] base64::DecodeError),
+    #[error("vault key is missing for existing vault")]
+    MissingVaultKey,
+    #[error("keychain access failed: {0}")]
+    KeychainAccess(String),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -398,11 +402,11 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
         return Ok(key);
     }
 
+    let vault_exists = dir.join(VAULT_FILE).exists();
+
     // 2. Try OS keychain (for Go bridge interop -- it stores key in keychain)
-    match try_keychain_get() {
-        Ok(Some(key)) => return Ok(key),
-        Ok(None) => {}
-        Err(e) => tracing::debug!(error = %e, "keychain read failed"),
+    if let Some(key) = resolve_keychain_key(try_keychain_get(), vault_exists)? {
+        return Ok(key);
     }
 
     // 3. Generate new key, store in file and try keychain
@@ -419,9 +423,41 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     }
 
     // Also store in keychain for Go bridge interop (best-effort)
-    let _ = try_keychain_set(&key);
+    if let Err(err) = try_keychain_set(&key) {
+        tracing::warn!(
+            error = %err,
+            "failed to store generated vault key in keychain; continuing with file-backed key"
+        );
+    }
 
     Ok(key)
+}
+
+fn resolve_keychain_key(
+    key_result: std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error>,
+    vault_exists: bool,
+) -> Result<Option<[u8; KEY_LEN]>> {
+    match key_result {
+        Ok(Some(key)) => Ok(Some(key)),
+        Ok(None) => {
+            if vault_exists {
+                Err(VaultError::MissingVaultKey)
+            } else {
+                Ok(None)
+            }
+        }
+        Err(err) => {
+            if vault_exists {
+                Err(VaultError::KeychainAccess(err.to_string()))
+            } else {
+                tracing::warn!(
+                    error = %err,
+                    "keychain read failed; continuing with file-backed key generation"
+                );
+                Ok(None)
+            }
+        }
+    }
 }
 
 /// Try to read the vault key from the OS keychain.
@@ -884,6 +920,35 @@ mod tests {
         let key2 = get_or_create_vault_key(tmp.path()).unwrap();
         assert_eq!(key1, key2);
         assert_ne!(key1, [0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn test_resolve_keychain_key_new_vault_no_key_is_allowed() {
+        let resolved = resolve_keychain_key(Ok(None), false).unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_resolve_keychain_key_existing_vault_no_key_is_error() {
+        let err = resolve_keychain_key(Ok(None), true).unwrap_err();
+        assert!(matches!(err, VaultError::MissingVaultKey));
+    }
+
+    #[test]
+    fn test_resolve_keychain_key_existing_vault_keychain_error_is_explicit() {
+        let err = resolve_keychain_key(
+            Err(keyring::Error::Invalid(
+                "decode".to_string(),
+                "bad-value".to_string(),
+            )),
+            true,
+        )
+        .unwrap_err();
+
+        match err {
+            VaultError::KeychainAccess(message) => assert!(message.contains("decode")),
+            _ => panic!("expected keychain access error"),
+        }
     }
 
     #[test]

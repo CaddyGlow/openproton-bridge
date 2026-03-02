@@ -64,12 +64,31 @@ fn default_pass_entry_name() -> String {
 
 #[cfg(target_os = "macos")]
 fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, keyring::Error> {
-    keyring::Entry::new_with_target("User", service, account)
+    keyring::Entry::new(service, account)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, keyring::Error> {
     keyring::Entry::new(service, account)
+}
+
+#[cfg(target_os = "macos")]
+fn keyring_entry_candidates(
+    service: &str,
+    account: &str,
+) -> Vec<(&'static str, std::result::Result<keyring::Entry, keyring::Error>)> {
+    vec![
+        ("default", keyring::Entry::new(service, account)),
+        ("user", keyring::Entry::new_with_target("User", service, account)),
+    ]
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keyring_entry_candidates(
+    service: &str,
+    account: &str,
+) -> Vec<(&'static str, std::result::Result<keyring::Entry, keyring::Error>)> {
+    vec![("default", keyring::Entry::new(service, account))]
 }
 
 #[cfg(target_os = "macos")]
@@ -885,27 +904,30 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
     let mut first_non_missing_error: Option<keyring::Error> = None;
 
     for service in keychain_services() {
-        tracing::debug!(
-            service = %service,
-            account = KEYCHAIN_SECRET,
-            "trying vault keychain service"
-        );
-        let entry = match new_keyring_entry(&service, KEYCHAIN_SECRET) {
-            Ok(entry) => entry,
-            Err(err) => {
-                if first_non_missing_error.is_none() {
-                    first_non_missing_error = Some(err);
-                }
-                continue;
-            }
-        };
+        for (target, entry_result) in keyring_entry_candidates(&service, KEYCHAIN_SECRET) {
+            tracing::debug!(
+                service = %service,
+                target,
+                account = KEYCHAIN_SECRET,
+                "trying vault keychain service"
+            );
 
-        match entry.get_password() {
-            Ok(encoded) => {
-                match decode_vault_key_string(encoded) {
+            let entry = match entry_result {
+                Ok(entry) => entry,
+                Err(err) => {
+                    if first_non_missing_error.is_none() {
+                        first_non_missing_error = Some(err);
+                    }
+                    continue;
+                }
+            };
+
+            match entry.get_password() {
+                Ok(encoded) => match decode_vault_key_string(encoded) {
                     Ok(key) => {
                         tracing::debug!(
                             service = %service,
+                            target,
                             "vault keychain service returned matching key"
                         );
                         return Ok(Some(key));
@@ -915,14 +937,18 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
                             first_non_missing_error = Some(err);
                         }
                     }
+                },
+                Err(keyring::Error::NoEntry) => {
+                    tracing::debug!(
+                        service = %service,
+                        target,
+                        "vault keychain service has no matching entry"
+                    );
                 }
-            }
-            Err(keyring::Error::NoEntry) => {
-                tracing::debug!(service = %service, "vault keychain service has no matching entry");
-            }
-            Err(err) => {
-                if first_non_missing_error.is_none() {
-                    first_non_missing_error = Some(err);
+                Err(err) => {
+                    if first_non_missing_error.is_none() {
+                        first_non_missing_error = Some(err);
+                    }
                 }
             }
         }
@@ -1000,9 +1026,42 @@ fn try_keychain_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Err
         .into_iter()
         .next()
         .unwrap_or_else(default_non_macos_keychain_service);
-    let entry = new_keyring_entry(&service, KEYCHAIN_SECRET)?;
     let encoded = BASE64.encode(key);
-    entry.set_password(&encoded)
+    let mut first_error: Option<keyring::Error> = None;
+
+    for (target, entry_result) in keyring_entry_candidates(&service, KEYCHAIN_SECRET) {
+        let entry = match entry_result {
+            Ok(entry) => entry,
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+                continue;
+            }
+        };
+
+        match entry.set_password(&encoded) {
+            Ok(()) => {
+                tracing::debug!(
+                    service = %service,
+                    target,
+                    "vault key written to keychain"
+                );
+                return Ok(());
+            }
+            Err(err) => {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+
+    Err(first_error.unwrap_or_else(|| {
+        keyring::Error::NoStorageAccess(Box::new(std::io::Error::other(
+            "no usable keychain target for vault key write",
+        )))
+    }))
 }
 
 #[cfg(target_os = "linux")]

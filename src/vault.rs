@@ -1113,6 +1113,7 @@ fn run_pass_command(
     ))))
 }
 
+#[cfg(target_os = "linux")]
 fn try_pass_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
     let entry = default_pass_entry_name();
     let output = match run_pass_command(&["show", entry.as_str()], None) {

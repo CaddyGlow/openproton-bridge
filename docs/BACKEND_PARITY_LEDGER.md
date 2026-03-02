@@ -42,7 +42,7 @@ Notes:
 | `SetColorSchemeName` | Exact | Validates and persists app setting. |
 | `ColorSchemeName` | Exact | Returns persisted app setting. |
 | `CurrentEmailClient` | Behavior Mismatch | Static `openproton-bridge` value. |
-| `ReportBug` | Partial | Accepts/logs metadata only; no upstream submission flow. |
+| `ReportBug` | Partial | Logs metadata and emits `reportBugSuccess` + `reportBugFinished`; no upstream submission flow. |
 | `ForceLauncher` | Exact | Persists launcher setting. |
 | `SetMainExecutable` | Exact | Persists executable setting. |
 | `RequestKnowledgeBaseSuggestions` | Partial | Logs request only; no KB backend. |
@@ -93,6 +93,8 @@ Notes:
 | `User.SyncFinishedEvent` | Exact | Emitted when resync lifecycle completes. |
 | `RunEventStream replay semantics` | Exact | Replays buffered pre-stream events in order. |
 | `RunEventStream stop semantics` | Exact | Stream terminates after `StopEventStream`; late events not delivered. |
+| `App.ReportBugSuccess` | Exact | Emitted on `ReportBug` request handling path. |
+| `App.ReportBugFinished` | Exact | Emitted after `App.ReportBugSuccess`. |
 
 ## Current Blockers Toward Full Exact Parity
 

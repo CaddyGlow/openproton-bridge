@@ -317,6 +317,22 @@ impl BridgeService {
         }));
     }
 
+    fn emit_report_bug_success(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::ReportBugSuccess(
+                pb::ReportBugSuccessEvent {},
+            )),
+        }));
+    }
+
+    fn emit_report_bug_finished(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::ReportBugFinished(
+                pb::ReportBugFinishedEvent {},
+            )),
+        }));
+    }
+
     fn emit_repair_started(&self) {
         self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
             event: Some(pb::app_event::Event::RepairStarted(
@@ -687,6 +703,8 @@ impl pb::bridge_server::Bridge for BridgeService {
             include_logs = req.include_logs,
             "bug report requested via grpc"
         );
+        self.emit_report_bug_success();
+        self.emit_report_bug_finished();
         Ok(Response::new(()))
     }
 
@@ -2155,6 +2173,44 @@ mod tests {
                 assert_eq!(event.user_id, "uid-1");
             }
             other => panic!("unexpected third sync event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_bug_emits_success_then_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        <BridgeService as pb::bridge_server::Bridge>::report_bug(
+            &service,
+            Request::new(pb::ReportBugRequest {
+                os_type: "linux".to_string(),
+                os_version: "6.1".to_string(),
+                title: "sample".to_string(),
+                description: "details".to_string(),
+                address: "alice@proton.me".to_string(),
+                email_client: "thunderbird".to_string(),
+                include_logs: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::ReportBugSuccess(_)),
+            })) => {}
+            other => panic!("unexpected first report bug event: {other:?}"),
+        }
+
+        let second = events.recv().await.unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::ReportBugFinished(_)),
+            })) => {}
+            other => panic!("unexpected second report bug event: {other:?}"),
         }
     }
 

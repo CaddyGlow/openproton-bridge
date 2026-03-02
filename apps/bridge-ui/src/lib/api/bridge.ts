@@ -39,6 +39,8 @@ export type AppSettings = {
   disk_cache_path: string
   is_doh_enabled: boolean
   color_scheme_name: string
+  current_keychain?: string
+  available_keychains?: string[]
 }
 
 export type BridgeUiEvent = {
@@ -47,6 +49,15 @@ export type BridgeUiEvent = {
   message: string
   refresh_hints: string[]
 }
+
+export type TrayAction =
+  | 'show_main'
+  | 'show_help'
+  | 'show_settings'
+  | {
+      type: 'select_user'
+      userId: string
+    }
 
 export async function getBridgeStatus(): Promise<BridgeSnapshot> {
   return invoke<BridgeSnapshot>('bridge_status')
@@ -64,12 +75,41 @@ export async function disconnectBridge(): Promise<BridgeSnapshot> {
   return invoke<BridgeSnapshot>('bridge_disconnect')
 }
 
+function hasTauriInvoke(): boolean {
+  if (typeof window === 'undefined') {
+    return false
+  }
+
+  type TauriInternalsWindow = Window & {
+    __TAURI_INTERNALS__?: {
+      invoke?: unknown
+    }
+  }
+
+  return typeof (window as TauriInternalsWindow).__TAURI_INTERNALS__?.invoke === 'function'
+}
+
+export async function quitBridge(): Promise<void> {
+  if (!hasTauriInvoke()) {
+    if (typeof window !== 'undefined') {
+      window.close()
+    }
+    return
+  }
+
+  return invoke<void>('bridge_quit')
+}
+
 export async function clearError(): Promise<BridgeSnapshot> {
   return invoke<BridgeSnapshot>('bridge_clear_error')
 }
 
 export async function fetchUsers(): Promise<UserSummary[]> {
   return invoke<UserSummary[]>('bridge_fetch_users')
+}
+
+export async function bridge_refresh_tray_users(users: UserSummary[]): Promise<void> {
+  return invoke<void>('bridge_refresh_tray_users', { users })
 }
 
 export async function login(
@@ -165,7 +205,12 @@ export async function exportTlsCertificates(outputDir: string): Promise<void> {
 }
 
 export async function getAppSettings(): Promise<AppSettings> {
-  return invoke<AppSettings>('bridge_get_app_settings')
+  const settings = await invoke<AppSettings>('bridge_get_app_settings')
+  return {
+    ...settings,
+    current_keychain: settings.current_keychain ?? '',
+    available_keychains: settings.available_keychains ?? [],
+  }
 }
 
 export async function setIsAutostartOn(enabled: boolean): Promise<void> {
@@ -196,6 +241,10 @@ export async function setColorSchemeName(name: string): Promise<void> {
   return invoke<void>('bridge_set_color_scheme_name', { name })
 }
 
+export async function setCurrentKeychain(name: string): Promise<void> {
+  return invoke<void>('bridge_set_current_keychain', { name })
+}
+
 export async function onBridgeStateChanged(handler: (snapshot: BridgeSnapshot) => void): Promise<UnlistenFn> {
   return listen<BridgeSnapshot>('bridge://state-changed', (event) => handler(event.payload))
 }
@@ -210,4 +259,24 @@ export async function onBridgeUiEvent(handler: (event: BridgeUiEvent) => void): 
 
 export async function onCaptchaToken(handler: (token: string) => void): Promise<UnlistenFn> {
   return listen<string>('bridge://captcha-token', (event) => handler(event.payload))
+}
+
+export async function onTrayAction(handler: (action: TrayAction) => void): Promise<UnlistenFn> {
+  return listen<string>('bridge://tray-action', (event) => {
+    if (event.payload === 'show_main' || event.payload === 'show_help' || event.payload === 'show_settings') {
+      handler(event.payload)
+      return
+    }
+
+    const selectUserPrefix = 'select_user:'
+    if (event.payload.startsWith(selectUserPrefix)) {
+      const userId = event.payload.slice(selectUserPrefix.length).trim()
+      if (userId.length > 0) {
+        handler({
+          type: 'select_user',
+          userId,
+        })
+      }
+    }
+  })
 }

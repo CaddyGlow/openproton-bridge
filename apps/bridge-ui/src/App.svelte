@@ -3,6 +3,7 @@
   import { fade, fly } from 'svelte/transition'
   import { connect, disconnect, resetError, updateConfigPath } from './lib/stores/bridge'
   import {
+    bridge_refresh_tray_users,
     onCaptchaToken,
     exportTlsCertificates,
     fetchUsers,
@@ -17,12 +18,15 @@
     login2fa,
     login2passwords,
     loginAbort,
+    quitBridge as requestBridgeQuit,
     openCaptchaWindow,
     closeCaptchaWindow,
+    onTrayAction,
     fidoAssertionAbort,
     logoutUser,
     removeUser,
     setColorSchemeName,
+    setCurrentKeychain,
     setDiskCachePath,
     setIsAllMailVisible,
     setIsAutostartOn,
@@ -32,6 +36,7 @@
     setUserSplitMode,
     setMailSettings,
     type AppSettings,
+    type TrayAction,
     type MailSettings,
     type UserSummary,
   } from './lib/api/bridge'
@@ -56,6 +61,8 @@
     disk_cache_path: '',
     is_doh_enabled: true,
     color_scheme_name: 'system',
+    current_keychain: '',
+    available_keychains: [],
   }
 
   const sections = [
@@ -67,7 +74,7 @@
 
   type SectionId = (typeof sections)[number]['id']
   type ThemeMode = 'system' | 'light' | 'dark'
-  type SettingsSectionId = 'preferences' | 'cache'
+  type SettingsSectionId = 'general' | 'advanced' | 'maintenance'
   type CacheMoveUiState = 'idle' | 'in_flight' | 'success' | 'failure'
   type UserParityHook = {
     syncProgress?: number | null
@@ -81,7 +88,9 @@
   let stopParityListeners = $state<(() => void) | undefined>(undefined)
   let stopParitySubscription = $state<(() => void) | undefined>(undefined)
   let stopCaptchaToken = $state<(() => void) | undefined>(undefined)
+  let stopTrayActions = $state<(() => void) | undefined>(undefined)
   let activeSection = $state<SectionId>('accounts')
+  let settingsOverflowOpen = $state(false)
   let loginWizardOpen = $state(false)
   let lastLoginStepSeen = $state('credentials')
   let systemPrefersDark = $state(false)
@@ -95,6 +104,7 @@
   let settingsStatus = $state('')
   let diskCachePathInput = $state('')
   let colorSchemeNameInput = $state('system')
+  let currentKeychainInput = $state('')
   let imapPort = $state('1143')
   let smtpPort = $state('1025')
   let useSslImap = $state(false)
@@ -114,8 +124,9 @@
   let tlsExportDir = $state('')
   let tlsStatus = $state('')
   let settingsExpandedSections = $state<Record<SettingsSectionId, boolean>>({
-    preferences: true,
-    cache: true,
+    general: true,
+    advanced: true,
+    maintenance: true,
   })
   let cacheMoveState = $state<CacheMoveUiState>('idle')
   let cacheMoveStatus = $state('')
@@ -196,6 +207,34 @@
     void persistThemeMode(nextMode)
   }
 
+  function avatarInitial(username: string): string {
+    const trimmed = username.trim()
+    if (trimmed.length === 0) {
+      return '?'
+    }
+    return trimmed.charAt(0).toUpperCase()
+  }
+
+  function accountSummaryStatus(user: UserSummary): string {
+    const parity = userParityById[user.id]
+    if (parity?.disconnected) {
+      return 'Disconnected'
+    }
+    if (typeof parity?.syncProgress === 'number' && parity.syncProgress >= 0 && parity.syncProgress < 100) {
+      return `Synchronizing (${parity.syncProgress}%)`
+    }
+    if (parity?.recovering) {
+      return 'Recovering session'
+    }
+    if (parity?.error) {
+      return 'Needs attention'
+    }
+    if (Number(user.state) !== 2) {
+      return 'Session paused'
+    }
+    return 'Ready'
+  }
+
   function openLoginWizard() {
     activeSection = 'accounts'
     loginWizardOpen = true
@@ -232,9 +271,28 @@
   let selectedClientConfigUser = $derived(users.find((user) => user.id === clientConfigUserId) ?? null)
   let userParityById = $derived(buildUserParityById(users, parityState, userRuntimeParityById, disconnectedUsernames))
   let toastLog = $derived(parityState.notifications.slice(0, 24).map((notification) => formatToast(notification)))
+  let activeAccountSummary = $derived(users.find((user) => user.id === clientConfigUserId) ?? users[0] ?? null)
 
   $effect(() => {
     syncLoginStatusWithStep(parityState.snapshot.login_step)
+  })
+
+  $effect(() => {
+    if (users.length === 0) {
+      if (clientConfigUserId !== '') {
+        clientConfigUserId = ''
+      }
+      return
+    }
+    if (!users.some((user) => user.id === clientConfigUserId)) {
+      clientConfigUserId = users[0].id
+    }
+  })
+
+  $effect(() => {
+    if (activeSection !== 'settings' && settingsOverflowOpen) {
+      settingsOverflowOpen = false
+    }
   })
 
   function extractHvUrl(text: string): string | null {
@@ -531,10 +589,39 @@
     }
   }
 
+  function handleTrayAction(action: TrayAction) {
+    if (typeof action === 'object' && action.type === 'select_user') {
+      activeSection = 'accounts'
+      const selectedUser = users.find((user) => user.id === action.userId)
+      if (selectedUser) {
+        clientConfigUserId = selectedUser.id
+      }
+      return
+    }
+
+    if (action === 'show_settings') {
+      activeSection = 'settings'
+      loginWizardOpen = false
+      clientConfigWizardOpen = false
+      return
+    }
+
+    if (action === 'show_help') {
+      activeSection = 'activity'
+      if (typeof window !== 'undefined') {
+        window.open('https://proton.me/support/proton-mail-bridge', '_blank', 'noopener,noreferrer')
+      }
+      return
+    }
+
+    activeSection = 'accounts'
+  }
+
   async function refreshUsersData() {
     hostname = await getHostname()
     const nextUsers = await fetchUsers()
     users = nextUsers
+    await bridge_refresh_tray_users(nextUsers)
     pruneUserRuntimeParity(nextUsers)
   }
 
@@ -550,6 +637,7 @@
     appSettings = await getAppSettings()
     diskCachePathInput = appSettings.disk_cache_path
     colorSchemeNameInput = appSettings.color_scheme_name
+    currentKeychainInput = appSettings.current_keychain ?? ''
   }
 
   async function refreshTlsSettings() {
@@ -815,6 +903,7 @@
       is_doh_enabled: appSettings.is_doh_enabled,
       disk_cache_path: diskCachePathInput,
       color_scheme_name: colorSchemeNameInput,
+      current_keychain: currentKeychainInput,
     })
     const previousDiskCachePath = appSettings.disk_cache_path
     const diskCachePathChanged = previousDiskCachePath !== diskCachePathInput
@@ -835,9 +924,13 @@
       await setIsDohEnabled(appSettings.is_doh_enabled)
       await setDiskCachePath(diskCachePathInput)
       await setColorSchemeName(colorSchemeNameInput)
+      if (currentKeychainInput.trim().length > 0) {
+        await setCurrentKeychain(currentKeychainInput)
+      }
 
       appSettings.disk_cache_path = diskCachePathInput
       appSettings.color_scheme_name = colorSchemeNameInput
+      appSettings.current_keychain = currentKeychainInput
       settingsStatus = 'saved (awaiting stream confirmation)'
       if (diskCachePathChanged) {
         cacheMoveStatus = 'Waiting for cache operation confirmation...'
@@ -849,6 +942,36 @@
         cacheMoveState = 'failure'
         cacheMoveStatus = String(error)
       }
+    }
+  }
+
+  function toggleSettingsOverflowMenu() {
+    settingsOverflowOpen = !settingsOverflowOpen
+  }
+
+  async function closeRuntimeWindow() {
+    settingsOverflowOpen = false
+    settingsStatus = 'Closing window...'
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window')
+      await getCurrentWindow().close()
+    } catch (error) {
+      logger.warn('app', 'close window fallback used', { error: String(error) })
+      if (typeof window !== 'undefined') {
+        window.close()
+      }
+      settingsStatus = 'Close window requested.'
+    }
+  }
+
+  async function quitBridge() {
+    settingsOverflowOpen = false
+    settingsStatus = 'Quitting Bridge...'
+    try {
+      await requestBridgeQuit()
+    } catch (error) {
+      logger.error('app', 'quit bridge failed', { error: String(error) })
+      settingsStatus = `quit failed: ${String(error)}`
     }
   }
 
@@ -885,6 +1008,9 @@
           token_len: token.length,
         })
       })
+      stopTrayActions = await onTrayAction((action) => {
+        handleTrayAction(action)
+      })
       configPathInput = parityStore.getState().snapshot.config_path ?? ''
       await refreshBridgeData()
       logger.info('app', 'mount completed')
@@ -902,6 +1028,7 @@
       stopParityListeners?.()
       stopParitySubscription?.()
       stopCaptchaToken?.()
+      stopTrayActions?.()
       void closeCaptchaVerificationWindow()
     }
   })
@@ -932,14 +1059,20 @@
 
   <section class="workspace">
     <aside class="left-rail">
-      <article class="card nav-card">
-        <h2>Navigation</h2>
-        <p class="muted">Switch between account, mail, settings, and live activity views.</p>
-        <div class="section-nav">
+      <article class="card account-summary-pane">
+        <div class="account-summary-header">
+          <h2>Accounts</h2>
+          <span class={`status-pill ${parityState.snapshot.connected ? 'good' : 'danger'}`}>
+            {parityState.snapshot.connected ? 'Connected' : 'Offline'}
+          </span>
+        </div>
+        <p class="muted">Runtime summary and quick navigation.</p>
+
+        <div class="summary-nav-chips">
           {#each sections as section}
             <button
               class:active={activeSection === section.id}
-              class="secondary nav-btn"
+              class="secondary summary-nav-chip"
               onclick={() => {
                 activeSection = section.id
               }}
@@ -947,6 +1080,40 @@
               {section.label}
             </button>
           {/each}
+        </div>
+
+        <div class="account-chip-list">
+          {#if users.length > 0}
+            {#each users as user}
+              <button
+                class={`account-pane-chip ${activeAccountSummary?.id === user.id ? 'active' : ''}`}
+                onclick={() => {
+                  activeSection = 'accounts'
+                  clientConfigUserId = user.id
+                }}
+              >
+                <span class="avatar">{avatarInitial(user.username)}</span>
+                <span class="account-chip-content">
+                  <span class="account-chip-name">{user.username}</span>
+                  <span class="account-chip-meta">{accountSummaryStatus(user)}</span>
+                </span>
+              </button>
+            {/each}
+          {:else}
+            <div class="account-pane-chip empty">
+              <span class="avatar">?</span>
+              <span class="account-chip-content">
+                <span class="account-chip-name">No account loaded</span>
+                <span class="account-chip-meta">Open sign-in to add an account</span>
+              </span>
+            </div>
+          {/if}
+        </div>
+
+        <div class="summary-metrics">
+          <span class="chip">Host: {hostname || '(not loaded)'}</span>
+          <span class="chip">Users: {users.length}</span>
+          <span class="chip">Theme: {resolveTheme(normalizeThemeMode(colorSchemeNameInput))}</span>
         </div>
       </article>
 
@@ -957,13 +1124,6 @@
         onConnect={connectAndLoad}
         onDisconnect={disconnect}
       />
-
-      <article class="card">
-        <h2>Host</h2>
-        <p class="muted"><strong>Hostname:</strong> {hostname || '(not loaded)'}</p>
-        <p class="muted"><strong>Users:</strong> {users.length}</p>
-        <p class="muted"><strong>Theme:</strong> {resolveTheme(normalizeThemeMode(colorSchemeNameInput))}</p>
-      </article>
     </aside>
 
     <section class="main-pane">
@@ -1011,10 +1171,38 @@
               onCheckPort={checkPort}
             />
           {:else if activeSection === 'settings'}
+            <article class="card settings-runtime-card">
+              <div class="settings-runtime-header">
+                <div>
+                  <h2>Runtime</h2>
+                  <p class="muted">Window/session controls for this bridge runtime.</p>
+                </div>
+                <div class="settings-runtime-menu">
+                  <button
+                    class="secondary settings-overflow-trigger"
+                    aria-label="Open runtime settings menu"
+                    aria-expanded={settingsOverflowOpen}
+                    onclick={toggleSettingsOverflowMenu}
+                  >
+                    •••
+                  </button>
+                  {#if settingsOverflowOpen}
+                    <div class="settings-overflow-menu" role="menu" data-testid="runtime-settings-overflow-menu">
+                      <button class="menu-item" role="menuitem" onclick={() => void closeRuntimeWindow()}>
+                        Close window
+                      </button>
+                      <button class="menu-item" role="menuitem" onclick={quitBridge}>Quit Bridge</button>
+                    </div>
+                  {/if}
+                </div>
+              </div>
+            </article>
+
             <GeneralSettingsCard
               bind:appSettings
               bind:diskCachePathInput
               bind:colorSchemeNameInput
+              bind:currentKeychainInput
               settingsStatus={settingsStatus}
               expandedSections={settingsExpandedSections}
               onToggleSection={toggleSettingsSection}

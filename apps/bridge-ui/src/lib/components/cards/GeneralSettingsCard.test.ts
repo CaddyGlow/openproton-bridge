@@ -10,6 +10,8 @@ const baseAppSettings = {
   disk_cache_path: '/tmp/cache',
   is_doh_enabled: true,
   color_scheme_name: 'system',
+  current_keychain: 'secret-service',
+  available_keychains: ['secret-service', 'pass'],
 }
 
 describe('GeneralSettingsCard', () => {
@@ -20,20 +22,33 @@ describe('GeneralSettingsCard', () => {
       props: {
         appSettings: { ...baseAppSettings },
         expandedSections: {
-          preferences: false,
-          cache: true,
+          general: false,
+          advanced: true,
+          maintenance: true,
         },
         onToggleSection,
       },
     })
 
-    const preferencesToggle = screen.getByRole('button', { name: 'Preferences' })
-    expect(preferencesToggle).toHaveAttribute('aria-expanded', 'false')
+    const generalToggle = screen.getByRole('button', { name: 'General' })
+    expect(generalToggle).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByLabelText('Autostart')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Disk Cache Path')).toBeInTheDocument()
 
-    await fireEvent.click(preferencesToggle)
-    expect(onToggleSection).toHaveBeenCalledWith('preferences', true)
+    await fireEvent.click(generalToggle)
+    expect(onToggleSection).toHaveBeenCalledWith('general', true)
+  })
+
+  it('renders explicit settings group labels', () => {
+    render(GeneralSettingsCard, {
+      props: {
+        appSettings: { ...baseAppSettings },
+      },
+    })
+
+    expect(screen.getByRole('button', { name: 'General' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Advanced' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Maintenance' })).toBeInTheDocument()
   })
 
   it('renders in-flight cache move state and disables apply action', () => {
@@ -68,5 +83,19 @@ describe('GeneralSettingsCard', () => {
 
     expect(screen.getByText('Cache move failed.')).toBeInTheDocument()
     expect(screen.getByText('Permission denied')).toBeInTheDocument()
+  })
+
+  it('renders keychain selector options from app settings', () => {
+    render(GeneralSettingsCard, {
+      props: {
+        appSettings: { ...baseAppSettings },
+        currentKeychainInput: 'secret-service',
+      },
+    })
+
+    const keychainSelect = screen.getByLabelText('Keychain')
+    expect(keychainSelect).toHaveValue('secret-service')
+    expect(screen.getByRole('option', { name: 'secret-service' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'pass' })).toBeInTheDocument()
   })
 })

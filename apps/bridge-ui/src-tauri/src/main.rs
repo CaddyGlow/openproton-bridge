@@ -271,6 +271,21 @@ async fn bridge_clear_error(
 }
 
 #[tauri::command]
+#[tracing::instrument(level = "debug", skip(app, adapter_state))]
+async fn bridge_quit(
+    app: AppHandle,
+    adapter_state: State<'_, AdapterState>,
+) -> Result<(), String> {
+    {
+        let mut adapter = adapter_state.adapter.lock().await;
+        adapter.disconnect().await;
+    }
+
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
 #[tracing::instrument(
     level = "debug",
     skip(log_state, context),
@@ -336,13 +351,28 @@ fn chrono_like_timestamp() -> String {
 }
 
 #[tauri::command]
-#[tracing::instrument(level = "debug", skip(state, adapter_state))]
+#[tracing::instrument(level = "debug", skip(app, state, adapter_state))]
 async fn bridge_fetch_users(
+    app: AppHandle,
     state: State<'_, AppState>,
     adapter_state: State<'_, AdapterState>,
 ) -> Result<Vec<UserSummary>, String> {
-    let adapter = adapter_state.adapter.lock().await;
-    adapter.fetch_users(state.inner()).await
+    let users = {
+        let adapter = adapter_state.adapter.lock().await;
+        adapter.fetch_users(state.inner()).await?
+    };
+
+    tray::refresh_tray_users(&app, &users)
+        .map_err(|err| format!("failed to refresh tray users: {err}"))?;
+
+    Ok(users)
+}
+
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip(app, users), fields(user_count = users.len()))]
+fn bridge_refresh_tray_users(app: AppHandle, users: Vec<UserSummary>) -> Result<(), String> {
+    tray::refresh_tray_users(&app, &users)
+        .map_err(|err| format!("failed to refresh tray users: {err}"))
 }
 
 #[tauri::command]
@@ -693,6 +723,17 @@ async fn bridge_set_color_scheme_name(
     adapter.set_color_scheme_name(state.inner(), &name).await
 }
 
+#[tauri::command]
+#[tracing::instrument(level = "debug", skip(state, adapter_state), fields(name = %name))]
+async fn bridge_set_current_keychain(
+    state: State<'_, AppState>,
+    adapter_state: State<'_, AdapterState>,
+    name: String,
+) -> Result<(), String> {
+    let adapter = adapter_state.adapter.lock().await;
+    adapter.set_current_keychain(state.inner(), &name).await
+}
+
 fn main() {
     let _log_guard = init_logging();
     let frontend_log_state = FrontendLogState::new();
@@ -728,8 +769,10 @@ fn main() {
             bridge_set_config_path,
             bridge_disconnect,
             bridge_clear_error,
+            bridge_quit,
             bridge_frontend_log,
             bridge_fetch_users,
+            bridge_refresh_tray_users,
             bridge_login,
             bridge_open_captcha_window,
             bridge_close_captcha_window,
@@ -756,7 +799,8 @@ fn main() {
             bridge_set_is_telemetry_disabled,
             bridge_set_disk_cache_path,
             bridge_set_is_doh_enabled,
-            bridge_set_color_scheme_name
+            bridge_set_color_scheme_name,
+            bridge_set_current_keychain
         ])
         .run(tauri::generate_context!())
         .expect("tauri runtime failed");

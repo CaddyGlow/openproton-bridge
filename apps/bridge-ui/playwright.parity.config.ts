@@ -15,7 +15,7 @@ const executablePath = resolveChromiumPath()
 
 export default defineConfig({
   testDir: './e2e',
-  testMatch: /parity\.spec\.ts/,
+  testMatch: /parity(\.runtime)?\.spec\.ts/,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,

@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { AppSettings } from '../../api/bridge'
 
-  type SettingsSectionId = 'preferences' | 'cache'
+  type SettingsSectionId = 'general' | 'advanced' | 'maintenance'
   type CacheMoveState = 'idle' | 'in_flight' | 'success' | 'failure'
 
   const defaultAppSettings: AppSettings = {
@@ -12,12 +12,15 @@
     disk_cache_path: '',
     is_doh_enabled: true,
     color_scheme_name: 'system',
+    current_keychain: '',
+    available_keychains: [],
   }
 
   let {
     appSettings = $bindable({ ...defaultAppSettings }),
     diskCachePathInput = $bindable(''),
     colorSchemeNameInput = $bindable('system'),
+    currentKeychainInput = $bindable(''),
     settingsStatus = '',
     expandedSections = {},
     cacheMoveState = 'idle',
@@ -28,6 +31,7 @@
     appSettings: AppSettings
     diskCachePathInput?: string
     colorSchemeNameInput?: string
+    currentKeychainInput?: string
     settingsStatus?: string
     expandedSections?: Partial<Record<SettingsSectionId, boolean>>
     cacheMoveState?: CacheMoveState
@@ -37,8 +41,9 @@
   } = $props()
 
   const defaultExpandedSections: Record<SettingsSectionId, boolean> = {
-    preferences: true,
-    cache: true,
+    general: true,
+    advanced: true,
+    maintenance: true,
   }
 
   function isSectionExpanded(section: SettingsSectionId): boolean {
@@ -84,35 +89,24 @@
       <button
         class="secondary"
         type="button"
-        aria-expanded={isSectionExpanded('preferences')}
-        aria-controls="general-settings-preferences"
-        onclick={() => toggleSection('preferences')}
+        aria-expanded={isSectionExpanded('general')}
+        aria-controls="general-settings-general"
+        onclick={() => toggleSection('general')}
       >
-        Preferences
+        General
       </button>
     </div>
-    {#if isSectionExpanded('preferences')}
-      <div id="general-settings-preferences">
+    {#if isSectionExpanded('general')}
+      <div id="general-settings-general">
+        <p class="muted">Core runtime behavior and appearance.</p>
         <div class="row wrap">
           <label class="checkbox">
             <input type="checkbox" bind:checked={appSettings.is_autostart_on} />
             Autostart
           </label>
           <label class="checkbox">
-            <input type="checkbox" bind:checked={appSettings.is_beta_enabled} />
-            Beta Channel
-          </label>
-          <label class="checkbox">
             <input type="checkbox" bind:checked={appSettings.is_all_mail_visible} />
             All Mail Visible
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" bind:checked={appSettings.is_telemetry_disabled} />
-            Telemetry Disabled
-          </label>
-          <label class="checkbox">
-            <input type="checkbox" bind:checked={appSettings.is_doh_enabled} />
-            DNS-over-HTTPS
           </label>
         </div>
         <div class="row wrap">
@@ -133,15 +127,62 @@
       <button
         class="secondary"
         type="button"
-        aria-expanded={isSectionExpanded('cache')}
-        aria-controls="general-settings-cache"
-        onclick={() => toggleSection('cache')}
+        aria-expanded={isSectionExpanded('advanced')}
+        aria-controls="general-settings-advanced"
+        onclick={() => toggleSection('advanced')}
       >
-        Cache
+        Advanced
       </button>
     </div>
-    {#if isSectionExpanded('cache')}
-      <div id="general-settings-cache">
+    {#if isSectionExpanded('advanced')}
+      <div id="general-settings-advanced">
+        <p class="muted">Compatibility and experimental runtime controls.</p>
+        <div class="row wrap">
+          <label class="checkbox">
+            <input type="checkbox" bind:checked={appSettings.is_beta_enabled} />
+            Beta Channel
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" bind:checked={appSettings.is_telemetry_disabled} />
+            Telemetry Disabled
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" bind:checked={appSettings.is_doh_enabled} />
+            DNS-over-HTTPS
+          </label>
+        </div>
+        <div class="row wrap">
+          <label>
+            Keychain
+            <select bind:value={currentKeychainInput}>
+              {#if (appSettings.available_keychains?.length ?? 0) === 0}
+                <option value="">(unavailable)</option>
+              {:else}
+                {#each appSettings.available_keychains ?? [] as keychain}
+                  <option value={keychain}>{keychain}</option>
+                {/each}
+              {/if}
+            </select>
+          </label>
+        </div>
+      </div>
+    {/if}
+  </section>
+  <section>
+    <div class="row">
+      <button
+        class="secondary"
+        type="button"
+        aria-expanded={isSectionExpanded('maintenance')}
+        aria-controls="general-settings-maintenance"
+        onclick={() => toggleSection('maintenance')}
+      >
+        Maintenance
+      </button>
+    </div>
+    {#if isSectionExpanded('maintenance')}
+      <div id="general-settings-maintenance">
+        <p class="muted">Cache storage and runtime housekeeping.</p>
         <div class="row wrap">
           <label class="grow">
             Disk Cache Path

@@ -128,27 +128,107 @@ body {
   font-weight: 600;
 }
 
-.nav-card h2 {
-  margin-bottom: 8px;
-}
-
-.section-nav {
+.account-summary-pane {
   display: grid;
+  gap: 10px;
+}
+
+.account-summary-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.account-summary-header h2 {
+  margin: 0;
+}
+
+.summary-nav-chips {
+  display: flex;
+  flex-wrap: wrap;
   gap: 6px;
-  margin-top: 8px;
 }
 
-.nav-btn {
-  width: 100%;
-  justify-content: flex-start;
-  text-align: left;
-  font-size: 0.84rem;
+.summary-nav-chip {
+  border-radius: 999px;
+  font-size: 0.78rem;
+  padding: 5px 10px;
 }
 
-.nav-btn.active {
+.summary-nav-chip.active {
   background: linear-gradient(120deg, var(--brand), var(--brand-2));
   border-color: var(--brand-2);
   color: #fff;
+}
+
+.account-chip-list {
+  display: grid;
+  gap: 8px;
+}
+
+.account-pane-chip {
+  border: 1px solid var(--panel-border);
+  border-radius: 12px;
+  background: color-mix(in oklab, var(--surface) 86%, transparent);
+  color: var(--text);
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px;
+}
+
+.account-pane-chip:hover {
+  background: color-mix(in oklab, var(--brand-soft) 36%, var(--surface));
+}
+
+.account-pane-chip.active {
+  border-color: color-mix(in oklab, var(--brand) 44%, var(--panel-border));
+  background: color-mix(in oklab, var(--brand-soft) 54%, var(--surface));
+}
+
+.account-pane-chip.empty {
+  cursor: default;
+}
+
+.app-shell .avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(130deg, var(--brand), var(--brand-2));
+  color: #fff;
+  font-size: 0.85rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.account-chip-content {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.account-chip-name {
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.account-chip-meta {
+  color: var(--text-muted);
+  font-size: 0.74rem;
+}
+
+.summary-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .card {
@@ -345,6 +425,64 @@ tbody tr:hover {
   flex-wrap: wrap;
 }
 
+.settings-runtime-card {
+  overflow: visible;
+}
+
+.settings-runtime-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.settings-runtime-header h2 {
+  margin-bottom: 4px;
+}
+
+.settings-runtime-menu {
+  position: relative;
+}
+
+.settings-overflow-trigger {
+  min-width: 44px;
+  font-size: 1rem;
+  line-height: 1;
+  padding: 6px 8px;
+}
+
+.settings-overflow-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  background: color-mix(in oklab, var(--surface) 88%, transparent);
+  box-shadow: 0 10px 24px color-mix(in oklab, var(--brand-soft) 35%, transparent);
+  padding: 6px;
+  display: grid;
+  gap: 4px;
+  min-width: 180px;
+  z-index: 20;
+}
+
+.menu-item {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  padding: 8px 9px;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  min-height: 0;
+}
+
+.menu-item:hover {
+  background: color-mix(in oklab, var(--brand-soft) 36%, transparent);
+  filter: none;
+  transform: none;
+}
+
 button {
   border: 1px solid var(--brand-2);
   background: var(--brand);
@@ -432,6 +570,14 @@ li {
 
   .flow-stepper {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .settings-runtime-header {
+    flex-direction: column;
+  }
+
+  .settings-runtime-menu {
+    align-self: flex-end;
   }
 }
 

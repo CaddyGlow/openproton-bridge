@@ -50,7 +50,7 @@ pub struct StreamTickEvent {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserSummary {
     pub id: String,
     pub username: String,
@@ -78,6 +78,8 @@ pub struct AppSettings {
     pub disk_cache_path: String,
     pub is_doh_enabled: bool,
     pub color_scheme_name: String,
+    pub current_keychain: String,
+    pub available_keychains: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,6 +576,20 @@ impl GrpcAdapter {
             .await
             .map_err(|err| format!("ColorSchemeName failed: {err}"))?
             .into_inner();
+        let current_keychain = match client.current_keychain(()).await {
+            Ok(response) => response.into_inner(),
+            Err(err) => {
+                debug!("CurrentKeychain failed, using fallback default: {err}");
+                String::new()
+            }
+        };
+        let available_keychains = match client.available_keychains(()).await {
+            Ok(response) => response.into_inner().keychains,
+            Err(err) => {
+                debug!("AvailableKeychains failed, using fallback defaults: {err}");
+                Vec::new()
+            }
+        };
 
         Ok(AppSettings {
             is_autostart_on,
@@ -583,6 +599,8 @@ impl GrpcAdapter {
             disk_cache_path,
             is_doh_enabled,
             color_scheme_name,
+            current_keychain,
+            available_keychains,
         })
     }
 
@@ -661,6 +679,16 @@ impl GrpcAdapter {
             .set_color_scheme_name(name.to_string())
             .await
             .map_err(|err| format!("SetColorSchemeName failed: {err}"))?;
+        Ok(())
+    }
+
+    pub async fn set_current_keychain(&self, state: &AppState, name: &str) -> Result<(), String> {
+        let config = self.resolve_server_config(state).await?;
+        let mut client = connect_client(&config).await?;
+        client
+            .set_current_keychain(name.to_string())
+            .await
+            .map_err(|err| format!("SetCurrentKeychain failed: {err}"))?;
         Ok(())
     }
 

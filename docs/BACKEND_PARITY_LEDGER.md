@@ -64,7 +64,7 @@ Notes:
 | `SetMailServerSettings` | Exact | Validates, persists, and emits change/finish/error events. |
 | `Hostname` | Exact | Returns configured bind host. |
 | `IsPortFree` | Exact | Checks local bind availability. |
-| `AvailableKeychains` | Partial | Runtime-discovered keychain backends with deterministic ordering; still missing full helper/OS parity semantics. |
+| `AvailableKeychains` | Partial | Runtime-discovered keychain backends with deterministic ordering and active keyring availability probe; still missing full helper/OS parity semantics. |
 | `SetCurrentKeychain` | Partial | Synchronizes vault key material to selected backend, persists setting, emits `changeKeychainFinished`; known unavailable backends return `FailedPrecondition` + `hasNoKeychain`. |
 | `CurrentKeychain` | Exact | Returns selected keychain setting. |
 | `GetUserList` | Exact | Lists persisted sessions as users. |

@@ -482,7 +482,7 @@ fn default_feature_flag_sticky_key() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 pub fn discover_available_keychains() -> Vec<String> {
-    discover_available_keychains_with_probe(keyring_credentials_available)
+    discover_available_keychains_with_probe(keyring_backend_available)
 }
 
 fn discover_available_keychains_with_probe<F>(mut keyring_probe: F) -> Vec<String>
@@ -497,8 +497,26 @@ where
     available
 }
 
-fn keyring_credentials_available() -> bool {
-    matches!(try_keychain_get(), Ok(Some(_)))
+fn keyring_backend_available() -> bool {
+    let probe_account = format!("{}-probe-{}", KEYCHAIN_SECRET, rand::random::<u64>());
+    let entry = match keyring::Entry::new(KEYCHAIN_SERVICE, &probe_account) {
+        Ok(entry) => entry,
+        Err(err) => {
+            record_keychain_failure("probe", false, false, &err);
+            return false;
+        }
+    };
+
+    match entry.set_password("probe") {
+        Ok(()) => {
+            let _ = entry.delete_credential();
+            true
+        }
+        Err(err) => {
+            record_keychain_failure("probe", false, false, &err);
+            false
+        }
+    }
 }
 
 /// Derive AES-256 key from the raw vault key using SHA-256 (matches Go bridge).

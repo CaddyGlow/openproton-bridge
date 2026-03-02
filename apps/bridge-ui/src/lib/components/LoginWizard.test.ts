@@ -81,33 +81,23 @@ describe('LoginWizard', () => {
     expect(onSubmitFidoAssertion).toHaveBeenCalledTimes(1)
   })
 
-  it('supports human verification continuation and close controls', async () => {
+  it('shows automatic human verification state without manual action buttons', async () => {
     const onSubmitCredentials = vi.fn()
-    const onRetryCaptcha = vi.fn()
-    const onOpenCaptchaWindow = vi.fn()
-    const onCloseCaptchaWindow = vi.fn()
 
     render(LoginWizard, {
       props: {
         open: true,
         loginStep: 'credentials',
         hvVerificationUrl: 'https://verify.proton.me/challenge/example',
-        hvCaptchaToken: 'pm-token',
         onSubmitCredentials,
-        onRetryCaptcha,
-        onOpenCaptchaWindow,
-        onCloseCaptchaWindow,
       },
     })
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Open Verification Window' }))
-    await fireEvent.click(screen.getByRole('button', { name: 'Close Verification Window' }))
-    await fireEvent.click(screen.getByRole('button', { name: 'Continue Sign-In' }))
     await fireEvent.keyDown(window, { key: 'Enter' })
 
-    expect(onOpenCaptchaWindow).toHaveBeenCalledTimes(1)
-    expect(onCloseCaptchaWindow).toHaveBeenCalledTimes(1)
-    expect(onRetryCaptcha).toHaveBeenCalledTimes(2)
+    expect(screen.queryByRole('button', { name: 'Open Verification Window' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Close Verification Window' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Continue Sign-In' })).not.toBeInTheDocument()
     expect(onSubmitCredentials).not.toHaveBeenCalled()
   })
 

@@ -478,6 +478,42 @@ td {
   margin-top: 0;
 }
 
+.users-sync-banner {
+  margin-top: 8px;
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px;
+  background: color-mix(in oklab, var(--surface) 78%, transparent);
+  display: grid;
+  gap: 8px;
+}
+
+.users-sync-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.users-sync-track {
+  height: 8px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--panel-border) 70%, transparent);
+  overflow: hidden;
+}
+
+.users-sync-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--brand), var(--brand-2));
+  transition: width 140ms ease;
+}
+
+.users-sync-message {
+  margin: 0;
+  font-size: 0.8rem;
+}
+
 tbody tr:hover {
   background: color-mix(in oklab, var(--brand-soft) 22%, transparent);
 }

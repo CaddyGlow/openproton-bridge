@@ -124,7 +124,9 @@ test.describe('bridge-ui parity runtime flows', () => {
       message: 'Synchronization started',
       refresh_hints: ['sync_user:u1', 'sync_username:alice@proton.me'],
     })
-    await expect(page.getByText('Recovering')).toBeVisible()
+    const syncBanner = page.getByTestId('users-sync-progress')
+    await expect(syncBanner).toBeVisible()
+    await expect(syncBanner.getByText(/Synchronizing\s*\(0%\)/)).toBeVisible()
 
     await emitBridgeUiEvent(page, {
       code: 'sync_finished',

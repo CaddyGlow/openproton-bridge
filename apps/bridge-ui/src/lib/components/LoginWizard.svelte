@@ -22,9 +22,6 @@
     hvVerificationUrl = '',
     hvCaptchaToken = $bindable(''),
     onSubmitCredentials = () => {},
-    onOpenCaptchaWindow = () => {},
-    onCloseCaptchaWindow = () => {},
-    onRetryCaptcha = () => {},
     onSubmitTwoFactor = () => {},
     onSubmitMailboxPassword = () => {},
     onSubmitFidoAssertion = () => {},
@@ -45,9 +42,6 @@
     hvVerificationUrl?: string
     hvCaptchaToken?: string
     onSubmitCredentials?: () => void
-    onOpenCaptchaWindow?: () => void
-    onCloseCaptchaWindow?: () => void
-    onRetryCaptcha?: () => void
     onSubmitTwoFactor?: () => void
     onSubmitMailboxPassword?: () => void
     onSubmitFidoAssertion?: () => void
@@ -59,8 +53,6 @@
   const statusIndicatesPending = $derived(loginStatusIndicatesPending(loginStatus))
   const isBusy = $derived(isBusyProp ?? statusIndicatesPending)
   const hasHumanVerification = $derived(Boolean(hvVerificationUrl))
-  const hasCaptchaToken = $derived(Boolean(hvCaptchaToken))
-  const canContinueHumanVerification = $derived(hasHumanVerification && hasCaptchaToken && !isBusy)
   const showFidoAbort = $derived(isFidoAbortAvailable(activeStep, loginStep))
   const showFidoInput = $derived(supportsFidoAlternative(loginStep, activeStep))
   const expectsFidoPin = $derived(activeStep === 'fido_pin')
@@ -72,11 +64,6 @@
 
     if (activeStep === 'credentials') {
       if (hasHumanVerification) {
-        if (hasCaptchaToken) {
-          onRetryCaptcha()
-          return
-        }
-        onOpenCaptchaWindow()
         return
       }
       onSubmitCredentials()
@@ -182,19 +169,8 @@
               {#if hasHumanVerification}
                 <div class="wizard-awaiting">
                   <p>Human verification required.</p>
-                  <p class="muted">Open the verification window, complete CAPTCHA, then continue sign-in.</p>
-                  <div class="wizard-actions">
-                    <button onclick={onOpenCaptchaWindow} disabled={isBusy}>Open Verification Window</button>
-                    <button class="secondary" onclick={onCloseCaptchaWindow} disabled={isBusy}>
-                      Close Verification Window
-                    </button>
-                    <button onclick={onRetryCaptcha} disabled={!canContinueHumanVerification}>Continue Sign-In</button>
-                  </div>
-                  {#if hasCaptchaToken}
-                    <p class="muted">Verification token received. Continue sign-in when ready.</p>
-                  {:else}
-                    <p class="muted">Waiting for verification to complete.</p>
-                  {/if}
+                  <p class="muted">A verification window opens automatically. Complete or close it to continue sign-in.</p>
+                  <p class="muted">Waiting for verification…</p>
                 </div>
               {/if}
             {/if}
@@ -364,13 +340,6 @@
   .wizard-awaiting p {
     margin: 0;
     font-size: 0.84rem;
-  }
-
-  .wizard-actions {
-    margin-top: 8px;
-    display: flex;
-    gap: 8px;
-    flex-wrap: wrap;
   }
 
   .wizard-success {

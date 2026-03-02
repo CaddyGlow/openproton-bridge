@@ -414,13 +414,20 @@ async fn bridge_open_captcha_window(app: AppHandle, url: String) -> Result<(), S
         let _ = existing.close();
     }
 
-    WebviewWindowBuilder::new(&app, CAPTCHA_WINDOW_LABEL, WebviewUrl::External(parsed))
+    let captcha_window = WebviewWindowBuilder::new(&app, CAPTCHA_WINDOW_LABEL, WebviewUrl::External(parsed))
         .title("Proton CAPTCHA Verification")
         .inner_size(520.0, 760.0)
         .resizable(true)
         .initialization_script(CAPTCHA_WINDOW_INIT_SCRIPT)
         .build()
         .map_err(|err| format!("failed to create captcha window: {err}"))?;
+
+    let app_handle = app.clone();
+    captcha_window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { .. } = event {
+            let _ = app_handle.emit("bridge://captcha-window-closed", ());
+        }
+    });
 
     Ok(())
 }

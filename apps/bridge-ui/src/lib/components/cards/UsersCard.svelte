@@ -19,6 +19,9 @@
     usersLoading = false,
     users = [],
     userParityById = {},
+    syncPhase = 'idle',
+    syncProgressPercent = null,
+    syncMessage = '',
     onConfigureClient = (_userId: string) => {},
     onToggleSplitMode = (_userId: string, _current: boolean) => {},
     onLogout = (_userId: string) => {},
@@ -28,6 +31,9 @@
     usersLoading?: boolean
     users?: UserSummary[]
     userParityById?: Record<string, UserParityHook>
+    syncPhase?: 'idle' | 'syncing' | 'complete' | 'error'
+    syncProgressPercent?: number | null
+    syncMessage?: string | null
     onConfigureClient?: (userId: string) => void
     onToggleSplitMode?: (userId: string, current: boolean) => void
     onLogout?: (userId: string) => void
@@ -86,6 +92,13 @@
         detail: hook.error,
       }
     }
+    if (typeof hook.syncProgress === 'number') {
+      const progress = normalizeSyncPercent(hook.syncProgress)
+      return {
+        label: `Synchronizing (${progress}%)`,
+        tone: 'good',
+      }
+    }
     if (hook.recovering) {
       return {
         label: 'Recovering',
@@ -98,20 +111,37 @@
         tone: 'muted',
       }
     }
-    if (typeof hook.syncProgress === 'number') {
-      const progress = normalizeSyncPercent(hook.syncProgress)
-      return {
-        label: `Synchronizing (${progress}%)`,
-        tone: 'good',
-      }
-    }
     return null
   }
+
+  const syncPercent = $derived(
+    typeof syncProgressPercent === 'number' ? normalizeSyncPercent(syncProgressPercent) : null,
+  )
+  const showSyncProgress = $derived(syncPhase === 'syncing')
+  const showSyncError = $derived(syncPhase === 'error' && Boolean(syncMessage))
 </script>
 
 <article class="card span-2">
   <h2>Users</h2>
   <p class="muted"><strong>Hostname:</strong> {hostname || '(not loaded)'}</p>
+  {#if showSyncProgress}
+    <div class="users-sync-banner" data-testid="users-sync-progress">
+      <div class="users-sync-header">
+        <span class="status-pill good">Synchronizing{#if syncPercent !== null} ({syncPercent}%){/if}</span>
+      </div>
+      <div class="users-sync-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={syncPercent ?? 0}>
+        <div class="users-sync-fill" style={`width: ${syncPercent ?? 0}%`}></div>
+      </div>
+      {#if syncMessage}
+        <p class="muted users-sync-message">{syncMessage}</p>
+      {/if}
+    </div>
+  {:else if showSyncError}
+    <div class="users-sync-banner" data-testid="users-sync-error">
+      <span class="status-pill danger">Sync issue</span>
+      <p class="muted users-sync-message">{syncMessage}</p>
+    </div>
+  {/if}
   {#if usersLoading}
     <p class="muted">Loading users...</p>
   {:else if users.length === 0}

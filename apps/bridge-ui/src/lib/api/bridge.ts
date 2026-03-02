@@ -261,6 +261,10 @@ export async function onCaptchaToken(handler: (token: string) => void): Promise<
   return listen<string>('bridge://captcha-token', (event) => handler(event.payload))
 }
 
+export async function onCaptchaWindowClosed(handler: () => void): Promise<UnlistenFn> {
+  return listen<null>('bridge://captcha-window-closed', () => handler())
+}
+
 export async function onTrayAction(handler: (action: TrayAction) => void): Promise<UnlistenFn> {
   return listen<string>('bridge://tray-action', (event) => {
     if (event.payload === 'show_main' || event.payload === 'show_help' || event.payload === 'show_settings') {

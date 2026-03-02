@@ -31,6 +31,24 @@ describe('UsersCard', () => {
     expect(screen.getByText('Synchronizing (42%)')).toBeInTheDocument()
   })
 
+  it('renders sync progress banner when syncing', () => {
+    render(UsersCard, {
+      props: {
+        hostname: 'bridge.local',
+        users,
+        syncPhase: 'syncing',
+        syncProgressPercent: 67,
+        syncMessage: 'Synchronizing mailbox',
+      },
+    })
+
+    const banner = screen.getByTestId('users-sync-progress')
+    expect(banner).toBeInTheDocument()
+    expect(screen.getByText(/Synchronizing\s*\(67%\)/)).toBeInTheDocument()
+    expect(screen.getByRole('progressbar')).toHaveAttribute('aria-valuenow', '67')
+    expect(screen.getByText('Synchronizing mailbox')).toBeInTheDocument()
+  })
+
   it('renders disconnected and recovering parity hook states', () => {
     const { rerender } = render(UsersCard, {
       props: {

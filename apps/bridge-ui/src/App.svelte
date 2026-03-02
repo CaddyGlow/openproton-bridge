@@ -5,6 +5,7 @@
   import {
     bridge_refresh_tray_users,
     onCaptchaToken,
+    onCaptchaWindowClosed,
     exportTlsCertificates,
     fetchUsers,
     getAppSettings,
@@ -85,6 +86,7 @@
   let stopParityListeners = $state<(() => void) | undefined>(undefined)
   let stopParitySubscription = $state<(() => void) | undefined>(undefined)
   let stopCaptchaToken = $state<(() => void) | undefined>(undefined)
+  let stopCaptchaWindowClosed = $state<(() => void) | undefined>(undefined)
   let stopTrayActions = $state<(() => void) | undefined>(undefined)
   let activeSection = $state<SectionId>('accounts')
   let settingsOverflowOpen = $state(false)
@@ -118,6 +120,8 @@
   let fidoAssertionPayload = $state('')
   let hvVerificationUrl = $state('')
   let hvCaptchaToken = $state('')
+  let captchaRetryInFlight = $state(false)
+  let captchaWindowOpenInFlight = $state(false)
   let loginStatus = $state('')
   let tlsInstalled = $state<boolean | null>(null)
   let tlsExportDir = $state('')
@@ -576,16 +580,21 @@
     if (!hvVerificationUrl) {
       return
     }
+    captchaWindowOpenInFlight = true
     try {
       logger.info('app', 'opening captcha verification window', { verification_url: hvVerificationUrl })
       await openCaptchaWindow(hvVerificationUrl)
-      loginStatus = 'Complete verification in the window, then click Continue.'
+      loginStatus = 'Complete CAPTCHA in the verification window. Sign-in continues automatically.'
     } catch (error) {
       logger.error('app', 'open captcha window failed', {
         error: String(error),
         verification_url: hvVerificationUrl,
       })
       loginStatus = 'Could not open verification window. Try again.'
+    } finally {
+      queueMicrotask(() => {
+        captchaWindowOpenInFlight = false
+      })
     }
   }
 
@@ -757,16 +766,21 @@
     }
   }
 
-  async function retryCaptchaLogin() {
-    logger.info('app', 'retry captcha login requested', {
-      username: loginUsername,
-      pm_captcha_token: hvCaptchaToken,
-      token_len: hvCaptchaToken.length,
-    })
-    if (!hvCaptchaToken) {
-      loginStatus = 'Complete verification first.'
+  async function retryCaptchaLogin(trigger: 'token' | 'window_closed' | 'manual' = 'manual') {
+    if (!hvVerificationUrl) {
       return
     }
+    if (captchaRetryInFlight) {
+      return
+    }
+    const captchaToken = hvCaptchaToken.trim()
+    logger.info('app', 'retry captcha login requested', {
+      trigger,
+      username: loginUsername,
+      has_token: captchaToken.length > 0,
+      token_len: captchaToken.length,
+    })
+    captchaRetryInFlight = true
     loginStatus = 'Continuing sign-in...'
     lastLoginStepSeen = ''
     try {
@@ -774,7 +788,7 @@
         logger.info('app', 'bridge stream not running, reconnecting before captcha retry')
         await connect()
       }
-      await login(loginUsername, loginPassword, true, hvCaptchaToken)
+      await login(loginUsername, loginPassword, true, captchaToken.length > 0 ? captchaToken : undefined)
       const step = parityStore.getState().snapshot.login_step
       syncLoginStatusWithStep(step, true)
       if (step === 'credentials' || step === 'idle') {
@@ -790,6 +804,8 @@
         await openCaptchaVerificationWindow()
       }
       loginStatus = userFacingLoginError(message)
+    } finally {
+      captchaRetryInFlight = false
     }
   }
 
@@ -1018,11 +1034,19 @@
       stopParityListeners = await parityStore.init()
       stopCaptchaToken = await onCaptchaToken((token) => {
         hvCaptchaToken = token
-        loginStatus = 'Verification complete. Click Continue.'
+        loginStatus = 'Verification complete. Continuing sign-in...'
         logger.info('app', 'captured pm_captcha token from verification window', {
           pm_captcha_token: token,
           token_len: token.length,
         })
+        void retryCaptchaLogin('token')
+      })
+      stopCaptchaWindowClosed = await onCaptchaWindowClosed(() => {
+        if (captchaWindowOpenInFlight || !hvVerificationUrl) {
+          return
+        }
+        logger.info('app', 'captcha window closed; retrying login continuation')
+        void retryCaptchaLogin('window_closed')
       })
       stopTrayActions = await onTrayAction((action) => {
         handleTrayAction(action)
@@ -1050,6 +1074,7 @@
       stopParityListeners?.()
       stopParitySubscription?.()
       stopCaptchaToken?.()
+      stopCaptchaWindowClosed?.()
       stopTrayActions?.()
       void closeCaptchaVerificationWindow()
     }
@@ -1172,6 +1197,9 @@
               usersLoading={usersLoading}
               users={users}
               userParityById={userParityById}
+              syncPhase={parityState.sync.phase}
+              syncProgressPercent={parityState.sync.progress_percent}
+              syncMessage={parityState.sync.message}
               onConfigureClient={(userId) => openClientConfigWizard(userId)}
               onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
               onLogout={(userId) => logout(userId)}
@@ -1239,9 +1267,6 @@
     bind:hvCaptchaToken
     loginStatus={loginStatus}
     onSubmitCredentials={submitCredentials}
-    onOpenCaptchaWindow={openCaptchaVerificationWindow}
-    onCloseCaptchaWindow={closeCaptchaVerificationWindow}
-    onRetryCaptcha={retryCaptchaLogin}
     onSubmitTwoFactor={submitTwoFactor}
     onSubmitMailboxPassword={submitMailboxPassword}
     onSubmitFidoAssertion={submitFidoAssertion}

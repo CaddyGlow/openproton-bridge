@@ -28,14 +28,35 @@ impl GrpcServerConfig {
 }
 
 pub fn resolve_server_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
+    let mut paths = resolve_server_config_paths(explicit)?;
+    Ok(paths.remove(0))
+}
+
+pub fn resolve_server_config_paths(explicit: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     if let Some(path) = explicit {
         return if path.exists() {
-            Ok(path.to_path_buf())
+            Ok(vec![path.to_path_buf()])
         } else {
             Err(format!("config path does not exist: {}", path.display()))
         };
     }
 
+    let candidates = default_server_config_candidates();
+    let mut existing = Vec::new();
+    for path in candidates {
+        if path.exists() && !existing.iter().any(|candidate| candidate == &path) {
+            existing.push(path);
+        }
+    }
+
+    if existing.is_empty() {
+        Err("could not resolve grpcServerConfig.json path".to_string())
+    } else {
+        Ok(existing)
+    }
+}
+
+fn default_server_config_candidates() -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(path) = std::env::var("OPENPROTON_BRIDGE_GRPC_CONFIG") {
@@ -43,25 +64,22 @@ pub fn resolve_server_config_path(explicit: Option<&Path>) -> Result<PathBuf, St
     }
 
     if let Some(config_home) = dirs::config_dir() {
-        candidates.push(
-            config_home
-                .join("openproton-bridge")
-                .join("grpcServerConfig.json"),
-        );
+        // Prefer the Proton Bridge runtime path to avoid stale legacy openproton config files.
         candidates.push(
             config_home
                 .join("protonmail")
                 .join("bridge-v3")
                 .join("grpcServerConfig.json"),
         );
+        candidates.push(
+            config_home
+                .join("openproton-bridge")
+                .join("grpcServerConfig.json"),
+        );
     }
 
     candidates.push(PathBuf::from("grpcServerConfig.json"));
-
     candidates
-        .into_iter()
-        .find(|path| path.exists())
-        .ok_or_else(|| "could not resolve grpcServerConfig.json path".to_string())
 }
 
 pub fn write_temp_client_token_file(token: &str) -> Result<PathBuf, String> {

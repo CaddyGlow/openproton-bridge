@@ -1,4 +1,7 @@
-use super::config::{resolve_server_config_path, write_temp_client_token_file, GrpcServerConfig};
+use super::config::{
+    resolve_server_config_path, resolve_server_config_paths, write_temp_client_token_file,
+    GrpcServerConfig,
+};
 use super::pb;
 use crate::state::AppState;
 use serde::{Deserialize, Serialize};
@@ -108,12 +111,48 @@ impl GrpcAdapter {
         }
 
         let explicit_path = state.snapshot().await.config_path;
-        let config_path = resolve_server_config_path(explicit_path.as_deref().map(Path::new))?;
-        let server_config = GrpcServerConfig::from_json_file(&config_path)?;
-        info!(config_path = %config_path.display(), "starting grpc bridge connection");
+        let candidate_paths = resolve_server_config_paths(explicit_path.as_deref().map(Path::new))?;
+        let mut attempt_errors = Vec::new();
+        let mut selected: Option<(std::path::PathBuf, GrpcServerConfig, BridgeClient)> = None;
 
-        let mut client = connect_client(&server_config).await?;
-        check_tokens(&mut client).await?;
+        for config_path in candidate_paths {
+            info!(config_path = %config_path.display(), "starting grpc bridge connection");
+            let server_config = match GrpcServerConfig::from_json_file(&config_path) {
+                Ok(server_config) => server_config,
+                Err(err) => {
+                    attempt_errors.push(err);
+                    continue;
+                }
+            };
+            let mut client = match connect_client(&server_config).await {
+                Ok(client) => client,
+                Err(err) => {
+                    attempt_errors.push(format!("{}: {err}", config_path.display()));
+                    continue;
+                }
+            };
+            if let Err(err) = check_tokens(&mut client).await {
+                attempt_errors.push(format!(
+                    "{}: token validation failed: {err}",
+                    config_path.display()
+                ));
+                continue;
+            }
+
+            selected = Some((config_path, server_config, client));
+            break;
+        }
+
+        let (config_path, server_config, mut client) = selected.ok_or_else(|| {
+            if attempt_errors.is_empty() {
+                "failed to connect grpc channel".to_string()
+            } else {
+                format!(
+                    "failed to connect grpc channel using any discovered config: {}",
+                    attempt_errors.join(" | ")
+                )
+            }
+        })?;
 
         let request = pb::EventStreamRequest {
             client_platform: client_platform_name(),

@@ -70,6 +70,15 @@ impl AccountRegistry {
     pub fn from_sessions(sessions: Vec<Session>) -> Self {
         let mut registry = Self::default();
         for session in sessions {
+            if !is_session_runtime_usable(&session) {
+                warn!(
+                    email = %session.email,
+                    uid = %session.uid,
+                    has_refresh_token = !session.refresh_token.trim().is_empty(),
+                    "skipping invalid account session while building account registry"
+                );
+                continue;
+            }
             registry.upsert_session(session);
         }
         registry
@@ -208,6 +217,10 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_ascii_lowercase()
 }
 
+fn is_session_runtime_usable(session: &Session) -> bool {
+    !session.uid.trim().is_empty() && !session.refresh_token.trim().is_empty()
+}
+
 impl RuntimeAccountRegistry {
     pub fn new(sessions: Vec<Session>, vault_dir: PathBuf) -> Self {
         Self::with_optional_vault_dir(sessions, Some(vault_dir))
@@ -221,6 +234,15 @@ impl RuntimeAccountRegistry {
         let mut map = HashMap::new();
         let mut health = HashMap::new();
         for session in sessions {
+            if !is_session_runtime_usable(&session) {
+                warn!(
+                    email = %session.email,
+                    uid = %session.uid,
+                    has_refresh_token = !session.refresh_token.trim().is_empty(),
+                    "skipping invalid account session while building runtime registry"
+                );
+                continue;
+            }
             let account_id = AccountId(session.uid.clone());
             map.insert(account_id.clone(), session);
             health.insert(account_id, AccountHealth::Healthy);

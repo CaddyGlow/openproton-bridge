@@ -4,19 +4,29 @@ use reqwest::Client;
 use super::error::{ApiError, Result};
 
 const BASE_URL: &str = "https://mail-api.proton.me";
+const DEFAULT_BRIDGE_APP_VERSION: &str = "3.22.0+git";
 
 fn bridge_app_version() -> String {
+    let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
+        .unwrap_or_else(|_| DEFAULT_BRIDGE_APP_VERSION.to_string());
     let os = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
         "windows" => "windows",
         _ => "linux",
     };
-    format!("{os}-bridge@{}", env!("CARGO_PKG_VERSION"))
+    format!("{os}-bridge@{bridge_version}")
 }
 
 fn bridge_user_agent() -> String {
-    format!("ProtonMailBridge/{}", env!("CARGO_PKG_VERSION"))
+    if let Ok(user_agent) = std::env::var("OPENPROTON_PM_USER_AGENT") {
+        if !user_agent.trim().is_empty() {
+            return user_agent;
+        }
+    }
+    let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
+        .unwrap_or_else(|_| DEFAULT_BRIDGE_APP_VERSION.to_string());
+    format!("ProtonMailBridge/{bridge_version}")
 }
 
 /// HTTP client preconfigured with Proton API headers.

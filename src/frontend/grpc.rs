@@ -21,6 +21,7 @@ use crate::api;
 use crate::api::client::ProtonClient;
 use crate::api::error::{any_human_verification_details, human_verification_details, ApiError};
 use crate::api::types::{HumanVerificationDetails, Session};
+use crate::bridge;
 use crate::paths::RuntimePaths;
 use crate::vault;
 
@@ -212,6 +213,39 @@ impl BridgeService {
             event: Some(pb::user_event::Event::UserChanged(pb::UserChangedEvent {
                 user_id: user_id.to_string(),
             })),
+        }));
+    }
+
+    fn emit_sync_started(&self, user_id: &str) {
+        self.emit_event(pb::stream_event::Event::User(pb::UserEvent {
+            event: Some(pb::user_event::Event::SyncStartedEvent(
+                pb::SyncStartedEvent {
+                    user_id: user_id.to_string(),
+                },
+            )),
+        }));
+    }
+
+    fn emit_sync_progress(&self, user_id: &str, progress: f64, elapsed_ms: i64, remaining_ms: i64) {
+        self.emit_event(pb::stream_event::Event::User(pb::UserEvent {
+            event: Some(pb::user_event::Event::SyncProgressEvent(
+                pb::SyncProgressEvent {
+                    user_id: user_id.to_string(),
+                    progress,
+                    elapsed_ms,
+                    remaining_ms,
+                },
+            )),
+        }));
+    }
+
+    fn emit_sync_finished(&self, user_id: &str) {
+        self.emit_event(pb::stream_event::Event::User(pb::UserEvent {
+            event: Some(pb::user_event::Event::SyncFinishedEvent(
+                pb::SyncFinishedEvent {
+                    user_id: user_id.to_string(),
+                },
+            )),
         }));
     }
 
@@ -1370,6 +1404,7 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, _) = broadcast::channel(128);
+    let active_disk_cache_path_for_sync = active_disk_cache_path.clone();
     let state = Arc::new(GrpcState {
         runtime_paths: runtime_paths.clone(),
         bind_host,
@@ -1384,6 +1419,13 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
     });
 
     let service = BridgeService::new(state);
+    let sync_event_service = service.clone();
+    let sync_event_workers = maybe_start_grpc_sync_workers(
+        &runtime_paths,
+        &sync_event_service,
+        &active_disk_cache_path_for_sync,
+    )
+    .await?;
     let expected_token = token;
     let bridge_svc =
         pb::bridge_server::BridgeServer::with_interceptor(service, move |req: Request<()>| {
@@ -1402,7 +1444,7 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
 
     info!(port, "grpc frontend service listening");
 
-    Server::builder()
+    let server_result = Server::builder()
         .tls_config(ServerTlsConfig::new().identity(tls_identity))
         .context("failed to configure gRPC TLS")?
         .add_service(bridge_svc)
@@ -1410,7 +1452,13 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
             wait_for_shutdown(shutdown_rx).await;
         })
         .await
-        .context("gRPC server exited with error")
+        .context("gRPC server exited with error");
+
+    if let Some(workers) = sync_event_workers {
+        workers.shutdown().await;
+    }
+
+    server_result
 }
 
 async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
@@ -1425,6 +1473,86 @@ async fn wait_for_shutdown(mut shutdown_rx: watch::Receiver<bool>) {
             return;
         }
     }
+}
+
+async fn maybe_start_grpc_sync_workers(
+    runtime_paths: &RuntimePaths,
+    service: &BridgeService,
+    active_disk_cache_path: &Path,
+) -> anyhow::Result<Option<bridge::events::EventWorkerGroup>> {
+    let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to load sessions for grpc sync workers; skipping startup"
+            );
+            return Ok(None);
+        }
+    };
+
+    if sessions.is_empty() {
+        return Ok(None);
+    }
+
+    let mut account_registry = bridge::accounts::AccountRegistry::from_sessions(sessions.clone());
+    for session in &sessions {
+        let account_id = bridge::types::AccountId(session.uid.clone());
+        if let Ok(split_mode) =
+            vault::load_split_mode_by_account_id(runtime_paths.settings_dir(), &session.uid)
+        {
+            let _ = account_registry.set_split_mode(&account_id, split_mode.unwrap_or(false));
+        }
+    }
+
+    let auth_router = bridge::auth_router::AuthRouter::new(account_registry);
+    let runtime_accounts = Arc::new(bridge::accounts::RuntimeAccountRegistry::new(
+        sessions,
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    let runtime_snapshot = runtime_accounts.snapshot().await;
+    if runtime_snapshot.is_empty() {
+        return Ok(None);
+    }
+
+    let store_root = active_disk_cache_path.join("imap-store");
+    let store: Arc<dyn crate::imap::store::MessageStore> =
+        crate::imap::store::PersistentStore::new(store_root)?;
+    let checkpoint_store: bridge::events::SharedCheckpointStore = Arc::new(
+        bridge::events::VaultCheckpointStore::new(runtime_paths.settings_dir().to_path_buf()),
+    );
+
+    let callback_service = service.clone();
+    let sync_progress_callback: bridge::events::SyncProgressCallback =
+        Arc::new(move |event| match event {
+            bridge::events::SyncProgressUpdate::Started { user_id } => {
+                callback_service.emit_sync_started(&user_id);
+            }
+            bridge::events::SyncProgressUpdate::Progress {
+                user_id,
+                progress,
+                elapsed_ms,
+                remaining_ms,
+            } => {
+                callback_service.emit_sync_progress(&user_id, progress, elapsed_ms, remaining_ms);
+            }
+            bridge::events::SyncProgressUpdate::Finished { user_id } => {
+                callback_service.emit_sync_finished(&user_id);
+            }
+        });
+
+    Ok(Some(
+        bridge::events::start_event_worker_group_with_sync_progress(
+            runtime_accounts,
+            runtime_snapshot,
+            "https://mail-api.proton.me".to_string(),
+            auth_router,
+            store,
+            checkpoint_store,
+            Some(sync_progress_callback),
+            std::time::Duration::from_secs(30),
+        ),
+    ))
 }
 
 fn status_from_api_error(err: ApiError) -> Status {
@@ -1957,6 +2085,50 @@ mod tests {
         assert_eq!(logs_path, expected_logs_dir);
         assert!(expected_logs_dir.exists());
         assert!(!settings_logs_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn sync_user_events_emit_expected_stream_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        service.emit_sync_started("uid-1");
+        service.emit_sync_progress("uid-1", 0.42, 210, 290);
+        service.emit_sync_finished("uid-1");
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+            }
+            other => panic!("unexpected first sync event: {other:?}"),
+        }
+
+        let second = events.recv().await.unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+                assert!((event.progress - 0.42).abs() < f64::EPSILON);
+                assert_eq!(event.elapsed_ms, 210);
+                assert_eq!(event.remaining_ms, 290);
+            }
+            other => panic!("unexpected second sync event: {other:?}"),
+        }
+
+        let third = events.recv().await.unwrap();
+        match third.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+            }
+            other => panic!("unexpected third sync event: {other:?}"),
+        }
     }
 
     #[tokio::test]

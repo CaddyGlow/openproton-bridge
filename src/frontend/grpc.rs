@@ -2158,10 +2158,29 @@ async fn ensure_mail_tls_certificate(vault_dir: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::path::Path;
     use std::time::Duration;
     use tokio_stream::StreamExt;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PROTON_FIXTURE_VAULT_ENC: &[u8] =
+        include_bytes!("../../tests/fixtures/proton_profile_golden/vault.enc");
+    const PROTON_FIXTURE_VAULT_KEY: &[u8] =
+        include_bytes!("../../tests/fixtures/proton_profile_golden/vault.key");
+    const PROTON_FIXTURE_DEFAULT_EMAIL: &str =
+        include_str!("../../tests/fixtures/proton_profile_golden/default_email");
+
+    fn write_proton_golden_fixture(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("vault.enc"), PROTON_FIXTURE_VAULT_ENC).unwrap();
+        std::fs::write(dir.join("vault.key"), PROTON_FIXTURE_VAULT_KEY).unwrap();
+        std::fs::write(
+            dir.join("default_email"),
+            PROTON_FIXTURE_DEFAULT_EMAIL.trim().as_bytes(),
+        )
+        .unwrap();
+    }
 
     fn build_test_service_with_paths(runtime_paths: RuntimePaths) -> BridgeService {
         let app_settings = StoredAppSettings::with_defaults_for(&runtime_paths.disk_cache_dir());
@@ -3410,5 +3429,233 @@ mod tests {
         assert_eq!(sessions[0].uid, "uid-1");
         assert_eq!(sessions[0].email, "alice@example.com");
         assert!(sessions[0].bridge_password.is_some());
+    }
+
+    #[tokio::test]
+    async fn parity_integration_proton_fixture_reuse_survives_service_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        write_proton_golden_fixture(dir.path());
+        let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
+
+        let service = build_test_service_with_paths(runtime_paths.clone());
+        let users_before = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(users_before.users.len(), 2);
+
+        let restarted_service = build_test_service_with_paths(runtime_paths);
+        let users_after = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
+            &restarted_service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(users_after.users.len(), 2);
+        assert!(users_after.users.iter().any(|user| user.id == "uid-alpha"));
+        assert!(users_after.users.iter().any(|user| user.id == "uid-beta"));
+    }
+
+    #[tokio::test]
+    async fn parity_integration_login_then_logout_updates_user_list_and_emits_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/auth/v4/2fa"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .and(body_partial_json(json!({
+                "FIDO2": {
+                    "CredentialID": [1, 2, 3]
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "Scopes": ["mail"]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/users"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "User": {
+                    "ID": "uid-1",
+                    "Name": "alice",
+                    "DisplayName": "Alice",
+                    "Email": "alice@example.com",
+                    "Keys": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/keys/salts"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "KeySalts": []
+            })))
+            .mount(&server)
+            .await;
+
+        let mut client = ProtonClient::with_base_url(&server.uri()).unwrap();
+        client.set_auth("uid-1", "access-1");
+        *service.state.pending_login.lock().await = Some(PendingLogin {
+            username: "alice@example.com".to_string(),
+            password: "mailbox-password".to_string(),
+            uid: "uid-1".to_string(),
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            client,
+            fido_authentication_options: Some(json!({
+                "publicKey": { "challenge": [1, 2, 3] }
+            })),
+        });
+
+        let payload = br#"{
+            "rawId":"AQID",
+            "response":{
+                "clientDataJSON":"BAUG",
+                "authenticatorData":"BwgJ",
+                "signature":"CgsM"
+            }
+        }"#;
+        call_login_fido(&service, "alice@example.com", payload)
+            .await
+            .unwrap();
+
+        let users = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(users.users.len(), 1);
+        assert_eq!(users.users[0].id, "uid-1");
+
+        let mut events = service.state.event_tx.subscribe();
+        <BridgeService as pb::bridge_server::Bridge>::logout_user(
+            &service,
+            Request::new("uid-1".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let users_after = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(users_after.users.is_empty());
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::UserDisconnected(disconnected)),
+            })) => {
+                assert_eq!(disconnected.username, "alice@example.com");
+            }
+            other => panic!("unexpected disconnect event payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_integration_disk_cache_move_persists_across_service_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
+        let source_cache_root = runtime_paths.disk_cache_dir();
+        tokio::fs::create_dir_all(source_cache_root.join("uid-1"))
+            .await
+            .unwrap();
+        tokio::fs::write(source_cache_root.join("uid-1/message.eml"), b"hello")
+            .await
+            .unwrap();
+
+        let service = build_test_service_with_paths(runtime_paths.clone());
+        let target_cache_root = dir.path().join("cache-moved");
+        <BridgeService as pb::bridge_server::Bridge>::set_disk_cache_path(
+            &service,
+            Request::new(target_cache_root.display().to_string()),
+        )
+        .await
+        .unwrap();
+
+        let restarted_service = build_test_service_with_paths(runtime_paths.clone());
+        let loaded_settings = load_app_settings(
+            &runtime_paths.settings_dir().join(APP_SETTINGS_FILE),
+            &runtime_paths.disk_cache_dir(),
+        )
+        .await
+        .unwrap();
+        {
+            let mut settings = restarted_service.state.app_settings.lock().await;
+            *settings = loaded_settings.clone();
+        }
+        *restarted_service.state.active_disk_cache_path.lock().await =
+            effective_disk_cache_path(&loaded_settings, &runtime_paths);
+
+        let effective = <BridgeService as pb::bridge_server::Bridge>::disk_cache_path(
+            &restarted_service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(effective, target_cache_root.display().to_string());
+        assert_eq!(
+            tokio::fs::read(target_cache_root.join("uid-1/message.eml"))
+                .await
+                .unwrap(),
+            b"hello"
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_integration_restart_and_quit_signal_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let restart_service = build_test_service(dir.path().to_path_buf());
+        let mut restart_shutdown = restart_service.state.shutdown_tx.subscribe();
+        let mut restart_events = restart_service.state.event_tx.subscribe();
+        assert!(!*restart_shutdown.borrow());
+
+        <BridgeService as pb::bridge_server::Bridge>::restart(&restart_service, Request::new(()))
+            .await
+            .unwrap();
+
+        restart_shutdown.changed().await.unwrap();
+        assert!(*restart_shutdown.borrow_and_update());
+        let event = restart_events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::ShowMainWindow(_)),
+            })) => {}
+            other => panic!("unexpected restart app event: {other:?}"),
+        }
+
+        let quit_service = build_test_service(dir.path().to_path_buf());
+        let mut quit_shutdown = quit_service.state.shutdown_tx.subscribe();
+        assert!(!*quit_shutdown.borrow());
+
+        <BridgeService as pb::bridge_server::Bridge>::quit(&quit_service, Request::new(()))
+            .await
+            .unwrap();
+
+        quit_shutdown.changed().await.unwrap();
+        assert!(*quit_shutdown.borrow_and_update());
     }
 }

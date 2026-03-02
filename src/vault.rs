@@ -4,8 +4,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::io::Write;
-#[cfg(target_os = "macos")]
-use std::process::Command;
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -920,11 +918,6 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
                 }
             }
             Err(keyring::Error::NoEntry) => {
-                #[cfg(target_os = "macos")]
-                match try_macos_security_cli_get_for_service(&service)? {
-                    Some(key) => return Ok(Some(key)),
-                    None => {}
-                }
                 tracing::debug!(service = %service, "vault keychain service has no matching entry");
             }
             Err(err) => {
@@ -955,48 +948,6 @@ fn decode_vault_key_string(encoded: String) -> std::result::Result<[u8; KEY_LEN]
     let mut key = [0u8; KEY_LEN];
     key.copy_from_slice(&decoded);
     Ok(key)
-}
-
-#[cfg(target_os = "macos")]
-fn try_macos_security_cli_get_for_service(
-    service: &str,
-) -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            service,
-            "-a",
-            KEYCHAIN_SECRET,
-            "-w",
-        ])
-        .output()
-        .map_err(|err| keyring::Error::NoStorageAccess(Box::new(err)))?;
-
-    if output.status.success() {
-        let encoded = String::from_utf8(output.stdout).map_err(|err| {
-            keyring::Error::Invalid("utf8 decode".to_string(), err.to_string())
-        })?;
-        let encoded = encoded.trim().to_string();
-        if encoded.is_empty() {
-            return Ok(None);
-        }
-        let key = decode_vault_key_string(encoded)?;
-        tracing::debug!(
-            service = %service,
-            backend = "security-cli",
-            "vault key found via macos security fallback"
-        );
-        return Ok(Some(key));
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if stderr.contains("could not be found") {
-        return Ok(None);
-    }
-    Err(keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
-        stderr,
-    ))))
 }
 
 fn try_any_secure_backend_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {

@@ -33,6 +33,11 @@ const SERVER_TOKEN_METADATA_KEY: &str = "server-token";
 const CAPTCHA_APPEAL_URL: &str = "https://proton.me/support/appeal-abuse";
 const MAX_BUFFERED_STREAM_EVENTS: usize = 256;
 const DEFAULT_EMAIL_CLIENT: &str = "NoClient/0.0.1";
+const KEYCHAIN_HELPER_MACOS: &str = "macos-keychain";
+const KEYCHAIN_HELPER_WINDOWS: &str = "windows-credentials";
+const KEYCHAIN_HELPER_SECRET_SERVICE_DBUS: &str = "secret-service-dbus";
+const KEYCHAIN_HELPER_SECRET_SERVICE: &str = "secret-service";
+const KEYCHAIN_HELPER_PASS_APP: &str = "pass-app";
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -153,6 +158,67 @@ struct BridgeService {
     state: Arc<GrpcState>,
 }
 
+fn os_keyring_helpers() -> &'static [&'static str] {
+    match std::env::consts::OS {
+        "macos" => &[KEYCHAIN_HELPER_MACOS],
+        "windows" => &[KEYCHAIN_HELPER_WINDOWS],
+        "linux" => &[
+            KEYCHAIN_HELPER_SECRET_SERVICE_DBUS,
+            KEYCHAIN_HELPER_SECRET_SERVICE,
+            KEYCHAIN_HELPER_PASS_APP,
+        ],
+        _ => &[vault::KEYCHAIN_BACKEND_KEYRING],
+    }
+}
+
+fn keychain_helper_to_backend(helper: &str) -> Option<&'static str> {
+    match helper.trim() {
+        vault::KEYCHAIN_BACKEND_FILE => Some(vault::KEYCHAIN_BACKEND_FILE),
+        vault::KEYCHAIN_BACKEND_KEYRING
+        | KEYCHAIN_HELPER_MACOS
+        | KEYCHAIN_HELPER_WINDOWS
+        | KEYCHAIN_HELPER_SECRET_SERVICE_DBUS
+        | KEYCHAIN_HELPER_SECRET_SERVICE
+        | KEYCHAIN_HELPER_PASS_APP => Some(vault::KEYCHAIN_BACKEND_KEYRING),
+        _ => None,
+    }
+}
+
+fn available_keychain_helpers_with_backends(available_backends: &[String]) -> Vec<String> {
+    let mut helpers = Vec::new();
+    let keyring_available = available_backends
+        .iter()
+        .any(|backend| backend == vault::KEYCHAIN_BACKEND_KEYRING);
+
+    if keyring_available {
+        for helper in os_keyring_helpers() {
+            if !helpers.iter().any(|candidate| candidate == helper) {
+                helpers.push((*helper).to_string());
+            }
+        }
+        if !helpers
+            .iter()
+            .any(|candidate| candidate == vault::KEYCHAIN_BACKEND_KEYRING)
+        {
+            helpers.push(vault::KEYCHAIN_BACKEND_KEYRING.to_string());
+        }
+    }
+
+    if !helpers
+        .iter()
+        .any(|candidate| candidate == vault::KEYCHAIN_BACKEND_FILE)
+    {
+        helpers.push(vault::KEYCHAIN_BACKEND_FILE.to_string());
+    }
+
+    helpers
+}
+
+fn available_keychain_helpers() -> Vec<String> {
+    let backends = vault::discover_available_keychains();
+    available_keychain_helpers_with_backends(&backends)
+}
+
 impl BridgeService {
     fn new(state: Arc<GrpcState>) -> Self {
         Self { state }
@@ -232,29 +298,27 @@ impl BridgeService {
         available: &[String],
     ) -> Result<(), Status> {
         let result = async {
-            let keychain = keychain_raw.trim();
-            if keychain.is_empty() {
+            let helper = keychain_raw.trim();
+            if helper.is_empty() {
                 return Err(Status::invalid_argument("keychain name is empty"));
             }
-            let known_backend = matches!(
-                keychain,
-                vault::KEYCHAIN_BACKEND_KEYRING | vault::KEYCHAIN_BACKEND_FILE
-            );
-            if !known_backend {
+            let Some(backend) = keychain_helper_to_backend(helper) else {
                 return Err(Status::invalid_argument(format!(
-                    "unknown keychain backend: {keychain}"
+                    "unknown keychain helper: {helper}"
                 )));
-            }
-            if !available.iter().any(|candidate| candidate == keychain) {
+            };
+            if !available.iter().any(|candidate| candidate == helper) {
                 self.emit_keychain_has_no_keychain();
                 return Err(Status::failed_precondition(format!(
-                    "keychain backend unavailable on this host: {keychain}"
+                    "keychain helper unavailable on this host: {helper}"
                 )));
             }
-            vault::sync_vault_key_to_backend(self.settings_dir(), keychain)
+            vault::sync_vault_key_to_backend(self.settings_dir(), backend)
+                .map_err(|err| self.status_from_vault_error_with_events(err))?;
+            vault::set_keychain_helper(self.settings_dir(), helper)
                 .map_err(|err| self.status_from_vault_error_with_events(err))?;
             let mut settings = self.state.app_settings.lock().await;
-            settings.current_keychain = keychain.to_string();
+            settings.current_keychain = helper.to_string();
             save_app_settings(&self.grpc_app_settings_path(), &settings)
                 .await
                 .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
@@ -262,6 +326,8 @@ impl BridgeService {
         }
         .await;
         self.emit_keychain_change_finished();
+        self.emit_show_main_window();
+        let _ = self.state.shutdown_tx.send(true);
         result
     }
 
@@ -642,8 +708,40 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn trigger_repair(&self, _request: Request<()>) -> Result<Response<()>, Status> {
-        self.emit_repair_started();
-        self.emit_show_main_window();
+        let service = self.clone();
+        tokio::spawn(async move {
+            match vault::list_sessions(service.settings_dir()) {
+                Ok(sessions) => {
+                    for session in sessions {
+                        let checkpoint = vault::StoredEventCheckpoint {
+                            last_event_id: String::new(),
+                            last_event_ts: None,
+                            sync_state: None,
+                        };
+                        if let Err(err) = vault::save_event_checkpoint_by_account_id(
+                            service.settings_dir(),
+                            &session.uid,
+                            &checkpoint,
+                        ) {
+                            tracing::warn!(
+                                user_id = %session.uid,
+                                error = %err,
+                                "failed to reset event checkpoint during repair"
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to list sessions during repair");
+                }
+            }
+
+            service
+                .refresh_sync_workers_for_transition("trigger_repair")
+                .await;
+            service.emit_repair_started();
+            service.emit_show_main_window();
+        });
         Ok(Response::new(()))
     }
 
@@ -1423,19 +1521,24 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::AvailableKeychainsResponse>, Status> {
-        let keychains = vault::discover_available_keychains();
+        let keychains = available_keychain_helpers();
         Ok(Response::new(pb::AvailableKeychainsResponse { keychains }))
     }
 
     async fn set_current_keychain(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let keychain = request.into_inner();
-        let available = vault::discover_available_keychains();
+        let available = available_keychain_helpers();
         self.set_current_keychain_with_available(&keychain, &available)
             .await?;
         Ok(Response::new(()))
     }
 
     async fn current_keychain(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        if let Some(helper) = vault::get_keychain_helper(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?
+        {
+            return Ok(Response::new(helper));
+        }
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.current_keychain.clone()))
     }
@@ -2861,7 +2964,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn available_keychains_uses_vault_discovery() {
+    async fn available_keychains_uses_helper_mapping() {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
 
@@ -2873,11 +2976,18 @@ mod tests {
         .unwrap()
         .into_inner();
 
-        assert_eq!(response.keychains, vault::discover_available_keychains());
+        assert!(response
+            .keychains
+            .iter()
+            .any(|helper| helper == vault::KEYCHAIN_BACKEND_FILE));
+        assert_eq!(
+            response.keychains,
+            available_keychain_helpers_with_backends(&vault::discover_available_keychains())
+        );
     }
 
     #[tokio::test]
-    async fn set_current_keychain_rejects_unknown_backend() {
+    async fn set_current_keychain_rejects_unknown_helper() {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
         let mut events = service.state.event_tx.subscribe();
@@ -2889,7 +2999,7 @@ mod tests {
         .await;
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
-        assert!(status.message().contains("unknown keychain backend"));
+        assert!(status.message().contains("unknown keychain helper"));
 
         let event = events.recv().await.unwrap();
         match event.event {
@@ -2905,6 +3015,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
         let mut events = service.state.event_tx.subscribe();
+        let mut shutdown = service.state.shutdown_tx.subscribe();
         let selected = vault::KEYCHAIN_BACKEND_FILE.to_string();
 
         <BridgeService as pb::bridge_server::Bridge>::set_current_keychain(
@@ -2923,6 +3034,8 @@ mod tests {
         .into_inner();
         assert_eq!(current, selected);
         assert!(service.settings_dir().join("vault.key").exists());
+        shutdown.changed().await.unwrap();
+        assert!(*shutdown.borrow_and_update());
 
         let event = events.recv().await.unwrap();
         match event.event {
@@ -2931,6 +3044,46 @@ mod tests {
             })) => {}
             other => panic!("unexpected keychain event payload: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn current_keychain_prefers_persisted_keychain_helper_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        vault::set_keychain_helper(service.settings_dir(), KEYCHAIN_HELPER_SECRET_SERVICE_DBUS)
+            .unwrap();
+
+        let current = <BridgeService as pb::bridge_server::Bridge>::current_keychain(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(current, KEYCHAIN_HELPER_SECRET_SERVICE_DBUS);
+    }
+
+    #[test]
+    fn available_keychain_helpers_file_only_when_keyring_backend_missing() {
+        let helpers =
+            available_keychain_helpers_with_backends(&[vault::KEYCHAIN_BACKEND_FILE.to_string()]);
+        assert_eq!(helpers, vec![vault::KEYCHAIN_BACKEND_FILE.to_string()]);
+    }
+
+    #[test]
+    fn available_keychain_helpers_include_file_and_keyring_alias_when_available() {
+        let helpers = available_keychain_helpers_with_backends(&[
+            vault::KEYCHAIN_BACKEND_KEYRING.to_string(),
+            vault::KEYCHAIN_BACKEND_FILE.to_string(),
+        ]);
+
+        assert!(helpers
+            .iter()
+            .any(|helper| helper == vault::KEYCHAIN_BACKEND_FILE));
+        assert!(helpers
+            .iter()
+            .any(|helper| helper == vault::KEYCHAIN_BACKEND_KEYRING));
     }
 
     #[tokio::test]
@@ -2964,6 +3117,59 @@ mod tests {
                 event: Some(pb::keychain_event::Event::ChangeKeychainFinished(_)),
             })) => {}
             other => panic!("unexpected second keychain event payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_repair_resets_event_checkpoints_and_emits_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+        let session = Session {
+            uid: "uid-repair-1".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "repair@proton.me".to_string(),
+            display_name: "Repair User".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+        let checkpoint = vault::StoredEventCheckpoint {
+            last_event_id: "event-123".to_string(),
+            last_event_ts: Some(1_700_000_000),
+            sync_state: Some("refresh_resync".to_string()),
+        };
+        vault::save_event_checkpoint_by_account_id(service.settings_dir(), &session.uid, &checkpoint)
+            .unwrap();
+        assert!(vault::load_event_checkpoint_by_account_id(service.settings_dir(), &session.uid)
+            .unwrap()
+            .is_some());
+
+        <BridgeService as pb::bridge_server::Bridge>::trigger_repair(&service, Request::new(()))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if vault::load_event_checkpoint_by_account_id(service.settings_dir(), &session.uid)
+                    .unwrap()
+                    .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::RepairStarted(_)),
+            })) => {}
+            other => panic!("unexpected repair event payload: {other:?}"),
         }
     }
 

@@ -16,6 +16,7 @@ const KEY_LEN: usize = 32;
 const VAULT_FILE: &str = "vault.enc";
 const KEY_FILE: &str = "vault.key";
 const DEFAULT_EMAIL_FILE: &str = "default_email";
+const KEYCHAIN_SETTINGS_FILE: &str = "keychain.json";
 const VAULT_VERSION: i32 = 2;
 const ADDRESS_MODE_COMBINED: i32 = 0;
 const ADDRESS_MODE_SPLIT: i32 = 1;
@@ -117,6 +118,13 @@ pub struct StoredEventCheckpoint {
     pub last_event_id: String,
     pub last_event_ts: Option<i64>,
     pub sync_state: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "PascalCase", default)]
+struct StoredKeychainSettings {
+    helper: String,
+    disable_test: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1067,45 @@ pub fn remove_session(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn load_keychain_settings(dir: &Path) -> Result<StoredKeychainSettings> {
+    let path = dir.join(KEYCHAIN_SETTINGS_FILE);
+    if !path.exists() {
+        return Ok(StoredKeychainSettings::default());
+    }
+    let payload = std::fs::read(&path)?;
+    let parsed = serde_json::from_slice(&payload).unwrap_or_default();
+    Ok(parsed)
+}
+
+fn save_keychain_settings(dir: &Path, settings: &StoredKeychainSettings) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(KEYCHAIN_SETTINGS_FILE);
+    let tmp_path = path.with_extension("tmp");
+    let payload = serde_json::to_vec_pretty(settings).map_err(std::io::Error::other)?;
+    std::fs::write(&tmp_path, payload)?;
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+pub fn get_keychain_helper(dir: &Path) -> Result<Option<String>> {
+    let settings = load_keychain_settings(dir)?;
+    let helper = settings.helper.trim();
+    if helper.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(helper.to_string()))
+}
+
+pub fn set_keychain_helper(dir: &Path, helper: &str) -> Result<()> {
+    let helper = helper.trim();
+    if helper.is_empty() {
+        return Ok(());
+    }
+    let mut settings = load_keychain_settings(dir)?;
+    settings.helper = helper.to_string();
+    save_keychain_settings(dir, &settings)
+}
+
 pub fn load_event_checkpoint_by_account_id(
     dir: &Path,
     account_id: &str,
@@ -1383,6 +1430,25 @@ mod tests {
         ];
         assert_eq!(available_first, expected);
         assert_eq!(available_second, expected);
+    }
+
+    #[test]
+    fn test_keychain_helper_settings_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(get_keychain_helper(tmp.path()).unwrap(), None);
+
+        set_keychain_helper(tmp.path(), "secret-service-dbus").unwrap();
+        assert_eq!(
+            get_keychain_helper(tmp.path()).unwrap(),
+            Some("secret-service-dbus".to_string())
+        );
+    }
+
+    #[test]
+    fn test_set_keychain_helper_ignores_empty_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_keychain_helper(tmp.path(), "  ").unwrap();
+        assert_eq!(get_keychain_helper(tmp.path()).unwrap(), None);
     }
 
     #[test]

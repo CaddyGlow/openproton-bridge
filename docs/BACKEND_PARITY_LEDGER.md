@@ -21,7 +21,7 @@ Notes:
 | `AddLogEntry` | Exact | Maps gRPC log levels to `tracing` levels. |
 | `GuiReady` | Exact | Emits show-main-window and returns splash flag. |
 | `Restart` | Exact | Signals controlled shutdown. |
-| `TriggerRepair` | Partial | Emits repair event only; no full repair workflow. |
+| `TriggerRepair` | Exact | Runs async repair pass (resets per-user event checkpoints, refreshes sync workers) and emits `repairStarted` on completion. |
 | `TriggerReset` | Exact | Clears session/settings artifacts, refreshes sync worker group state, and emits `resetFinished`. |
 | `ShowOnStartup` | Exact | Returns persisted app setting. |
 | `SetIsAutostartOn` | Exact | Persists app setting. |
@@ -64,8 +64,8 @@ Notes:
 | `SetMailServerSettings` | Exact | Validates, persists, and emits change/finish/error events. |
 | `Hostname` | Exact | Returns configured bind host. |
 | `IsPortFree` | Exact | Checks local bind availability. |
-| `AvailableKeychains` | Partial | Runtime-discovered keychain backends with deterministic ordering and active keyring availability probe; still missing full helper/OS parity semantics. |
-| `SetCurrentKeychain` | Partial | Synchronizes vault key material to selected backend, persists setting, emits `changeKeychainFinished`; known unavailable backends return `FailedPrecondition` + `hasNoKeychain`. |
+| `AvailableKeychains` | Exact | Returns Proton-style helper names with OS-aware ordering and availability probing, plus file fallback. |
+| `SetCurrentKeychain` | Exact | Maps helper -> backend, synchronizes vault key material, persists helper selection, emits `changeKeychainFinished`, and triggers controlled restart semantics. |
 | `CurrentKeychain` | Exact | Returns selected keychain setting. |
 | `GetUserList` | Exact | Lists persisted sessions as users. |
 | `GetUser` | Exact | Resolves by account id or email. |
@@ -99,7 +99,7 @@ Notes:
 | `App.KnowledgeBaseSuggestions` | Exact | Emitted by `RequestKnowledgeBaseSuggestions` with suggestion payload. |
 | `App.ResetFinished` | Exact | Emitted after `TriggerReset` completes state cleanup. |
 | `Keychain.ChangeKeychainFinished` | Exact | Emitted for every `SetCurrentKeychain` attempt (success and error). |
-| `Keychain.HasNoKeychain` | Partial | Emitted when a known backend is unavailable on host during keychain selection. |
+| `Keychain.HasNoKeychain` | Exact | Emitted when a known helper is unavailable on host during keychain selection. |
 | `Keychain.RebuildKeychain` | Partial | Emitted when vault keychain failures (`MissingVaultKey`/`KeychainAccess`) are surfaced to gRPC callers. |
 
 ## Current Blockers Toward Full Exact Parity
@@ -107,4 +107,3 @@ Notes:
 - Updater workflow RPCs (`CheckUpdate`, `InstallUpdate`) are placeholders.
 - Bug reporting and KB suggestions remain reduced stubs.
 - Apple Mail auto-configuration remains unimplemented (validation + safe SMTP SSL side effect wired).
-- Keychain helper/OS integration semantics are still simplified compared to upstream Proton Bridge.

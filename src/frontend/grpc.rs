@@ -333,6 +333,14 @@ impl BridgeService {
         }));
     }
 
+    fn emit_reset_finished(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::ResetFinished(
+                pb::ResetFinishedEvent {},
+            )),
+        }));
+    }
+
     fn emit_repair_started(&self) {
         self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
             event: Some(pb::app_event::Event::RepairStarted(
@@ -512,6 +520,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         vault::remove_session(self.settings_dir()).map_err(status_from_vault_error)?;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
         let _ = tokio::fs::remove_file(self.grpc_app_settings_path()).await;
+        self.emit_reset_finished();
         Ok(Response::new(()))
     }
 
@@ -2258,6 +2267,49 @@ mod tests {
                 assert!(suggestion.title.contains("imap login failure"));
             }
             other => panic!("unexpected knowledge base suggestion event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn trigger_reset_clears_state_and_emits_reset_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let session = Session {
+            uid: "uid-reset-1".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "reset@proton.me".to_string(),
+            display_name: "Reset User".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        tokio::fs::write(service.grpc_mail_settings_path(), b"{}")
+            .await
+            .unwrap();
+        tokio::fs::write(service.grpc_app_settings_path(), b"{}")
+            .await
+            .unwrap();
+
+        <BridgeService as pb::bridge_server::Bridge>::trigger_reset(&service, Request::new(()))
+            .await
+            .unwrap();
+
+        assert!(vault::list_sessions(service.settings_dir())
+            .unwrap()
+            .is_empty());
+        assert!(!service.grpc_mail_settings_path().exists());
+        assert!(!service.grpc_app_settings_path().exists());
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::ResetFinished(_)),
+            })) => {}
+            other => panic!("unexpected trigger reset event: {other:?}"),
         }
     }
 

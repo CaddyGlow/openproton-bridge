@@ -22,7 +22,7 @@ Notes:
 | `GuiReady` | Exact | Emits show-main-window and returns splash flag. |
 | `Restart` | Exact | Signals controlled shutdown. |
 | `TriggerRepair` | Partial | Emits repair event only; no full repair workflow. |
-| `TriggerReset` | Exact | Clears session and persisted grpc settings files. |
+| `TriggerReset` | Exact | Clears session/settings artifacts and emits `resetFinished`. |
 | `ShowOnStartup` | Exact | Returns persisted app setting. |
 | `SetIsAutostartOn` | Exact | Persists app setting. |
 | `IsAutostartOn` | Exact | Returns persisted app setting. |
@@ -96,6 +96,7 @@ Notes:
 | `App.ReportBugSuccess` | Exact | Emitted on `ReportBug` request handling path. |
 | `App.ReportBugFinished` | Exact | Emitted after `App.ReportBugSuccess`. |
 | `App.KnowledgeBaseSuggestions` | Exact | Emitted by `RequestKnowledgeBaseSuggestions` with suggestion payload. |
+| `App.ResetFinished` | Exact | Emitted after `TriggerReset` completes state cleanup. |
 
 ## Current Blockers Toward Full Exact Parity
 

@@ -97,6 +97,8 @@
   let hostname = $state('')
   let users = $state<UserSummary[]>([])
   let usersLoading = $state(false)
+  let initialUsersLoadDone = $state(false)
+  let onboardingOnlyMode = $state(false)
   let appSettings = $state<AppSettings>({ ...defaultAppSettings })
   let settingsStatus = $state('')
   let diskCachePathInput = $state('')
@@ -238,6 +240,9 @@
   }
 
   function closeLoginWizard() {
+    if (showOnboardingOnlyWizard) {
+      return
+    }
     loginWizardOpen = false
   }
 
@@ -268,6 +273,7 @@
   let selectedClientConfigUser = $derived(users.find((user) => user.id === clientConfigUserId) ?? null)
   let userParityById = $derived(buildUserParityById(users, parityState, userRuntimeParityById, disconnectedUsernames))
   let activeAccountSummary = $derived(users.find((user) => user.id === clientConfigUserId) ?? users[0] ?? null)
+  let showOnboardingOnlyWizard = $derived(onboardingOnlyMode && initialUsersLoadDone && users.length === 0)
 
   $effect(() => {
     syncLoginStatusWithStep(parityState.snapshot.login_step)
@@ -283,6 +289,18 @@
     if (!users.some((user) => user.id === clientConfigUserId)) {
       clientConfigUserId = users[0].id
     }
+  })
+
+  $effect(() => {
+    if (!onboardingOnlyMode) {
+      return
+    }
+    if (users.length === 0) {
+      loginWizardOpen = true
+      activeSection = 'accounts'
+      return
+    }
+    onboardingOnlyMode = false
   })
 
   $effect(() => {
@@ -591,7 +609,9 @@
 
     if (action === 'show_settings') {
       activeSection = 'settings'
-      loginWizardOpen = false
+      if (!showOnboardingOnlyWizard) {
+        loginWizardOpen = false
+      }
       clientConfigWizardOpen = false
       return
     }
@@ -1009,6 +1029,12 @@
       })
       configPathInput = parityStore.getState().snapshot.config_path ?? ''
       await refreshBridgeData()
+      initialUsersLoadDone = true
+      if (users.length === 0) {
+        onboardingOnlyMode = true
+        loginWizardOpen = true
+        activeSection = 'accounts'
+      }
       logger.info('app', 'mount completed')
     })()
 
@@ -1031,7 +1057,8 @@
 </script>
 
 <main class="app-shell">
-  <section class="workspace">
+  {#if !showOnboardingOnlyWizard}
+    <section class="workspace">
     <aside class="left-rail">
       <article class="card account-summary-pane">
         <div class="shell-status-bar">
@@ -1196,10 +1223,12 @@
         </div>
       {/key}
     </section>
-  </section>
+    </section>
+  {/if}
 
   <LoginWizard
     open={loginWizardOpen}
+    canClose={!showOnboardingOnlyWizard}
     loginStep={parityState.snapshot.login_step}
     bind:loginUsername
     bind:loginPassword
@@ -1221,14 +1250,16 @@
     onClose={closeLoginWizard}
   />
 
-  <ClientConfigWizard
-    open={clientConfigWizardOpen}
-    username={selectedClientConfigUser?.username ?? ''}
-    addresses={selectedClientConfigUser?.addresses ?? []}
-    hostname={hostname || '127.0.0.1'}
-    imapPort={imapPort}
-    smtpPort={smtpPort}
-    password={clientConfigPassword}
-    onClose={closeClientConfigWizard}
-  />
+  {#if !showOnboardingOnlyWizard}
+    <ClientConfigWizard
+      open={clientConfigWizardOpen}
+      username={selectedClientConfigUser?.username ?? ''}
+      addresses={selectedClientConfigUser?.addresses ?? []}
+      hostname={hostname || '127.0.0.1'}
+      imapPort={imapPort}
+      smtpPort={smtpPort}
+      password={clientConfigPassword}
+      onClose={closeClientConfigWizard}
+    />
+  {/if}
 </main>

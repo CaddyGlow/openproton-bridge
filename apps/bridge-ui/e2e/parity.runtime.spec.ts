@@ -28,6 +28,19 @@ async function openSettingsSection(page: Page): Promise<void> {
 }
 
 test.describe('bridge-ui parity runtime flows', () => {
+  test('first run with no accounts shows onboarding wizard only', async ({ page }) => {
+    await installTauriRuntimeMocks(page, {
+      users: [],
+    })
+    await page.goto('/')
+
+    const wizardDialog = page.getByRole('dialog', { name: 'Proton login wizard' })
+    await expect(wizardDialog).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Close' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Open Sign-In Wizard' })).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Settings', exact: true })).toHaveCount(0)
+  })
+
   test('auth wizard opens in credentials welcome state', async ({ page }) => {
     await installTauriRuntimeMocks(page)
     await page.goto('/')

@@ -15,6 +15,7 @@
     open = false,
     loginStep = 'credentials',
     loginStatus = '',
+    canClose = true,
     isBusy: isBusyProp,
     loginUsername = $bindable(''),
     loginPassword = $bindable(''),
@@ -37,6 +38,7 @@
     open?: boolean
     loginStep?: string
     loginStatus?: string
+    canClose?: boolean
     isBusy?: boolean
     loginUsername?: string
     loginPassword?: string
@@ -103,7 +105,7 @@
     if (!open) {
       return
     }
-    if (event.key === 'Escape') {
+    if (event.key === 'Escape' && canClose) {
       onClose()
       return
     }
@@ -170,7 +172,9 @@
               <h2>Sign In Wizard</h2>
               <p class="muted">{loginWizardStepTitle(activeStep)}</p>
             </div>
-            <button class="secondary" onclick={onClose}>Close</button>
+            {#if canClose}
+              <button class="secondary" onclick={onClose}>Close</button>
+            {/if}
           </header>
 
           <div class="wizard-body" aria-busy={isBusy}>
@@ -258,7 +262,9 @@
             {#if activeStep === 'done'}
               <div class="wizard-success">
                 <p>Account authentication finished successfully.</p>
-                <button onclick={onClose}>Close Wizard</button>
+                {#if canClose}
+                  <button onclick={onClose}>Close Wizard</button>
+                {/if}
               </div>
             {/if}
 

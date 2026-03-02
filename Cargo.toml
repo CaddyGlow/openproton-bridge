@@ -46,6 +46,7 @@ fs2 = "0.4"
 
 # Go-compatible vault (MessagePack + OS keychain)
 rmp-serde = "1"
+rmpv = { version = "1", features = ["with-serde"] }
 serde_bytes = "0.11"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 

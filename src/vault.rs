@@ -10,6 +10,7 @@ use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use rmpv::Value as MsgpackValue;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
@@ -36,6 +37,7 @@ const KEYCHAIN_NAME: &str = "bridge-v3";
 #[cfg(target_os = "macos")]
 const LEGACY_KEYCHAIN_NAME: &str = "bridge";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
+type ExtraFields = HashMap<String, MsgpackValue>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialStoreBackend {
@@ -627,6 +629,8 @@ struct VaultData {
         default = "default_feature_flag_sticky_key"
     )]
     feature_flag_sticky_key: Vec<u8>,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 impl Default for VaultData {
@@ -638,6 +642,7 @@ impl Default for VaultData {
             certs: VaultCerts::default(),
             migrated: false,
             feature_flag_sticky_key: vec![0u8; 16],
+            extra_fields: HashMap::new(),
         }
     }
 }
@@ -691,6 +696,8 @@ struct UserData {
     uid_validity: HashMap<String, u32>,
 
     should_resync: bool,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -703,6 +710,8 @@ struct SyncStatus {
     #[serde(rename = "FailedMessageIDs")]
     #[serde(deserialize_with = "deserialize_nullable_default")]
     failed_message_ids: Vec<String>,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -743,6 +752,8 @@ struct Settings {
 
     sync_workers: i32,
     sync_att_pool: i32,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 impl Default for Settings {
@@ -769,6 +780,7 @@ impl Default for Settings {
             password_archive: PasswordArchive::default(),
             sync_workers: 16,
             sync_att_pool: 16,
+            extra_fields: HashMap::new(),
         }
     }
 }
@@ -778,6 +790,8 @@ impl Default for Settings {
 struct PasswordArchive {
     #[serde(deserialize_with = "deserialize_nullable_default")]
     archive: HashMap<String, serde_bytes::ByteBuf>,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -787,6 +801,8 @@ struct VaultCerts {
     bridge: VaultCert,
     custom_cert_path: String,
     custom_key_path: String,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -804,6 +820,8 @@ struct VaultCert {
         default
     )]
     key: Vec<u8>,
+    #[serde(flatten)]
+    extra_fields: ExtraFields,
 }
 
 fn serialize_bytes<S>(value: &Vec<u8>, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -1506,6 +1524,7 @@ fn session_to_userdata(session: &Session) -> UserData {
         sync_state: None,
         uid_validity: HashMap::new(),
         should_resync: false,
+        extra_fields: HashMap::new(),
     }
 }
 
@@ -2282,6 +2301,7 @@ path = "custom-vault.key"
             sync_state: None,
             uid_validity: HashMap::new(),
             should_resync: false,
+            extra_fields: HashMap::new(),
         });
 
         let encoded = marshal_vault(&data, &key).unwrap();
@@ -2324,6 +2344,80 @@ path = "custom-vault.key"
         assert_eq!(loaded.display_name, session.display_name);
         assert_eq!(loaded.key_passphrase, session.key_passphrase);
         assert_eq!(loaded.bridge_password, session.bridge_password);
+    }
+
+    #[test]
+    fn test_save_session_preserves_unknown_vault_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x35u8; KEY_LEN];
+
+        let mut fixture = VaultData::default();
+        fixture
+            .extra_fields
+            .insert("UnknownTopField".to_string(), MsgpackValue::from(42));
+        fixture.settings.extra_fields.insert(
+            "UnknownSettingsField".to_string(),
+            MsgpackValue::from("keep-settings"),
+        );
+        fixture.users.push(UserData {
+            user_id: "user-preserve".to_string(),
+            username: "Before".to_string(),
+            primary_email: "preserve@proton.me".to_string(),
+            gluon_key: vec![7u8; 32],
+            gluon_ids: HashMap::new(),
+            bridge_pass: b"before-bridge".to_vec(),
+            address_mode: ADDRESS_MODE_COMBINED,
+            auth_uid: "uid-preserve".to_string(),
+            auth_ref: "refresh-before".to_string(),
+            key_pass: b"before-key-pass".to_vec(),
+            sync_status: SyncStatus::default(),
+            event_id: String::new(),
+            last_event_ts: None,
+            sync_state: None,
+            uid_validity: HashMap::new(),
+            should_resync: false,
+            extra_fields: HashMap::from([(
+                "UnknownUserField".to_string(),
+                MsgpackValue::from("keep-user"),
+            )]),
+        });
+
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        std::fs::write(tmp.path().join(DEFAULT_EMAIL_FILE), b"preserve@proton.me").unwrap();
+
+        let updated = Session {
+            uid: "uid-preserve".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-after".to_string(),
+            email: "preserve@proton.me".to_string(),
+            display_name: "After".to_string(),
+            key_passphrase: Some(BASE64.encode(b"after-key-pass")),
+            bridge_password: Some("after-bridge".to_string()),
+        };
+        save_session(&updated, tmp.path()).unwrap();
+
+        let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert_eq!(
+            saved.extra_fields.get("UnknownTopField"),
+            Some(&MsgpackValue::from(42))
+        );
+        assert_eq!(
+            saved.settings.extra_fields.get("UnknownSettingsField"),
+            Some(&MsgpackValue::from("keep-settings"))
+        );
+        let saved_user = saved
+            .users
+            .iter()
+            .find(|user| user.auth_uid == "uid-preserve")
+            .unwrap();
+        assert_eq!(
+            saved_user.extra_fields.get("UnknownUserField"),
+            Some(&MsgpackValue::from("keep-user"))
+        );
+        assert_eq!(saved_user.auth_ref, "refresh-after");
+        assert_eq!(saved_user.username, "After");
     }
 
     #[test]
@@ -2372,6 +2466,7 @@ path = "custom-vault.key"
                 sync_state: None,
                 uid_validity: HashMap::new(),
                 should_resync: false,
+                extra_fields: HashMap::new(),
             }],
             ..VaultData::default()
         };
@@ -2746,6 +2841,7 @@ path = "custom-vault.key"
             sync_state: None,
             uid_validity: HashMap::new(),
             should_resync: false,
+            extra_fields: HashMap::new(),
         };
         let encoded = rmp_serde::to_vec_named(&ud).unwrap();
         let as_str = String::from_utf8_lossy(&encoded);

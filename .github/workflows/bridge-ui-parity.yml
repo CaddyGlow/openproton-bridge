@@ -1,0 +1,57 @@
+name: Bridge UI Parity Gate
+
+on:
+  pull_request:
+    paths:
+      - 'apps/bridge-ui/**'
+      - 'docs/workflows/**'
+      - '.github/workflows/bridge-ui-parity.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/bridge-ui/**'
+      - 'docs/workflows/**'
+      - '.github/workflows/bridge-ui-parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity-suite:
+    name: bridge-ui parity suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: apps/bridge-ui
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.9'
+
+      - name: Install frontend dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: bunx playwright install --with-deps chromium
+
+      - name: Frontend typecheck
+        run: bun run check
+
+      - name: Frontend unit tests
+        run: bun run test:run
+
+      - name: Parity e2e tests
+        run: bun run test:parity
+
+      - name: Visual regression parity tests
+        run: bun run test:visual

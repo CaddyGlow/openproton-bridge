@@ -1,18 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { fade, fly } from 'svelte/transition'
-  import { get } from 'svelte/store'
+  import { connect, disconnect, resetError, updateConfigPath } from './lib/stores/bridge'
   import {
-    bridgeStatus,
-    connect,
-    disconnect,
-    initBridgeStore,
-    resetError,
-    streamLog,
-    updateConfigPath,
-  } from './lib/stores/bridge'
-  import {
-    onBridgeUiEvent,
     onCaptchaToken,
     exportTlsCertificates,
     fetchUsers,
@@ -42,13 +32,14 @@
     setUserSplitMode,
     setMailSettings,
     type AppSettings,
-    type BridgeUiEvent,
     type MailSettings,
     type UserSummary,
   } from './lib/api/bridge'
+  import { createParityStateStore, type ParityDomainState, type UiNotification } from './lib/parity-state'
   import { logger } from './lib/logging/logger'
   import BridgeConnectionCard from './lib/components/cards/BridgeConnectionCard.svelte'
   import LoginWizard from './lib/components/LoginWizard.svelte'
+  import ClientConfigWizard from './lib/components/ClientConfigWizard.svelte'
   import ErrorStateCard from './lib/components/cards/ErrorStateCard.svelte'
   import GeneralSettingsCard from './lib/components/cards/GeneralSettingsCard.svelte'
   import StreamEventsCard from './lib/components/cards/StreamEventsCard.svelte'
@@ -76,9 +67,19 @@
 
   type SectionId = (typeof sections)[number]['id']
   type ThemeMode = 'system' | 'light' | 'dark'
+  type SettingsSectionId = 'preferences' | 'cache'
+  type CacheMoveUiState = 'idle' | 'in_flight' | 'success' | 'failure'
+  type UserParityHook = {
+    syncProgress?: number | null
+    disconnected?: boolean
+    recovering?: boolean
+    error?: string | null
+  }
 
-  let stop = $state<(() => void) | undefined>(undefined)
-  let stopUi = $state<(() => void) | undefined>(undefined)
+  const parityStore = createParityStateStore()
+  let parityState = $state<ParityDomainState>(parityStore.getState())
+  let stopParityListeners = $state<(() => void) | undefined>(undefined)
+  let stopParitySubscription = $state<(() => void) | undefined>(undefined)
   let stopCaptchaToken = $state<(() => void) | undefined>(undefined)
   let activeSection = $state<SectionId>('accounts')
   let loginWizardOpen = $state(false)
@@ -112,7 +113,18 @@
   let tlsInstalled = $state<boolean | null>(null)
   let tlsExportDir = $state('')
   let tlsStatus = $state('')
-  let toastLog = $state<string[]>([])
+  let settingsExpandedSections = $state<Record<SettingsSectionId, boolean>>({
+    preferences: true,
+    cache: true,
+  })
+  let cacheMoveState = $state<CacheMoveUiState>('idle')
+  let cacheMoveStatus = $state('')
+  let lastHandledNotificationId = $state(0)
+  let userRuntimeParityById = $state<Record<string, UserParityHook>>({})
+  let disconnectedUsernames = $state<Record<string, boolean>>({})
+  let clientConfigWizardOpen = $state(false)
+  let clientConfigUserId = $state('')
+  let clientConfigPassword = $state('generated app password')
 
   function normalizeThemeMode(value: string | undefined): ThemeMode {
     if (value === 'light' || value === 'dark') {
@@ -193,13 +205,37 @@
     loginWizardOpen = false
   }
 
-  $effect(() => {
-    syncLoginStatusWithStep($bridgeStatus.login_step)
-  })
-
-  function pushToast(message: string) {
-    toastLog = [`${new Date().toLocaleTimeString()} ${message}`, ...toastLog].slice(0, 24)
+  function resolveClientConfigPassword(): string {
+    if (mailboxPassword.trim().length > 0) {
+      return mailboxPassword.trim()
+    }
+    return 'generated app password'
   }
+
+  function openClientConfigWizard(userId?: string) {
+    const selectedUser = (userId ? users.find((user) => user.id === userId) : users[0]) ?? null
+    if (!selectedUser) {
+      settingsStatus = 'No account available for client configuration.'
+      return
+    }
+
+    clientConfigUserId = selectedUser.id
+    clientConfigPassword = resolveClientConfigPassword()
+    clientConfigWizardOpen = true
+    activeSection = 'accounts'
+  }
+
+  function closeClientConfigWizard() {
+    clientConfigWizardOpen = false
+  }
+
+  let selectedClientConfigUser = $derived(users.find((user) => user.id === clientConfigUserId) ?? null)
+  let userParityById = $derived(buildUserParityById(users, parityState, userRuntimeParityById, disconnectedUsernames))
+  let toastLog = $derived(parityState.notifications.slice(0, 24).map((notification) => formatToast(notification)))
+
+  $effect(() => {
+    syncLoginStatusWithStep(parityState.snapshot.login_step)
+  })
 
   function extractHvUrl(text: string): string | null {
     const match = text.match(/https:\/\/verify\.proton\.me\/\S+/i)
@@ -229,12 +265,246 @@
     return 'Sign-in failed. Try again.'
   }
 
-  function toastMessageForEvent(event: BridgeUiEvent): string {
-    if (event.code === 'login_error') {
-      return `${event.level.toUpperCase()}: Sign-in needs attention`
-    }
-    return `${event.level.toUpperCase()}: ${event.message}`
+  function formatToast(notification: UiNotification): string {
+    const time = new Date(notification.created_at).toLocaleTimeString()
+    const message = notification.code === 'login_error' ? 'Sign-in needs attention' : notification.message
+    return `${time} ${notification.level.toUpperCase()}: ${message}`
   }
+
+  function normalizeSyncProgress(value: number): number {
+    if (!Number.isFinite(value)) {
+      return 0
+    }
+    if (value >= 0 && value <= 1) {
+      return Math.round(value * 100)
+    }
+    return Math.round(Math.max(0, Math.min(100, value)))
+  }
+
+  function buildUserParityById(
+    list: UserSummary[],
+    state: ParityDomainState,
+    runtimeById: Record<string, UserParityHook>,
+    disconnectedByUsername: Record<string, boolean>,
+  ): Record<string, UserParityHook> {
+    const globalSyncProgress = state.sync.phase === 'syncing' ? state.sync.progress_percent : null
+    const globalSyncError = state.sync.phase === 'error' ? state.sync.message : null
+
+    const byId: Record<string, UserParityHook> = {}
+    for (const user of list) {
+      const runtime = runtimeById[user.id] ?? {}
+      const backendDisconnected = Number(user.state) !== 2
+      const usernameDisconnected = disconnectedByUsername[user.username] ?? false
+      const disconnected =
+        runtime.disconnected ?? (usernameDisconnected || backendDisconnected || !state.snapshot.connected)
+      const recovering = runtime.recovering ?? (state.snapshot.connected && state.sync.phase === 'syncing')
+      const syncProgress =
+        runtime.syncProgress ?? (typeof globalSyncProgress === 'number' ? normalizeSyncProgress(globalSyncProgress) : null)
+      const error = runtime.error ?? globalSyncError
+
+      byId[user.id] = {
+        syncProgress: typeof syncProgress === 'number' ? normalizeSyncProgress(syncProgress) : null,
+        disconnected,
+        recovering,
+        error,
+      }
+    }
+    return byId
+  }
+
+  function hintValue(hints: string[], prefix: string): string | null {
+    const targetPrefix = `${prefix}:`
+    const matched = hints.find((hint) => hint.startsWith(targetPrefix))
+    if (!matched) {
+      return null
+    }
+    return matched.slice(targetPrefix.length)
+  }
+
+  function updateUserRuntimeParity(userId: string, patch: Partial<UserParityHook>) {
+    const current = userRuntimeParityById[userId] ?? {}
+    userRuntimeParityById = {
+      ...userRuntimeParityById,
+      [userId]: {
+        ...current,
+        ...patch,
+      },
+    }
+  }
+
+  function applyUserNotificationEffects(notification: UiNotification) {
+    const userId = hintValue(notification.refresh_hints, 'sync_user')
+    const username = hintValue(notification.refresh_hints, 'sync_username')
+    const progressHint = hintValue(notification.refresh_hints, 'sync_progress')
+    const parsedProgress = progressHint ? Number.parseInt(progressHint, 10) : NaN
+    const progress = Number.isFinite(parsedProgress) ? normalizeSyncProgress(parsedProgress) : null
+
+    if (notification.code === 'sync_started' && userId) {
+      updateUserRuntimeParity(userId, {
+        syncProgress: 0,
+        recovering: true,
+        disconnected: false,
+        error: null,
+      })
+      return
+    }
+
+    if (notification.code === 'sync_progress' && userId) {
+      updateUserRuntimeParity(userId, {
+        syncProgress: progress ?? 0,
+        recovering: true,
+        disconnected: false,
+        error: null,
+      })
+      return
+    }
+
+    if (notification.code === 'sync_finished' && userId) {
+      updateUserRuntimeParity(userId, {
+        syncProgress: 100,
+        recovering: false,
+        disconnected: false,
+        error: null,
+      })
+      return
+    }
+
+    if (notification.code === 'user_bad_event' && userId) {
+      updateUserRuntimeParity(userId, {
+        error: notification.message,
+        recovering: false,
+      })
+      return
+    }
+
+    if (notification.code === 'user_disconnected') {
+      if (username) {
+        disconnectedUsernames = {
+          ...disconnectedUsernames,
+          [username]: true,
+        }
+        const disconnectedUser = users.find((user) => user.username === username)
+        if (disconnectedUser) {
+          updateUserRuntimeParity(disconnectedUser.id, {
+            disconnected: true,
+            recovering: false,
+          })
+        }
+      }
+      return
+    }
+
+    if (notification.code === 'imap_login_failed' && username) {
+      const targetUser = users.find((user) => user.username === username)
+      if (targetUser) {
+        updateUserRuntimeParity(targetUser.id, {
+          error: notification.message,
+        })
+      }
+      return
+    }
+
+    if ((notification.code === 'users_updated' || notification.code === 'user_changed') && userId) {
+      updateUserRuntimeParity(userId, {
+        disconnected: false,
+      })
+    }
+  }
+
+  function pruneUserRuntimeParity(nextUsers: UserSummary[]) {
+    const activeIds = new Set(nextUsers.map((user) => user.id))
+    const activeUsernames = new Set(nextUsers.map((user) => user.username))
+
+    userRuntimeParityById = Object.fromEntries(
+      Object.entries(userRuntimeParityById).filter(([id]) => activeIds.has(id)),
+    ) as Record<string, UserParityHook>
+
+    disconnectedUsernames = Object.fromEntries(
+      Object.entries(disconnectedUsernames).filter(([username]) => activeUsernames.has(username)),
+    )
+  }
+
+  function toggleSettingsSection(section: SettingsSectionId, nextExpanded: boolean) {
+    settingsExpandedSections = {
+      ...settingsExpandedSections,
+      [section]: nextExpanded,
+    }
+  }
+
+  function consumeRefreshHint(hint: string, refreshFn: () => Promise<void>) {
+    const count = parityState.refresh_hints[hint] ?? 0
+    if (count < 1) {
+      return
+    }
+
+    for (let index = 0; index < count; index += 1) {
+      parityStore.dispatch({ type: 'ui.refresh-hint.consumed', hint })
+    }
+
+    void refreshFn()
+  }
+
+  function applyNotificationEffects(notification: UiNotification) {
+    applyUserNotificationEffects(notification)
+
+    if (notification.code === 'mail_settings_saved') {
+      saveStatus = 'saved (stream confirmed)'
+    }
+    if (notification.code === 'login_finished') {
+      hvVerificationUrl = ''
+      hvCaptchaToken = ''
+      void closeCaptchaVerificationWindow()
+    }
+    if (notification.code === 'autostart_saved' || notification.code === 'disk_cache_saved') {
+      settingsStatus = 'saved (stream confirmed)'
+    }
+    if (
+      notification.code === 'tfa_requested' ||
+      notification.code === 'fido_requested' ||
+      notification.code === 'tfa_or_fido_requested' ||
+      notification.code === 'fido_touch_requested' ||
+      notification.code === 'fido_touch_completed' ||
+      notification.code === 'fido_pin_required'
+    ) {
+      loginStatus = notification.message
+    }
+    if (notification.level === 'error' && notification.code !== 'login_error') {
+      settingsStatus = notification.message
+    }
+    if (notification.code === 'login_error') {
+      const hvUrl = extractHvUrl(notification.message)
+      if (hvUrl) {
+        hvVerificationUrl = hvUrl
+        logger.info('app', 'captcha challenge detected from stream event', { verification_url: hvUrl })
+        void openCaptchaVerificationWindow()
+      }
+      loginStatus = userFacingLoginError(notification.message)
+    }
+    if (notification.code === 'disk_cache_saved') {
+      cacheMoveState = 'success'
+      cacheMoveStatus = notification.message
+    }
+    if (notification.code === 'disk_cache_error') {
+      cacheMoveState = 'failure'
+      cacheMoveStatus = notification.message
+    }
+  }
+
+  $effect(() => {
+    consumeRefreshHint('users', refreshUsersData)
+    consumeRefreshHint('mail_settings', refreshMailServerSettings)
+    consumeRefreshHint('app_settings', refreshGeneralSettings)
+    consumeRefreshHint('tls', refreshTlsSettings)
+  })
+
+  $effect(() => {
+    const latest = parityState.notifications[0]
+    if (!latest || latest.id === lastHandledNotificationId) {
+      return
+    }
+    lastHandledNotificationId = latest.id
+    applyNotificationEffects(latest)
+  })
 
   async function openCaptchaVerificationWindow() {
     if (!hvVerificationUrl) {
@@ -263,7 +533,9 @@
 
   async function refreshUsersData() {
     hostname = await getHostname()
-    users = await fetchUsers()
+    const nextUsers = await fetchUsers()
+    users = nextUsers
+    pruneUserRuntimeParity(nextUsers)
   }
 
   async function refreshMailServerSettings() {
@@ -361,7 +633,7 @@
     hvCaptchaToken = ''
     await closeCaptchaVerificationWindow()
     try {
-      if (!get(bridgeStatus).stream_running) {
+      if (!parityState.snapshot.stream_running) {
         logger.info('app', 'bridge stream not running, connecting before login')
         await connect()
       }
@@ -394,12 +666,12 @@
     loginStatus = 'Continuing sign-in...'
     lastLoginStepSeen = ''
     try {
-      if (!get(bridgeStatus).stream_running) {
+      if (!parityState.snapshot.stream_running) {
         logger.info('app', 'bridge stream not running, reconnecting before captcha retry')
         await connect()
       }
       await login(loginUsername, loginPassword, true, hvCaptchaToken)
-      const step = get(bridgeStatus).login_step
+      const step = parityStore.getState().snapshot.login_step
       syncLoginStatusWithStep(step, true)
       if (step === 'credentials' || step === 'idle') {
         loginStatus = 'Verification submitted. Waiting for the next step...'
@@ -544,7 +816,17 @@
       disk_cache_path: diskCachePathInput,
       color_scheme_name: colorSchemeNameInput,
     })
+    const previousDiskCachePath = appSettings.disk_cache_path
+    const diskCachePathChanged = previousDiskCachePath !== diskCachePathInput
+
     settingsStatus = 'saving...'
+    if (diskCachePathChanged) {
+      cacheMoveState = 'in_flight'
+      cacheMoveStatus = 'Applying settings...'
+    } else {
+      cacheMoveState = 'idle'
+      cacheMoveStatus = ''
+    }
     try {
       await setIsAutostartOn(appSettings.is_autostart_on)
       await setIsBetaEnabled(appSettings.is_beta_enabled)
@@ -556,62 +838,17 @@
 
       appSettings.disk_cache_path = diskCachePathInput
       appSettings.color_scheme_name = colorSchemeNameInput
-      settingsStatus = 'saved'
+      settingsStatus = 'saved (awaiting stream confirmation)'
+      if (diskCachePathChanged) {
+        cacheMoveStatus = 'Waiting for cache operation confirmation...'
+      }
     } catch (error) {
       logger.error('app', 'apply general settings failed', { error: String(error) })
       settingsStatus = `save failed: ${String(error)}`
-    }
-  }
-
-  function handleUiEvent(event: BridgeUiEvent) {
-    logger.debug('app', 'ui event received', event)
-    pushToast(toastMessageForEvent(event))
-
-    if (event.code === 'mail_settings_saved') {
-      saveStatus = 'saved (stream confirmed)'
-    }
-    if (event.code === 'login_finished') {
-      hvVerificationUrl = ''
-      hvCaptchaToken = ''
-      void closeCaptchaVerificationWindow()
-    }
-    if (event.code === 'autostart_saved' || event.code === 'disk_cache_saved') {
-      settingsStatus = 'saved (stream confirmed)'
-    }
-    if (
-      event.code === 'tfa_requested' ||
-      event.code === 'fido_requested' ||
-      event.code === 'tfa_or_fido_requested' ||
-      event.code === 'fido_touch_requested' ||
-      event.code === 'fido_touch_completed' ||
-      event.code === 'fido_pin_required'
-    ) {
-      loginStatus = event.message
-    }
-    if (event.level === 'error' && event.code !== 'login_error') {
-      settingsStatus = event.message
-    }
-    if (event.code === 'login_error') {
-      const hvUrl = extractHvUrl(event.message)
-      if (hvUrl) {
-        hvVerificationUrl = hvUrl
-        logger.info('app', 'captcha challenge detected from stream event', { verification_url: hvUrl })
-        void openCaptchaVerificationWindow()
+      if (diskCachePathChanged) {
+        cacheMoveState = 'failure'
+        cacheMoveStatus = String(error)
       }
-      loginStatus = userFacingLoginError(event.message)
-    }
-
-    if (event.refresh_hints.includes('users')) {
-      void refreshUsersData()
-    }
-    if (event.refresh_hints.includes('mail_settings')) {
-      void refreshMailServerSettings()
-    }
-    if (event.refresh_hints.includes('app_settings')) {
-      void refreshGeneralSettings()
-    }
-    if (event.refresh_hints.includes('tls')) {
-      void refreshTlsSettings()
     }
   }
 
@@ -636,8 +873,10 @@
     }
     void (async () => {
       logger.info('app', 'mount start')
-      stop = await initBridgeStore()
-      stopUi = await onBridgeUiEvent((event) => handleUiEvent(event))
+      stopParitySubscription = parityStore.subscribe((nextState) => {
+        parityState = nextState
+      })
+      stopParityListeners = await parityStore.init()
       stopCaptchaToken = await onCaptchaToken((token) => {
         hvCaptchaToken = token
         loginStatus = 'Verification complete. Click Continue.'
@@ -646,7 +885,7 @@
           token_len: token.length,
         })
       })
-      configPathInput = get(bridgeStatus).config_path ?? ''
+      configPathInput = parityStore.getState().snapshot.config_path ?? ''
       await refreshBridgeData()
       logger.info('app', 'mount completed')
     })()
@@ -660,8 +899,8 @@
         mediaQuery.removeListener(handleSystemThemeChange)
         motionQuery.removeListener(handleMotionChange)
       }
-      stop?.()
-      stopUi?.()
+      stopParityListeners?.()
+      stopParitySubscription?.()
       stopCaptchaToken?.()
       void closeCaptchaVerificationWindow()
     }
@@ -674,12 +913,12 @@
       <h1>OpenProton Bridge</h1>
       <p class="muted">Desktop console for Proton account sessions, mail transport, and bridge health.</p>
       <div class="header-metrics">
-        <span class={`status-pill ${$bridgeStatus.connected ? 'good' : 'danger'}`}>
-          {$bridgeStatus.connected ? 'Bridge Connected' : 'Bridge Offline'}
+        <span class={`status-pill ${parityState.snapshot.connected ? 'good' : 'danger'}`}>
+          {parityState.snapshot.connected ? 'Bridge Connected' : 'Bridge Offline'}
         </span>
-        <span class="status-pill muted">Step: {formatLoginStep($bridgeStatus.login_step)}</span>
-        <span class={`status-pill ${$bridgeStatus.stream_running ? 'good' : 'muted'}`}>
-          Stream {$bridgeStatus.stream_running ? 'Running' : 'Stopped'}
+        <span class="status-pill muted">Step: {formatLoginStep(parityState.snapshot.login_step)}</span>
+        <span class={`status-pill ${parityState.snapshot.stream_running ? 'good' : 'muted'}`}>
+          Stream {parityState.snapshot.stream_running ? 'Running' : 'Stopped'}
         </span>
       </div>
     </div>
@@ -712,7 +951,7 @@
       </article>
 
       <BridgeConnectionCard
-        status={$bridgeStatus}
+        status={parityState.snapshot}
         bind:configPathInput
         onSetPath={(path) => updateConfigPath(path)}
         onConnect={connectAndLoad}
@@ -739,10 +978,13 @@
               <h2>Account Access</h2>
               <p class="muted">
                 Use the sign-in wizard for Proton authentication. Current login step:
-                <strong> {formatLoginStep($bridgeStatus.login_step)}</strong>
+                <strong> {formatLoginStep(parityState.snapshot.login_step)}</strong>
               </p>
               <div class="row">
                 <button onclick={openLoginWizard}>Open Sign-In Wizard</button>
+                <button class="secondary" onclick={() => openClientConfigWizard()} disabled={users.length === 0}>
+                  Configure Email Client
+                </button>
               </div>
             </article>
 
@@ -750,6 +992,8 @@
               hostname={hostname}
               usersLoading={usersLoading}
               users={users}
+              userParityById={userParityById}
+              onConfigureClient={(userId) => openClientConfigWizard(userId)}
               onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
               onLogout={(userId) => logout(userId)}
               onRemove={(userId) => remove(userId)}
@@ -772,6 +1016,10 @@
               bind:diskCachePathInput
               bind:colorSchemeNameInput
               settingsStatus={settingsStatus}
+              expandedSections={settingsExpandedSections}
+              onToggleSection={toggleSettingsSection}
+              cacheMoveState={cacheMoveState}
+              cacheMoveStatus={cacheMoveStatus}
               onApplySettings={applyGeneralSettings}
             />
 
@@ -783,7 +1031,7 @@
               onExportTls={exportTls}
             />
           {:else}
-            <StreamEventsCard events={$streamLog} />
+            <StreamEventsCard events={parityState.stream_log} />
           {/if}
         </div>
       {/key}
@@ -792,20 +1040,20 @@
     <aside class="status-rail">
       <article class="card">
         <h2>Status Rail</h2>
-        <p class="muted"><strong>Stream:</strong> {$bridgeStatus.stream_running ? 'running' : 'stopped'}</p>
-        <p class="muted"><strong>Login:</strong> {$bridgeStatus.login_step}</p>
+        <p class="muted"><strong>Stream:</strong> {parityState.snapshot.stream_running ? 'running' : 'stopped'}</p>
+        <p class="muted"><strong>Login:</strong> {parityState.snapshot.login_step}</p>
         <p class="muted"><strong>TLS:</strong> {tlsInstalled === null ? 'unknown' : tlsInstalled ? 'installed' : 'missing'}</p>
       </article>
 
-      <ErrorStateCard lastError={$bridgeStatus.last_error} onClearError={resetError} />
+      <ErrorStateCard lastError={parityState.snapshot.last_error} onClearError={resetError} />
       <EventToastsCard toasts={toastLog} />
-      <StreamEventsCard events={$streamLog.slice(0, 10)} />
+      <StreamEventsCard events={parityState.stream_log.slice(0, 10)} />
     </aside>
   </section>
 
   <LoginWizard
     open={loginWizardOpen}
-    loginStep={$bridgeStatus.login_step}
+    loginStep={parityState.snapshot.login_step}
     bind:loginUsername
     bind:loginPassword
     bind:twoFactorCode
@@ -824,5 +1072,16 @@
     onAbortFidoFlow={abortFidoFlow}
     onAbortLoginFlow={abortLoginFlow}
     onClose={closeLoginWizard}
+  />
+
+  <ClientConfigWizard
+    open={clientConfigWizardOpen}
+    username={selectedClientConfigUser?.username ?? ''}
+    addresses={selectedClientConfigUser?.addresses ?? []}
+    hostname={hostname || '127.0.0.1'}
+    imapPort={imapPort}
+    smtpPort={smtpPort}
+    password={clientConfigPassword}
+    onClose={closeClientConfigWizard}
   />
 </main>

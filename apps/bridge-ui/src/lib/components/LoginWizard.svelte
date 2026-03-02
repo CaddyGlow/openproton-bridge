@@ -1,11 +1,21 @@
 <script lang="ts">
-  type WizardStep = 'credentials' | 'verify' | 'unlock' | 'done'
-  const stepOrder: WizardStep[] = ['credentials', 'verify', 'unlock', 'done']
+  import {
+    isFidoAbortAvailable,
+    loginStatusIndicatesPending,
+    loginWizardStateOrder,
+    loginWizardStepHint,
+    loginWizardStepTitle,
+    resolveLoginWizardState,
+    supportsFidoAlternative,
+  } from './login-wizard-auth'
+
+  const stepOrder = loginWizardStateOrder
 
   let {
     open = false,
     loginStep = 'credentials',
     loginStatus = '',
+    isBusy: isBusyProp,
     loginUsername = $bindable(''),
     loginPassword = $bindable(''),
     twoFactorCode = $bindable(''),
@@ -27,6 +37,7 @@
     open?: boolean
     loginStep?: string
     loginStatus?: string
+    isBusy?: boolean
     loginUsername?: string
     loginPassword?: string
     twoFactorCode?: string
@@ -45,70 +56,46 @@
     onAbortLoginFlow?: () => void
     onClose?: () => void
   } = $props()
-  let activeStep = $derived(normalizeStep(loginStep))
-
-  function normalizeStep(step: string): WizardStep {
-    if (step === '2fa' || step === '2fa_or_fido' || step === 'fido' || step === 'fido_touch' || step === 'fido_pin') {
-      return 'verify'
-    }
-    if (step === 'mailbox_password') {
-      return 'unlock'
-    }
-    if (step === 'done') {
-      return 'done'
-    }
-    return 'credentials'
-  }
-
-  function stepTitle(step: WizardStep): string {
-    if (step === 'verify') {
-      return 'Verify Account'
-    }
-    if (step === 'unlock') {
-      return 'Unlock Mailbox'
-    }
-    if (step === 'done') {
-      return 'Login Complete'
-    }
-    return 'Account Credentials'
-  }
-
-  function stepHint(step: string): string {
-    if (step === 'fido_touch') {
-      return 'Touch your security key to continue.'
-    }
-    if (step === 'fido_pin') {
-      return 'Enter your security key PIN.'
-    }
-    if (step === '2fa' || step === '2fa_or_fido' || step === 'fido') {
-      return 'Use 2FA code or security key verification.'
-    }
-    if (step === 'mailbox_password') {
-      return 'Decrypt mailbox data with your mailbox password.'
-    }
-    if (step === 'done') {
-      return 'Your account is now authenticated.'
-    }
-    return 'Enter your Proton account username and password.'
-  }
+  const activeStep = $derived(resolveLoginWizardState(loginStep))
+  const statusIndicatesPending = $derived(loginStatusIndicatesPending(loginStatus))
+  const isBusy = $derived(isBusyProp ?? statusIndicatesPending)
+  const hasHumanVerification = $derived(Boolean(hvVerificationUrl))
+  const hasCaptchaToken = $derived(Boolean(hvCaptchaToken))
+  const canContinueHumanVerification = $derived(hasHumanVerification && hasCaptchaToken && !isBusy)
+  const showFidoAbort = $derived(isFidoAbortAvailable(activeStep, loginStep))
+  const showFidoInput = $derived(supportsFidoAlternative(loginStep, activeStep))
+  const expectsFidoPin = $derived(activeStep === 'fido_pin')
 
   function runEnterAction() {
+    if (isBusy) {
+      return
+    }
+
     if (activeStep === 'credentials') {
+      if (hasHumanVerification) {
+        if (hasCaptchaToken) {
+          onRetryCaptcha()
+          return
+        }
+        onOpenCaptchaWindow()
+        return
+      }
       onSubmitCredentials()
       return
     }
-    if (activeStep === 'unlock') {
+
+    if (activeStep === 'mailbox_password') {
       onSubmitMailboxPassword()
       return
     }
-    if (activeStep === 'verify') {
-      if (loginStep === '2fa' || loginStep === '2fa_or_fido') {
-        onSubmitTwoFactor()
-        return
-      }
-      if (loginStep === 'fido' || loginStep === 'fido_pin') {
-        onSubmitFidoAssertion()
-      }
+
+    if (activeStep === '2fa') {
+      onSubmitTwoFactor()
+      return
+    }
+
+    if (activeStep === 'fido' || activeStep === 'fido_pin') {
+      onSubmitFidoAssertion()
     }
   }
 
@@ -149,12 +136,12 @@
                 <circle cx="30" cy="46" r="4" />
                 <line x1="38" y1="46" x2="54" y2="46" />
               </svg>
-            {:else if activeStep === 'verify'}
+            {:else if activeStep === '2fa' || activeStep === 'fido' || activeStep === 'fido_touch' || activeStep === 'fido_pin'}
               <svg viewBox="0 0 80 80">
                 <path d="M40 14 62 22v18c0 15-9 24-22 28-13-4-22-13-22-28V22z" />
                 <path d="m28 41 8 8 16-16" />
               </svg>
-            {:else if activeStep === 'unlock'}
+            {:else if activeStep === 'mailbox_password'}
               <svg viewBox="0 0 80 80">
                 <rect x="18" y="34" width="44" height="28" rx="7" />
                 <path d="M28 34v-6a12 12 0 1 1 24 0v6" />
@@ -170,23 +157,23 @@
           <ol class="wizard-steps">
             {#each stepOrder as step}
               <li class:active={activeStep === step}>
-                <span>{stepOrder.indexOf(step) + 1}</span>{stepTitle(step)}
+                <span>{stepOrder.indexOf(step) + 1}</span>{loginWizardStepTitle(step)}
               </li>
             {/each}
           </ol>
-          <p class="muted wizard-step-hint">{stepHint(loginStep)}</p>
+          <p class="muted wizard-step-hint">{loginWizardStepHint(loginStep, activeStep)}</p>
         </aside>
 
         <section class="wizard-main">
           <header class="wizard-header">
             <div>
               <h2>Sign In Wizard</h2>
-              <p class="muted">{stepTitle(activeStep)}</p>
+              <p class="muted">{loginWizardStepTitle(activeStep)}</p>
             </div>
             <button class="secondary" onclick={onClose}>Close</button>
           </header>
 
-          <div class="wizard-body">
+          <div class="wizard-body" aria-busy={isBusy}>
             {#if activeStep === 'credentials'}
               <div class="wizard-fields">
                 <label>
@@ -197,18 +184,23 @@
                   Password
                   <input type="password" bind:value={loginPassword} autocomplete="current-password" placeholder="password" />
                 </label>
-                <button onclick={onSubmitCredentials}>Continue</button>
+                <button onclick={onSubmitCredentials} disabled={isBusy || hasHumanVerification}>
+                  {isBusy ? 'Working...' : hasHumanVerification ? 'Pending Verification' : 'Continue'}
+                </button>
               </div>
-              {#if hvVerificationUrl}
+              {#if hasHumanVerification}
                 <div class="wizard-awaiting">
-                  <p>Verification required.</p>
-                  <p class="muted">Open the verification window, complete CAPTCHA, then continue.</p>
+                  <p>Human verification required.</p>
+                  <p class="muted">Open the verification window, complete CAPTCHA, then continue sign-in.</p>
                   <div class="wizard-actions">
-                    <button onclick={onOpenCaptchaWindow}>Open Verification</button>
-                    <button onclick={onRetryCaptcha} disabled={!hvCaptchaToken}>Continue</button>
+                    <button onclick={onOpenCaptchaWindow} disabled={isBusy}>Open Verification Window</button>
+                    <button class="secondary" onclick={onCloseCaptchaWindow} disabled={isBusy}>
+                      Close Verification Window
+                    </button>
+                    <button onclick={onRetryCaptcha} disabled={!canContinueHumanVerification}>Continue Sign-In</button>
                   </div>
-                  {#if hvCaptchaToken}
-                    <p class="muted">Verification token received. You can continue.</p>
+                  {#if hasCaptchaToken}
+                    <p class="muted">Verification token received. Continue sign-in when ready.</p>
                   {:else}
                     <p class="muted">Waiting for verification to complete.</p>
                   {/if}
@@ -216,46 +208,50 @@
               {/if}
             {/if}
 
-            {#if activeStep === 'verify'}
-              {#if loginStep === '2fa' || loginStep === '2fa_or_fido'}
-                <div class="wizard-fields">
-                  <label>
-                    2FA Code
-                    <input bind:value={twoFactorCode} inputmode="numeric" placeholder="123456" />
-                  </label>
-                  <button onclick={onSubmitTwoFactor}>Submit 2FA</button>
-                </div>
-              {/if}
+            {#if activeStep === '2fa'}
+              <div class="wizard-fields">
+                <label>
+                  2FA Code
+                  <input bind:value={twoFactorCode} inputmode="numeric" placeholder="123456" />
+                </label>
+                <button onclick={onSubmitTwoFactor} disabled={isBusy}>Submit 2FA</button>
+              </div>
 
-              {#if ['fido', '2fa_or_fido', 'fido_pin'].includes(loginStep)}
-                <div class="wizard-fields">
-                  <label>
-                    {loginStep === 'fido_pin' ? 'FIDO PIN' : 'FIDO Assertion Payload'}
-                    <input
-                      bind:value={fidoAssertionPayload}
-                      type={loginStep === 'fido_pin' ? 'password' : 'text'}
-                      placeholder={loginStep === 'fido_pin' ? 'enter security key PIN' : 'assertion payload'}
-                    />
-                  </label>
-                  <button onclick={onSubmitFidoAssertion}>Submit FIDO</button>
-                </div>
-              {/if}
-
-              {#if loginStep === 'fido_touch'}
-                <div class="wizard-awaiting">
-                  <p>Waiting for security key touch.</p>
-                  <p class="muted">Keep your key connected and confirm touch when prompted.</p>
-                </div>
+              {#if loginStep === '2fa_or_fido'}
+                <p class="muted">You can also use your security key for this step.</p>
               {/if}
             {/if}
 
-            {#if activeStep === 'unlock'}
+            {#if showFidoInput && (activeStep === '2fa' || activeStep === 'fido' || activeStep === 'fido_pin')}
+              <div class="wizard-fields">
+                <label>
+                  {expectsFidoPin ? 'FIDO PIN' : 'FIDO Assertion Payload'}
+                  <input
+                    bind:value={fidoAssertionPayload}
+                    type={expectsFidoPin ? 'password' : 'text'}
+                    placeholder={expectsFidoPin ? 'enter security key PIN' : 'assertion payload'}
+                  />
+                </label>
+                <button onclick={onSubmitFidoAssertion} disabled={isBusy}>
+                  {expectsFidoPin ? 'Submit PIN' : 'Submit FIDO'}
+                </button>
+              </div>
+            {/if}
+
+            {#if activeStep === 'fido_touch'}
+              <div class="wizard-awaiting">
+                <p>Waiting for security key touch.</p>
+                <p class="muted">Keep your key connected and confirm touch when prompted.</p>
+              </div>
+            {/if}
+
+            {#if activeStep === 'mailbox_password'}
               <div class="wizard-fields">
                 <label>
                   Mailbox Password
                   <input type="password" bind:value={mailboxPassword} placeholder="mailbox password" />
                 </label>
-                <button onclick={onSubmitMailboxPassword}>Unlock Mailbox</button>
+                <button onclick={onSubmitMailboxPassword} disabled={isBusy}>Unlock Mailbox</button>
               </div>
             {/if}
 
@@ -271,7 +267,7 @@
 
           {#if activeStep !== 'done'}
             <footer class="wizard-footer">
-              {#if activeStep === 'verify'}
+              {#if showFidoAbort}
                 <button class="secondary" onclick={onAbortFidoFlow}>Abort FIDO</button>
               {/if}
               <button class="secondary" onclick={onAbortLoginFlow}>Abort Login</button>

@@ -15,7 +15,7 @@ const executablePath = resolveChromiumPath()
 
 export default defineConfig({
   testDir: './e2e',
-  testMatch: /visual\.spec\.ts/,
+  testMatch: /parity\.spec\.ts/,
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
@@ -34,13 +34,6 @@ export default defineConfig({
       use: {
         ...devices['Desktop Chrome'],
         colorScheme: 'light',
-      },
-    },
-    {
-      name: 'chromium-dark',
-      use: {
-        ...devices['Desktop Chrome'],
-        colorScheme: 'dark',
       },
     },
   ],

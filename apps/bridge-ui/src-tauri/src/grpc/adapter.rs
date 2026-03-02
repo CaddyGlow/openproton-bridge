@@ -885,13 +885,70 @@ fn stream_ui_event(event: &pb::StreamEvent) -> Option<UiEvent> {
             }
         }
         Some(pb::stream_event::Event::User(user)) => match user.event.as_ref() {
+            Some(pb::user_event::Event::SyncStartedEvent(sync)) => Some(UiEvent {
+                level: "info".to_string(),
+                code: "sync_started".to_string(),
+                message: "Synchronizing (0%)".to_string(),
+                refresh_hints: vec![
+                    "users".to_string(),
+                    format!("sync_user:{}", sync.user_id),
+                    "sync_progress:0".to_string(),
+                ],
+            }),
+            Some(pb::user_event::Event::SyncProgressEvent(sync)) => {
+                let progress_percent = (sync.progress * 100.0).round().clamp(0.0, 100.0) as i32;
+                Some(UiEvent {
+                    level: "info".to_string(),
+                    code: "sync_progress".to_string(),
+                    message: format!("Synchronizing ({progress_percent}%)"),
+                    refresh_hints: vec![
+                        "users".to_string(),
+                        format!("sync_user:{}", sync.user_id),
+                        format!("sync_progress:{progress_percent}"),
+                    ],
+                })
+            }
+            Some(pb::user_event::Event::SyncFinishedEvent(sync)) => Some(UiEvent {
+                level: "info".to_string(),
+                code: "sync_finished".to_string(),
+                message: "Synchronization completed".to_string(),
+                refresh_hints: vec![
+                    "users".to_string(),
+                    format!("sync_user:{}", sync.user_id),
+                    "sync_progress:100".to_string(),
+                ],
+            }),
+            Some(pb::user_event::Event::UserBadEvent(user_bad)) => Some(UiEvent {
+                level: "error".to_string(),
+                code: "user_bad_event".to_string(),
+                message: user_bad.error_message.clone(),
+                refresh_hints: vec!["users".to_string(), format!("sync_user:{}", user_bad.user_id)],
+            }),
+            Some(pb::user_event::Event::ImapLoginFailedEvent(imap_login_failed)) => Some(UiEvent {
+                level: "error".to_string(),
+                code: "imap_login_failed".to_string(),
+                message: format!("IMAP login failed for {}", imap_login_failed.username),
+                refresh_hints: vec![
+                    "users".to_string(),
+                    format!("sync_username:{}", imap_login_failed.username),
+                ],
+            }),
             Some(pb::user_event::Event::ToggleSplitModeFinished(_))
             | Some(pb::user_event::Event::UserChanged(_))
-            | Some(pb::user_event::Event::UserDisconnected(_)) => Some(UiEvent {
+            | Some(pb::user_event::Event::UsedBytesChangedEvent(_)) => Some(UiEvent {
                 level: "info".to_string(),
                 code: "users_updated".to_string(),
                 message: "User state updated".to_string(),
                 refresh_hints: vec!["users".to_string()],
+            }),
+            Some(pb::user_event::Event::UserDisconnected(disconnected)) => Some(UiEvent {
+                level: "error".to_string(),
+                code: "user_disconnected".to_string(),
+                message: format!("User {} disconnected", disconnected.username),
+                refresh_hints: vec![
+                    "users".to_string(),
+                    format!("sync_username:{}", disconnected.username),
+                ],
             }),
             _ => None,
         },
@@ -959,6 +1016,14 @@ mod tests {
     fn login_stream_event(event: pb::login_event::Event) -> pb::StreamEvent {
         pb::StreamEvent {
             event: Some(pb::stream_event::Event::Login(pb::LoginEvent {
+                event: Some(event),
+            })),
+        }
+    }
+
+    fn user_stream_event(event: pb::user_event::Event) -> pb::StreamEvent {
+        pb::StreamEvent {
+            event: Some(pb::stream_event::Event::User(pb::UserEvent {
                 event: Some(event),
             })),
         }
@@ -1053,5 +1118,46 @@ mod tests {
         assert_eq!(ui_event.level, "error");
         assert_eq!(ui_event.code, "login_error");
         assert_eq!(ui_event.message, "bad fido assertion");
+    }
+
+    #[test]
+    fn stream_ui_event_emits_sync_progress_with_user_hint() {
+        let event = user_stream_event(pb::user_event::Event::SyncProgressEvent(
+            pb::SyncProgressEvent {
+                user_id: "u1".to_string(),
+                progress: 0.42,
+                elapsed_ms: 1000,
+                remaining_ms: 1200,
+            },
+        ));
+
+        let ui_event = stream_ui_event(&event).expect("expected a ui event");
+        assert_eq!(ui_event.level, "info");
+        assert_eq!(ui_event.code, "sync_progress");
+        assert_eq!(ui_event.message, "Synchronizing (42%)");
+        assert!(ui_event.refresh_hints.iter().any(|hint| hint == "users"));
+        assert!(ui_event.refresh_hints.iter().any(|hint| hint == "sync_user:u1"));
+        assert!(ui_event
+            .refresh_hints
+            .iter()
+            .any(|hint| hint == "sync_progress:42"));
+    }
+
+    #[test]
+    fn stream_ui_event_emits_user_disconnected_with_username_hint() {
+        let event = user_stream_event(pb::user_event::Event::UserDisconnected(
+            pb::UserDisconnectedEvent {
+                username: "alice@proton.me".to_string(),
+            },
+        ));
+
+        let ui_event = stream_ui_event(&event).expect("expected a ui event");
+        assert_eq!(ui_event.level, "error");
+        assert_eq!(ui_event.code, "user_disconnected");
+        assert_eq!(ui_event.message, "User alice@proton.me disconnected");
+        assert!(ui_event
+            .refresh_hints
+            .iter()
+            .any(|hint| hint == "sync_username:alice@proton.me"));
     }
 }

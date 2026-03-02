@@ -386,16 +386,8 @@ impl RuntimeAccountRegistry {
 
         let mut session_for_refresh = existing;
 
-        let mut refresh_result = {
-            let mut client = ProtonClient::new()?;
-            auth::refresh_auth(
-                &mut client,
-                &session_for_refresh.uid,
-                &session_for_refresh.refresh_token,
-                Some(&session_for_refresh.access_token),
-            )
-            .await
-        };
+        let mut refresh_result =
+            refresh_with_optional_access_token(&session_for_refresh, true).await;
 
         if let Err(err) = &refresh_result {
             if is_invalid_refresh_token_error(err) {
@@ -414,18 +406,21 @@ impl RuntimeAccountRegistry {
                             "retrying refresh with latest vault session after invalid refresh token"
                         );
                         session_for_refresh = reloaded;
-                        refresh_result = {
-                            let mut client = ProtonClient::new()?;
-                            auth::refresh_auth(
-                                &mut client,
-                                &session_for_refresh.uid,
-                                &session_for_refresh.refresh_token,
-                                Some(&session_for_refresh.access_token),
-                            )
-                            .await
-                        };
+                        refresh_result =
+                            refresh_with_optional_access_token(&session_for_refresh, true).await;
                     }
                 }
+            }
+        }
+
+        if let Err(err) = &refresh_result {
+            if is_invalid_refresh_token_error(err) && !session_for_refresh.access_token.is_empty() {
+                debug!(
+                    account_id = %account_id.0,
+                    "retrying refresh without access token after invalid refresh token"
+                );
+                refresh_result =
+                    refresh_with_optional_access_token(&session_for_refresh, false).await;
             }
         }
 
@@ -465,6 +460,19 @@ impl RuntimeAccountRegistry {
         let _ = self.set_health(account_id, AccountHealth::Healthy).await;
         Ok(updated)
     }
+}
+
+async fn refresh_with_optional_access_token(
+    session: &Session,
+    include_access_token: bool,
+) -> Result<crate::api::types::RefreshResponse, ApiError> {
+    let mut client = ProtonClient::new()?;
+    let access = if include_access_token {
+        Some(session.access_token.as_str())
+    } else {
+        None
+    };
+    auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, access).await
 }
 
 #[cfg(test)]

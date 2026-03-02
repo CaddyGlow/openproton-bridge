@@ -32,6 +32,7 @@ const APP_SETTINGS_FILE: &str = "grpc_app_settings.json";
 const SERVER_TOKEN_METADATA_KEY: &str = "server-token";
 const CAPTCHA_APPEAL_URL: &str = "https://proton.me/support/appeal-abuse";
 const MAX_BUFFERED_STREAM_EVENTS: usize = 256;
+const DEFAULT_EMAIL_CLIENT: &str = "NoClient/0.0.1";
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -798,7 +799,10 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<String>, Status> {
-        Ok(Response::new("openproton-bridge".to_string()))
+        Ok(Response::new(format!(
+            "{DEFAULT_EMAIL_CLIENT} ({})",
+            std::env::consts::OS
+        )))
     }
 
     async fn logs_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
@@ -2397,6 +2401,26 @@ mod tests {
         assert_eq!(logs_path, expected_logs_dir);
         assert!(expected_logs_dir.exists());
         assert!(!settings_logs_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn current_email_client_uses_proton_default_user_agent_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let current =
+            <BridgeService as pb::bridge_server::Bridge>::current_email_client(
+                &service,
+                Request::new(()),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(
+            current,
+            format!("{DEFAULT_EMAIL_CLIENT} ({})", std::env::consts::OS)
+        );
     }
 
     #[tokio::test]

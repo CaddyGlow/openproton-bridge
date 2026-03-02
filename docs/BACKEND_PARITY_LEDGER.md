@@ -41,7 +41,7 @@ Notes:
 | `LandingPageLink` | Exact | Returns Proton Bridge landing URL. |
 | `SetColorSchemeName` | Exact | Validates and persists app setting. |
 | `ColorSchemeName` | Exact | Returns persisted app setting. |
-| `CurrentEmailClient` | Behavior Mismatch | Static `openproton-bridge` value. |
+| `CurrentEmailClient` | Partial | Returns Proton default shape (`NoClient/0.0.1 (<os>)`); dynamic IMAP/SMTP client ID tracking is not yet wired. |
 | `ReportBug` | Partial | Logs metadata and emits `reportBugSuccess` + `reportBugFinished`; no upstream submission flow. |
 | `ForceLauncher` | Exact | Persists launcher setting. |
 | `SetMainExecutable` | Exact | Persists executable setting. |

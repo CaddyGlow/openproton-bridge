@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::io::Write;
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -21,6 +22,7 @@ const VAULT_FILE: &str = "vault.enc";
 const KEY_FILE: &str = "vault.key";
 const DEFAULT_EMAIL_FILE: &str = "default_email";
 const KEYCHAIN_SETTINGS_FILE: &str = "keychain.json";
+const CREDENTIAL_STORE_CONFIG_FILE: &str = "credential_store.toml";
 const VAULT_VERSION: i32 = 2;
 const ADDRESS_MODE_COMBINED: i32 = 0;
 const ADDRESS_MODE_SPLIT: i32 = 1;
@@ -34,6 +36,68 @@ const KEYCHAIN_NAME: &str = "bridge-v3";
 #[cfg(target_os = "macos")]
 const LEGACY_KEYCHAIN_NAME: &str = "bridge";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialStoreBackend {
+    Auto,
+    System,
+    Pass,
+    File,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CredentialStoreOverrides {
+    pub backend: Option<CredentialStoreBackend>,
+    pub namespace: Option<String>,
+    pub secret: Option<String>,
+    pub system_service: Option<String>,
+    pub pass_entry: Option<String>,
+    pub file_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CredentialStoreConfig {
+    backend: CredentialStoreBackend,
+    namespace: String,
+    secret: String,
+    system_service: Option<String>,
+    pass_entry: Option<String>,
+    file_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CredentialStoreFileConfig {
+    backend: Option<String>,
+    namespace: Option<String>,
+    secret: Option<String>,
+    #[serde(default)]
+    system: CredentialStoreSystemFileConfig,
+    #[serde(default)]
+    pass: CredentialStorePassFileConfig,
+    #[serde(default)]
+    file: CredentialStorePathFileConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CredentialStoreSystemFileConfig {
+    service: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CredentialStorePassFileConfig {
+    entry: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct CredentialStorePathFileConfig {
+    path: Option<String>,
+}
+
+static PROCESS_CREDENTIAL_STORE_OVERRIDES: OnceLock<CredentialStoreOverrides> = OnceLock::new();
+
+pub fn set_process_credential_store_overrides(overrides: CredentialStoreOverrides) {
+    let _ = PROCESS_CREDENTIAL_STORE_OVERRIDES.set(overrides);
+}
 
 #[cfg(target_os = "macos")]
 fn title_case_keychain_name(raw: &str) -> String {
@@ -58,17 +122,181 @@ fn default_non_macos_keychain_service() -> String {
     non_macos_keychain_service_for(KEYCHAIN_NAME)
 }
 
-fn default_pass_entry_name() -> String {
-    format!("{}/{}", default_non_macos_keychain_service(), KEYCHAIN_SECRET)
+fn parse_store_backend(raw: &str) -> Option<CredentialStoreBackend> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(CredentialStoreBackend::Auto),
+        "system" => Some(CredentialStoreBackend::System),
+        "pass" => Some(CredentialStoreBackend::Pass),
+        "file" => Some(CredentialStoreBackend::File),
+        _ => None,
+    }
+}
+
+fn normalized_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn resolve_file_path(dir: &Path, value: Option<&str>) -> Option<PathBuf> {
+    let raw = normalized_non_empty(value)?;
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(dir.join(path))
+    }
+}
+
+fn load_credential_store_file_config(dir: &Path) -> Option<CredentialStoreFileConfig> {
+    let path = dir.join(CREDENTIAL_STORE_CONFIG_FILE);
+    if !path.exists() {
+        return None;
+    }
+
+    let payload = match std::fs::read_to_string(&path) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to read credential store config; using defaults"
+            );
+            return None;
+        }
+    };
+
+    match toml::from_str::<CredentialStoreFileConfig>(&payload) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to parse credential store config; using defaults"
+            );
+            None
+        }
+    }
+}
+
+fn derive_system_service(config: &CredentialStoreConfig) -> String {
+    config
+        .system_service
+        .clone()
+        .unwrap_or_else(|| non_macos_keychain_service_for(&config.namespace))
+}
+
+fn derive_pass_entry(config: &CredentialStoreConfig) -> String {
+    config
+        .pass_entry
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}", derive_system_service(config), config.secret))
+}
+
+fn keychain_services_for_config(config: &CredentialStoreConfig) -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(custom) = config.system_service.clone() {
+            return vec![custom];
+        }
+
+        if config.namespace != KEYCHAIN_NAME {
+            return vec![derive_system_service(config)];
+        }
+
+        keychain_services()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        vec![derive_system_service(config)]
+    }
+}
+
+fn credential_store_key_path(dir: &Path) -> PathBuf {
+    resolve_credential_store_config(dir).file_path
+}
+
+fn resolve_credential_store_config(dir: &Path) -> CredentialStoreConfig {
+    let mut config = CredentialStoreConfig {
+        backend: CredentialStoreBackend::Auto,
+        namespace: KEYCHAIN_NAME.to_string(),
+        secret: KEYCHAIN_SECRET.to_string(),
+        system_service: None,
+        pass_entry: None,
+        file_path: dir.join(KEY_FILE),
+    };
+
+    if let Some(file_cfg) = load_credential_store_file_config(dir) {
+        if let Some(raw) = file_cfg.backend.as_deref() {
+            if let Some(backend) = parse_store_backend(raw) {
+                config.backend = backend;
+            } else {
+                tracing::warn!(
+                    backend = %raw,
+                    "ignoring invalid credential store backend in config file"
+                );
+            }
+        }
+        if let Some(namespace) = normalized_non_empty(file_cfg.namespace.as_deref()) {
+            config.namespace = namespace;
+        }
+        if let Some(secret) = normalized_non_empty(file_cfg.secret.as_deref()) {
+            config.secret = secret;
+        }
+        if let Some(service) = normalized_non_empty(file_cfg.system.service.as_deref()) {
+            config.system_service = Some(service);
+        }
+        if let Some(entry) = normalized_non_empty(file_cfg.pass.entry.as_deref()) {
+            config.pass_entry = Some(entry);
+        }
+        if let Some(path) = resolve_file_path(dir, file_cfg.file.path.as_deref()) {
+            config.file_path = path;
+        }
+    }
+
+    if let Some(overrides) = PROCESS_CREDENTIAL_STORE_OVERRIDES.get() {
+        if let Some(backend) = overrides.backend {
+            config.backend = backend;
+        }
+        if let Some(namespace) = normalized_non_empty(overrides.namespace.as_deref()) {
+            config.namespace = namespace;
+        }
+        if let Some(secret) = normalized_non_empty(overrides.secret.as_deref()) {
+            config.secret = secret;
+        }
+        if let Some(service) = normalized_non_empty(overrides.system_service.as_deref()) {
+            config.system_service = Some(service);
+        }
+        if let Some(entry) = normalized_non_empty(overrides.pass_entry.as_deref()) {
+            config.pass_entry = Some(entry);
+        }
+        if let Some(path) = overrides.file_path.as_ref() {
+            config.file_path = if path.is_absolute() {
+                path.clone()
+            } else {
+                dir.join(path)
+            };
+        }
+    }
+
+    config
 }
 
 #[cfg(target_os = "macos")]
-fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, keyring::Error> {
+fn new_keyring_entry(
+    service: &str,
+    account: &str,
+) -> std::result::Result<keyring::Entry, keyring::Error> {
     keyring::Entry::new(service, account)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, keyring::Error> {
+fn new_keyring_entry(
+    service: &str,
+    account: &str,
+) -> std::result::Result<keyring::Entry, keyring::Error> {
     keyring::Entry::new(service, account)
 }
 
@@ -76,10 +304,16 @@ fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyrin
 fn keyring_entry_candidates(
     service: &str,
     account: &str,
-) -> Vec<(&'static str, std::result::Result<keyring::Entry, keyring::Error>)> {
+) -> Vec<(
+    &'static str,
+    std::result::Result<keyring::Entry, keyring::Error>,
+)> {
     vec![
         ("default", keyring::Entry::new(service, account)),
-        ("user", keyring::Entry::new_with_target("User", service, account)),
+        (
+            "user",
+            keyring::Entry::new_with_target("User", service, account),
+        ),
     ]
 }
 
@@ -87,7 +321,10 @@ fn keyring_entry_candidates(
 fn keyring_entry_candidates(
     service: &str,
     account: &str,
-) -> Vec<(&'static str, std::result::Result<keyring::Entry, keyring::Error>)> {
+) -> Vec<(
+    &'static str,
+    std::result::Result<keyring::Entry, keyring::Error>,
+)> {
     vec![("default", keyring::Entry::new(service, account))]
 }
 
@@ -659,7 +896,10 @@ fn keyring_backend_available() -> bool {
 fn pass_backend_available() -> bool {
     let probe_account = format!("{}-probe-{}", KEYCHAIN_SECRET, rand::random::<u64>());
     let probe_entry = format!("{}/{}", default_non_macos_keychain_service(), probe_account);
-    match run_pass_command(&["insert", "-m", "-f", probe_entry.as_str()], Some("probe\n")) {
+    match run_pass_command(
+        &["insert", "-m", "-f", probe_entry.as_str()],
+        Some("probe\n"),
+    ) {
         Ok(_) => {
             let _ = run_pass_command(&["rm", "-f", probe_entry.as_str()], None);
             true
@@ -712,8 +952,10 @@ fn decrypt(data: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
 /// then OS keychain (for Go bridge interop). If neither exists, generates a new key
 /// and stores it in both keychain (if available) and file.
 fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
+    let store_config = resolve_credential_store_config(dir);
+    let key_path = store_config.file_path.clone();
+
     // 1. Try vault.key file (preferred: local, deterministic, no race conditions)
-    let key_path = dir.join(KEY_FILE);
     if key_path.exists() {
         let data = std::fs::read(&key_path)?;
         if data.len() != KEY_LEN {
@@ -726,26 +968,26 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
 
     let vault_exists = dir.join(VAULT_FILE).exists();
 
-    // 2. Try OS keychain (for Go bridge interop -- it stores key in keychain)
-    if let Some(key) = resolve_keychain_key(try_any_secure_backend_get(), vault_exists)? {
-        return Ok(key);
+    // 2. Try secure backend, unless forced to file-only mode.
+    if !matches!(store_config.backend, CredentialStoreBackend::File) {
+        if let Some(key) =
+            resolve_keychain_key(try_secure_backend_get(&store_config), vault_exists)?
+        {
+            return Ok(key);
+        }
+    } else if vault_exists {
+        return Err(VaultError::MissingVaultKey);
     }
 
-    // 3. Generate new key, store in file and try keychain
+    // 3. Generate new key, store in file and try secure backend.
     let mut key = [0u8; KEY_LEN];
     use rand::RngCore;
     OsRng.fill_bytes(&mut key);
 
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(&key_path, key)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    write_vault_key_file(&key_path, &key)?;
 
-    // Also store in keychain for Go bridge interop (best-effort)
-    if let Err(err) = try_keychain_set(&key) {
+    // Also store in secure backend for interop (best-effort).
+    if let Err(err) = try_secure_backend_set(&store_config, &key) {
         record_keychain_failure("write", vault_exists, false, &err);
     }
 
@@ -785,7 +1027,7 @@ fn resolve_key_material_with_keychain_ops<FG>(
 where
     FG: FnMut() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error>,
 {
-    let key_path = dir.join(KEY_FILE);
+    let key_path = credential_store_key_path(dir);
     if let Some(key) = read_vault_key_file(&key_path)? {
         return Ok(key);
     }
@@ -822,7 +1064,7 @@ where
     }
 
     let key = resolve_key_material_with_keychain_ops(dir, keychain_get)?;
-    let key_path = dir.join(KEY_FILE);
+    let key_path = credential_store_key_path(dir);
 
     if backend == KEYCHAIN_BACKEND_FILE {
         write_vault_key_file(&key_path, &key)?;
@@ -848,15 +1090,19 @@ where
 
 pub fn sync_vault_key_to_backend(dir: &Path, backend: &str) -> Result<()> {
     let backend = backend.trim();
+    let config = resolve_credential_store_config(dir);
     match backend {
-        KEYCHAIN_BACKEND_PASS_APP => {
-            sync_vault_key_to_backend_with_ops(dir, backend, try_any_secure_backend_get, try_pass_set)
-        }
+        KEYCHAIN_BACKEND_PASS_APP => sync_vault_key_to_backend_with_ops(
+            dir,
+            backend,
+            || try_secure_backend_get(&config),
+            |key| try_pass_set_with_config(&config, key),
+        ),
         _ => sync_vault_key_to_backend_with_ops(
             dir,
             backend,
-            try_any_secure_backend_get,
-            try_keychain_set,
+            || try_secure_backend_get(&config),
+            |key| try_keychain_set_with_config(&config, key),
         ),
     }
 }
@@ -900,15 +1146,17 @@ fn resolve_keychain_key(
 
 /// Try to read the vault key from the OS keychain.
 /// Returns Ok(Some(key)) if found, Ok(None) if not found, Err on failure.
-fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+fn try_keychain_get_with_config(
+    config: &CredentialStoreConfig,
+) -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
     let mut first_non_missing_error: Option<keyring::Error> = None;
 
-    for service in keychain_services() {
-        for (target, entry_result) in keyring_entry_candidates(&service, KEYCHAIN_SECRET) {
+    for service in keychain_services_for_config(config) {
+        for (target, entry_result) in keyring_entry_candidates(&service, &config.secret) {
             tracing::debug!(
                 service = %service,
                 target,
-                account = KEYCHAIN_SECRET,
+                account = %config.secret,
                 "trying vault keychain service"
             );
 
@@ -976,39 +1224,62 @@ fn decode_vault_key_string(encoded: String) -> std::result::Result<[u8; KEY_LEN]
     Ok(key)
 }
 
-fn try_any_secure_backend_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+fn try_secure_backend_get(
+    config: &CredentialStoreConfig,
+) -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
     let mut first_non_missing_error: Option<keyring::Error> = None;
-    tracing::debug!("attempting vault key lookup via secure backends");
+    tracing::debug!(
+        backend = ?config.backend,
+        "attempting vault key lookup via secure backends"
+    );
 
-    match try_keychain_get() {
-        Ok(Some(key)) => {
-            tracing::debug!(backend = KEYCHAIN_BACKEND_KEYRING, "vault key found in secure backend");
-            return Ok(Some(key));
+    if matches!(
+        config.backend,
+        CredentialStoreBackend::Auto | CredentialStoreBackend::System
+    ) {
+        match try_keychain_get_with_config(config) {
+            Ok(Some(key)) => {
+                tracing::debug!(
+                    backend = KEYCHAIN_BACKEND_KEYRING,
+                    "vault key found in secure backend"
+                );
+                return Ok(Some(key));
+            }
+            Ok(None) | Err(keyring::Error::NoEntry) => {
+                tracing::debug!(
+                    backend = KEYCHAIN_BACKEND_KEYRING,
+                    "vault key not found in keyring backend"
+                );
+            }
+            Err(err) => first_non_missing_error = Some(err),
         }
-        Ok(None) | Err(keyring::Error::NoEntry) => {
-            tracing::debug!(
-                backend = KEYCHAIN_BACKEND_KEYRING,
-                "vault key not found in keyring backend"
-            );
-        }
-        Err(err) => first_non_missing_error = Some(err),
     }
 
     #[cfg(target_os = "linux")]
-    match try_pass_get() {
-        Ok(Some(key)) => {
-            tracing::debug!(backend = KEYCHAIN_BACKEND_PASS_APP, "vault key found in secure backend");
-            return Ok(Some(key));
-        }
-        Ok(None) | Err(keyring::Error::NoEntry) => {
-            tracing::debug!(
-                backend = KEYCHAIN_BACKEND_PASS_APP,
-                "vault key not found in pass backend"
-            );
-        }
-        Err(err) => {
-            if first_non_missing_error.is_none() {
-                first_non_missing_error = Some(err);
+    {
+        if matches!(
+            config.backend,
+            CredentialStoreBackend::Auto | CredentialStoreBackend::Pass
+        ) {
+            match try_pass_get_with_config(config) {
+                Ok(Some(key)) => {
+                    tracing::debug!(
+                        backend = KEYCHAIN_BACKEND_PASS_APP,
+                        "vault key found in secure backend"
+                    );
+                    return Ok(Some(key));
+                }
+                Ok(None) | Err(keyring::Error::NoEntry) => {
+                    tracing::debug!(
+                        backend = KEYCHAIN_BACKEND_PASS_APP,
+                        "vault key not found in pass backend"
+                    );
+                }
+                Err(err) => {
+                    if first_non_missing_error.is_none() {
+                        first_non_missing_error = Some(err);
+                    }
+                }
             }
         }
     }
@@ -1021,15 +1292,31 @@ fn try_any_secure_backend_get() -> std::result::Result<Option<[u8; KEY_LEN]>, ke
 }
 
 /// Try to store the vault key in the OS keychain (base64-encoded, like Go bridge).
-fn try_keychain_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Error> {
-    let service = keychain_services()
+fn try_secure_backend_set(
+    config: &CredentialStoreConfig,
+    key: &[u8; KEY_LEN],
+) -> std::result::Result<(), keyring::Error> {
+    match config.backend {
+        CredentialStoreBackend::Auto | CredentialStoreBackend::System => {
+            try_keychain_set_with_config(config, key)
+        }
+        CredentialStoreBackend::Pass => try_pass_set_with_config(config, key),
+        CredentialStoreBackend::File => Ok(()),
+    }
+}
+
+fn try_keychain_set_with_config(
+    config: &CredentialStoreConfig,
+    key: &[u8; KEY_LEN],
+) -> std::result::Result<(), keyring::Error> {
+    let service = keychain_services_for_config(config)
         .into_iter()
         .next()
-        .unwrap_or_else(default_non_macos_keychain_service);
+        .unwrap_or_else(|| derive_system_service(config));
     let encoded = BASE64.encode(key);
     let mut first_error: Option<keyring::Error> = None;
 
-    for (target, entry_result) in keyring_entry_candidates(&service, KEYCHAIN_SECRET) {
+    for (target, entry_result) in keyring_entry_candidates(&service, &config.secret) {
         let entry = match entry_result {
             Ok(entry) => entry,
             Err(err) => {
@@ -1065,7 +1352,10 @@ fn try_keychain_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Err
 }
 
 #[cfg(target_os = "linux")]
-fn run_pass_command(args: &[&str], stdin_payload: Option<&str>) -> std::result::Result<String, keyring::Error> {
+fn run_pass_command(
+    args: &[&str],
+    stdin_payload: Option<&str>,
+) -> std::result::Result<String, keyring::Error> {
     let mut command = Command::new("pass");
     command
         .args(args)
@@ -1087,9 +1377,9 @@ fn run_pass_command(args: &[&str], stdin_payload: Option<&str>) -> std::result::
                 .write_all(payload.as_bytes())
                 .map_err(|err| keyring::Error::PlatformFailure(Box::new(err)))?;
         } else {
-            return Err(keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
-                "pass command missing stdin",
-            ))));
+            return Err(keyring::Error::PlatformFailure(Box::new(
+                std::io::Error::other("pass command missing stdin"),
+            )));
         }
     }
 
@@ -1118,9 +1408,9 @@ fn run_pass_command(args: &[&str], stdin_payload: Option<&str>) -> std::result::
             std::io::Error::other(message),
         )));
     }
-    Err(keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
-        message,
-    ))))
+    Err(keyring::Error::PlatformFailure(Box::new(
+        std::io::Error::other(message),
+    )))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1128,14 +1418,16 @@ fn run_pass_command(
     _args: &[&str],
     _stdin_payload: Option<&str>,
 ) -> std::result::Result<String, keyring::Error> {
-    Err(keyring::Error::NoStorageAccess(Box::new(std::io::Error::other(
-        "pass backend unavailable on this platform",
-    ))))
+    Err(keyring::Error::NoStorageAccess(Box::new(
+        std::io::Error::other("pass backend unavailable on this platform"),
+    )))
 }
 
 #[cfg(target_os = "linux")]
-fn try_pass_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
-    let entry = default_pass_entry_name();
+fn try_pass_get_with_config(
+    config: &CredentialStoreConfig,
+) -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+    let entry = derive_pass_entry(config);
     let output = match run_pass_command(&["show", entry.as_str()], None) {
         Ok(output) => output,
         Err(keyring::Error::NoEntry) => return Ok(None),
@@ -1149,15 +1441,24 @@ fn try_pass_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> 
     Ok(Some(key))
 }
 
-fn try_pass_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Error> {
-    let entry = default_pass_entry_name();
+fn try_pass_set_with_config(
+    config: &CredentialStoreConfig,
+    key: &[u8; KEY_LEN],
+) -> std::result::Result<(), keyring::Error> {
+    let entry = derive_pass_entry(config);
     let mut payload = BASE64.encode(key);
     payload.push('\n');
-    run_pass_command(&["insert", "-m", "-f", entry.as_str()], Some(payload.as_str())).map(|_| ())
+    run_pass_command(
+        &["insert", "-m", "-f", entry.as_str()],
+        Some(payload.as_str()),
+    )
+    .map(|_| ())
 }
 
-fn try_pass_delete() -> std::result::Result<(), keyring::Error> {
-    let entry = default_pass_entry_name();
+fn try_pass_delete_with_config(
+    config: &CredentialStoreConfig,
+) -> std::result::Result<(), keyring::Error> {
+    let entry = derive_pass_entry(config);
     match run_pass_command(&["rm", "-f", entry.as_str()], None) {
         Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(err) => Err(err),
@@ -1446,8 +1747,9 @@ pub fn remove_session_by_email(dir: &Path, email: &str) -> Result<()> {
 }
 
 pub fn remove_session(dir: &Path) -> Result<()> {
+    let store_config = resolve_credential_store_config(dir);
     let vault = dir.join(VAULT_FILE);
-    let key_file = dir.join(KEY_FILE);
+    let key_file = store_config.file_path.clone();
     let default_email_file = dir.join(DEFAULT_EMAIL_FILE);
     if vault.exists() {
         std::fs::remove_file(&vault)?;
@@ -1459,12 +1761,12 @@ pub fn remove_session(dir: &Path) -> Result<()> {
         std::fs::remove_file(&default_email_file)?;
     }
     // Also try to remove keychain entry (best-effort) from all known service names.
-    for service in keychain_services() {
-        if let Ok(entry) = new_keyring_entry(&service, KEYCHAIN_SECRET) {
+    for service in keychain_services_for_config(&store_config) {
+        if let Ok(entry) = new_keyring_entry(&service, &store_config.secret) {
             let _ = entry.delete_credential();
         }
     }
-    let _ = try_pass_delete();
+    let _ = try_pass_delete_with_config(&store_config);
     Ok(())
 }
 
@@ -1652,6 +1954,56 @@ mod tests {
         let key2 = get_or_create_vault_key(tmp.path()).unwrap();
         assert_eq!(key1, key2);
         assert_ne!(key1, [0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn credential_store_config_defaults_match_proton_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = resolve_credential_store_config(tmp.path());
+
+        assert_eq!(config.backend, CredentialStoreBackend::Auto);
+        assert_eq!(config.namespace, KEYCHAIN_NAME);
+        assert_eq!(config.secret, KEYCHAIN_SECRET);
+        assert_eq!(config.system_service, None);
+        assert_eq!(config.pass_entry, None);
+        assert_eq!(config.file_path, tmp.path().join(KEY_FILE));
+    }
+
+    #[test]
+    fn credential_store_config_reads_toml_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(CREDENTIAL_STORE_CONFIG_FILE),
+            r#"
+backend = "pass"
+namespace = "openproton-bridge"
+secret = "openproton-vault-key"
+
+[system]
+service = "protonmail/custom/users"
+
+[pass]
+entry = "protonmail/custom/users/openproton-vault-key"
+
+[file]
+path = "custom-vault.key"
+"#,
+        )
+        .unwrap();
+
+        let config = resolve_credential_store_config(tmp.path());
+        assert_eq!(config.backend, CredentialStoreBackend::Pass);
+        assert_eq!(config.namespace, "openproton-bridge");
+        assert_eq!(config.secret, "openproton-vault-key");
+        assert_eq!(
+            config.system_service.as_deref(),
+            Some("protonmail/custom/users")
+        );
+        assert_eq!(
+            config.pass_entry.as_deref(),
+            Some("protonmail/custom/users/openproton-vault-key")
+        );
+        assert_eq!(config.file_path, tmp.path().join("custom-vault.key"));
     }
 
     #[test]

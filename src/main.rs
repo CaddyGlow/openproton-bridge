@@ -33,6 +33,30 @@ struct Cli {
     #[arg(long, global = true)]
     vault_dir: Option<std::path::PathBuf>,
 
+    /// Credential store backend: auto, system, pass, file
+    #[arg(long, global = true)]
+    credential_store: Option<CredentialStoreBackendArg>,
+
+    /// Credential store namespace (default: bridge-v3)
+    #[arg(long, global = true)]
+    credential_store_namespace: Option<String>,
+
+    /// Credential store secret/account key (default: bridge-vault-key)
+    #[arg(long, global = true)]
+    credential_store_secret: Option<String>,
+
+    /// Override system keychain service name
+    #[arg(long, global = true)]
+    credential_store_system_service: Option<String>,
+
+    /// Override pass entry path
+    #[arg(long, global = true)]
+    credential_store_pass_entry: Option<String>,
+
+    /// Override credential file path
+    #[arg(long, global = true)]
+    credential_store_file_path: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -121,6 +145,14 @@ enum FidoProvider {
     Os,
 }
 
+#[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
+enum CredentialStoreBackendArg {
+    Auto,
+    System,
+    Pass,
+    File,
+}
+
 #[derive(Subcommand)]
 enum AccountsCommand {
     /// List all saved accounts
@@ -132,6 +164,15 @@ enum AccountsCommand {
     },
 }
 
+const ENV_OPENPROTON_VAULT_DIR: &str = "OPENPROTON_VAULT_DIR";
+const ENV_OPENPROTON_CREDENTIAL_STORE: &str = "OPENPROTON_CREDENTIAL_STORE";
+const ENV_OPENPROTON_CREDENTIAL_STORE_NAMESPACE: &str = "OPENPROTON_CREDENTIAL_STORE_NAMESPACE";
+const ENV_OPENPROTON_CREDENTIAL_STORE_SECRET: &str = "OPENPROTON_CREDENTIAL_STORE_SECRET";
+const ENV_OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE: &str =
+    "OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE";
+const ENV_OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY: &str = "OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY";
+const ENV_OPENPROTON_CREDENTIAL_STORE_FILE_PATH: &str = "OPENPROTON_CREDENTIAL_STORE_FILE_PATH";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -142,7 +183,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let runtime_paths = runtime_paths(cli.vault_dir.as_deref())?;
+    let credential_store_overrides = resolve_credential_store_overrides(&cli)?;
+    vault::set_process_credential_store_overrides(credential_store_overrides);
+    let resolved_vault_dir = resolve_vault_dir(&cli);
+    let runtime_paths = runtime_paths(resolved_vault_dir.as_deref())?;
     let dir = runtime_paths.settings_dir().to_path_buf();
     let _instance_lock = match &cli.command {
         Command::Serve { .. } | Command::Grpc { .. } => {
@@ -197,6 +241,100 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Grpc { bind } => cmd_grpc(&bind, &runtime_paths).await,
     }
+}
+
+fn resolve_vault_dir(cli: &Cli) -> Option<std::path::PathBuf> {
+    cli.vault_dir
+        .clone()
+        .or_else(|| env_non_empty(ENV_OPENPROTON_VAULT_DIR).map(std::path::PathBuf::from))
+}
+
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+}
+
+fn parse_credential_store_backend(raw: &str) -> anyhow::Result<vault::CredentialStoreBackend> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(vault::CredentialStoreBackend::Auto),
+        "system" => Ok(vault::CredentialStoreBackend::System),
+        "pass" => Ok(vault::CredentialStoreBackend::Pass),
+        "file" => Ok(vault::CredentialStoreBackend::File),
+        other => anyhow::bail!(
+            "invalid credential store backend `{other}`; expected one of: auto, system, pass, file"
+        ),
+    }
+}
+
+fn map_credential_store_backend_arg(
+    backend: CredentialStoreBackendArg,
+) -> vault::CredentialStoreBackend {
+    match backend {
+        CredentialStoreBackendArg::Auto => vault::CredentialStoreBackend::Auto,
+        CredentialStoreBackendArg::System => vault::CredentialStoreBackend::System,
+        CredentialStoreBackendArg::Pass => vault::CredentialStoreBackend::Pass,
+        CredentialStoreBackendArg::File => vault::CredentialStoreBackend::File,
+    }
+}
+
+fn resolve_credential_store_overrides(
+    cli: &Cli,
+) -> anyhow::Result<vault::CredentialStoreOverrides> {
+    let mut overrides = vault::CredentialStoreOverrides::default();
+
+    if let Some(raw) = env_non_empty(ENV_OPENPROTON_CREDENTIAL_STORE) {
+        overrides.backend = Some(parse_credential_store_backend(&raw)?);
+    }
+    if let Some(raw) = env_non_empty(ENV_OPENPROTON_CREDENTIAL_STORE_NAMESPACE) {
+        overrides.namespace = Some(raw);
+    }
+    if let Some(raw) = env_non_empty(ENV_OPENPROTON_CREDENTIAL_STORE_SECRET) {
+        overrides.secret = Some(raw);
+    }
+    if let Some(raw) = env_non_empty(ENV_OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE) {
+        overrides.system_service = Some(raw);
+    }
+    if let Some(raw) = env_non_empty(ENV_OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY) {
+        overrides.pass_entry = Some(raw);
+    }
+    if let Some(raw) = env_non_empty(ENV_OPENPROTON_CREDENTIAL_STORE_FILE_PATH) {
+        overrides.file_path = Some(std::path::PathBuf::from(raw));
+    }
+
+    if let Some(backend) = cli.credential_store.clone() {
+        overrides.backend = Some(map_credential_store_backend_arg(backend));
+    }
+    if let Some(namespace) = cli.credential_store_namespace.as_deref() {
+        let namespace = namespace.trim();
+        if !namespace.is_empty() {
+            overrides.namespace = Some(namespace.to_string());
+        }
+    }
+    if let Some(secret) = cli.credential_store_secret.as_deref() {
+        let secret = secret.trim();
+        if !secret.is_empty() {
+            overrides.secret = Some(secret.to_string());
+        }
+    }
+    if let Some(service) = cli.credential_store_system_service.as_deref() {
+        let service = service.trim();
+        if !service.is_empty() {
+            overrides.system_service = Some(service.to_string());
+        }
+    }
+    if let Some(pass_entry) = cli.credential_store_pass_entry.as_deref() {
+        let pass_entry = pass_entry.trim();
+        if !pass_entry.is_empty() {
+            overrides.pass_entry = Some(pass_entry.to_string());
+        }
+    }
+    if let Some(path) = cli.credential_store_file_path.as_ref() {
+        overrides.file_path = Some(path.clone());
+    }
+
+    Ok(overrides)
 }
 
 async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyhow::Result<()> {
@@ -1628,6 +1766,59 @@ mod tests {
             } => assert_eq!(event_poll_secs, 10),
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn parse_global_credential_store_flags() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "--credential-store",
+            "file",
+            "--credential-store-namespace",
+            "openproton-bridge",
+            "--credential-store-secret",
+            "openproton-vault-key",
+            "--credential-store-file-path",
+            "/tmp/openproton.key",
+            "status",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.credential_store, Some(CredentialStoreBackendArg::File));
+        assert_eq!(
+            cli.credential_store_namespace.as_deref(),
+            Some("openproton-bridge")
+        );
+        assert_eq!(
+            cli.credential_store_secret.as_deref(),
+            Some("openproton-vault-key")
+        );
+        assert_eq!(
+            cli.credential_store_file_path.as_deref(),
+            Some(std::path::Path::new("/tmp/openproton.key"))
+        );
+        assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn parse_credential_store_backend_accepts_expected_values() {
+        assert_eq!(
+            parse_credential_store_backend("auto").unwrap(),
+            vault::CredentialStoreBackend::Auto
+        );
+        assert_eq!(
+            parse_credential_store_backend("system").unwrap(),
+            vault::CredentialStoreBackend::System
+        );
+        assert_eq!(
+            parse_credential_store_backend("pass").unwrap(),
+            vault::CredentialStoreBackend::Pass
+        );
+        assert_eq!(
+            parse_credential_store_backend("file").unwrap(),
+            vault::CredentialStoreBackend::File
+        );
+        assert!(parse_credential_store_backend("invalid").is_err());
     }
 
     #[test]

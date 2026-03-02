@@ -54,6 +54,15 @@ openproton-bridge serve
 # Optional: tune per-account event poll interval
 openproton-bridge serve --event-poll-secs 10
 
+# Run with isolated vault directory + file credential store
+openproton-bridge --vault-dir ~/.config/protonmail/openproton-bridge \
+  --credential-store file serve
+
+# Force system keychain namespace/secret (side-by-side with official Bridge)
+openproton-bridge --credential-store system \
+  --credential-store-namespace openproton-bridge \
+  --credential-store-secret openproton-vault-key serve
+
 # Check status
 openproton-bridge status
 
@@ -119,6 +128,34 @@ openproton-bridge status
 
 2. If one account shows repeated auth failures in logs, re-run `login` for that account; other accounts continue serving.
 3. After account list changes (`login`, `logout --email`, `logout --all`), restart `serve` so runtime workers match vault state.
+
+### Credential Store Options
+
+Global options:
+
+- `--credential-store <auto|system|pass|file>`
+- `--credential-store-namespace <name>`
+- `--credential-store-secret <name>`
+- `--credential-store-system-service <service>`
+- `--credential-store-pass-entry <entry>`
+- `--credential-store-file-path <path>`
+
+Environment variable equivalents:
+
+- `OPENPROTON_VAULT_DIR`
+- `OPENPROTON_CREDENTIAL_STORE`
+- `OPENPROTON_CREDENTIAL_STORE_NAMESPACE`
+- `OPENPROTON_CREDENTIAL_STORE_SECRET`
+- `OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE`
+- `OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY`
+- `OPENPROTON_CREDENTIAL_STORE_FILE_PATH`
+
+Precedence:
+
+1. CLI flags
+2. Environment variables
+3. `<vault-dir>/credential_store.toml`
+4. Built-in defaults
 
 ## Configuration
 

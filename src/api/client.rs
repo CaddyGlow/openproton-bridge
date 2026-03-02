@@ -4,8 +4,20 @@ use reqwest::Client;
 use super::error::{ApiError, Result};
 
 const BASE_URL: &str = "https://mail-api.proton.me";
-const APP_VERSION: &str = "web-mail@5.0.103.3";
-const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+fn bridge_app_version() -> String {
+    let os = match std::env::consts::OS {
+        "macos" => "macos",
+        "linux" => "linux",
+        "windows" => "windows",
+        _ => "linux",
+    };
+    format!("{os}-bridge@{}", env!("CARGO_PKG_VERSION"))
+}
+
+fn bridge_user_agent() -> String {
+    format!("ProtonMailBridge/{}", env!("CARGO_PKG_VERSION"))
+}
 
 /// HTTP client preconfigured with Proton API headers.
 #[derive(Debug, Clone)]
@@ -25,8 +37,14 @@ impl ProtonClient {
     /// Create client pointing at a custom base URL (for testing with wiremock).
     pub fn with_base_url(base_url: &str) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        headers.insert("x-pm-appversion", HeaderValue::from_static(APP_VERSION));
-        headers.insert("User-Agent", HeaderValue::from_static(USER_AGENT));
+        let app_version = bridge_app_version();
+        let app_version_header = HeaderValue::from_str(&app_version)
+            .map_err(|err| ApiError::Auth(format!("invalid app version header value: {err}")))?;
+        headers.insert("x-pm-appversion", app_version_header);
+        let user_agent = bridge_user_agent();
+        let user_agent_header = HeaderValue::from_str(&user_agent)
+            .map_err(|err| ApiError::Auth(format!("invalid user agent header value: {err}")))?;
+        headers.insert("User-Agent", user_agent_header);
 
         let client = Client::builder()
             .default_headers(headers)

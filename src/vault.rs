@@ -65,6 +65,16 @@ fn default_pass_entry_name() -> String {
 }
 
 #[cfg(target_os = "macos")]
+fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, keyring::Error> {
+    keyring::Entry::new_with_target("User", service, account)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn new_keyring_entry(service: &str, account: &str) -> std::result::Result<keyring::Entry, keyring::Error> {
+    keyring::Entry::new(service, account)
+}
+
+#[cfg(target_os = "macos")]
 fn keychain_services() -> Vec<String> {
     let title_name = title_case_keychain_name(KEYCHAIN_NAME);
     let legacy_title = title_case_keychain_name(LEGACY_KEYCHAIN_NAME);
@@ -608,7 +618,7 @@ fn keyring_backend_available() -> bool {
         .into_iter()
         .next()
         .unwrap_or_else(default_non_macos_keychain_service);
-    let entry = match keyring::Entry::new(&probe_service, &probe_account) {
+    let entry = match new_keyring_entry(&probe_service, &probe_account) {
         Ok(entry) => entry,
         Err(err) => {
             record_keychain_failure("probe", false, false, &err);
@@ -882,7 +892,7 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
             account = KEYCHAIN_SECRET,
             "trying vault keychain service"
         );
-        let entry = match keyring::Entry::new(&service, KEYCHAIN_SECRET) {
+        let entry = match new_keyring_entry(&service, KEYCHAIN_SECRET) {
             Ok(entry) => entry,
             Err(err) => {
                 if first_non_missing_error.is_none() {
@@ -1039,7 +1049,7 @@ fn try_keychain_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Err
         .into_iter()
         .next()
         .unwrap_or_else(default_non_macos_keychain_service);
-    let entry = keyring::Entry::new(&service, KEYCHAIN_SECRET)?;
+    let entry = new_keyring_entry(&service, KEYCHAIN_SECRET)?;
     let encoded = BASE64.encode(key);
     entry.set_password(&encoded)
 }
@@ -1440,7 +1450,7 @@ pub fn remove_session(dir: &Path) -> Result<()> {
     }
     // Also try to remove keychain entry (best-effort) from all known service names.
     for service in keychain_services() {
-        if let Ok(entry) = keyring::Entry::new(&service, KEYCHAIN_SECRET) {
+        if let Ok(entry) = new_keyring_entry(&service, KEYCHAIN_SECRET) {
             let _ = entry.delete_credential();
         }
     }

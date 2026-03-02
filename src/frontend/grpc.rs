@@ -128,6 +128,7 @@ struct PendingHumanVerification {
 struct GrpcState {
     runtime_paths: RuntimePaths,
     bind_host: String,
+    active_disk_cache_path: Mutex<PathBuf>,
     event_tx: broadcast::Sender<pb::StreamEvent>,
     active_stream_stop: Mutex<Option<watch::Sender<bool>>>,
     pending_login: Mutex<Option<PendingLogin>>,
@@ -518,8 +519,8 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn disk_cache_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
-        let settings = self.state.app_settings.lock().await;
-        Ok(Response::new(settings.disk_cache_path.clone()))
+        let path = self.state.active_disk_cache_path.lock().await.clone();
+        Ok(Response::new(path.display().to_string()))
     }
 
     async fn set_disk_cache_path(&self, request: Request<String>) -> Result<Response<()>, Status> {
@@ -527,19 +528,29 @@ impl pb::bridge_server::Bridge for BridgeService {
         if path.trim().is_empty() {
             return Err(Status::invalid_argument("disk cache path is empty"));
         }
-        let target = PathBuf::from(path.clone());
-        if let Err(err) = tokio::fs::create_dir_all(&target).await {
+
+        let target = PathBuf::from(path.trim());
+        let current = self.state.active_disk_cache_path.lock().await.clone();
+        if let Err(err) = move_disk_cache_payload(&current, &target).await {
             self.emit_disk_cache_error(pb::DiskCacheErrorType::CantMoveDiskCacheError);
+            self.emit_disk_cache_path_change_finished();
             return Err(Status::internal(format!(
-                "failed to create disk cache path: {err}"
+                "failed to move disk cache path: {err}"
             )));
         }
 
+        *self.state.active_disk_cache_path.lock().await = target.clone();
+
         let mut settings = self.state.app_settings.lock().await;
-        settings.disk_cache_path = path;
-        save_app_settings(&self.grpc_app_settings_path(), &settings)
-            .await
-            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        settings.disk_cache_path = target.display().to_string();
+        if let Err(err) = save_app_settings(&self.grpc_app_settings_path(), &settings).await {
+            self.emit_disk_cache_error(pb::DiskCacheErrorType::CantMoveDiskCacheError);
+            self.emit_disk_cache_path_change_finished();
+            return Err(Status::internal(format!(
+                "failed to save app settings: {err}"
+            )));
+        }
+
         self.emit_disk_cache_path_changed(&settings.disk_cache_path);
         self.emit_disk_cache_path_change_finished();
         Ok(Response::new(()))
@@ -1347,11 +1358,22 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
 
     let settings = load_mail_settings(&grpc_mail_settings_path).await?;
     let app_settings = load_app_settings(&grpc_app_settings_path, &disk_cache_dir).await?;
+    let active_disk_cache_path = effective_disk_cache_path(&app_settings, &runtime_paths);
+    tokio::fs::create_dir_all(&active_disk_cache_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create active disk cache path {}",
+                active_disk_cache_path.display()
+            )
+        })?;
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, _) = broadcast::channel(128);
     let state = Arc::new(GrpcState {
         runtime_paths: runtime_paths.clone(),
         bind_host,
+        active_disk_cache_path: Mutex::new(active_disk_cache_path),
         event_tx,
         active_stream_stop: Mutex::new(None),
         pending_login: Mutex::new(None),
@@ -1610,6 +1632,100 @@ async fn save_app_settings(path: &Path, settings: &StoredAppSettings) -> anyhow:
     Ok(())
 }
 
+fn effective_disk_cache_path(
+    settings: &StoredAppSettings,
+    runtime_paths: &RuntimePaths,
+) -> PathBuf {
+    let configured = settings.disk_cache_path.trim();
+    if configured.is_empty() {
+        return runtime_paths.disk_cache_dir();
+    }
+    PathBuf::from(configured)
+}
+
+async fn move_disk_cache_payload(current: &Path, target: &Path) -> anyhow::Result<()> {
+    if current == target {
+        tokio::fs::create_dir_all(target)
+            .await
+            .with_context(|| format!("failed to create disk cache path {}", target.display()))?;
+        return Ok(());
+    }
+
+    if target.starts_with(current) {
+        anyhow::bail!(
+            "target disk cache path {} must not be inside current path {}",
+            target.display(),
+            current.display()
+        );
+    }
+
+    tokio::fs::create_dir_all(target)
+        .await
+        .with_context(|| format!("failed to create disk cache path {}", target.display()))?;
+
+    if tokio::fs::metadata(current).await.is_err() {
+        return Ok(());
+    }
+
+    copy_dir_contents(current, target).await?;
+
+    if let Err(err) = tokio::fs::remove_dir_all(current).await {
+        warn!(
+            error = %err,
+            old_path = %current.display(),
+            "failed to clean old disk cache path after successful move"
+        );
+    }
+
+    Ok(())
+}
+
+async fn copy_dir_contents(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+
+    while let Some((current_src, current_dst)) = stack.pop() {
+        tokio::fs::create_dir_all(&current_dst)
+            .await
+            .with_context(|| format!("failed to create directory {}", current_dst.display()))?;
+
+        let mut entries = tokio::fs::read_dir(&current_src)
+            .await
+            .with_context(|| format!("failed to read directory {}", current_src.display()))?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .with_context(|| format!("failed reading entries for {}", current_src.display()))?
+        {
+            let src_path = entry.path();
+            let dst_path = current_dst.join(entry.file_name());
+            let file_type = entry
+                .file_type()
+                .await
+                .with_context(|| format!("failed to read file type for {}", src_path.display()))?;
+
+            if file_type.is_dir() {
+                stack.push((src_path, dst_path));
+                continue;
+            }
+
+            if file_type.is_file() {
+                tokio::fs::copy(&src_path, &dst_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to copy file from {} to {}",
+                            src_path.display(),
+                            dst_path.display()
+                        )
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn mail_cert_paths(vault_dir: &Path) -> (PathBuf, PathBuf) {
     let cert_dir = vault_dir.join("tls");
     (cert_dir.join("cert.pem"), cert_dir.join("key.pem"))
@@ -1649,14 +1765,15 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn build_test_service_with_paths(runtime_paths: RuntimePaths) -> BridgeService {
+        let app_settings = StoredAppSettings::with_defaults_for(&runtime_paths.disk_cache_dir());
+        let active_disk_cache_path = effective_disk_cache_path(&app_settings, &runtime_paths);
         let (event_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = watch::channel(false);
         let state = Arc::new(GrpcState {
-            app_settings: Mutex::new(StoredAppSettings::with_defaults_for(
-                &runtime_paths.disk_cache_dir(),
-            )),
+            app_settings: Mutex::new(app_settings),
             runtime_paths,
             bind_host: "127.0.0.1".to_string(),
+            active_disk_cache_path: Mutex::new(active_disk_cache_path),
             event_tx,
             active_stream_stop: Mutex::new(None),
             pending_login: Mutex::new(None),
@@ -1840,6 +1957,121 @@ mod tests {
         assert_eq!(logs_path, expected_logs_dir);
         assert!(expected_logs_dir.exists());
         assert!(!settings_logs_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn set_disk_cache_path_moves_payload_and_updates_effective_path() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_paths = RuntimePaths::from_bases(
+            root.path().join("cfg"),
+            root.path().join("data"),
+            root.path().join("cache"),
+        );
+        let old_path = runtime_paths.disk_cache_dir();
+        let service = build_test_service_with_paths(runtime_paths.clone());
+        let mut events = service.state.event_tx.subscribe();
+
+        let old_payload = old_path.join("nested").join("payload.txt");
+        tokio::fs::create_dir_all(old_payload.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&old_payload, b"cache-payload")
+            .await
+            .unwrap();
+
+        let new_path = root.path().join("moved-cache");
+        <BridgeService as pb::bridge_server::Bridge>::set_disk_cache_path(
+            &service,
+            Request::new(new_path.display().to_string()),
+        )
+        .await
+        .unwrap();
+
+        let copied_payload = new_path.join("nested").join("payload.txt");
+        assert_eq!(
+            tokio::fs::read(&copied_payload).await.unwrap(),
+            b"cache-payload"
+        );
+        assert!(!old_path.exists());
+
+        let effective = <BridgeService as pb::bridge_server::Bridge>::disk_cache_path(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(effective, new_path.display().to_string());
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+                event: Some(pb::disk_cache_event::Event::PathChanged(changed)),
+            })) => assert_eq!(changed.path, new_path.display().to_string()),
+            other => panic!("unexpected first disk cache event: {other:?}"),
+        }
+
+        let second = events.recv().await.unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+                event: Some(pb::disk_cache_event::Event::PathChangeFinished(_)),
+            })) => {}
+            other => panic!("unexpected second disk cache event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_disk_cache_path_failure_emits_error_then_finished() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_paths = RuntimePaths::from_bases(
+            root.path().join("cfg"),
+            root.path().join("data"),
+            root.path().join("cache"),
+        );
+        let service = build_test_service_with_paths(runtime_paths.clone());
+        let mut events = service.state.event_tx.subscribe();
+
+        let target_file = root.path().join("not-a-directory");
+        tokio::fs::write(&target_file, b"file").await.unwrap();
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::set_disk_cache_path(
+            &service,
+            Request::new(target_file.display().to_string()),
+        )
+        .await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal);
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+                event: Some(pb::disk_cache_event::Event::Error(err)),
+            })) => assert_eq!(
+                err.r#type,
+                pb::DiskCacheErrorType::CantMoveDiskCacheError as i32
+            ),
+            other => panic!("unexpected first failure event: {other:?}"),
+        }
+
+        let second = events.recv().await.unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+                event: Some(pb::disk_cache_event::Event::PathChangeFinished(_)),
+            })) => {}
+            other => panic!("unexpected second failure event: {other:?}"),
+        }
+
+        let effective = <BridgeService as pb::bridge_server::Bridge>::disk_cache_path(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            effective,
+            runtime_paths.disk_cache_dir().display().to_string()
+        );
     }
 
     #[tokio::test]

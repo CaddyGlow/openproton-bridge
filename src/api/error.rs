@@ -51,6 +51,10 @@ pub fn is_auth_error(err: &ApiError) -> bool {
     }
 }
 
+pub fn is_invalid_refresh_token_error(err: &ApiError) -> bool {
+    matches!(err, ApiError::Api { code: 10013, .. })
+}
+
 pub fn human_verification_details(err: &ApiError) -> Option<HumanVerificationDetails> {
     let ApiError::Api { code, .. } = err else {
         return None;
@@ -121,5 +125,25 @@ mod tests {
         let hv = any_human_verification_details(&err).expect("expected HV details");
         assert_eq!(hv.human_verification_methods, vec!["captcha"]);
         assert_eq!(hv.human_verification_token, "token-456");
+    }
+
+    #[test]
+    fn invalid_refresh_token_error_helper_matches_10013() {
+        let err = ApiError::Api {
+            code: 10013,
+            message: "Invalid refresh token".to_string(),
+            details: None,
+        };
+        assert!(is_invalid_refresh_token_error(&err));
+    }
+
+    #[test]
+    fn invalid_refresh_token_error_helper_rejects_other_codes() {
+        let err = ApiError::Api {
+            code: 8002,
+            message: "Invalid credentials".to_string(),
+            details: None,
+        };
+        assert!(!is_invalid_refresh_token_error(&err));
     }
 }

@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::api::auth;
 use crate::api::client::ProtonClient;
-use crate::api::error::{is_auth_error, ApiError};
+use crate::api::error::{is_auth_error, is_invalid_refresh_token_error, ApiError};
 use crate::api::types::Session;
 
 use super::types::{AccountId, AccountResolver};
@@ -241,6 +241,40 @@ impl RuntimeAccountRegistry {
             .clone()
     }
 
+    fn load_latest_session_from_vault(
+        &self,
+        account_id: &AccountId,
+        existing: &Session,
+    ) -> Option<Session> {
+        let Some(vault_dir) = &self.vault_dir else {
+            return None;
+        };
+
+        let sessions = match crate::vault::list_sessions(vault_dir) {
+            Ok(sessions) => sessions,
+            Err(err) => {
+                warn!(
+                    account_id = %account_id.0,
+                    error = %err,
+                    "failed to reload sessions from vault after refresh-token failure"
+                );
+                return None;
+            }
+        };
+
+        let mut by_email = None;
+        for session in sessions {
+            if session.uid == account_id.0 {
+                return Some(session);
+            }
+            if normalize_email(&session.email) == normalize_email(&existing.email) {
+                by_email = Some(session);
+            }
+        }
+
+        by_email
+    }
+
     pub async fn get_session(&self, account_id: &AccountId) -> Option<Session> {
         let sessions = self.sessions.read().await;
         sessions.get(account_id).cloned()
@@ -350,15 +384,52 @@ impl RuntimeAccountRegistry {
             }
         }
 
-        let mut client = ProtonClient::new()?;
-        let refreshed = auth::refresh_auth(
-            &mut client,
-            &existing.uid,
-            &existing.refresh_token,
-            Some(&existing.access_token),
-        )
-        .await;
-        let refreshed = match refreshed {
+        let mut session_for_refresh = existing;
+
+        let mut refresh_result = {
+            let mut client = ProtonClient::new()?;
+            auth::refresh_auth(
+                &mut client,
+                &session_for_refresh.uid,
+                &session_for_refresh.refresh_token,
+                Some(&session_for_refresh.access_token),
+            )
+            .await
+        };
+
+        if let Err(err) = &refresh_result {
+            if is_invalid_refresh_token_error(err) {
+                if let Some(reloaded) =
+                    self.load_latest_session_from_vault(account_id, &session_for_refresh)
+                {
+                    let changed_refresh_context = reloaded.uid != session_for_refresh.uid
+                        || reloaded.refresh_token != session_for_refresh.refresh_token
+                        || reloaded.access_token != session_for_refresh.access_token;
+
+                    if changed_refresh_context {
+                        debug!(
+                            account_id = %account_id.0,
+                            old_uid = %session_for_refresh.uid,
+                            new_uid = %reloaded.uid,
+                            "retrying refresh with latest vault session after invalid refresh token"
+                        );
+                        session_for_refresh = reloaded;
+                        refresh_result = {
+                            let mut client = ProtonClient::new()?;
+                            auth::refresh_auth(
+                                &mut client,
+                                &session_for_refresh.uid,
+                                &session_for_refresh.refresh_token,
+                                Some(&session_for_refresh.access_token),
+                            )
+                            .await
+                        };
+                    }
+                }
+            }
+        }
+
+        let refreshed = match refresh_result {
             Ok(auth) => auth,
             Err(err) => {
                 let next_health = if is_auth_error(&err) {
@@ -380,7 +451,7 @@ impl RuntimeAccountRegistry {
             uid: refreshed.uid,
             access_token: refreshed.access_token,
             refresh_token: refreshed.refresh_token,
-            ..existing
+            ..session_for_refresh
         };
 
         if let Some(vault_dir) = &self.vault_dir {

@@ -45,7 +45,7 @@ Notes:
 | `ReportBug` | Partial | Logs metadata and emits `reportBugSuccess` + `reportBugFinished`; no upstream submission flow. |
 | `ForceLauncher` | Exact | Persists launcher setting. |
 | `SetMainExecutable` | Exact | Persists executable setting. |
-| `RequestKnowledgeBaseSuggestions` | Partial | Logs request only; no KB backend. |
+| `RequestKnowledgeBaseSuggestions` | Partial | Emits `knowledgeBaseSuggestions` with derived support-search suggestion; no upstream KB backend. |
 | `Login` | Exact | Full auth flow + vault session persistence. |
 | `Login2FA` | Exact | Completes pending 2FA flow. |
 | `LoginFido` | Exact | Completes pending auth via FIDO assertion payload. |
@@ -95,6 +95,7 @@ Notes:
 | `RunEventStream stop semantics` | Exact | Stream terminates after `StopEventStream`; late events not delivered. |
 | `App.ReportBugSuccess` | Exact | Emitted on `ReportBug` request handling path. |
 | `App.ReportBugFinished` | Exact | Emitted after `App.ReportBugSuccess`. |
+| `App.KnowledgeBaseSuggestions` | Exact | Emitted by `RequestKnowledgeBaseSuggestions` with suggestion payload. |
 
 ## Current Blockers Toward Full Exact Parity
 

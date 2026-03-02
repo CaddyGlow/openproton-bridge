@@ -341,6 +341,14 @@ impl BridgeService {
         }));
     }
 
+    fn emit_knowledge_base_suggestions(&self, suggestions: Vec<pb::KnowledgeBaseSuggestion>) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::KnowledgeBaseSuggestions(
+                pb::KnowledgeBaseSuggestionsEvent { suggestions },
+            )),
+        }));
+    }
+
     fn emit_disk_cache_path_changed(&self, path: &str) {
         self.emit_event(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
             event: Some(pb::disk_cache_event::Event::PathChanged(
@@ -732,10 +740,21 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         request: Request<String>,
     ) -> Result<Response<()>, Status> {
+        let query = request.into_inner();
         tracing::info!(
-            query = %request.into_inner(),
+            query = %query,
             "knowledge base suggestion request received"
         );
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            let encoded = trimmed.replace(' ', "+");
+            self.emit_knowledge_base_suggestions(vec![pb::KnowledgeBaseSuggestion {
+                url: format!("https://proton.me/support/search?q={encoded}"),
+                title: format!("Search Proton support for \"{trimmed}\""),
+            }]);
+        } else {
+            self.emit_knowledge_base_suggestions(Vec::new());
+        }
         Ok(Response::new(()))
     }
 
@@ -2211,6 +2230,34 @@ mod tests {
                 event: Some(pb::app_event::Event::ReportBugFinished(_)),
             })) => {}
             other => panic!("unexpected second report bug event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_knowledge_base_suggestions_emits_suggestions_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        <BridgeService as pb::bridge_server::Bridge>::request_knowledge_base_suggestions(
+            &service,
+            Request::new("imap login failure".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::KnowledgeBaseSuggestions(event)),
+            })) => {
+                assert_eq!(event.suggestions.len(), 1);
+                let suggestion = &event.suggestions[0];
+                assert!(suggestion.url.contains("proton.me/support/search"));
+                assert!(suggestion.url.contains("imap+login+failure"));
+                assert!(suggestion.title.contains("imap login failure"));
+            }
+            other => panic!("unexpected knowledge base suggestion event: {other:?}"),
         }
     }
 

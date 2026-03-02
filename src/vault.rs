@@ -1,5 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
+#[cfg(target_os = "linux")]
+use std::io::Write;
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -22,6 +26,7 @@ const ADDRESS_MODE_COMBINED: i32 = 0;
 const ADDRESS_MODE_SPLIT: i32 = 1;
 
 pub const KEYCHAIN_BACKEND_KEYRING: &str = "keyring";
+pub const KEYCHAIN_BACKEND_PASS_APP: &str = "pass-app";
 pub const KEYCHAIN_BACKEND_FILE: &str = "file";
 
 // Keychain constants matching the Go bridge.
@@ -45,6 +50,10 @@ fn title_case_keychain_name(raw: &str) -> String {
 
 fn default_non_macos_keychain_service() -> String {
     format!("protonmail/{KEYCHAIN_NAME}/users")
+}
+
+fn default_pass_entry_name() -> String {
+    format!("{}/{}", default_non_macos_keychain_service(), KEYCHAIN_SECRET)
 }
 
 #[cfg(target_os = "macos")]
@@ -544,14 +553,26 @@ fn default_feature_flag_sticky_key() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 pub fn discover_available_keychains() -> Vec<String> {
-    discover_available_keychains_with_probe(keyring_backend_available)
+    discover_available_keychains_with_probes(keyring_backend_available, pass_backend_available)
 }
 
-fn discover_available_keychains_with_probe<F>(mut keyring_probe: F) -> Vec<String>
+fn discover_available_keychains_with_probes<FK, FP>(
+    mut keyring_probe: FK,
+    mut pass_probe: FP,
+) -> Vec<String>
 where
-    F: FnMut() -> bool,
+    FK: FnMut() -> bool,
+    FP: FnMut() -> bool,
 {
-    let mut available = Vec::with_capacity(2);
+    let mut available = Vec::with_capacity(3);
+    #[cfg(target_os = "linux")]
+    {
+        if pass_probe() {
+            available.push(KEYCHAIN_BACKEND_PASS_APP.to_string());
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = &mut pass_probe;
     if keyring_probe() {
         available.push(KEYCHAIN_BACKEND_KEYRING.to_string());
     }
@@ -583,6 +604,27 @@ fn keyring_backend_available() -> bool {
             false
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn pass_backend_available() -> bool {
+    let probe_account = format!("{}-probe-{}", KEYCHAIN_SECRET, rand::random::<u64>());
+    let probe_entry = format!("{}/{}", default_non_macos_keychain_service(), probe_account);
+    match run_pass_command(&["insert", "-m", "-f", probe_entry.as_str()], Some("probe\n")) {
+        Ok(_) => {
+            let _ = run_pass_command(&["rm", "-f", probe_entry.as_str()], None);
+            true
+        }
+        Err(err) => {
+            record_keychain_failure("probe", false, false, &err);
+            false
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pass_backend_available() -> bool {
+    false
 }
 
 /// Derive AES-256 key from the raw vault key using SHA-256 (matches Go bridge).
@@ -636,7 +678,7 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     let vault_exists = dir.join(VAULT_FILE).exists();
 
     // 2. Try OS keychain (for Go bridge interop -- it stores key in keychain)
-    if let Some(key) = resolve_keychain_key(try_keychain_get(), vault_exists)? {
+    if let Some(key) = resolve_keychain_key(try_any_secure_backend_get(), vault_exists)? {
         return Ok(key);
     }
 
@@ -720,7 +762,10 @@ where
     FS: FnMut(&[u8; KEY_LEN]) -> std::result::Result<(), keyring::Error>,
 {
     let backend = backend.trim();
-    let known_backend = matches!(backend, KEYCHAIN_BACKEND_FILE | KEYCHAIN_BACKEND_KEYRING);
+    let known_backend = matches!(
+        backend,
+        KEYCHAIN_BACKEND_FILE | KEYCHAIN_BACKEND_KEYRING | KEYCHAIN_BACKEND_PASS_APP
+    );
     if !known_backend {
         return Err(VaultError::KeychainAccess(format!(
             "unknown backend: {backend}"
@@ -753,7 +798,18 @@ where
 }
 
 pub fn sync_vault_key_to_backend(dir: &Path, backend: &str) -> Result<()> {
-    sync_vault_key_to_backend_with_ops(dir, backend, try_keychain_get, try_keychain_set)
+    let backend = backend.trim();
+    match backend {
+        KEYCHAIN_BACKEND_PASS_APP => {
+            sync_vault_key_to_backend_with_ops(dir, backend, try_any_secure_backend_get, try_pass_set)
+        }
+        _ => sync_vault_key_to_backend_with_ops(
+            dir,
+            backend,
+            try_any_secure_backend_get,
+            try_keychain_set,
+        ),
+    }
 }
 
 fn resolve_keychain_key(
@@ -799,6 +855,11 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
     let mut first_non_missing_error: Option<keyring::Error> = None;
 
     for service in keychain_services() {
+        tracing::debug!(
+            service = %service,
+            account = KEYCHAIN_SECRET,
+            "trying vault keychain service"
+        );
         let entry = match keyring::Entry::new(&service, KEYCHAIN_SECRET) {
             Ok(entry) => entry,
             Err(err) => {
@@ -822,13 +883,60 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
                 }
                 let mut key = [0u8; KEY_LEN];
                 key.copy_from_slice(&decoded);
+                tracing::debug!(service = %service, "vault keychain service returned matching key");
                 return Ok(Some(key));
             }
-            Err(keyring::Error::NoEntry) => {}
+            Err(keyring::Error::NoEntry) => {
+                tracing::debug!(service = %service, "vault keychain service has no matching entry");
+            }
             Err(err) => {
                 if first_non_missing_error.is_none() {
                     first_non_missing_error = Some(err);
                 }
+            }
+        }
+    }
+
+    if let Some(err) = first_non_missing_error {
+        Err(err)
+    } else {
+        Ok(None)
+    }
+}
+
+fn try_any_secure_backend_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+    let mut first_non_missing_error: Option<keyring::Error> = None;
+    tracing::debug!("attempting vault key lookup via secure backends");
+
+    match try_keychain_get() {
+        Ok(Some(key)) => {
+            tracing::debug!(backend = KEYCHAIN_BACKEND_KEYRING, "vault key found in secure backend");
+            return Ok(Some(key));
+        }
+        Ok(None) | Err(keyring::Error::NoEntry) => {
+            tracing::debug!(
+                backend = KEYCHAIN_BACKEND_KEYRING,
+                "vault key not found in keyring backend"
+            );
+        }
+        Err(err) => first_non_missing_error = Some(err),
+    }
+
+    #[cfg(target_os = "linux")]
+    match try_pass_get() {
+        Ok(Some(key)) => {
+            tracing::debug!(backend = KEYCHAIN_BACKEND_PASS_APP, "vault key found in secure backend");
+            return Ok(Some(key));
+        }
+        Ok(None) | Err(keyring::Error::NoEntry) => {
+            tracing::debug!(
+                backend = KEYCHAIN_BACKEND_PASS_APP,
+                "vault key not found in pass backend"
+            );
+        }
+        Err(err) => {
+            if first_non_missing_error.is_none() {
+                first_non_missing_error = Some(err);
             }
         }
     }
@@ -849,6 +957,115 @@ fn try_keychain_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Err
     let entry = keyring::Entry::new(&service, KEYCHAIN_SECRET)?;
     let encoded = BASE64.encode(key);
     entry.set_password(&encoded)
+}
+
+#[cfg(target_os = "linux")]
+fn run_pass_command(args: &[&str], stdin_payload: Option<&str>) -> std::result::Result<String, keyring::Error> {
+    let mut command = Command::new("pass");
+    command
+        .args(args)
+        .stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|err| keyring::Error::NoStorageAccess(Box::new(err)))?;
+
+    if let Some(payload) = stdin_payload {
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(payload.as_bytes())
+                .map_err(|err| keyring::Error::PlatformFailure(Box::new(err)))?;
+        } else {
+            return Err(keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+                "pass command missing stdin",
+            ))));
+        }
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| keyring::Error::PlatformFailure(Box::new(err)))?;
+
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let message = if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    }
+    .to_string();
+
+    if message.contains("is not in the password store") {
+        return Err(keyring::Error::NoEntry);
+    }
+    if message.contains("Try \"pass init\"") || message.contains("password store is empty") {
+        return Err(keyring::Error::NoStorageAccess(Box::new(
+            std::io::Error::other(message),
+        )));
+    }
+    Err(keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+        message,
+    ))))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn run_pass_command(
+    _args: &[&str],
+    _stdin_payload: Option<&str>,
+) -> std::result::Result<String, keyring::Error> {
+    Err(keyring::Error::NoStorageAccess(Box::new(std::io::Error::other(
+        "pass backend unavailable on this platform",
+    ))))
+}
+
+fn try_pass_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+    let entry = default_pass_entry_name();
+    let output = match run_pass_command(&["show", entry.as_str()], None) {
+        Ok(output) => output,
+        Err(keyring::Error::NoEntry) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let encoded = output.lines().next().unwrap_or_default().trim().to_string();
+    if encoded.is_empty() {
+        return Ok(None);
+    }
+    let decoded = BASE64
+        .decode(&encoded)
+        .map_err(|e| keyring::Error::Invalid(e.to_string(), encoded.clone()))?;
+    if decoded.len() != KEY_LEN {
+        return Err(keyring::Error::Invalid(
+            "wrong key length".to_string(),
+            encoded,
+        ));
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&decoded);
+    Ok(Some(key))
+}
+
+fn try_pass_set(key: &[u8; KEY_LEN]) -> std::result::Result<(), keyring::Error> {
+    let entry = default_pass_entry_name();
+    let mut payload = BASE64.encode(key);
+    payload.push('\n');
+    run_pass_command(&["insert", "-m", "-f", entry.as_str()], Some(payload.as_str())).map(|_| ())
+}
+
+fn try_pass_delete() -> std::result::Result<(), keyring::Error> {
+    let entry = default_pass_entry_name();
+    match run_pass_command(&["rm", "-f", entry.as_str()], None) {
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,6 +1368,7 @@ pub fn remove_session(dir: &Path) -> Result<()> {
             let _ = entry.delete_credential();
         }
     }
+    let _ = try_pass_delete();
     Ok(())
 }
 
@@ -1496,27 +1714,63 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_vault_key_to_pass_backend_writes_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0xCD; KEY_LEN];
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        let called = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let called_set = called.clone();
+
+        sync_vault_key_to_backend_with_ops(
+            tmp.path(),
+            KEYCHAIN_BACKEND_PASS_APP,
+            || Ok(None),
+            move |incoming| {
+                assert_eq!(*incoming, key);
+                *called_set.lock().unwrap() = true;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(*called.lock().unwrap());
+    }
+
+    #[test]
     fn test_keychain_backend_constants_match_grpc_names() {
         assert_eq!(KEYCHAIN_BACKEND_KEYRING, "keyring");
+        assert_eq!(KEYCHAIN_BACKEND_PASS_APP, "pass-app");
         assert_eq!(KEYCHAIN_BACKEND_FILE, "file");
     }
 
     #[test]
     fn test_discover_available_keychains_falls_back_to_file_only() {
-        let available = discover_available_keychains_with_probe(|| false);
+        let available = discover_available_keychains_with_probes(|| false, || false);
         assert_eq!(available, vec![KEYCHAIN_BACKEND_FILE.to_string()]);
     }
 
     #[test]
     fn test_discover_available_keychains_is_deterministic_with_keyring_first() {
-        let available_first = discover_available_keychains_with_probe(|| true);
-        let available_second = discover_available_keychains_with_probe(|| true);
+        let available_first = discover_available_keychains_with_probes(|| true, || false);
+        let available_second = discover_available_keychains_with_probes(|| true, || false);
         let expected = vec![
             KEYCHAIN_BACKEND_KEYRING.to_string(),
             KEYCHAIN_BACKEND_FILE.to_string(),
         ];
         assert_eq!(available_first, expected);
         assert_eq!(available_second, expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_discover_available_keychains_prefers_pass_on_linux() {
+        let available = discover_available_keychains_with_probes(|| true, || true);
+        let expected = vec![
+            KEYCHAIN_BACKEND_PASS_APP.to_string(),
+            KEYCHAIN_BACKEND_KEYRING.to_string(),
+            KEYCHAIN_BACKEND_FILE.to_string(),
+        ];
+        assert_eq!(available, expected);
     }
 
     #[test]

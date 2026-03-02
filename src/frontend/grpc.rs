@@ -162,12 +162,15 @@ fn os_keyring_helpers() -> &'static [&'static str] {
     match std::env::consts::OS {
         "macos" => &[KEYCHAIN_HELPER_MACOS],
         "windows" => &[KEYCHAIN_HELPER_WINDOWS],
-        "linux" => &[
-            KEYCHAIN_HELPER_SECRET_SERVICE_DBUS,
-            KEYCHAIN_HELPER_SECRET_SERVICE,
-            KEYCHAIN_HELPER_PASS_APP,
-        ],
+        "linux" => &[KEYCHAIN_HELPER_SECRET_SERVICE_DBUS, KEYCHAIN_HELPER_SECRET_SERVICE],
         _ => &[vault::KEYCHAIN_BACKEND_KEYRING],
+    }
+}
+
+fn os_pass_helpers() -> &'static [&'static str] {
+    match std::env::consts::OS {
+        "linux" => &[KEYCHAIN_HELPER_PASS_APP],
+        _ => &[],
     }
 }
 
@@ -178,8 +181,8 @@ fn keychain_helper_to_backend(helper: &str) -> Option<&'static str> {
         | KEYCHAIN_HELPER_MACOS
         | KEYCHAIN_HELPER_WINDOWS
         | KEYCHAIN_HELPER_SECRET_SERVICE_DBUS
-        | KEYCHAIN_HELPER_SECRET_SERVICE
-        | KEYCHAIN_HELPER_PASS_APP => Some(vault::KEYCHAIN_BACKEND_KEYRING),
+        | KEYCHAIN_HELPER_SECRET_SERVICE => Some(vault::KEYCHAIN_BACKEND_KEYRING),
+        KEYCHAIN_HELPER_PASS_APP => Some(vault::KEYCHAIN_BACKEND_PASS_APP),
         _ => None,
     }
 }
@@ -189,6 +192,9 @@ fn available_keychain_helpers_with_backends(available_backends: &[String]) -> Ve
     let keyring_available = available_backends
         .iter()
         .any(|backend| backend == vault::KEYCHAIN_BACKEND_KEYRING);
+    let pass_available = available_backends
+        .iter()
+        .any(|backend| backend == vault::KEYCHAIN_BACKEND_PASS_APP);
 
     if keyring_available {
         for helper in os_keyring_helpers() {
@@ -201,6 +207,20 @@ fn available_keychain_helpers_with_backends(available_backends: &[String]) -> Ve
             .any(|candidate| candidate == vault::KEYCHAIN_BACKEND_KEYRING)
         {
             helpers.push(vault::KEYCHAIN_BACKEND_KEYRING.to_string());
+        }
+    }
+
+    if pass_available {
+        for helper in os_pass_helpers() {
+            if !helpers.iter().any(|candidate| candidate == helper) {
+                helpers.push((*helper).to_string());
+            }
+        }
+        if !helpers
+            .iter()
+            .any(|candidate| candidate == vault::KEYCHAIN_BACKEND_PASS_APP)
+        {
+            helpers.push(vault::KEYCHAIN_BACKEND_PASS_APP.to_string());
         }
     }
 
@@ -1873,6 +1893,20 @@ async fn maybe_start_grpc_sync_workers(
     service: &BridgeService,
     active_disk_cache_path: &Path,
 ) -> anyhow::Result<Option<bridge::events::EventWorkerGroup>> {
+    let available_backends = vault::discover_available_keychains();
+    let configured_helper = match vault::get_keychain_helper(runtime_paths.settings_dir()) {
+        Ok(helper) => helper,
+        Err(err) => {
+            debug!(error = %err, "failed to load persisted keychain helper");
+            None
+        }
+    };
+    debug!(
+        backends = ?available_backends,
+        helper = configured_helper.as_deref().unwrap_or("<unset>"),
+        "grpc sync worker keychain context"
+    );
+
     let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
         Ok(sessions) => sessions,
         Err(err) => {

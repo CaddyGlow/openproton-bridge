@@ -23,7 +23,7 @@ async function closeLoginWizardIfOpen(page: Page): Promise<void> {
 
 async function openSettingsSection(page: Page): Promise<void> {
   await closeLoginWizardIfOpen(page)
-  await page.getByRole('button', { name: 'Settings' }).click()
+  await page.getByRole('button', { name: 'Settings', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Runtime' })).toBeVisible()
 }
 
@@ -131,7 +131,7 @@ test.describe('bridge-ui parity runtime flows', () => {
 
     await expect(page.getByRole('button', { name: 'A alice@proton.me Ready' })).toBeVisible()
     await closeLoginWizardIfOpen(page)
-    await page.getByRole('button', { name: 'Settings' }).click()
+    await page.getByRole('button', { name: 'Settings', exact: true }).click()
     const generalSettingsCard = page.locator('article').filter({
       has: page.getByRole('heading', { name: 'General Settings' }),
     })

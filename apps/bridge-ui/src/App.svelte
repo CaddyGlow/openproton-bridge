@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { fade, fly } from 'svelte/transition'
-  import { connect, disconnect, resetError, updateConfigPath } from './lib/stores/bridge'
+  import { connect } from './lib/stores/bridge'
   import {
     bridge_refresh_tray_users,
     onCaptchaToken,
@@ -42,16 +42,13 @@
   } from './lib/api/bridge'
   import { createParityStateStore, type ParityDomainState, type UiNotification } from './lib/parity-state'
   import { logger } from './lib/logging/logger'
-  import BridgeConnectionCard from './lib/components/cards/BridgeConnectionCard.svelte'
   import LoginWizard from './lib/components/LoginWizard.svelte'
   import ClientConfigWizard from './lib/components/ClientConfigWizard.svelte'
-  import ErrorStateCard from './lib/components/cards/ErrorStateCard.svelte'
   import GeneralSettingsCard from './lib/components/cards/GeneralSettingsCard.svelte'
   import StreamEventsCard from './lib/components/cards/StreamEventsCard.svelte'
   import UsersCard from './lib/components/cards/UsersCard.svelte'
   import MailSettingsCard from './lib/components/cards/MailSettingsCard.svelte'
   import TlsSettingsCard from './lib/components/cards/TlsSettingsCard.svelte'
-  import EventToastsCard from './lib/components/cards/EventToastsCard.svelte'
 
   const defaultAppSettings: AppSettings = {
     is_autostart_on: false,
@@ -270,7 +267,6 @@
 
   let selectedClientConfigUser = $derived(users.find((user) => user.id === clientConfigUserId) ?? null)
   let userParityById = $derived(buildUserParityById(users, parityState, userRuntimeParityById, disconnectedUsernames))
-  let toastLog = $derived(parityState.notifications.slice(0, 24).map((notification) => formatToast(notification)))
   let activeAccountSummary = $derived(users.find((user) => user.id === clientConfigUserId) ?? users[0] ?? null)
 
   $effect(() => {
@@ -321,12 +317,6 @@
       return 'Sign-in was canceled.'
     }
     return 'Sign-in failed. Try again.'
-  }
-
-  function formatToast(notification: UiNotification): string {
-    const time = new Date(notification.created_at).toLocaleTimeString()
-    const message = notification.code === 'login_error' ? 'Sign-in needs attention' : notification.message
-    return `${time} ${notification.level.toUpperCase()}: ${message}`
   }
 
   function normalizeSyncProgress(value: number): number {
@@ -615,6 +605,12 @@
     }
 
     activeSection = 'accounts'
+  }
+
+  function openSupportPage() {
+    if (typeof window !== 'undefined') {
+      window.open('https://proton.me/support/proton-mail-bridge', '_blank', 'noopener,noreferrer')
+    }
   }
 
   async function refreshUsersData() {
@@ -1035,53 +1031,39 @@
 </script>
 
 <main class="app-shell">
-  <header class="card app-header">
-    <div>
-      <h1>OpenProton Bridge</h1>
-      <p class="muted">Desktop console for Proton account sessions, mail transport, and bridge health.</p>
-      <div class="header-metrics">
-        <span class={`status-pill ${parityState.snapshot.connected ? 'good' : 'danger'}`}>
-          {parityState.snapshot.connected ? 'Bridge Connected' : 'Bridge Offline'}
-        </span>
-        <span class="status-pill muted">Step: {formatLoginStep(parityState.snapshot.login_step)}</span>
-        <span class={`status-pill ${parityState.snapshot.stream_running ? 'good' : 'muted'}`}>
-          Stream {parityState.snapshot.stream_running ? 'Running' : 'Stopped'}
-        </span>
-      </div>
-    </div>
-    <div class="header-actions">
-      <button class="secondary" onclick={() => void refreshBridgeData()}>Refresh Data</button>
-      <button class="secondary" onclick={cycleThemeMode}>
-        Theme: {normalizeThemeMode(colorSchemeNameInput)}
-      </button>
-    </div>
-  </header>
-
   <section class="workspace">
     <aside class="left-rail">
       <article class="card account-summary-pane">
-        <div class="account-summary-header">
-          <h2>Accounts</h2>
-          <span class={`status-pill ${parityState.snapshot.connected ? 'good' : 'danger'}`}>
+        <div class="shell-status-bar">
+          <span class="status-inline">
+            <span class="status-dot" aria-hidden="true"></span>
             {parityState.snapshot.connected ? 'Connected' : 'Offline'}
           </span>
-        </div>
-        <p class="muted">Runtime summary and quick navigation.</p>
-
-        <div class="summary-nav-chips">
-          {#each sections as section}
+          <div class="shell-icon-actions">
+            <button class="icon-btn" aria-label="Help" title="Help" onclick={openSupportPage}>?</button>
             <button
-              class:active={activeSection === section.id}
-              class="secondary summary-nav-chip"
+              class={`icon-btn ${activeSection === 'settings' ? 'active' : ''}`}
+              aria-label="Settings"
+              title="Settings"
               onclick={() => {
-                activeSection = section.id
+                activeSection = 'settings'
               }}
             >
-              {section.label}
+              ⚙
             </button>
-          {/each}
+            <button
+              class="icon-btn"
+              aria-label="Open runtime settings menu"
+              aria-expanded={settingsOverflowOpen}
+              title="Runtime menu"
+              onclick={toggleSettingsOverflowMenu}
+            >
+              ⋮
+            </button>
+          </div>
         </div>
 
+        <h2>Accounts</h2>
         <div class="account-chip-list">
           {#if users.length > 0}
             {#each users as user}
@@ -1113,17 +1095,27 @@
         <div class="summary-metrics">
           <span class="chip">Host: {hostname || '(not loaded)'}</span>
           <span class="chip">Users: {users.length}</span>
-          <span class="chip">Theme: {resolveTheme(normalizeThemeMode(colorSchemeNameInput))}</span>
+          <span class="chip">Stream: {parityState.snapshot.stream_running ? 'running' : 'stopped'}</span>
         </div>
-      </article>
 
-      <BridgeConnectionCard
-        status={parityState.snapshot}
-        bind:configPathInput
-        onSetPath={(path) => updateConfigPath(path)}
-        onConnect={connectAndLoad}
-        onDisconnect={disconnect}
-      />
+        <button
+          class="secondary add-account-btn"
+          aria-label="Open Sign-In Wizard"
+          title="Open Sign-In Wizard"
+          onclick={openLoginWizard}
+        >
+          +
+        </button>
+
+        {#if settingsOverflowOpen}
+          <div class="settings-overflow-menu sidebar-overflow-menu" role="menu" data-testid="runtime-settings-overflow-menu">
+            <button class="menu-item" role="menuitem" onclick={() => void closeRuntimeWindow()}>
+              Close window
+            </button>
+            <button class="menu-item" role="menuitem" onclick={quitBridge}>Quit Bridge</button>
+          </div>
+        {/if}
+      </article>
     </aside>
 
     <section class="main-pane">
@@ -1171,30 +1163,10 @@
               onCheckPort={checkPort}
             />
           {:else if activeSection === 'settings'}
-            <article class="card settings-runtime-card">
-              <div class="settings-runtime-header">
-                <div>
-                  <h2>Runtime</h2>
-                  <p class="muted">Window/session controls for this bridge runtime.</p>
-                </div>
-                <div class="settings-runtime-menu">
-                  <button
-                    class="secondary settings-overflow-trigger"
-                    aria-label="Open runtime settings menu"
-                    aria-expanded={settingsOverflowOpen}
-                    onclick={toggleSettingsOverflowMenu}
-                  >
-                    •••
-                  </button>
-                  {#if settingsOverflowOpen}
-                    <div class="settings-overflow-menu" role="menu" data-testid="runtime-settings-overflow-menu">
-                      <button class="menu-item" role="menuitem" onclick={() => void closeRuntimeWindow()}>
-                        Close window
-                      </button>
-                      <button class="menu-item" role="menuitem" onclick={quitBridge}>Quit Bridge</button>
-                    </div>
-                  {/if}
-                </div>
+            <article class="card settings-heading-card">
+              <div class="settings-title-row">
+                <h1>Settings</h1>
+                <h2>Runtime</h2>
               </div>
             </article>
 
@@ -1224,19 +1196,6 @@
         </div>
       {/key}
     </section>
-
-    <aside class="status-rail">
-      <article class="card">
-        <h2>Status Rail</h2>
-        <p class="muted"><strong>Stream:</strong> {parityState.snapshot.stream_running ? 'running' : 'stopped'}</p>
-        <p class="muted"><strong>Login:</strong> {parityState.snapshot.login_step}</p>
-        <p class="muted"><strong>TLS:</strong> {tlsInstalled === null ? 'unknown' : tlsInstalled ? 'installed' : 'missing'}</p>
-      </article>
-
-      <ErrorStateCard lastError={parityState.snapshot.last_error} onClearError={resetError} />
-      <EventToastsCard toasts={toastLog} />
-      <StreamEventsCard events={parityState.stream_log.slice(0, 10)} />
-    </aside>
   </section>
 
   <LoginWizard

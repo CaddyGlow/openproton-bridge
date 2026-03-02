@@ -1,43 +1,53 @@
 :root {
   --font-ui: "IBM Plex Sans", "SF Pro Text", "Segoe UI", system-ui, -apple-system, sans-serif;
 
-  --bg-1: #f3f6fc;
-  --bg-2: #e8edf7;
-  --panel: rgba(255, 255, 255, 0.9);
-  --panel-border: #d3dded;
-  --surface: #ffffff;
+  --bg-1: #121223;
+  --bg-2: #15162a;
+  --panel: #1c1d31;
+  --panel-muted: #181a2c;
+  --panel-border: #2d3050;
+  --surface: #20223a;
 
-  --text: #122034;
-  --text-muted: #5f708c;
+  --text: #f2f4ff;
+  --text-muted: #a2a8c6;
 
-  --brand: #3159d5;
-  --brand-2: #3f70e8;
-  --brand-soft: #dce7ff;
-  --danger: #b83256;
+  --brand: #6d4aff;
+  --brand-2: #7f65ff;
+  --brand-soft: rgba(120, 95, 255, 0.22);
+  --danger: #e36f95;
 
-  --input-bg: #ffffff;
-  --input-border: #bcc8de;
-  --table-sep: #e1e8f6;
+  --success-text: #38d39f;
+  --success-border: rgba(56, 211, 159, 0.45);
+  --success-bg: rgba(56, 211, 159, 0.12);
+
+  --input-bg: #191b2f;
+  --input-border: #35385a;
+  --table-sep: #323555;
 }
 
-:root[data-theme='dark'] {
-  --bg-1: #091025;
-  --bg-2: #111d3a;
-  --panel: rgba(14, 23, 44, 0.88);
-  --panel-border: #24375f;
-  --surface: #152342;
+:root[data-theme='light'] {
+  --bg-1: #f0f2ff;
+  --bg-2: #e7eafc;
+  --panel: #ffffff;
+  --panel-muted: #f6f7ff;
+  --panel-border: #d7dcf0;
+  --surface: #fafbff;
 
-  --text: #e8efff;
-  --text-muted: #a7b4d4;
+  --text: #21243e;
+  --text-muted: #65709a;
 
-  --brand: #4d7fff;
-  --brand-2: #6999ff;
-  --brand-soft: rgba(77, 127, 255, 0.2);
-  --danger: #f06a8d;
+  --brand: #5f3ff5;
+  --brand-2: #6f54fb;
+  --brand-soft: rgba(95, 63, 245, 0.14);
+  --danger: #c9406c;
 
-  --input-bg: #0f1c37;
-  --input-border: #345082;
-  --table-sep: #23375f;
+  --success-text: #1a8a66;
+  --success-border: rgba(26, 138, 102, 0.45);
+  --success-bg: rgba(26, 138, 102, 0.14);
+
+  --input-bg: #ffffff;
+  --input-border: #c7cee6;
+  --table-sep: #d8deef;
 }
 
 * {
@@ -54,139 +64,153 @@ body {
   font-family: var(--font-ui);
   color: var(--text);
   background:
-    radial-gradient(circle at 0% 0%, var(--bg-2), transparent 45%),
-    radial-gradient(circle at 100% 0%, var(--bg-2), transparent 45%),
-    linear-gradient(160deg, var(--bg-1), var(--bg-2));
+    radial-gradient(120% 140% at 0% 0%, rgba(113, 85, 255, 0.14), transparent 52%),
+    radial-gradient(120% 160% at 100% 0%, rgba(77, 90, 200, 0.16), transparent 48%),
+    linear-gradient(165deg, var(--bg-1), var(--bg-2));
 }
 
 .app-shell {
-  max-width: 1520px;
+  max-width: 1500px;
+  min-height: 100vh;
   margin: 0 auto;
-  padding: 12px;
-  display: grid;
-  gap: 10px;
+  padding: 14px;
 }
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(240px, 272px) minmax(620px, 1fr) minmax(260px, 310px);
-  gap: 10px;
+  grid-template-columns: minmax(250px, 306px) minmax(0, 1fr);
+  gap: 14px;
   align-items: start;
 }
 
 .left-rail,
-.main-pane,
-.status-rail {
+.main-pane {
   display: grid;
-  gap: 10px;
+  gap: 14px;
+}
+
+.left-rail {
+  position: sticky;
+  top: 14px;
+  align-self: start;
 }
 
 .section-stage {
   display: grid;
-  gap: 10px;
-}
-
-.left-rail,
-.status-rail {
-  position: sticky;
-  top: 12px;
-}
-
-.app-header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px;
-  background:
-    linear-gradient(108deg, var(--panel) 0%, color-mix(in oklab, var(--panel) 84%, var(--brand-soft)) 100%);
-  box-shadow:
-    0 1px 0 color-mix(in oklab, var(--panel-border) 70%, transparent),
-    0 10px 28px color-mix(in oklab, var(--brand-soft) 26%, transparent);
-}
-
-.header-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  justify-content: flex-end;
-}
-
-.header-metrics {
-  margin-top: 8px;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.chip {
-  border: 1px solid var(--panel-border);
-  background: var(--brand-soft);
-  color: var(--text);
-  border-radius: 999px;
-  padding: 5px 8px;
-  font-size: 0.78rem;
-  font-weight: 600;
+  gap: 14px;
 }
 
 .account-summary-pane {
   display: grid;
-  gap: 10px;
+  gap: 12px;
+  padding: 14px;
+  min-height: calc(100vh - 28px);
+  position: relative;
 }
 
-.account-summary-header {
+.status-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #1fc89c;
+  font-weight: 600;
+  font-size: 1.45rem;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  background: #1fc89c;
+  box-shadow: 0 0 0 4px rgba(31, 200, 156, 0.14);
+}
+
+.shell-status-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--table-sep);
 }
 
-.account-summary-header h2 {
-  margin: 0;
-}
-
-.summary-nav-chips {
+.shell-icon-actions {
   display: flex;
-  flex-wrap: wrap;
   gap: 6px;
 }
 
+.icon-btn {
+  min-width: 34px;
+  min-height: 34px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  display: grid;
+  place-items: center;
+  font-size: 0.95rem;
+  font-weight: 600;
+  padding: 0;
+}
+
+.icon-btn:hover {
+  background: color-mix(in oklab, var(--brand-soft) 40%, transparent);
+  border-color: color-mix(in oklab, var(--brand) 40%, var(--input-border));
+}
+
+.icon-btn.active {
+  background: color-mix(in oklab, var(--brand-soft) 55%, transparent);
+  color: var(--text);
+  border-color: color-mix(in oklab, var(--brand) 55%, var(--input-border));
+}
+
+.summary-nav-chips {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+  margin: 2px 0 4px;
+}
+
 .summary-nav-chip {
-  border-radius: 999px;
-  font-size: 0.78rem;
-  padding: 5px 10px;
+  width: 100%;
+  border-radius: 9px;
+  font-size: 0.82rem;
+  padding: 8px 10px;
+  justify-content: flex-start;
+  text-align: left;
 }
 
 .summary-nav-chip.active {
-  background: linear-gradient(120deg, var(--brand), var(--brand-2));
-  border-color: var(--brand-2);
-  color: #fff;
+  border-color: color-mix(in oklab, var(--brand) 55%, var(--input-border));
+  background: color-mix(in oklab, var(--brand-soft) 64%, transparent);
+  color: var(--text);
 }
 
 .account-chip-list {
   display: grid;
-  gap: 8px;
+  border-top: 1px solid var(--table-sep);
 }
 
 .account-pane-chip {
-  border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  background: color-mix(in oklab, var(--surface) 86%, transparent);
+  border: 0;
+  border-bottom: 1px solid var(--table-sep);
+  border-radius: 0;
+  background: transparent;
   color: var(--text);
   text-align: left;
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 8px;
+  padding: 9px 2px;
 }
 
 .account-pane-chip:hover {
-  background: color-mix(in oklab, var(--brand-soft) 36%, var(--surface));
+  background: color-mix(in oklab, var(--brand-soft) 22%, transparent);
 }
 
 .account-pane-chip.active {
-  border-color: color-mix(in oklab, var(--brand) 44%, var(--panel-border));
-  background: color-mix(in oklab, var(--brand-soft) 54%, var(--surface));
+  background: color-mix(in oklab, var(--brand-soft) 32%, transparent);
 }
 
 .account-pane-chip.empty {
@@ -194,14 +218,14 @@ body {
 }
 
 .app-shell .avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
+  width: 34px;
+  height: 34px;
+  border-radius: 9px;
   display: grid;
   place-items: center;
-  background: linear-gradient(130deg, var(--brand), var(--brand-2));
+  background: linear-gradient(140deg, var(--brand), var(--brand-2));
   color: #fff;
-  font-size: 0.85rem;
+  font-size: 0.84rem;
   font-weight: 700;
   flex-shrink: 0;
 }
@@ -213,8 +237,8 @@ body {
 }
 
 .account-chip-name {
-  font-size: 0.82rem;
-  font-weight: 650;
+  font-size: 0.93rem;
+  font-weight: 600;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -222,21 +246,57 @@ body {
 
 .account-chip-meta {
   color: var(--text-muted);
-  font-size: 0.74rem;
+  font-size: 0.8rem;
 }
 
 .summary-metrics {
-  display: flex;
-  flex-wrap: wrap;
+  margin-top: 2px;
+  display: grid;
   gap: 6px;
+}
+
+.add-account-btn {
+  margin-top: auto;
+  width: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  border-radius: 10px;
+  font-size: 1.15rem;
+  line-height: 1;
+  padding: 0;
+}
+
+.chip {
+  border: 1px solid var(--panel-border);
+  background: var(--panel-muted);
+  color: var(--text-muted);
+  border-radius: 8px;
+  padding: 5px 8px;
+  font-size: 0.75rem;
+  font-weight: 600;
+}
+
+.runtime-insights {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.runtime-overview-card {
+  grid-column: span 2;
+}
+
+.runtime-overview-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
 }
 
 .card {
   background: var(--panel);
   border: 1px solid var(--panel-border);
-  border-radius: 14px;
-  padding: 10px;
-  backdrop-filter: blur(4px);
+  border-radius: 12px;
+  padding: 14px;
 }
 
 .status-pill {
@@ -244,30 +304,30 @@ body {
   align-items: center;
   border: 1px solid var(--panel-border);
   border-radius: 999px;
-  padding: 4px 8px;
-  font-size: 0.74rem;
+  padding: 4px 9px;
+  font-size: 0.75rem;
   line-height: 1;
   font-weight: 700;
   color: var(--text-muted);
-  background: color-mix(in oklab, var(--surface) 75%, transparent);
+  background: color-mix(in oklab, var(--surface) 88%, transparent);
 }
 
 .status-pill.good {
-  color: color-mix(in oklab, #1f7e45 75%, var(--text));
-  border-color: color-mix(in oklab, #2e9753 40%, var(--panel-border));
-  background: color-mix(in oklab, #48c76d 18%, var(--surface));
+  color: var(--success-text);
+  border-color: var(--success-border);
+  background: var(--success-bg);
 }
 
 .status-pill.danger {
-  color: color-mix(in oklab, #b52f5b 76%, var(--text));
-  border-color: color-mix(in oklab, #e45a87 44%, var(--panel-border));
-  background: color-mix(in oklab, #f06a8d 18%, var(--surface));
+  color: color-mix(in oklab, var(--danger) 80%, var(--text));
+  border-color: color-mix(in oklab, var(--danger) 45%, var(--panel-border));
+  background: color-mix(in oklab, var(--danger) 18%, var(--panel-muted));
 }
 
 .status-pill.muted {
   color: var(--text-muted);
   border-color: var(--panel-border);
-  background: color-mix(in oklab, var(--surface) 70%, transparent);
+  background: color-mix(in oklab, var(--surface) 86%, transparent);
 }
 
 .span-2 {
@@ -282,13 +342,14 @@ h2 {
 }
 
 h1 {
-  font-size: 1.22rem;
+  font-size: 1.08rem;
+  line-height: 1.3;
 }
 
 h2 {
-  font-size: 0.84rem;
+  font-size: 0.83rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.07em;
   color: var(--text-muted);
   font-weight: 700;
 }
@@ -299,19 +360,19 @@ h2 {
 }
 
 .flow-stepper {
-  margin: 6px 0 0;
+  margin: 8px 0 0;
   padding: 0;
   list-style: none;
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 6px;
+  gap: 7px;
 }
 
 .flow-stepper li {
   margin: 0;
-  border: 1px solid var(--panel-border);
+  border: 1px solid var(--input-border);
   border-radius: 999px;
-  background: var(--surface);
+  background: var(--panel-muted);
   color: var(--text-muted);
   font-size: 0.72rem;
   font-weight: 600;
@@ -320,25 +381,25 @@ h2 {
 }
 
 .flow-stepper li.active {
-  border-color: var(--brand);
-  background: var(--brand-soft);
+  border-color: color-mix(in oklab, var(--brand) 70%, var(--input-border));
+  background: color-mix(in oklab, var(--brand-soft) 65%, transparent);
   color: var(--text);
 }
 
 .flow-hint {
-  margin-top: 6px;
+  margin-top: 7px;
   font-size: 0.82rem;
 }
 
 .status-block p {
-  margin: 4px 0;
+  margin: 3px 0;
   font-size: 0.84rem;
 }
 
 .row {
-  margin-top: 8px;
+  margin-top: 10px;
   display: flex;
-  gap: 6px;
+  gap: 8px;
   align-items: center;
 }
 
@@ -349,9 +410,9 @@ h2 {
 label {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
   color: var(--text);
-  font-size: 0.82rem;
+  font-size: 0.84rem;
 }
 
 input,
@@ -360,7 +421,7 @@ select {
   border: 1px solid var(--input-border);
   background: var(--input-bg);
   color: var(--text);
-  padding: 6px 8px;
+  padding: 7px 9px;
   min-width: 120px;
   font-size: 0.84rem;
 }
@@ -368,7 +429,7 @@ select {
 input:focus-visible,
 select:focus-visible,
 button:focus-visible {
-  outline: 2px solid color-mix(in oklab, var(--brand) 70%, white 30%);
+  outline: 2px solid color-mix(in oklab, var(--brand) 72%, #ffffff 28%);
   outline-offset: 1px;
 }
 
@@ -385,14 +446,14 @@ button:focus-visible {
 table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: 6px;
+  margin-top: 8px;
 }
 
 th,
 td {
   border-bottom: 1px solid var(--table-sep);
   text-align: left;
-  padding: 5px 6px;
+  padding: 8px 6px;
   vertical-align: top;
   font-size: 0.82rem;
 }
@@ -402,15 +463,15 @@ td {
 }
 
 .user-primary {
-  font-size: 0.82rem;
+  font-size: 0.85rem;
   font-weight: 600;
   color: var(--text);
 }
 
 .user-secondary {
-  margin-top: 2px;
+  margin-top: 3px;
   color: var(--text-muted);
-  font-size: 0.74rem;
+  font-size: 0.77rem;
 }
 
 .user-actions .row {
@@ -418,7 +479,7 @@ td {
 }
 
 tbody tr:hover {
-  background: color-mix(in oklab, var(--brand-soft) 24%, transparent);
+  background: color-mix(in oklab, var(--brand-soft) 22%, transparent);
 }
 
 .wrap {
@@ -429,41 +490,37 @@ tbody tr:hover {
   overflow: visible;
 }
 
-.settings-runtime-header {
+.settings-title-row {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   justify-content: space-between;
-  gap: 8px;
+  gap: 10px;
+  border-bottom: 1px solid var(--table-sep);
+  padding-bottom: 10px;
 }
 
-.settings-runtime-header h2 {
-  margin-bottom: 4px;
-}
-
-.settings-runtime-menu {
-  position: relative;
-}
-
-.settings-overflow-trigger {
-  min-width: 44px;
-  font-size: 1rem;
-  line-height: 1;
-  padding: 6px 8px;
+.settings-title-row h1 {
+  font-size: 2.95rem;
 }
 
 .settings-overflow-menu {
   position: absolute;
-  top: calc(100% + 6px);
+  top: calc(100% + 7px);
   right: 0;
   border: 1px solid var(--panel-border);
   border-radius: 10px;
-  background: color-mix(in oklab, var(--surface) 88%, transparent);
-  box-shadow: 0 10px 24px color-mix(in oklab, var(--brand-soft) 35%, transparent);
+  background: var(--panel);
+  box-shadow: 0 10px 26px rgba(8, 9, 17, 0.45);
   padding: 6px;
   display: grid;
   gap: 4px;
   min-width: 180px;
   z-index: 20;
+}
+
+.sidebar-overflow-menu {
+  top: 52px;
+  right: 8px;
 }
 
 .menu-item {
@@ -478,41 +535,39 @@ tbody tr:hover {
 }
 
 .menu-item:hover {
-  background: color-mix(in oklab, var(--brand-soft) 36%, transparent);
-  filter: none;
-  transform: none;
+  background: color-mix(in oklab, var(--brand-soft) 38%, transparent);
 }
 
 button {
-  border: 1px solid var(--brand-2);
-  background: var(--brand);
+  border: 1px solid var(--brand);
+  background: linear-gradient(135deg, var(--brand), var(--brand-2));
   color: #fff;
-  border-radius: 8px;
-  padding: 6px 9px;
+  border-radius: 9px;
+  padding: 7px 11px;
   cursor: pointer;
   font-weight: 600;
   font-size: 0.82rem;
-  transition: transform 120ms ease, filter 120ms ease, background 120ms ease;
+  transition: filter 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
 button.secondary {
-  background: var(--surface);
+  background: var(--panel-muted);
   color: var(--text);
   border-color: var(--input-border);
 }
 
 button.danger {
-  background: var(--danger);
-  border-color: var(--danger);
+  background: color-mix(in oklab, var(--danger) 70%, #5c0f2f 30%);
+  border-color: color-mix(in oklab, var(--danger) 75%, #6f1a3d 25%);
 }
 
 button:hover {
-  filter: brightness(1.04);
-  transform: translateY(-1px);
+  filter: brightness(1.08);
 }
 
-button:active {
-  transform: translateY(0);
+button:disabled {
+  opacity: 0.58;
+  cursor: not-allowed;
 }
 
 ul {
@@ -534,60 +589,44 @@ li {
 }
 
 @media (max-width: 1240px) {
-  .left-rail,
-  .status-rail {
-    position: static;
-  }
-
   .workspace {
-    grid-template-columns: minmax(230px, 280px) minmax(0, 1fr);
+    grid-template-columns: minmax(230px, 282px) minmax(0, 1fr);
+    gap: 12px;
   }
 
-  .status-rail {
-    grid-column: span 2;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .left-rail {
+    top: 12px;
+  }
+
+  .account-summary-pane {
+    min-height: auto;
   }
 }
 
 @media (max-width: 920px) {
-  .app-header {
-    flex-direction: column;
-  }
-
-  .header-actions {
-    width: 100%;
-    justify-content: flex-start;
+  .app-shell {
+    padding: 10px;
   }
 
   .workspace {
     grid-template-columns: 1fr;
   }
 
-  .status-rail {
-    grid-column: auto;
-    grid-template-columns: 1fr;
+  .left-rail {
+    position: static;
   }
 
   .flow-stepper {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .settings-runtime-header {
-    flex-direction: column;
-  }
-
-  .settings-runtime-menu {
-    align-self: flex-end;
+  .settings-title-row h1 {
+    font-size: 2.2rem;
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   button {
     transition: none;
-  }
-
-  button:hover,
-  button:active {
-    transform: none;
   }
 }

@@ -137,11 +137,11 @@
     }
 
     if (step === '2fa') {
-      loginStatus = 'CAPTCHA accepted. Enter your 2FA code.'
+      loginStatus = 'Enter your 2FA code.'
     } else if (step === '2fa_or_fido') {
-      loginStatus = 'CAPTCHA accepted. Complete 2FA or security key verification.'
+      loginStatus = 'Verify with 2FA or your security key.'
     } else if (step === 'fido' || step === 'fido_touch' || step === 'fido_pin') {
-      loginStatus = 'CAPTCHA accepted. Complete security key verification.'
+      loginStatus = 'Complete security key verification.'
     } else if (step === 'mailbox_password') {
       loginStatus = 'Account verified. Enter mailbox password to unlock.'
     } else if (step === 'done') {
@@ -209,16 +209,47 @@
     return match[0].replace(/[),.;]+$/, '')
   }
 
+  function userFacingLoginError(message: string): string {
+    const lower = message.toLowerCase()
+    if (lower.includes('2fa')) {
+      return '2FA failed. Check your code and try again.'
+    }
+    if (lower.includes('fido') || lower.includes('security key')) {
+      return 'Security key verification failed. Try again.'
+    }
+    if (lower.includes('mailbox')) {
+      return 'Mailbox password failed. Try again.'
+    }
+    if (lower.includes('captcha') || lower.includes('human verification')) {
+      return 'Verification is still required. Complete it and continue.'
+    }
+    if (lower.includes('abort')) {
+      return 'Sign-in was canceled.'
+    }
+    return 'Sign-in failed. Try again.'
+  }
+
+  function toastMessageForEvent(event: BridgeUiEvent): string {
+    if (event.code === 'login_error') {
+      return `${event.level.toUpperCase()}: Sign-in needs attention`
+    }
+    return `${event.level.toUpperCase()}: ${event.message}`
+  }
+
   async function openCaptchaVerificationWindow() {
     if (!hvVerificationUrl) {
       return
     }
     try {
+      logger.info('app', 'opening captcha verification window', { verification_url: hvVerificationUrl })
       await openCaptchaWindow(hvVerificationUrl)
-      loginStatus = 'complete CAPTCHA in the verification window, then click Retry CAPTCHA'
+      loginStatus = 'Complete verification in the window, then click Continue.'
     } catch (error) {
-      logger.error('app', 'open captcha window failed', { error: String(error) })
-      loginStatus = `failed to open verification window: ${String(error)}`
+      logger.error('app', 'open captcha window failed', {
+        error: String(error),
+        verification_url: hvVerificationUrl,
+      })
+      loginStatus = 'Could not open verification window. Try again.'
     }
   }
 
@@ -324,7 +355,7 @@
 
   async function submitCredentials() {
     logger.info('app', 'submit credentials requested', { username: loginUsername })
-    loginStatus = 'submitting credentials...'
+    loginStatus = 'Signing in...'
     lastLoginStepSeen = ''
     hvVerificationUrl = ''
     hvCaptchaToken = ''
@@ -335,27 +366,32 @@
         await connect()
       }
       await login(loginUsername, loginPassword)
-      loginStatus = 'credentials submitted'
+      loginStatus = 'Sign-in submitted.'
     } catch (error) {
       const message = String(error)
-      logger.error('app', 'submit credentials failed', { error: String(error) })
+      logger.error('app', 'submit credentials failed', { error: message })
       const hvUrl = extractHvUrl(message)
       if (hvUrl) {
         hvVerificationUrl = hvUrl
+        logger.info('app', 'captcha challenge detected during login', { verification_url: hvUrl })
         await openCaptchaVerificationWindow()
       } else {
-        loginStatus = `login failed: ${message}`
+        loginStatus = userFacingLoginError(message)
       }
     }
   }
 
   async function retryCaptchaLogin() {
-    logger.info('app', 'retry captcha login requested', { username: loginUsername })
+    logger.info('app', 'retry captcha login requested', {
+      username: loginUsername,
+      pm_captcha_token: hvCaptchaToken,
+      token_len: hvCaptchaToken.length,
+    })
     if (!hvCaptchaToken) {
-      loginStatus = 'complete CAPTCHA in the verification window first'
+      loginStatus = 'Complete verification first.'
       return
     }
-    loginStatus = 'retrying login with human verification token...'
+    loginStatus = 'Continuing sign-in...'
     lastLoginStepSeen = ''
     try {
       if (!get(bridgeStatus).stream_running) {
@@ -366,7 +402,7 @@
       const step = get(bridgeStatus).login_step
       syncLoginStatusWithStep(step, true)
       if (step === 'credentials' || step === 'idle') {
-        loginStatus = 'CAPTCHA retry submitted. Waiting for next login step...'
+        loginStatus = 'Verification submitted. Waiting for the next step...'
       }
     } catch (error) {
       const message = String(error)
@@ -374,9 +410,10 @@
       const hvUrl = extractHvUrl(message)
       if (hvUrl) {
         hvVerificationUrl = hvUrl
+        logger.info('app', 'captcha challenge reissued during retry', { verification_url: hvUrl })
         await openCaptchaVerificationWindow()
       }
-      loginStatus = `captcha retry failed: ${message}`
+      loginStatus = userFacingLoginError(message)
     }
   }
 
@@ -392,8 +429,9 @@
       await closeCaptchaVerificationWindow()
       loginStatus = 'Login completed.'
     } catch (error) {
-      logger.error('app', 'submit 2FA failed', { error: String(error) })
-      loginStatus = `2FA failed: ${String(error)}`
+      const message = String(error)
+      logger.error('app', 'submit 2FA failed', { error: message })
+      loginStatus = userFacingLoginError(message)
     }
   }
 
@@ -406,8 +444,9 @@
       await refreshBridgeData()
       loginStatus = 'Login completed.'
     } catch (error) {
-      logger.error('app', 'submit mailbox password failed', { error: String(error) })
-      loginStatus = `mailbox password failed: ${String(error)}`
+      const message = String(error)
+      logger.error('app', 'submit mailbox password failed', { error: message })
+      loginStatus = userFacingLoginError(message)
     }
   }
 
@@ -420,8 +459,9 @@
       await refreshBridgeData()
       loginStatus = 'Login completed.'
     } catch (error) {
-      logger.error('app', 'submit FIDO assertion failed', { error: String(error) })
-      loginStatus = `FIDO failed: ${String(error)}`
+      const message = String(error)
+      logger.error('app', 'submit FIDO assertion failed', { error: message })
+      loginStatus = userFacingLoginError(message)
     }
   }
 
@@ -432,8 +472,9 @@
       await fidoAssertionAbort(loginUsername)
       loginStatus = 'FIDO assertion aborted'
     } catch (error) {
-      logger.error('app', 'abort FIDO assertion failed', { error: String(error) })
-      loginStatus = `FIDO abort failed: ${String(error)}`
+      const message = String(error)
+      logger.error('app', 'abort FIDO assertion failed', { error: message })
+      loginStatus = userFacingLoginError(message)
     }
   }
 
@@ -444,8 +485,9 @@
       await loginAbort(loginUsername)
       loginStatus = 'login aborted'
     } catch (error) {
-      logger.error('app', 'abort login failed', { error: String(error) })
-      loginStatus = `abort failed: ${String(error)}`
+      const message = String(error)
+      logger.error('app', 'abort login failed', { error: message })
+      loginStatus = userFacingLoginError(message)
     }
   }
 
@@ -523,8 +565,7 @@
 
   function handleUiEvent(event: BridgeUiEvent) {
     logger.debug('app', 'ui event received', event)
-    const message = `${event.level.toUpperCase()}: ${event.message}`
-    pushToast(message)
+    pushToast(toastMessageForEvent(event))
 
     if (event.code === 'mail_settings_saved') {
       saveStatus = 'saved (stream confirmed)'
@@ -547,16 +588,17 @@
     ) {
       loginStatus = event.message
     }
-    if (event.level === 'error') {
+    if (event.level === 'error' && event.code !== 'login_error') {
       settingsStatus = event.message
-      if (event.code === 'login_error') {
-        const hvUrl = extractHvUrl(event.message)
-        if (hvUrl) {
-          hvVerificationUrl = hvUrl
-          void openCaptchaVerificationWindow()
-        }
-        loginStatus = event.message
+    }
+    if (event.code === 'login_error') {
+      const hvUrl = extractHvUrl(event.message)
+      if (hvUrl) {
+        hvVerificationUrl = hvUrl
+        logger.info('app', 'captcha challenge detected from stream event', { verification_url: hvUrl })
+        void openCaptchaVerificationWindow()
       }
+      loginStatus = userFacingLoginError(event.message)
     }
 
     if (event.refresh_hints.includes('users')) {
@@ -598,8 +640,9 @@
       stopUi = await onBridgeUiEvent((event) => handleUiEvent(event))
       stopCaptchaToken = await onCaptchaToken((token) => {
         hvCaptchaToken = token
-        loginStatus = 'CAPTCHA token captured. Click Retry CAPTCHA to continue.'
-        logger.info('app', 'captured captcha token from verification window', {
+        loginStatus = 'Verification complete. Click Continue.'
+        logger.info('app', 'captured pm_captcha token from verification window', {
+          pm_captcha_token: token,
           token_len: token.length,
         })
       })

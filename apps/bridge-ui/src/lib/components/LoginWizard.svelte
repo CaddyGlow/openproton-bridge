@@ -201,29 +201,16 @@
               </div>
               {#if hvVerificationUrl}
                 <div class="wizard-awaiting">
-                  <p>Human verification required.</p>
-                  <p class="muted">Complete CAPTCHA in the verification window, then retry login.</p>
-                  <p class="muted break-anywhere">{hvVerificationUrl}</p>
+                  <p>Verification required.</p>
+                  <p class="muted">Open the verification window, complete CAPTCHA, then continue.</p>
                   <div class="wizard-actions">
-                    <button onclick={onOpenCaptchaWindow}>Open CAPTCHA Window</button>
-                    <button class="secondary" onclick={onCloseCaptchaWindow}>Close CAPTCHA Window</button>
-                    <a class="button-like secondary" href={hvVerificationUrl} target="_blank" rel="noreferrer">
-                      Open in Browser
-                    </a>
-                    <button onclick={onRetryCaptcha} disabled={!hvCaptchaToken}>Retry CAPTCHA</button>
+                    <button onclick={onOpenCaptchaWindow}>Open Verification</button>
+                    <button onclick={onRetryCaptcha} disabled={!hvCaptchaToken}>Continue</button>
                   </div>
-                  <label class="wizard-token-field">
-                    CAPTCHA token (optional)
-                    <textarea
-                      bind:value={hvCaptchaToken}
-                      rows="3"
-                      placeholder="Paste token here if webview capture is blocked"
-                    ></textarea>
-                  </label>
                   {#if hvCaptchaToken}
-                    <p class="muted">CAPTCHA token captured ({hvCaptchaToken.length} chars).</p>
+                    <p class="muted">Verification token received. You can continue.</p>
                   {:else}
-                    <p class="muted">Waiting for `pm_captcha` token from verification window.</p>
+                    <p class="muted">Waiting for verification to complete.</p>
                   {/if}
                 </div>
               {/if}
@@ -462,24 +449,6 @@
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
-  }
-
-  .wizard-token-field {
-    margin-top: 8px;
-    display: grid;
-    gap: 6px;
-    font-size: 0.84rem;
-  }
-
-  .button-like {
-    text-decoration: none;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-
-  .break-anywhere {
-    overflow-wrap: anywhere;
   }
 
   .wizard-success {

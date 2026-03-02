@@ -156,6 +156,7 @@ impl BridgeService {
     fn emit_login_error(&self, message: impl Into<String>) {
         self.emit_event(pb::stream_event::Event::Login(pb::LoginEvent {
             event: Some(pb::login_event::Event::Error(pb::LoginErrorEvent {
+                r#type: pb::LoginErrorType::ConnectionError as i32,
                 message: message.into(),
             })),
         }));
@@ -237,16 +238,58 @@ impl BridgeService {
         ));
     }
 
-    fn emit_mail_settings_error(&self, message: impl Into<String>) {
+    fn emit_mail_settings_error(&self, error_type: pb::MailServerSettingsErrorType) {
         self.emit_event(pb::stream_event::Event::MailServerSettings(
             pb::MailServerSettingsEvent {
                 event: Some(pb::mail_server_settings_event::Event::Error(
                     pb::MailServerSettingsErrorEvent {
-                        message: message.into(),
+                        r#type: error_type as i32,
                     },
                 )),
             },
         ));
+    }
+
+    fn emit_toggle_autostart_finished(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::ToggleAutostartFinished(
+                pb::ToggleAutostartFinishedEvent {},
+            )),
+        }));
+    }
+
+    fn emit_repair_started(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::RepairStarted(
+                pb::RepairStartedEvent {},
+            )),
+        }));
+    }
+
+    fn emit_disk_cache_path_changed(&self, path: &str) {
+        self.emit_event(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+            event: Some(pb::disk_cache_event::Event::PathChanged(
+                pb::DiskCachePathChangedEvent {
+                    path: path.to_string(),
+                },
+            )),
+        }));
+    }
+
+    fn emit_disk_cache_path_change_finished(&self) {
+        self.emit_event(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+            event: Some(pb::disk_cache_event::Event::PathChangeFinished(
+                pb::DiskCachePathChangeFinishedEvent {},
+            )),
+        }));
+    }
+
+    fn emit_disk_cache_error(&self, error_type: pb::DiskCacheErrorType) {
+        self.emit_event(pb::stream_event::Event::Cache(pb::DiskCacheEvent {
+            event: Some(pb::disk_cache_event::Event::Error(pb::DiskCacheErrorEvent {
+                r#type: error_type as i32,
+            })),
+        }));
     }
 
     async fn complete_login(
@@ -375,6 +418,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn trigger_repair(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        self.emit_repair_started();
         self.emit_show_main_window();
         Ok(Response::new(()))
     }
@@ -397,6 +441,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         save_app_settings(&self.state.vault_dir, &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        self.emit_toggle_autostart_finished();
         Ok(Response::new(()))
     }
 
@@ -464,15 +509,22 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("disk cache path is empty"));
         }
         let target = PathBuf::from(path.clone());
-        tokio::fs::create_dir_all(&target)
+        if let Err(err) = tokio::fs::create_dir_all(&target)
             .await
-            .map_err(|e| Status::internal(format!("failed to create disk cache path: {e}")))?;
+        {
+            self.emit_disk_cache_error(pb::DiskCacheErrorType::CantMoveDiskCacheError);
+            return Err(Status::internal(format!(
+                "failed to create disk cache path: {err}"
+            )));
+        }
 
         let mut settings = self.state.app_settings.lock().await;
         settings.disk_cache_path = path;
         save_app_settings(&self.state.vault_dir, &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        self.emit_disk_cache_path_changed(&settings.disk_cache_path);
+        self.emit_disk_cache_path_change_finished();
         Ok(Response::new(()))
     }
 
@@ -1079,11 +1131,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
 
         if !is_port_free(incoming.imap_port as u16).await {
-            self.emit_mail_settings_error("IMAP port is not available");
+            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortChangeError);
             return Err(Status::failed_precondition("IMAP port is not available"));
         }
         if !is_port_free(incoming.smtp_port as u16).await {
-            self.emit_mail_settings_error("SMTP port is not available");
+            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
             return Err(Status::failed_precondition("SMTP port is not available"));
         }
 

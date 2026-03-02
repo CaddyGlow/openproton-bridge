@@ -1054,8 +1054,21 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn fido_assertion_abort(
         &self,
-        _request: Request<pb::LoginAbortRequest>,
+        request: Request<pb::LoginAbortRequest>,
     ) -> Result<Response<()>, Status> {
+        let username = request.into_inner().username;
+        let mut pending = self.state.pending_login.lock().await;
+        let should_abort = pending
+            .as_ref()
+            .map(|item| {
+                item.fido_authentication_options.is_some()
+                    && (username.is_empty() || item.username.eq_ignore_ascii_case(&username))
+            })
+            .unwrap_or(false);
+        if should_abort {
+            *pending = None;
+            self.emit_login_error("fido assertion aborted");
+        }
         Ok(Response::new(()))
     }
 
@@ -2704,6 +2717,85 @@ mod tests {
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(status.message().contains("no pending login"));
+    }
+
+    #[tokio::test]
+    async fn fido_assertion_abort_clears_matching_pending_fido_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let client = ProtonClient::with_base_url("http://127.0.0.1:1").unwrap();
+        let pending = PendingLogin {
+            username: "alice@example.com".to_string(),
+            password: "mailbox-password".to_string(),
+            uid: "uid-1".to_string(),
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            client,
+            fido_authentication_options: Some(json!({
+                "publicKey": { "challenge": [1, 2, 3] }
+            })),
+        };
+        *service.state.pending_login.lock().await = Some(pending);
+
+        <BridgeService as pb::bridge_server::Bridge>::fido_assertion_abort(
+            &service,
+            Request::new(pb::LoginAbortRequest {
+                username: "alice@example.com".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(service.state.pending_login.lock().await.is_none());
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::Login(pb::LoginEvent {
+                event: Some(pb::login_event::Event::Error(err)),
+            })) => {
+                assert!(err.message.contains("fido assertion aborted"));
+            }
+            other => panic!("unexpected fido abort event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fido_assertion_abort_keeps_non_matching_pending_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let client = ProtonClient::with_base_url("http://127.0.0.1:1").unwrap();
+        let pending = PendingLogin {
+            username: "alice@example.com".to_string(),
+            password: "mailbox-password".to_string(),
+            uid: "uid-1".to_string(),
+            access_token: "access-1".to_string(),
+            refresh_token: "refresh-1".to_string(),
+            client,
+            fido_authentication_options: Some(json!({
+                "publicKey": { "challenge": [1, 2, 3] }
+            })),
+        };
+        *service.state.pending_login.lock().await = Some(pending);
+
+        <BridgeService as pb::bridge_server::Bridge>::fido_assertion_abort(
+            &service,
+            Request::new(pb::LoginAbortRequest {
+                username: "bob@example.com".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(service.state.pending_login.lock().await.is_some());
+        let recv_result = tokio::time::timeout(Duration::from_millis(200), events.recv()).await;
+        assert!(
+            recv_result.is_err(),
+            "unexpected event emitted on non-match"
+        );
     }
 
     #[tokio::test]

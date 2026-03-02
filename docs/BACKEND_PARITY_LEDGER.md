@@ -51,7 +51,7 @@ Notes:
 | `LoginFido` | Exact | Completes pending auth via FIDO assertion payload. |
 | `Login2Passwords` | Exact | Alias to primary login flow. |
 | `LoginAbort` | Exact | Cancels pending login and emits error event. |
-| `FidoAssertionAbort` | Partial | No-op success; no dedicated active FIDO flow state. |
+| `FidoAssertionAbort` | Exact | Cancels matching pending FIDO login and emits login error event. |
 | `CheckUpdate` | Partial | Placeholder success; no updater integration. |
 | `InstallUpdate` | Partial | Shutdown handoff placeholder only. |
 | `SetIsAutomaticUpdateOn` | Exact | Persists app setting. |

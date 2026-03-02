@@ -42,7 +42,7 @@ Notes:
 | `SetColorSchemeName` | Exact | Validates and persists app setting. |
 | `ColorSchemeName` | Exact | Returns persisted app setting. |
 | `CurrentEmailClient` | Partial | Returns Proton default shape (`NoClient/0.0.1 (<os>)`); dynamic IMAP/SMTP client ID tracking is not yet wired. |
-| `ReportBug` | Partial | Logs metadata and emits `reportBugSuccess` + `reportBugFinished`; no upstream submission flow. |
+| `ReportBug` | Partial | Async handling emits `reportBugSuccess`/`reportBugError` then `reportBugFinished`; still no upstream ticket submission flow. |
 | `ForceLauncher` | Exact | Persists launcher setting. |
 | `SetMainExecutable` | Exact | Persists executable setting. |
 | `RequestKnowledgeBaseSuggestions` | Partial | Emits `knowledgeBaseSuggestions` with derived support-search suggestion; no upstream KB backend. |

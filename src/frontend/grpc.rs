@@ -446,6 +446,14 @@ impl BridgeService {
         }));
     }
 
+    fn emit_report_bug_error(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::ReportBugError(
+                pb::ReportBugErrorEvent {},
+            )),
+        }));
+    }
+
     fn emit_report_bug_finished(&self) {
         self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
             event: Some(pb::app_event::Event::ReportBugFinished(
@@ -853,8 +861,16 @@ impl pb::bridge_server::Bridge for BridgeService {
             include_logs = req.include_logs,
             "bug report requested via grpc"
         );
-        self.emit_report_bug_success();
-        self.emit_report_bug_finished();
+        let service = self.clone();
+        tokio::spawn(async move {
+            if req.title.trim().is_empty() || req.description.trim().is_empty() {
+                tracing::warn!("bug report rejected: missing title or description");
+                service.emit_report_bug_error();
+            } else {
+                service.emit_report_bug_success();
+            }
+            service.emit_report_bug_finished();
+        });
         Ok(Response::new(()))
     }
 
@@ -2502,6 +2518,44 @@ mod tests {
                 event: Some(pb::app_event::Event::ReportBugFinished(_)),
             })) => {}
             other => panic!("unexpected second report bug event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn report_bug_missing_required_fields_emits_error_then_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        <BridgeService as pb::bridge_server::Bridge>::report_bug(
+            &service,
+            Request::new(pb::ReportBugRequest {
+                os_type: "linux".to_string(),
+                os_version: "6.1".to_string(),
+                title: "   ".to_string(),
+                description: "".to_string(),
+                address: "alice@proton.me".to_string(),
+                email_client: "thunderbird".to_string(),
+                include_logs: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::ReportBugError(_)),
+            })) => {}
+            other => panic!("unexpected first report bug error event: {other:?}"),
+        }
+
+        let second = events.recv().await.unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::App(pb::AppEvent {
+                event: Some(pb::app_event::Event::ReportBugFinished(_)),
+            })) => {}
+            other => panic!("unexpected second report bug finished event: {other:?}"),
         }
     }
 

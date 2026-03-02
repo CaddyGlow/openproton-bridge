@@ -4,6 +4,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 #[cfg(target_os = "linux")]
 use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::process::Command;
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -31,6 +33,8 @@ pub const KEYCHAIN_BACKEND_FILE: &str = "file";
 
 // Keychain constants matching the Go bridge.
 const KEYCHAIN_NAME: &str = "bridge-v3";
+#[cfg(target_os = "macos")]
+const LEGACY_KEYCHAIN_NAME: &str = "bridge";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
 
 #[cfg(target_os = "macos")]
@@ -48,8 +52,12 @@ fn title_case_keychain_name(raw: &str) -> String {
     out
 }
 
+fn non_macos_keychain_service_for(name: &str) -> String {
+    format!("protonmail/{name}/users")
+}
+
 fn default_non_macos_keychain_service() -> String {
-    format!("protonmail/{KEYCHAIN_NAME}/users")
+    non_macos_keychain_service_for(KEYCHAIN_NAME)
 }
 
 fn default_pass_entry_name() -> String {
@@ -59,6 +67,7 @@ fn default_pass_entry_name() -> String {
 #[cfg(target_os = "macos")]
 fn keychain_services() -> Vec<String> {
     let title_name = title_case_keychain_name(KEYCHAIN_NAME);
+    let legacy_title = title_case_keychain_name(LEGACY_KEYCHAIN_NAME);
     let executable_path = std::env::current_exe()
         .ok()
         .and_then(|path| path.to_str().map(ToString::to_string))
@@ -82,7 +91,20 @@ fn keychain_services() -> Vec<String> {
     if services[0] != alternate {
         services.push(alternate);
     }
+
+    for title in [title_name, legacy_title] {
+        for candidate in [
+            format!("Proton Mail {title}"),
+            format!("ProtonMail{title}Service"),
+        ] {
+            if !services.iter().any(|existing| existing == &candidate) {
+                services.push(candidate);
+            }
+        }
+    }
+
     services.push(default_non_macos_keychain_service());
+    services.push(non_macos_keychain_service_for(LEGACY_KEYCHAIN_NAME));
     services
 }
 
@@ -872,21 +894,27 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
 
         match entry.get_password() {
             Ok(encoded) => {
-                let decoded = BASE64
-                    .decode(&encoded)
-                    .map_err(|e| keyring::Error::Invalid(e.to_string(), encoded.clone()))?;
-                if decoded.len() != KEY_LEN {
-                    return Err(keyring::Error::Invalid(
-                        "wrong key length".to_string(),
-                        encoded,
-                    ));
+                match decode_vault_key_string(encoded) {
+                    Ok(key) => {
+                        tracing::debug!(
+                            service = %service,
+                            "vault keychain service returned matching key"
+                        );
+                        return Ok(Some(key));
+                    }
+                    Err(err) => {
+                        if first_non_missing_error.is_none() {
+                            first_non_missing_error = Some(err);
+                        }
+                    }
                 }
-                let mut key = [0u8; KEY_LEN];
-                key.copy_from_slice(&decoded);
-                tracing::debug!(service = %service, "vault keychain service returned matching key");
-                return Ok(Some(key));
             }
             Err(keyring::Error::NoEntry) => {
+                #[cfg(target_os = "macos")]
+                match try_macos_security_cli_get_for_service(&service)? {
+                    Some(key) => return Ok(Some(key)),
+                    None => {}
+                }
                 tracing::debug!(service = %service, "vault keychain service has no matching entry");
             }
             Err(err) => {
@@ -902,6 +930,63 @@ fn try_keychain_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Err
     } else {
         Ok(None)
     }
+}
+
+fn decode_vault_key_string(encoded: String) -> std::result::Result<[u8; KEY_LEN], keyring::Error> {
+    let decoded = BASE64
+        .decode(&encoded)
+        .map_err(|err| keyring::Error::Invalid(err.to_string(), encoded.clone()))?;
+    if decoded.len() != KEY_LEN {
+        return Err(keyring::Error::Invalid(
+            "wrong key length".to_string(),
+            encoded,
+        ));
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&decoded);
+    Ok(key)
+}
+
+#[cfg(target_os = "macos")]
+fn try_macos_security_cli_get_for_service(
+    service: &str,
+) -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            service,
+            "-a",
+            KEYCHAIN_SECRET,
+            "-w",
+        ])
+        .output()
+        .map_err(|err| keyring::Error::NoStorageAccess(Box::new(err)))?;
+
+    if output.status.success() {
+        let encoded = String::from_utf8(output.stdout).map_err(|err| {
+            keyring::Error::Invalid("utf8 decode".to_string(), err.to_string())
+        })?;
+        let encoded = encoded.trim().to_string();
+        if encoded.is_empty() {
+            return Ok(None);
+        }
+        let key = decode_vault_key_string(encoded)?;
+        tracing::debug!(
+            service = %service,
+            backend = "security-cli",
+            "vault key found via macos security fallback"
+        );
+        return Ok(Some(key));
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if stderr.contains("could not be found") {
+        return Ok(None);
+    }
+    Err(keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+        stderr,
+    ))))
 }
 
 fn try_any_secure_backend_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
@@ -1039,17 +1124,7 @@ fn try_pass_get() -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> 
     if encoded.is_empty() {
         return Ok(None);
     }
-    let decoded = BASE64
-        .decode(&encoded)
-        .map_err(|e| keyring::Error::Invalid(e.to_string(), encoded.clone()))?;
-    if decoded.len() != KEY_LEN {
-        return Err(keyring::Error::Invalid(
-            "wrong key length".to_string(),
-            encoded,
-        ));
-    }
-    let mut key = [0u8; KEY_LEN];
-    key.copy_from_slice(&decoded);
+    let key = decode_vault_key_string(encoded)?;
     Ok(Some(key))
 }
 

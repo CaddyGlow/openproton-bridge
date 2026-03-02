@@ -215,7 +215,7 @@ pub struct EmailAddress {
     pub address: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct MessageMetadata {
     #[serde(rename = "ID")]

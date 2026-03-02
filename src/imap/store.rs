@@ -1,9 +1,14 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tracing::warn;
 
 use crate::api::types::MessageMetadata;
 
@@ -47,6 +52,7 @@ pub trait MessageStore: Send + Sync {
     async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>>;
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct MailboxData {
     uid_validity: u32,
     next_uid: u32,
@@ -57,6 +63,12 @@ struct MailboxData {
     flags: HashMap<u32, Vec<String>>,
     uid_order: Vec<u32>,
     mod_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistentMailboxFile {
+    mailbox: String,
+    data: MailboxData,
 }
 
 impl MailboxData {
@@ -88,6 +100,104 @@ impl InMemoryStore {
         Arc::new(Self {
             mailboxes: RwLock::new(HashMap::new()),
         })
+    }
+}
+
+pub struct PersistentStore {
+    root: PathBuf,
+    inner: InMemoryStore,
+}
+
+impl PersistentStore {
+    pub fn new(root: PathBuf) -> Result<Arc<Self>> {
+        std::fs::create_dir_all(&root)?;
+        let loaded = Self::load_mailboxes(&root)?;
+        Ok(Arc::new(Self {
+            root,
+            inner: InMemoryStore {
+                mailboxes: RwLock::new(loaded),
+            },
+        }))
+    }
+
+    fn load_mailboxes(root: &Path) -> Result<HashMap<String, MailboxData>> {
+        let mut mailboxes = HashMap::new();
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+
+            let payload = match std::fs::read(&path) {
+                Ok(data) => data,
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "failed to read persistent mailbox file; skipping"
+                    );
+                    continue;
+                }
+            };
+
+            match serde_json::from_slice::<PersistentMailboxFile>(&payload) {
+                Ok(record) => {
+                    mailboxes.insert(record.mailbox, record.data);
+                }
+                Err(err) => {
+                    warn!(
+                        error = %err,
+                        path = %path.display(),
+                        "failed to parse persistent mailbox file; skipping"
+                    );
+                }
+            }
+        }
+
+        Ok(mailboxes)
+    }
+
+    fn mailbox_path(&self, mailbox: &str) -> PathBuf {
+        let encoded = BASE64_URL_NO_PAD.encode(mailbox.as_bytes());
+        self.root.join(format!("{encoded}.json"))
+    }
+
+    async fn persist_all(&self) -> Result<()> {
+        tokio::fs::create_dir_all(&self.root).await?;
+
+        let snapshot = self.inner.mailboxes.read().await.clone();
+        let mut retained = std::collections::HashSet::new();
+
+        for (mailbox, data) in snapshot {
+            let record = PersistentMailboxFile {
+                mailbox: mailbox.clone(),
+                data,
+            };
+            let path = self.mailbox_path(&mailbox);
+            retained.insert(path.clone());
+            let tmp = path.with_extension("json.tmp");
+
+            let payload = serde_json::to_vec(&record).map_err(|err| {
+                super::ImapError::Protocol(format!("failed to serialize mailbox {mailbox}: {err}"))
+            })?;
+
+            tokio::fs::write(&tmp, payload).await?;
+            tokio::fs::rename(&tmp, &path).await?;
+        }
+
+        let mut entries = tokio::fs::read_dir(&self.root).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if !retained.contains(&path) {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -300,6 +410,85 @@ impl MessageStore for InMemoryStore {
                 .position(|&u| u == uid)
                 .map(|p| p as u32 + 1)
         }))
+    }
+}
+
+#[async_trait]
+impl MessageStore for PersistentStore {
+    async fn store_metadata(
+        &self,
+        mailbox: &str,
+        proton_id: &str,
+        meta: MessageMetadata,
+    ) -> Result<u32> {
+        let uid = self.inner.store_metadata(mailbox, proton_id, meta).await?;
+        self.persist_all().await?;
+        Ok(uid)
+    }
+
+    async fn get_metadata(&self, mailbox: &str, uid: u32) -> Result<Option<MessageMetadata>> {
+        self.inner.get_metadata(mailbox, uid).await
+    }
+
+    async fn get_proton_id(&self, mailbox: &str, uid: u32) -> Result<Option<String>> {
+        self.inner.get_proton_id(mailbox, uid).await
+    }
+
+    async fn get_uid(&self, mailbox: &str, proton_id: &str) -> Result<Option<u32>> {
+        self.inner.get_uid(mailbox, proton_id).await
+    }
+
+    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+        self.inner.store_rfc822(mailbox, uid, data).await?;
+        self.persist_all().await
+    }
+
+    async fn get_rfc822(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+        self.inner.get_rfc822(mailbox, uid).await
+    }
+
+    async fn list_uids(&self, mailbox: &str) -> Result<Vec<u32>> {
+        self.inner.list_uids(mailbox).await
+    }
+
+    async fn mailbox_status(&self, mailbox: &str) -> Result<MailboxStatus> {
+        self.inner.mailbox_status(mailbox).await
+    }
+
+    async fn mailbox_snapshot(&self, mailbox: &str) -> Result<MailboxSnapshot> {
+        self.inner.mailbox_snapshot(mailbox).await
+    }
+
+    async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()> {
+        self.inner.set_flags(mailbox, uid, flags).await?;
+        self.persist_all().await
+    }
+
+    async fn add_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+        self.inner.add_flags(mailbox, uid, flags).await?;
+        self.persist_all().await
+    }
+
+    async fn remove_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+        self.inner.remove_flags(mailbox, uid, flags).await?;
+        self.persist_all().await
+    }
+
+    async fn get_flags(&self, mailbox: &str, uid: u32) -> Result<Vec<String>> {
+        self.inner.get_flags(mailbox, uid).await
+    }
+
+    async fn remove_message(&self, mailbox: &str, uid: u32) -> Result<()> {
+        self.inner.remove_message(mailbox, uid).await?;
+        self.persist_all().await
+    }
+
+    async fn seq_to_uid(&self, mailbox: &str, seq: u32) -> Result<Option<u32>> {
+        self.inner.seq_to_uid(mailbox, seq).await
+    }
+
+    async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
+        self.inner.uid_to_seq(mailbox, uid).await
     }
 }
 
@@ -563,5 +752,98 @@ mod tests {
         let snapshot3 = store.mailbox_snapshot("INBOX").await.unwrap();
         assert_eq!(snapshot3.exists, 0);
         assert!(snapshot3.mod_seq > snapshot2.mod_seq);
+    }
+
+    #[tokio::test]
+    async fn persistent_store_restart_continuity_roundtrip_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = "uid-1::INBOX";
+
+        let store = PersistentStore::new(dir.path().to_path_buf()).unwrap();
+        let uid1 = store
+            .store_metadata(mailbox, "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let uid2 = store
+            .store_metadata(mailbox, "msg-2", make_meta("msg-2", 0))
+            .await
+            .unwrap();
+        assert_eq!(uid1, 1);
+        assert_eq!(uid2, 2);
+        store
+            .set_flags(
+                mailbox,
+                uid1,
+                vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+            )
+            .await
+            .unwrap();
+        store
+            .store_rfc822(mailbox, uid1, b"From: a\r\n\r\nbody".to_vec())
+            .await
+            .unwrap();
+        store.remove_message(mailbox, uid2).await.unwrap();
+
+        let reloaded = PersistentStore::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.get_uid(mailbox, "msg-1").await.unwrap(), Some(1));
+        assert_eq!(reloaded.get_uid(mailbox, "msg-2").await.unwrap(), None);
+        assert_eq!(
+            reloaded.get_rfc822(mailbox, uid1).await.unwrap().unwrap(),
+            b"From: a\r\n\r\nbody".to_vec()
+        );
+        let flags = reloaded.get_flags(mailbox, uid1).await.unwrap();
+        assert!(flags.contains(&"\\Seen".to_string()));
+        assert!(flags.contains(&"\\Flagged".to_string()));
+        let status = reloaded.mailbox_status(mailbox).await.unwrap();
+        assert_eq!(status.exists, 1);
+        assert_eq!(status.next_uid, 3);
+    }
+
+    #[tokio::test]
+    async fn persistent_store_account_isolation_same_proton_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PersistentStore::new(dir.path().to_path_buf()).unwrap();
+        let mailbox_a = "uid-a::INBOX";
+        let mailbox_b = "uid-b::INBOX";
+
+        let uid_a = store
+            .store_metadata(mailbox_a, "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let uid_b = store
+            .store_metadata(mailbox_b, "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        assert_eq!(uid_a, 1);
+        assert_eq!(uid_b, 1);
+
+        store
+            .set_flags(mailbox_a, uid_a, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+        store.remove_message(mailbox_a, uid_a).await.unwrap();
+
+        assert_eq!(store.get_uid(mailbox_a, "msg-1").await.unwrap(), None);
+        assert_eq!(store.get_uid(mailbox_b, "msg-1").await.unwrap(), Some(1));
+        let flags_b = store.get_flags(mailbox_b, uid_b).await.unwrap();
+        assert!(!flags_b.contains(&"\\Seen".to_string()));
+    }
+
+    #[tokio::test]
+    async fn persistent_store_skips_corrupted_json_and_keeps_valid_mailboxes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mailbox = "uid-1::INBOX";
+
+        let store = PersistentStore::new(dir.path().to_path_buf()).unwrap();
+        store
+            .store_metadata(mailbox, "msg-1", make_meta("msg-1", 0))
+            .await
+            .unwrap();
+        drop(store);
+
+        std::fs::write(dir.path().join("corrupt.json"), b"{not valid json").unwrap();
+
+        let reloaded = PersistentStore::new(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.get_uid(mailbox, "msg-1").await.unwrap(), Some(1));
     }
 }

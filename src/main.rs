@@ -174,7 +174,18 @@ async fn main() -> anyhow::Result<()> {
             bind,
             no_tls,
             event_poll_secs,
-        } => cmd_serve(imap_port, smtp_port, &bind, no_tls, event_poll_secs, &dir).await,
+        } => {
+            cmd_serve(
+                imap_port,
+                smtp_port,
+                &bind,
+                no_tls,
+                event_poll_secs,
+                &dir,
+                &runtime_paths,
+            )
+            .await
+        }
         Command::Grpc { bind } => cmd_grpc(&bind, &runtime_paths).await,
     }
 }
@@ -1104,6 +1115,7 @@ async fn cmd_serve(
     no_tls: bool,
     event_poll_secs: u64,
     dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
     // Reject --no-tls with non-loopback bind address
     if no_tls {
@@ -1211,8 +1223,11 @@ async fn cmd_serve(
     let runtime_snapshot = runtime_accounts.snapshot().await;
     let api_base_url = "https://mail-api.proton.me".to_string();
 
-    let store = imap::store::InMemoryStore::new();
-    let event_store: Arc<dyn imap::store::MessageStore> = store.clone();
+    let store_root = effective_disk_cache_path(runtime_paths).join("imap-store");
+    let store: Arc<dyn imap::store::MessageStore> =
+        imap::store::PersistentStore::new(store_root)
+            .context("failed to initialize persistent IMAP store")?;
+    let event_store = store.clone();
 
     let imap_config = imap::session::SessionConfig {
         api_base_url: api_base_url.clone(),
@@ -1436,6 +1451,35 @@ fn runtime_paths(override_dir: Option<&std::path::Path>) -> anyhow::Result<paths
     paths::RuntimePaths::resolve(override_dir)
 }
 
+fn effective_disk_cache_path(runtime_paths: &paths::RuntimePaths) -> std::path::PathBuf {
+    let default_path = runtime_paths.disk_cache_dir();
+    let settings_path = runtime_paths.grpc_app_settings_path();
+
+    let Ok(raw) = std::fs::read_to_string(&settings_path) else {
+        return default_path;
+    };
+
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(
+                path = %settings_path.display(),
+                error = %err,
+                "failed to parse app settings while resolving disk cache path; using default"
+            );
+            return default_path;
+        }
+    };
+
+    parsed
+        .get("disk_cache_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or(default_path)
+}
+
 fn session_dir(override_dir: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     Ok(runtime_paths(override_dir)?.settings_dir().to_path_buf())
 }
@@ -1613,6 +1657,36 @@ mod tests {
     fn session_dir_default_does_not_use_legacy_openproton_suffix() {
         let dir = session_dir(None).unwrap();
         assert!(!dir.ends_with(std::path::Path::new("openproton-bridge")));
+    }
+
+    #[test]
+    fn effective_disk_cache_path_defaults_to_runtime_path_when_settings_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+
+        assert_eq!(
+            effective_disk_cache_path(&runtime_paths),
+            runtime_paths.disk_cache_dir()
+        );
+    }
+
+    #[test]
+    fn effective_disk_cache_path_uses_configured_path_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+        let configured = tmp.path().join("custom-cache");
+
+        std::fs::create_dir_all(runtime_paths.settings_dir()).unwrap();
+        std::fs::write(
+            runtime_paths.grpc_app_settings_path(),
+            serde_json::json!({
+                "disk_cache_path": configured.display().to_string()
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(effective_disk_cache_path(&runtime_paths), configured);
     }
 
     #[test]

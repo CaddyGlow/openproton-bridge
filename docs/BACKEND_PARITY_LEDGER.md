@@ -35,7 +35,7 @@ Notes:
 | `GoOs` | Exact | Returns runtime OS constant. |
 | `Version` | Exact | Returns crate version. |
 | `LogsPath` | Exact | Returns runtime resolver logs path. |
-| `LicensePath` | Partial | Placeholder path only; no packaged-license resolution parity. |
+| `LicensePath` | Exact | Resolves license path via Proton-style runtime/package heuristics (adjacent binary path + OS fallbacks). |
 | `ReleaseNotesPageLink` | Exact | Returns Proton Bridge releases URL. |
 | `DependencyLicensesLink` | Exact | Returns upstream dependency licenses URL. |
 | `LandingPageLink` | Exact | Returns Proton Bridge landing URL. |

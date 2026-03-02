@@ -822,9 +822,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn license_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
-        Ok(Response::new(
-            self.settings_dir().join("LICENSE").display().to_string(),
-        ))
+        Ok(Response::new(resolve_license_path()))
     }
 
     async fn release_notes_page_link(
@@ -1984,6 +1982,47 @@ fn generate_bridge_password() -> String {
         .collect()
 }
 
+fn resolve_license_path() -> String {
+    resolve_license_path_with_exe(std::env::current_exe().ok().as_deref())
+}
+
+fn resolve_license_path_with_exe(exe_path: Option<&Path>) -> String {
+    if let Some(exe_path) = exe_path {
+        if let Some(exe_dir) = exe_path.parent() {
+            let local_name = if std::env::consts::OS == "windows" {
+                "LICENSE.txt"
+            } else {
+                "LICENSE"
+            };
+            let local_path = exe_dir.join(local_name);
+            if local_path.exists() {
+                return local_path.display().to_string();
+            }
+
+            if std::env::consts::OS == "macos" {
+                let resources_path = exe_dir.join("..").join("Resources").join("LICENSE");
+                if resources_path.exists() {
+                    return resources_path.display().to_string();
+                }
+            }
+        }
+    }
+
+    match std::env::consts::OS {
+        "linux" => {
+            let distro_path = PathBuf::from("/usr/share/doc/protonmail/bridge/LICENSE");
+            if distro_path.exists() {
+                distro_path.display().to_string()
+            } else {
+                "/usr/share/licenses/protonmail-bridge/LICENSE".to_string()
+            }
+        }
+        "macos" => "/Applications/Proton Mail Bridge.app/Contents/Resources/LICENSE".to_string(),
+        "windows" => "C:\\Program Files\\Proton\\Proton Mail Bridge\\LICENSE.txt".to_string(),
+        _ => String::new(),
+    }
+}
+
 fn generate_ephemeral_tls_cert() -> anyhow::Result<(String, String)> {
     let cert =
         rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
@@ -2420,6 +2459,24 @@ mod tests {
         assert_eq!(logs_path, expected_logs_dir);
         assert!(expected_logs_dir.exists());
         assert!(!settings_logs_dir.exists());
+    }
+
+    #[test]
+    fn resolve_license_path_with_exe_prefers_adjacent_license_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe_path = dir.path().join("bridge-bin");
+        std::fs::write(&exe_path, b"").unwrap();
+
+        let license_name = if std::env::consts::OS == "windows" {
+            "LICENSE.txt"
+        } else {
+            "LICENSE"
+        };
+        let license_path = dir.path().join(license_name);
+        std::fs::write(&license_path, b"license").unwrap();
+
+        let resolved = resolve_license_path_with_exe(Some(&exe_path));
+        assert_eq!(resolved, license_path.display().to_string());
     }
 
     #[tokio::test]

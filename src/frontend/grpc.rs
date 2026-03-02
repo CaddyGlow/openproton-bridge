@@ -10,7 +10,11 @@ use rand::distributions::Alphanumeric;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, watch, Mutex};
+#[cfg(unix)]
+use tokio_stream::wrappers::UnixListenerStream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tokio_stream::Stream;
 use tonic::metadata::MetadataMap;
@@ -38,6 +42,20 @@ const KEYCHAIN_HELPER_WINDOWS: &str = "windows-credentials";
 const KEYCHAIN_HELPER_SECRET_SERVICE_DBUS: &str = "secret-service-dbus";
 const KEYCHAIN_HELPER_SECRET_SERVICE: &str = "secret-service";
 const KEYCHAIN_HELPER_PASS_APP: &str = "pass-app";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterruptAction {
+    InitiateShutdown,
+    ForceExit,
+}
+
+fn next_interrupt_action(shutdown_requested: bool) -> InterruptAction {
+    if shutdown_requested {
+        InterruptAction::ForceExit
+    } else {
+        InterruptAction::InitiateShutdown
+    }
+}
 
 #[allow(clippy::all)]
 pub mod pb {
@@ -162,7 +180,10 @@ fn os_keyring_helpers() -> &'static [&'static str] {
     match std::env::consts::OS {
         "macos" => &[KEYCHAIN_HELPER_MACOS],
         "windows" => &[KEYCHAIN_HELPER_WINDOWS],
-        "linux" => &[KEYCHAIN_HELPER_SECRET_SERVICE_DBUS, KEYCHAIN_HELPER_SECRET_SERVICE],
+        "linux" => &[
+            KEYCHAIN_HELPER_SECRET_SERVICE_DBUS,
+            KEYCHAIN_HELPER_SECRET_SERVICE,
+        ],
         _ => &[vault::KEYCHAIN_BACKEND_KEYRING],
     }
 }
@@ -1783,6 +1804,19 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         .local_addr()
         .context("failed to read listener local address")?
         .port();
+    #[cfg(unix)]
+    let (unix_listener, unix_socket_path, _unix_socket_cleanup) = {
+        let path = compute_grpc_unix_socket_path()?;
+        let listener = UnixListener::bind(&path).with_context(|| {
+            format!(
+                "failed to bind gRPC unix socket listener at {}",
+                path.display()
+            )
+        })?;
+        (listener, path.clone(), UnixSocketCleanup { path })
+    };
+    #[cfg(not(unix))]
+    let unix_socket_path: Option<PathBuf> = None;
 
     let grpc_server_config_path = runtime_paths.grpc_server_config_path();
     let grpc_mail_settings_path = runtime_paths.grpc_mail_settings_path();
@@ -1797,7 +1831,19 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
             port,
             cert: cert_pem.clone(),
             token: token.clone(),
-            file_socket_path: String::new(),
+            file_socket_path: {
+                #[cfg(unix)]
+                {
+                    unix_socket_path.display().to_string()
+                }
+                #[cfg(not(unix))]
+                {
+                    unix_socket_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default()
+                }
+            },
         },
     )
     .await?;
@@ -1839,28 +1885,71 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         .context("failed to start grpc sync workers")?;
     let service_for_shutdown = service.clone();
     let expected_token = token;
-    let bridge_svc =
+    let expected_token_tcp = expected_token.clone();
+    let bridge_svc_tcp =
         pb::bridge_server::BridgeServer::with_interceptor(service, move |req: Request<()>| {
-            if let Some(status) = validate_server_token(req.metadata(), &expected_token) {
+            if let Some(status) = validate_server_token(req.metadata(), &expected_token_tcp) {
                 return Err(status);
             }
             Ok(req)
         });
+    #[cfg(unix)]
+    let bridge_svc_unix = pb::bridge_server::BridgeServer::with_interceptor(
+        service_for_shutdown.clone(),
+        move |req: Request<()>| {
+            if let Some(status) = validate_server_token(req.metadata(), &expected_token) {
+                return Err(status);
+            }
+            Ok(req)
+        },
+    );
 
-    let tls_identity = Identity::from_pem(cert_pem, key_pem);
+    let cert_pem_tcp = cert_pem.clone();
+    let key_pem_tcp = key_pem.clone();
+    #[cfg(unix)]
+    let cert_pem_unix = cert_pem.clone();
+    #[cfg(unix)]
+    let key_pem_unix = key_pem.clone();
     let shutdown_tx_ctrlc = shutdown_tx.clone();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        let _ = shutdown_tx_ctrlc.send(true);
+        let mut shutdown_requested = false;
+        loop {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                warn!(error = %err, "failed to listen for Ctrl-C");
+                break;
+            }
+
+            match next_interrupt_action(shutdown_requested) {
+                InterruptAction::InitiateShutdown => {
+                    shutdown_requested = true;
+                    info!("Ctrl-C received, initiating graceful shutdown");
+                    let _ = shutdown_tx_ctrlc.send(true);
+                }
+                InterruptAction::ForceExit => {
+                    warn!("second Ctrl-C received, forcing process exit");
+                    std::process::exit(130);
+                }
+            }
+        }
     });
 
+    #[cfg(unix)]
+    info!(
+        port,
+        file_socket_path = %unix_socket_path.display(),
+        "grpc frontend service listening"
+    );
+    #[cfg(not(unix))]
     info!(port, "grpc frontend service listening");
 
+    #[cfg(not(unix))]
     let server_result = async {
         Server::builder()
-            .tls_config(ServerTlsConfig::new().identity(tls_identity))
+            .tls_config(
+                ServerTlsConfig::new().identity(Identity::from_pem(cert_pem_tcp, key_pem_tcp)),
+            )
             .context("failed to configure gRPC TLS")?
-            .add_service(bridge_svc)
+            .add_service(bridge_svc_tcp)
             .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
                 wait_for_shutdown(shutdown_rx).await;
             })
@@ -1868,6 +1957,52 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
             .context("gRPC server exited with error")
     }
     .await;
+    #[cfg(unix)]
+    let server_result = {
+        let shutdown_rx_tcp = shutdown_rx.clone();
+        let shutdown_rx_unix = shutdown_rx.clone();
+        let shutdown_tx_on_exit = shutdown_tx.clone();
+
+        let tcp_server = async move {
+            Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new().identity(Identity::from_pem(cert_pem_tcp, key_pem_tcp)),
+                )
+                .context("failed to configure gRPC TLS for tcp listener")?
+                .add_service(bridge_svc_tcp)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    wait_for_shutdown(shutdown_rx_tcp).await;
+                })
+                .await
+                .context("gRPC tcp server exited with error")
+        };
+
+        let unix_server = async move {
+            Server::builder()
+                .tls_config(
+                    ServerTlsConfig::new()
+                        .identity(Identity::from_pem(cert_pem_unix, key_pem_unix)),
+                )
+                .context("failed to configure gRPC TLS for unix listener")?
+                .add_service(bridge_svc_unix)
+                .serve_with_incoming_shutdown(UnixListenerStream::new(unix_listener), async move {
+                    wait_for_shutdown(shutdown_rx_unix).await;
+                })
+                .await
+                .context("gRPC unix socket server exited with error")
+        };
+
+        tokio::select! {
+            result = tcp_server => {
+                let _ = shutdown_tx_on_exit.send(true);
+                result
+            }
+            result = unix_server => {
+                let _ = shutdown_tx_on_exit.send(true);
+                result
+            }
+        }
+    };
 
     service_for_shutdown.shutdown_sync_workers().await;
 
@@ -2109,6 +2244,47 @@ fn generate_server_token() -> String {
         .take(32)
         .map(char::from)
         .collect()
+}
+
+#[cfg(unix)]
+struct UnixSocketCleanup {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for UnixSocketCleanup {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    path = %self.path.display(),
+                    error = %err,
+                    "failed to remove grpc unix socket file"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn compute_grpc_unix_socket_path() -> anyhow::Result<PathBuf> {
+    let temp_dir = std::env::temp_dir();
+    for _ in 0..1000 {
+        let suffix = rand::thread_rng().gen_range(0..10_000);
+        let candidate = temp_dir.join(format!("bridge{suffix:04}"));
+
+        if candidate.exists() {
+            match std::fs::remove_file(&candidate) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+        }
+
+        return Ok(candidate);
+    }
+
+    anyhow::bail!("failed to allocate grpc unix socket path")
 }
 
 fn generate_bridge_password() -> String {
@@ -2370,6 +2546,15 @@ mod tests {
     const PROTON_FIXTURE_DEFAULT_EMAIL: &str =
         include_str!("../../tests/fixtures/proton_profile_golden/default_email");
 
+    #[test]
+    fn next_interrupt_action_transitions_after_first_signal() {
+        assert_eq!(
+            next_interrupt_action(false),
+            InterruptAction::InitiateShutdown
+        );
+        assert_eq!(next_interrupt_action(true), InterruptAction::ForceExit);
+    }
+
     fn write_proton_golden_fixture(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("vault.enc"), PROTON_FIXTURE_VAULT_ENC).unwrap();
@@ -2621,14 +2806,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
 
-        let current =
-            <BridgeService as pb::bridge_server::Bridge>::current_email_client(
-                &service,
-                Request::new(()),
-            )
-            .await
-            .unwrap()
-            .into_inner();
+        let current = <BridgeService as pb::bridge_server::Bridge>::current_email_client(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
 
         assert_eq!(
             current,
@@ -3174,11 +3358,17 @@ mod tests {
             last_event_ts: Some(1_700_000_000),
             sync_state: Some("refresh_resync".to_string()),
         };
-        vault::save_event_checkpoint_by_account_id(service.settings_dir(), &session.uid, &checkpoint)
-            .unwrap();
-        assert!(vault::load_event_checkpoint_by_account_id(service.settings_dir(), &session.uid)
-            .unwrap()
-            .is_some());
+        vault::save_event_checkpoint_by_account_id(
+            service.settings_dir(),
+            &session.uid,
+            &checkpoint,
+        )
+        .unwrap();
+        assert!(
+            vault::load_event_checkpoint_by_account_id(service.settings_dir(), &session.uid)
+                .unwrap()
+                .is_some()
+        );
 
         <BridgeService as pb::bridge_server::Bridge>::trigger_repair(&service, Request::new(()))
             .await
@@ -3840,13 +4030,11 @@ mod tests {
         let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
 
         let service = build_test_service_with_paths(runtime_paths.clone());
-        let users_before = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
-            &service,
-            Request::new(()),
-        )
-        .await
-        .unwrap()
-        .into_inner();
+        let users_before =
+            <BridgeService as pb::bridge_server::Bridge>::get_user_list(&service, Request::new(()))
+                .await
+                .unwrap()
+                .into_inner();
         assert_eq!(users_before.users.len(), 2);
 
         let restarted_service = build_test_service_with_paths(runtime_paths);
@@ -3938,13 +4126,11 @@ mod tests {
             .await
             .unwrap();
 
-        let users = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
-            &service,
-            Request::new(()),
-        )
-        .await
-        .unwrap()
-        .into_inner();
+        let users =
+            <BridgeService as pb::bridge_server::Bridge>::get_user_list(&service, Request::new(()))
+                .await
+                .unwrap()
+                .into_inner();
         assert_eq!(users.users.len(), 1);
         assert_eq!(users.users[0].id, "uid-1");
 
@@ -3956,13 +4142,11 @@ mod tests {
         .await
         .unwrap();
 
-        let users_after = <BridgeService as pb::bridge_server::Bridge>::get_user_list(
-            &service,
-            Request::new(()),
-        )
-        .await
-        .unwrap()
-        .into_inner();
+        let users_after =
+            <BridgeService as pb::bridge_server::Bridge>::get_user_list(&service, Request::new(()))
+                .await
+                .unwrap()
+                .into_inner();
         assert!(users_after.users.is_empty());
 
         let event = events.recv().await.unwrap();

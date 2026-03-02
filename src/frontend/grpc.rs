@@ -2345,6 +2345,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_event_stream_preserves_order_for_interleaved_multi_user_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut stream = <BridgeService as pb::bridge_server::Bridge>::run_event_stream(
+            &service,
+            Request::new(pb::EventStreamRequest::default()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        service.emit_sync_started("uid-a");
+        service.emit_sync_started("uid-b");
+        service.emit_sync_progress("uid-a", 0.10, 10, 90);
+        service.emit_sync_progress("uid-b", 0.20, 20, 80);
+        service.emit_sync_finished("uid-a");
+        service.emit_sync_finished("uid-b");
+
+        let mut observed = Vec::new();
+        for _ in 0..6 {
+            let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            observed.push(next);
+        }
+
+        match &observed[0].event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-a"),
+            other => panic!("unexpected first interleaved event: {other:?}"),
+        }
+        match &observed[1].event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-b"),
+            other => panic!("unexpected second interleaved event: {other:?}"),
+        }
+        match &observed[2].event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-a");
+                assert!((event.progress - 0.10).abs() < f64::EPSILON);
+                assert_eq!(event.elapsed_ms, 10);
+                assert_eq!(event.remaining_ms, 90);
+            }
+            other => panic!("unexpected third interleaved event: {other:?}"),
+        }
+        match &observed[3].event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-b");
+                assert!((event.progress - 0.20).abs() < f64::EPSILON);
+                assert_eq!(event.elapsed_ms, 20);
+                assert_eq!(event.remaining_ms, 80);
+            }
+            other => panic!("unexpected fourth interleaved event: {other:?}"),
+        }
+        match &observed[4].event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-a"),
+            other => panic!("unexpected fifth interleaved event: {other:?}"),
+        }
+        match &observed[5].event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-b"),
+            other => panic!("unexpected sixth interleaved event: {other:?}"),
+        }
+
+        <BridgeService as pb::bridge_server::Bridge>::stop_event_stream(&service, Request::new(()))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn set_disk_cache_path_moves_payload_and_updates_effective_path() {
         let root = tempfile::tempdir().unwrap();
         let runtime_paths = RuntimePaths::from_bases(

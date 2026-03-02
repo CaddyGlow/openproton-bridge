@@ -2,14 +2,11 @@
   import {
     isFidoAbortAvailable,
     loginStatusIndicatesPending,
-    loginWizardStateOrder,
     loginWizardStepHint,
     loginWizardStepTitle,
     resolveLoginWizardState,
     supportsFidoAlternative,
   } from './login-wizard-auth'
-
-  const stepOrder = loginWizardStateOrder
 
   let {
     open = false,
@@ -126,10 +123,21 @@
 {#if open}
   <div class="wizard-backdrop" role="presentation">
     <div class="wizard-panel card" role="dialog" aria-modal="true" aria-label="Proton login wizard">
-      <div class="wizard-grid">
-        <aside class="wizard-side">
-          <div class="wizard-emblem">P</div>
-          <p class="wizard-brand">OpenProton Mail Bridge</p>
+      <section class="wizard-main">
+        <header class="wizard-header">
+          <div>
+            <p class="wizard-brand">OpenProton Mail Bridge</p>
+            <h2>Sign In Wizard</h2>
+            <p class="muted">{loginWizardStepTitle(activeStep)}</p>
+          </div>
+          {#if canClose}
+            <button class="secondary" onclick={onClose}>Close</button>
+          {/if}
+        </header>
+
+        <p class="muted wizard-step-hint">{loginWizardStepHint(loginStep, activeStep)}</p>
+
+        <div class="wizard-body" aria-busy={isBusy}>
           <div class="wizard-illustration" aria-hidden="true">
             {#if activeStep === 'credentials'}
               <svg viewBox="0 0 80 80">
@@ -156,28 +164,7 @@
               </svg>
             {/if}
           </div>
-          <ol class="wizard-steps">
-            {#each stepOrder as step}
-              <li class:active={activeStep === step}>
-                <span>{stepOrder.indexOf(step) + 1}</span>{loginWizardStepTitle(step)}
-              </li>
-            {/each}
-          </ol>
-          <p class="muted wizard-step-hint">{loginWizardStepHint(loginStep, activeStep)}</p>
-        </aside>
 
-        <section class="wizard-main">
-          <header class="wizard-header">
-            <div>
-              <h2>Sign In Wizard</h2>
-              <p class="muted">{loginWizardStepTitle(activeStep)}</p>
-            </div>
-            {#if canClose}
-              <button class="secondary" onclick={onClose}>Close</button>
-            {/if}
-          </header>
-
-          <div class="wizard-body" aria-busy={isBusy}>
             {#if activeStep === 'credentials'}
               <div class="wizard-fields">
                 <label>
@@ -269,18 +256,17 @@
             {/if}
 
             <p class="muted wizard-status">{loginStatus}</p>
-          </div>
+        </div>
 
-          {#if activeStep !== 'done'}
-            <footer class="wizard-footer">
-              {#if showFidoAbort}
-                <button class="secondary" onclick={onAbortFidoFlow}>Abort FIDO</button>
-              {/if}
-              <button class="secondary" onclick={onAbortLoginFlow}>Abort Login</button>
-            </footer>
-          {/if}
-        </section>
-      </div>
+        {#if activeStep !== 'done'}
+          <footer class="wizard-footer">
+            {#if showFidoAbort}
+              <button class="secondary" onclick={onAbortFidoFlow}>Abort FIDO</button>
+            {/if}
+            <button class="secondary" onclick={onAbortLoginFlow}>Abort Login</button>
+          </footer>
+        {/if}
+      </section>
     </div>
   </div>
 {/if}
@@ -297,54 +283,30 @@
   }
 
   .wizard-panel {
-    width: min(880px, 100%);
+    width: min(560px, 100%);
     max-height: calc(100vh - 40px);
     overflow: auto;
-    padding: 0;
-  }
-
-  .wizard-grid {
-    display: grid;
-    grid-template-columns: minmax(210px, 250px) minmax(0, 1fr);
-    min-height: 440px;
-  }
-
-  .wizard-side {
-    padding: 16px;
-    border-right: 1px solid var(--panel-border);
-    background: linear-gradient(165deg, color-mix(in oklab, var(--brand-soft) 60%, transparent), transparent 65%);
-    display: grid;
-    align-content: start;
-    gap: 10px;
-  }
-
-  .wizard-emblem {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-    background: linear-gradient(130deg, var(--brand), var(--brand-2));
-    color: #fff;
-    display: grid;
-    place-items: center;
-    font-weight: 700;
-    letter-spacing: 0.02em;
+    padding: 14px;
   }
 
   .wizard-brand {
-    margin: 0;
-    font-size: 0.78rem;
-    font-weight: 600;
+    margin: 0 0 2px;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     color: var(--text-muted);
   }
 
   .wizard-illustration {
+    margin-bottom: 2px;
     border: 1px solid var(--panel-border);
     border-radius: 14px;
     background: color-mix(in oklab, var(--surface) 70%, transparent);
     padding: 8px;
     display: grid;
     place-items: center;
-    min-height: 120px;
+    min-height: 90px;
   }
 
   .wizard-illustration svg {
@@ -358,7 +320,6 @@
   }
 
   .wizard-main {
-    padding: 14px;
     display: grid;
     gap: 10px;
     align-content: start;
@@ -369,47 +330,6 @@
     align-items: flex-start;
     justify-content: space-between;
     gap: 8px;
-  }
-
-  .wizard-steps {
-    margin: 0;
-    padding: 0;
-    list-style: none;
-    display: grid;
-    gap: 5px;
-  }
-
-  .wizard-steps li {
-    border-radius: 10px;
-    text-align: left;
-    padding: 7px 8px;
-    font-size: 0.76rem;
-    color: var(--text-muted);
-    background: color-mix(in oklab, var(--surface) 70%, transparent);
-    font-weight: 600;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .wizard-steps span {
-    display: inline-grid;
-    place-items: center;
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    border: 1px solid var(--panel-border);
-    font-size: 0.7rem;
-  }
-
-  .wizard-steps li.active {
-    background: var(--brand-soft);
-    color: var(--text);
-  }
-
-  .wizard-steps li.active span {
-    border-color: var(--brand);
-    background: color-mix(in oklab, var(--brand-soft) 30%, transparent);
   }
 
   .wizard-step-hint {
@@ -476,14 +396,8 @@
   }
 
   @media (max-width: 760px) {
-    .wizard-grid {
-      grid-template-columns: 1fr;
-      min-height: auto;
-    }
-
-    .wizard-side {
-      border-right: 0;
-      border-bottom: 1px solid var(--panel-border);
+    .wizard-panel {
+      padding: 12px;
     }
   }
 </style>

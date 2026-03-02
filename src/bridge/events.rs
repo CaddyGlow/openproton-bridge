@@ -1115,11 +1115,34 @@ pub fn start_event_worker_group(
     checkpoint_store: SharedCheckpointStore,
     poll_interval: Duration,
 ) -> EventWorkerGroup {
+    start_event_worker_group_with_sync_progress(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        checkpoint_store,
+        None,
+        poll_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_worker_group_with_sync_progress(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    checkpoint_store: SharedCheckpointStore,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> EventWorkerGroup {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let handles = accounts
         .into_iter()
         .map(|account| {
-            let config = EventWorkerConfig::new(
+            let mut config = EventWorkerConfig::new(
                 account.account_id,
                 account.email,
                 api_base_url.clone(),
@@ -1128,6 +1151,9 @@ pub fn start_event_worker_group(
                 store.clone(),
                 checkpoint_store.clone(),
             );
+            if let Some(callback) = sync_progress_callback.as_ref() {
+                config = config.with_sync_progress_callback(callback.clone());
+            }
             let shutdown_rx = shutdown_tx.subscribe();
             tokio::spawn(run_event_worker_with_shutdown(
                 config,
@@ -1152,10 +1178,33 @@ pub fn start_event_workers(
     checkpoint_store: SharedCheckpointStore,
     poll_interval: Duration,
 ) -> Vec<JoinHandle<()>> {
+    start_event_workers_with_sync_progress(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        checkpoint_store,
+        None,
+        poll_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_workers_with_sync_progress(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    checkpoint_store: SharedCheckpointStore,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> Vec<JoinHandle<()>> {
     accounts
         .into_iter()
         .map(|account| {
-            let config = EventWorkerConfig::new(
+            let mut config = EventWorkerConfig::new(
                 account.account_id,
                 account.email,
                 api_base_url.clone(),
@@ -1164,6 +1213,9 @@ pub fn start_event_workers(
                 store.clone(),
                 checkpoint_store.clone(),
             );
+            if let Some(callback) = sync_progress_callback.as_ref() {
+                config = config.with_sync_progress_callback(callback.clone());
+            }
             tokio::spawn(run_event_worker(config, poll_interval))
         })
         .collect()
@@ -2466,6 +2518,133 @@ mod tests {
                 .unwrap(),
             AccountHealth::Healthy
         );
+
+        group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn worker_group_sync_progress_callback_is_propagated() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-1"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-cb-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Callback propagation",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let sessions = vec![sample_session("uid-1", "alice@proton.me", "pass-a")];
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(sessions));
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+        let auth_router = AuthRouter::new(AccountRegistry::from_sessions(vec![sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        )]));
+        let accounts = vec![RuntimeAccountInfo {
+            account_id: AccountId("uid-1".to_string()),
+            email: "alice@proton.me".to_string(),
+            health: AccountHealth::Healthy,
+        }];
+        let progress_events = Arc::new(StdMutex::new(Vec::new()));
+        let progress_events_sink = progress_events.clone();
+        let callback: SyncProgressCallback = Arc::new(move |event| {
+            progress_events_sink.lock().unwrap().push(event);
+        });
+
+        let group = start_event_worker_group_with_sync_progress(
+            runtime,
+            accounts,
+            server.uri(),
+            auth_router,
+            store,
+            checkpoints,
+            Some(callback),
+            Duration::from_millis(50),
+        );
+
+        let start = tokio::time::Instant::now();
+        loop {
+            let snapshot = progress_events.lock().unwrap().clone();
+            let saw_started = snapshot
+                .iter()
+                .any(|event| matches!(event, SyncProgressUpdate::Started { user_id } if user_id == "uid-1"));
+            let saw_finished = snapshot
+                .iter()
+                .any(|event| matches!(event, SyncProgressUpdate::Finished { user_id } if user_id == "uid-1"));
+            let saw_progress = snapshot
+                .iter()
+                .any(|event| matches!(event, SyncProgressUpdate::Progress { user_id, .. } if user_id == "uid-1"));
+            if saw_started && saw_progress && saw_finished {
+                break;
+            }
+            if start.elapsed() >= Duration::from_secs(4) {
+                panic!("timed out waiting for sync progress callback events");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
 
         group.shutdown().await;
     }

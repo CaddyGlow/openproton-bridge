@@ -1298,13 +1298,38 @@ async fn cmd_serve(
 
     let checkpoint_store: bridge::events::SharedCheckpointStore =
         Arc::new(bridge::events::VaultCheckpointStore::new(dir.to_path_buf()));
-    let event_workers = bridge::events::start_event_worker_group(
+    let sync_progress_callback: bridge::events::SyncProgressCallback =
+        Arc::new(|event| match event {
+            bridge::events::SyncProgressUpdate::Started { user_id } => {
+                tracing::info!(user_id = %user_id, "account sync started");
+            }
+            bridge::events::SyncProgressUpdate::Progress {
+                user_id,
+                progress,
+                elapsed_ms,
+                remaining_ms,
+            } => {
+                tracing::debug!(
+                    user_id = %user_id,
+                    progress,
+                    elapsed_ms,
+                    remaining_ms,
+                    "account sync progress"
+                );
+            }
+            bridge::events::SyncProgressUpdate::Finished { user_id } => {
+                tracing::info!(user_id = %user_id, "account sync finished");
+            }
+        });
+
+    let event_workers = bridge::events::start_event_worker_group_with_sync_progress(
         runtime_accounts.clone(),
         runtime_snapshot.clone(),
         api_base_url,
         auth_router.clone(),
         event_store,
         checkpoint_store,
+        Some(sync_progress_callback),
         std::time::Duration::from_secs(event_poll_secs),
     );
 

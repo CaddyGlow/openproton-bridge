@@ -20,6 +20,9 @@ const VAULT_VERSION: i32 = 2;
 const ADDRESS_MODE_COMBINED: i32 = 0;
 const ADDRESS_MODE_SPLIT: i32 = 1;
 
+pub const KEYCHAIN_BACKEND_KEYRING: &str = "keyring";
+pub const KEYCHAIN_BACKEND_FILE: &str = "file";
+
 // Keychain constants matching the Go bridge
 const KEYCHAIN_SERVICE: &str = "protonmail/bridge-v3/users";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
@@ -353,6 +356,26 @@ struct VaultCert {
 // ---------------------------------------------------------------------------
 // Key management
 // ---------------------------------------------------------------------------
+
+pub fn discover_available_keychains() -> Vec<String> {
+    discover_available_keychains_with_probe(keyring_credentials_available)
+}
+
+fn discover_available_keychains_with_probe<F>(mut keyring_probe: F) -> Vec<String>
+where
+    F: FnMut() -> bool,
+{
+    let mut available = Vec::with_capacity(2);
+    if keyring_probe() {
+        available.push(KEYCHAIN_BACKEND_KEYRING.to_string());
+    }
+    available.push(KEYCHAIN_BACKEND_FILE.to_string());
+    available
+}
+
+fn keyring_credentials_available() -> bool {
+    matches!(try_keychain_get(), Ok(Some(_)))
+}
 
 /// Derive AES-256 key from the raw vault key using SHA-256 (matches Go bridge).
 fn derive_aes_key(raw: &[u8; KEY_LEN]) -> [u8; KEY_LEN] {
@@ -949,6 +972,30 @@ mod tests {
             VaultError::KeychainAccess(message) => assert!(message.contains("decode")),
             _ => panic!("expected keychain access error"),
         }
+    }
+
+    #[test]
+    fn test_keychain_backend_constants_match_grpc_names() {
+        assert_eq!(KEYCHAIN_BACKEND_KEYRING, "keyring");
+        assert_eq!(KEYCHAIN_BACKEND_FILE, "file");
+    }
+
+    #[test]
+    fn test_discover_available_keychains_falls_back_to_file_only() {
+        let available = discover_available_keychains_with_probe(|| false);
+        assert_eq!(available, vec![KEYCHAIN_BACKEND_FILE.to_string()]);
+    }
+
+    #[test]
+    fn test_discover_available_keychains_is_deterministic_with_keyring_first() {
+        let available_first = discover_available_keychains_with_probe(|| true);
+        let available_second = discover_available_keychains_with_probe(|| true);
+        let expected = vec![
+            KEYCHAIN_BACKEND_KEYRING.to_string(),
+            KEYCHAIN_BACKEND_FILE.to_string(),
+        ];
+        assert_eq!(available_first, expected);
+        assert_eq!(available_second, expected);
     }
 
     #[test]

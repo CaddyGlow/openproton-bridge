@@ -22,7 +22,7 @@ Notes:
 | `GuiReady` | Exact | Emits show-main-window and returns splash flag. |
 | `Restart` | Exact | Signals controlled shutdown. |
 | `TriggerRepair` | Partial | Emits repair event only; no full repair workflow. |
-| `TriggerReset` | Exact | Clears session/settings artifacts and emits `resetFinished`. |
+| `TriggerReset` | Exact | Clears session/settings artifacts, refreshes sync worker group state, and emits `resetFinished`. |
 | `ShowOnStartup` | Exact | Returns persisted app setting. |
 | `SetIsAutostartOn` | Exact | Persists app setting. |
 | `IsAutostartOn` | Exact | Returns persisted app setting. |
@@ -46,7 +46,7 @@ Notes:
 | `ForceLauncher` | Exact | Persists launcher setting. |
 | `SetMainExecutable` | Exact | Persists executable setting. |
 | `RequestKnowledgeBaseSuggestions` | Partial | Emits `knowledgeBaseSuggestions` with derived support-search suggestion; no upstream KB backend. |
-| `Login` | Exact | Full auth flow + vault session persistence. |
+| `Login` | Exact | Full auth flow + vault session persistence + sync worker lifecycle refresh. |
 | `Login2FA` | Exact | Completes pending 2FA flow. |
 | `LoginFido` | Exact | Completes pending auth via FIDO assertion payload. |
 | `Login2Passwords` | Exact | Alias to primary login flow. |
@@ -57,7 +57,7 @@ Notes:
 | `SetIsAutomaticUpdateOn` | Exact | Persists app setting. |
 | `IsAutomaticUpdateOn` | Exact | Returns persisted app setting. |
 | `DiskCachePath` | Exact | Returns runtime-effective active cache path. |
-| `SetDiskCachePath` | Exact | Real copy/switch/cleanup flow + error/finish events. |
+| `SetDiskCachePath` | Exact | Real copy/switch/cleanup flow + error/finish events + sync worker refresh onto new cache root. |
 | `SetIsDoHEnabled` | Exact | Persists app setting. |
 | `IsDoHEnabled` | Exact | Returns persisted app setting. |
 | `MailServerSettings` | Exact | Returns persisted IMAP/SMTP settings. |
@@ -70,10 +70,10 @@ Notes:
 | `GetUserList` | Exact | Lists persisted sessions as users. |
 | `GetUser` | Exact | Resolves by account id or email. |
 | `SetUserSplitMode` | Exact | Persists split mode and emits user-changed. |
-| `SendBadEventUserFeedback` | Partial | Accepts/logs feedback only. |
-| `LogoutUser` | Exact | Removes account session and emits disconnected event. |
+| `SendBadEventUserFeedback` | Partial | Validates user; `doResync=true` refreshes sync workers, `doResync=false` performs logout/disconnect path. |
+| `LogoutUser` | Exact | Removes account session, emits disconnected event, and refreshes sync workers. |
 | `RemoveUser` | Exact | Alias to remove/logout path. |
-| `ConfigureUserAppleMail` | Partial | Logs request only; no OS automation. |
+| `ConfigureUserAppleMail` | Partial | Validates user/address, enables SMTP SSL when required, emits `mailServerSettingsChanged`, then returns `Unimplemented` (no OS automation). |
 | `IsTLSCertificateInstalled` | Exact | Checks TLS cert/key presence. |
 | `InstallTLSCertificate` | Exact | Generates cert/key if missing. |
 | `ExportTLSCertificates` | Exact | Exports cert/key to target directory. |
@@ -93,6 +93,7 @@ Notes:
 | `User.SyncFinishedEvent` | Exact | Emitted when resync lifecycle completes. |
 | `RunEventStream replay semantics` | Exact | Replays buffered pre-stream events in order. |
 | `RunEventStream stop semantics` | Exact | Stream terminates after `StopEventStream`; late events not delivered. |
+| `Sync worker lifecycle refresh` | Exact | Worker group is state-managed and refreshed on startup/login/logout/reset/disk-cache-path transitions. |
 | `App.ReportBugSuccess` | Exact | Emitted on `ReportBug` request handling path. |
 | `App.ReportBugFinished` | Exact | Emitted after `App.ReportBugSuccess`. |
 | `App.KnowledgeBaseSuggestions` | Exact | Emitted by `RequestKnowledgeBaseSuggestions` with suggestion payload. |
@@ -101,5 +102,6 @@ Notes:
 ## Current Blockers Toward Full Exact Parity
 
 - Updater workflow RPCs (`CheckUpdate`, `InstallUpdate`) are placeholders.
-- Bug reporting, KB suggestions, Apple Mail config, and bad-event feedback are currently reduced stubs.
+- Bug reporting and KB suggestions remain reduced stubs.
+- Apple Mail auto-configuration remains unimplemented (validation + safe SMTP SSL side effect wired).
 - Keychain surface is static list rather than full backend parity behavior.

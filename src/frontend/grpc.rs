@@ -93,6 +93,10 @@ struct StoredAppSettings {
 
 impl StoredAppSettings {
     fn with_defaults_for(disk_cache_dir: &Path) -> Self {
+        let default_keychain = vault::discover_available_keychains()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| vault::KEYCHAIN_BACKEND_FILE.to_string());
         Self {
             show_on_startup: true,
             is_autostart_on: false,
@@ -103,7 +107,7 @@ impl StoredAppSettings {
             is_doh_enabled: true,
             color_scheme_name: "system".to_string(),
             is_automatic_update_on: true,
-            current_keychain: "keyring".to_string(),
+            current_keychain: default_keychain,
             main_executable: String::new(),
             forced_launcher: String::new(),
         }
@@ -127,7 +131,6 @@ struct PendingHumanVerification {
     details: HumanVerificationDetails,
 }
 
-#[derive(Debug)]
 struct GrpcState {
     runtime_paths: RuntimePaths,
     bind_host: String,
@@ -140,9 +143,11 @@ struct GrpcState {
     shutdown_tx: watch::Sender<bool>,
     mail_settings: Mutex<StoredMailSettings>,
     app_settings: Mutex<StoredAppSettings>,
+    sync_workers_enabled: bool,
+    sync_event_workers: Mutex<Option<bridge::events::EventWorkerGroup>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct BridgeService {
     state: Arc<GrpcState>,
 }
@@ -166,6 +171,48 @@ impl BridgeService {
 
     fn grpc_app_settings_path(&self) -> PathBuf {
         self.state.runtime_paths.grpc_app_settings_path()
+    }
+
+    async fn refresh_sync_workers(&self) -> anyhow::Result<()> {
+        if !self.state.sync_workers_enabled {
+            return Ok(());
+        }
+
+        let active_disk_cache_path = self.state.active_disk_cache_path.lock().await.clone();
+        let next_group =
+            maybe_start_grpc_sync_workers(&self.state.runtime_paths, self, &active_disk_cache_path)
+                .await?;
+
+        let previous_group = {
+            let mut guard = self.state.sync_event_workers.lock().await;
+            std::mem::replace(&mut *guard, next_group)
+        };
+
+        if let Some(group) = previous_group {
+            group.shutdown().await;
+        }
+
+        Ok(())
+    }
+
+    async fn shutdown_sync_workers(&self) {
+        let previous_group = {
+            let mut guard = self.state.sync_event_workers.lock().await;
+            guard.take()
+        };
+        if let Some(group) = previous_group {
+            group.shutdown().await;
+        }
+    }
+
+    async fn refresh_sync_workers_for_transition(&self, transition: &'static str) {
+        if let Err(err) = self.refresh_sync_workers().await {
+            warn!(
+                transition,
+                error = %err,
+                "failed to refresh grpc sync workers during transition"
+            );
+        }
     }
 
     fn emit_event(&self, event: pb::stream_event::Event) {
@@ -446,6 +493,7 @@ impl BridgeService {
 
         self.emit_login_finished(&session.uid);
         self.emit_user_changed(&session.uid);
+        self.refresh_sync_workers_for_transition("login").await;
 
         Ok(session)
     }
@@ -520,6 +568,10 @@ impl pb::bridge_server::Bridge for BridgeService {
         vault::remove_session(self.settings_dir()).map_err(status_from_vault_error)?;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
         let _ = tokio::fs::remove_file(self.grpc_app_settings_path()).await;
+        *self.state.pending_login.lock().await = None;
+        *self.state.pending_hv.lock().await = None;
+        self.refresh_sync_workers_for_transition("trigger_reset")
+            .await;
         self.emit_reset_finished();
         Ok(Response::new(()))
     }
@@ -627,6 +679,8 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         self.emit_disk_cache_path_changed(&settings.disk_cache_path);
         self.emit_disk_cache_path_change_finished();
+        self.refresh_sync_workers_for_transition("set_disk_cache_path")
+            .await;
         Ok(Response::new(()))
     }
 
@@ -1136,11 +1190,34 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::UserBadEventFeedbackRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        let lookup = req.user_id.trim();
+        if lookup.is_empty() {
+            return Err(Status::invalid_argument("user id is required"));
+        }
+        let sessions =
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let session = sessions
+            .into_iter()
+            .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(lookup))
+            .ok_or_else(|| Status::not_found("user not found"))?;
         tracing::warn!(
-            user_id = %req.user_id,
+            user_id = %session.uid,
             do_resync = req.do_resync,
             "user bad event feedback received"
         );
+
+        if req.do_resync {
+            self.refresh_sync_workers().await.map_err(|err| {
+                Status::internal(format!("failed to refresh sync workers: {err}"))
+            })?;
+            return Ok(Response::new(()));
+        }
+
+        vault::remove_session_by_email(self.settings_dir(), &session.email)
+            .map_err(status_from_vault_error)?;
+        self.emit_user_disconnected(&session.email);
+        self.refresh_sync_workers_for_transition("send_bad_event_user_feedback_logout")
+            .await;
         Ok(Response::new(()))
     }
 
@@ -1156,6 +1233,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(status_from_vault_error)?;
         self.emit_user_disconnected(&session.email);
+        self.refresh_sync_workers_for_transition("logout_user")
+            .await;
         Ok(Response::new(()))
     }
 
@@ -1168,12 +1247,50 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::ConfigureAppleMailRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
+        let lookup = req.user_id.trim();
+        if lookup.is_empty() {
+            return Err(Status::invalid_argument("user id is required"));
+        }
+        let sessions =
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let session = sessions
+            .into_iter()
+            .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(lookup))
+            .ok_or_else(|| Status::not_found("user not found"))?;
+        let requested_address = req.address.trim();
+        if !requested_address.is_empty() && !session.email.eq_ignore_ascii_case(requested_address) {
+            return Err(Status::invalid_argument(
+                "address must match a known user address",
+            ));
+        }
+
+        let mut changed_settings = None;
+        {
+            let mut settings = self.state.mail_settings.lock().await;
+            if !settings.use_ssl_for_smtp {
+                settings.use_ssl_for_smtp = true;
+                save_mail_settings(&self.grpc_mail_settings_path(), &settings)
+                    .await
+                    .map_err(|e| Status::internal(format!("failed to save mail settings: {e}")))?;
+                changed_settings = Some(settings.clone());
+            }
+        }
+        if let Some(settings) = changed_settings.as_ref() {
+            self.emit_mail_settings_changed(settings);
+        }
+
         tracing::info!(
-            user_id = %req.user_id,
-            address = %req.address,
-            "configure user apple mail requested; not yet integrated with system mail setup"
+            user_id = %session.uid,
+            address = %if requested_address.is_empty() {
+                session.email.as_str()
+            } else {
+                requested_address
+            },
+            "configure user apple mail requested; automatic platform integration is unavailable"
         );
-        Ok(Response::new(()))
+        Err(Status::unimplemented(
+            "Apple Mail auto-configuration is not implemented",
+        ))
     }
 
     async fn check_update(&self, _request: Request<()>) -> Result<Response<()>, Status> {
@@ -1210,18 +1327,24 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::AvailableKeychainsResponse>, Status> {
-        Ok(Response::new(pb::AvailableKeychainsResponse {
-            keychains: vec!["keyring".to_string(), "file".to_string()],
-        }))
+        let keychains = vault::discover_available_keychains();
+        Ok(Response::new(pb::AvailableKeychainsResponse { keychains }))
     }
 
     async fn set_current_keychain(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let keychain = request.into_inner();
-        if keychain.trim().is_empty() {
+        let keychain = keychain.trim();
+        if keychain.is_empty() {
             return Err(Status::invalid_argument("keychain name is empty"));
         }
+        let available = vault::discover_available_keychains();
+        if !available.iter().any(|candidate| candidate == keychain) {
+            return Err(Status::invalid_argument(format!(
+                "unknown keychain backend: {keychain}"
+            )));
+        }
         let mut settings = self.state.app_settings.lock().await;
-        settings.current_keychain = keychain;
+        settings.current_keychain = keychain.to_string();
         save_app_settings(&self.grpc_app_settings_path(), &settings)
             .await
             .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
@@ -1486,7 +1609,6 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, _) = broadcast::channel(128);
-    let active_disk_cache_path_for_sync = active_disk_cache_path.clone();
     let state = Arc::new(GrpcState {
         runtime_paths: runtime_paths.clone(),
         bind_host,
@@ -1499,16 +1621,16 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         shutdown_tx: shutdown_tx.clone(),
         mail_settings: Mutex::new(settings),
         app_settings: Mutex::new(app_settings),
+        sync_workers_enabled: true,
+        sync_event_workers: Mutex::new(None),
     });
 
     let service = BridgeService::new(state);
-    let sync_event_service = service.clone();
-    let sync_event_workers = maybe_start_grpc_sync_workers(
-        &runtime_paths,
-        &sync_event_service,
-        &active_disk_cache_path_for_sync,
-    )
-    .await?;
+    service
+        .refresh_sync_workers()
+        .await
+        .context("failed to start grpc sync workers")?;
+    let service_for_shutdown = service.clone();
     let expected_token = token;
     let bridge_svc =
         pb::bridge_server::BridgeServer::with_interceptor(service, move |req: Request<()>| {
@@ -1527,19 +1649,20 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
 
     info!(port, "grpc frontend service listening");
 
-    let server_result = Server::builder()
-        .tls_config(ServerTlsConfig::new().identity(tls_identity))
-        .context("failed to configure gRPC TLS")?
-        .add_service(bridge_svc)
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-            wait_for_shutdown(shutdown_rx).await;
-        })
-        .await
-        .context("gRPC server exited with error");
-
-    if let Some(workers) = sync_event_workers {
-        workers.shutdown().await;
+    let server_result = async {
+        Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(tls_identity))
+            .context("failed to configure gRPC TLS")?
+            .add_service(bridge_svc)
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                wait_for_shutdown(shutdown_rx).await;
+            })
+            .await
+            .context("gRPC server exited with error")
     }
+    .await;
+
+    service_for_shutdown.shutdown_sync_workers().await;
 
     server_result
 }
@@ -1994,6 +2117,8 @@ mod tests {
             pending_hv: Mutex::new(None),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
+            sync_workers_enabled: false,
+            sync_event_workers: Mutex::new(None),
         });
         BridgeService::new(state)
     }
@@ -2281,6 +2406,252 @@ mod tests {
             }
             other => panic!("unexpected knowledge base suggestion event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn send_bad_event_user_feedback_requires_user_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::send_bad_event_user_feedback(
+            &service,
+            Request::new(pb::UserBadEventFeedbackRequest {
+                user_id: "   ".to_string(),
+                do_resync: false,
+            }),
+        )
+        .await;
+
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("user id is required"));
+    }
+
+    #[tokio::test]
+    async fn send_bad_event_user_feedback_without_resync_logs_user_out_and_emits_disconnect() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+        let session = Session {
+            uid: "uid-bad-event-1".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "bad-event@proton.me".to_string(),
+            display_name: "Bad Event".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        <BridgeService as pb::bridge_server::Bridge>::send_bad_event_user_feedback(
+            &service,
+            Request::new(pb::UserBadEventFeedbackRequest {
+                user_id: session.uid.clone(),
+                do_resync: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(vault::list_sessions(service.settings_dir())
+            .unwrap()
+            .is_empty());
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::UserDisconnected(disconnected)),
+            })) => {
+                assert_eq!(disconnected.username, session.email);
+            }
+            other => panic!("unexpected bad event feedback result event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_bad_event_user_feedback_with_resync_keeps_user_connected() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+        let session = Session {
+            uid: "uid-bad-event-2".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "resync@proton.me".to_string(),
+            display_name: "Resync User".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        <BridgeService as pb::bridge_server::Bridge>::send_bad_event_user_feedback(
+            &service,
+            Request::new(pb::UserBadEventFeedbackRequest {
+                user_id: session.uid.clone(),
+                do_resync: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let sessions = vault::list_sessions(service.settings_dir()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].uid, session.uid);
+
+        let recv_result = tokio::time::timeout(Duration::from_millis(200), events.recv()).await;
+        assert!(
+            recv_result.is_err(),
+            "resync feedback should not emit disconnect event"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_user_apple_mail_rejects_unknown_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::configure_user_apple_mail(
+            &service,
+            Request::new(pb::ConfigureAppleMailRequest {
+                user_id: "missing-user".to_string(),
+                address: "missing@proton.me".to_string(),
+            }),
+        )
+        .await;
+
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert!(status.message().contains("user not found"));
+    }
+
+    #[tokio::test]
+    async fn configure_user_apple_mail_rejects_unknown_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-apple-mail-1".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "apple-user@proton.me".to_string(),
+            display_name: "Apple User".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::configure_user_apple_mail(
+            &service,
+            Request::new(pb::ConfigureAppleMailRequest {
+                user_id: session.uid.clone(),
+                address: "different@proton.me".to_string(),
+            }),
+        )
+        .await;
+
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("known user address"));
+    }
+
+    #[tokio::test]
+    async fn configure_user_apple_mail_enables_smtp_ssl_and_emits_settings_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+        let session = Session {
+            uid: "uid-apple-mail-2".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "apple-config@proton.me".to_string(),
+            display_name: "Apple Config".to_string(),
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::configure_user_apple_mail(
+            &service,
+            Request::new(pb::ConfigureAppleMailRequest {
+                user_id: session.uid.clone(),
+                address: session.email.clone(),
+            }),
+        )
+        .await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
+
+        let settings = service.state.mail_settings.lock().await;
+        assert!(settings.use_ssl_for_smtp);
+        drop(settings);
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::MailServerSettings(pb::MailServerSettingsEvent {
+                event:
+                    Some(pb::mail_server_settings_event::Event::MailServerSettingsChanged(changed)),
+            })) => {
+                let emitted = changed.settings.expect("mail settings payload");
+                assert!(emitted.use_ssl_for_smtp);
+            }
+            other => panic!("unexpected apple mail event payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn available_keychains_uses_vault_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let response = <BridgeService as pb::bridge_server::Bridge>::available_keychains(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.keychains, vault::discover_available_keychains());
+    }
+
+    #[tokio::test]
+    async fn set_current_keychain_rejects_unknown_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::set_current_keychain(
+            &service,
+            Request::new("unsupported".to_string()),
+        )
+        .await;
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert!(status.message().contains("unknown keychain backend"));
+    }
+
+    #[tokio::test]
+    async fn set_current_keychain_accepts_discovered_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let selected = vault::discover_available_keychains()
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| vault::KEYCHAIN_BACKEND_FILE.to_string());
+
+        <BridgeService as pb::bridge_server::Bridge>::set_current_keychain(
+            &service,
+            Request::new(selected.clone()),
+        )
+        .await
+        .unwrap();
+
+        let current = <BridgeService as pb::bridge_server::Bridge>::current_keychain(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(current, selected);
     }
 
     #[tokio::test]

@@ -104,4 +104,4 @@ Notes:
 - Updater workflow RPCs (`CheckUpdate`, `InstallUpdate`) are placeholders.
 - Bug reporting and KB suggestions remain reduced stubs.
 - Apple Mail auto-configuration remains unimplemented (validation + safe SMTP SSL side effect wired).
-- Keychain surface is static list rather than full backend parity behavior.
+- Keychain discovery now reflects runtime-available backends, but full Proton-profile fixture interop coverage is still pending.

@@ -215,6 +215,53 @@ impl BridgeService {
         }
     }
 
+    fn status_from_vault_error_with_events(&self, err: vault::VaultError) -> Status {
+        if matches!(
+            err,
+            vault::VaultError::MissingVaultKey | vault::VaultError::KeychainAccess(_)
+        ) {
+            self.emit_keychain_rebuild();
+        }
+        status_from_vault_error(err)
+    }
+
+    async fn set_current_keychain_with_available(
+        &self,
+        keychain_raw: &str,
+        available: &[String],
+    ) -> Result<(), Status> {
+        let result = async {
+            let keychain = keychain_raw.trim();
+            if keychain.is_empty() {
+                return Err(Status::invalid_argument("keychain name is empty"));
+            }
+            let known_backend = matches!(
+                keychain,
+                vault::KEYCHAIN_BACKEND_KEYRING | vault::KEYCHAIN_BACKEND_FILE
+            );
+            if !known_backend {
+                return Err(Status::invalid_argument(format!(
+                    "unknown keychain backend: {keychain}"
+                )));
+            }
+            if !available.iter().any(|candidate| candidate == keychain) {
+                self.emit_keychain_has_no_keychain();
+                return Err(Status::failed_precondition(format!(
+                    "keychain backend unavailable on this host: {keychain}"
+                )));
+            }
+            let mut settings = self.state.app_settings.lock().await;
+            settings.current_keychain = keychain.to_string();
+            save_app_settings(&self.grpc_app_settings_path(), &settings)
+                .await
+                .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+            Ok(())
+        }
+        .await;
+        self.emit_keychain_change_finished();
+        result
+    }
+
     fn emit_event(&self, event: pb::stream_event::Event) {
         let stream_event = pb::StreamEvent { event: Some(event) };
         if let Ok(mut backlog) = self.state.event_backlog.lock() {
@@ -356,6 +403,30 @@ impl BridgeService {
         ));
     }
 
+    fn emit_keychain_change_finished(&self) {
+        self.emit_event(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+            event: Some(pb::keychain_event::Event::ChangeKeychainFinished(
+                pb::ChangeKeychainFinishedEvent {},
+            )),
+        }));
+    }
+
+    fn emit_keychain_has_no_keychain(&self) {
+        self.emit_event(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+            event: Some(pb::keychain_event::Event::HasNoKeychain(
+                pb::HasNoKeychainEvent {},
+            )),
+        }));
+    }
+
+    fn emit_keychain_rebuild(&self) {
+        self.emit_event(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+            event: Some(pb::keychain_event::Event::RebuildKeychain(
+                pb::RebuildKeychainEvent {},
+            )),
+        }));
+    }
+
     fn emit_toggle_autostart_finished(&self) {
         self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
             event: Some(pb::app_event::Event::ToggleAutostartFinished(
@@ -485,9 +556,10 @@ impl BridgeService {
             bridge_password: Some(bridge_password),
         };
 
-        vault::save_session(&session, self.settings_dir()).map_err(status_from_vault_error)?;
+        vault::save_session(&session, self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         vault::set_default_email(self.settings_dir(), &session.email)
-            .map_err(status_from_vault_error)?;
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
 
         client.set_auth(&session.uid, &session.access_token);
 
@@ -565,7 +637,8 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn trigger_reset(&self, _request: Request<()>) -> Result<Response<()>, Status> {
-        vault::remove_session(self.settings_dir()).map_err(status_from_vault_error)?;
+        vault::remove_session(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
         let _ = tokio::fs::remove_file(self.grpc_app_settings_path()).await;
         *self.state.pending_login.lock().await = None;
@@ -1130,8 +1203,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::UserListResponse>, Status> {
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let users = sessions
             .iter()
             .map(|session| {
@@ -1148,8 +1221,8 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn get_user(&self, request: Request<String>) -> Result<Response<pb::User>, Status> {
         let lookup = request.into_inner();
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let session = sessions
             .iter()
             .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(&lookup))
@@ -1166,8 +1239,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::UserSplitModeRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let account_id = sessions
             .iter()
             .find(|s| s.uid == req.user_id || s.email.eq_ignore_ascii_case(&req.user_id))
@@ -1175,7 +1248,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             .ok_or_else(|| Status::not_found("user not found"))?;
 
         vault::save_split_mode_by_account_id(self.settings_dir(), &account_id, req.active)
-            .map_err(status_from_vault_error)?;
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         self.emit_user_changed(&account_id);
         tracing::info!(
             user_id = %account_id,
@@ -1194,8 +1267,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         if lookup.is_empty() {
             return Err(Status::invalid_argument("user id is required"));
         }
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let session = sessions
             .into_iter()
             .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(lookup))
@@ -1214,7 +1287,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
-            .map_err(status_from_vault_error)?;
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("send_bad_event_user_feedback_logout")
             .await;
@@ -1223,15 +1296,15 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn logout_user(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let value = request.into_inner();
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let session = sessions
             .into_iter()
             .find(|s| s.uid == value || s.email.eq_ignore_ascii_case(&value))
             .ok_or_else(|| Status::not_found("user not found"))?;
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
-            .map_err(status_from_vault_error)?;
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("logout_user")
             .await;
@@ -1251,8 +1324,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         if lookup.is_empty() {
             return Err(Status::invalid_argument("user id is required"));
         }
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let session = sessions
             .into_iter()
             .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(lookup))
@@ -1333,21 +1406,9 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn set_current_keychain(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let keychain = request.into_inner();
-        let keychain = keychain.trim();
-        if keychain.is_empty() {
-            return Err(Status::invalid_argument("keychain name is empty"));
-        }
         let available = vault::discover_available_keychains();
-        if !available.iter().any(|candidate| candidate == keychain) {
-            return Err(Status::invalid_argument(format!(
-                "unknown keychain backend: {keychain}"
-            )));
-        }
-        let mut settings = self.state.app_settings.lock().await;
-        settings.current_keychain = keychain.to_string();
-        save_app_settings(&self.grpc_app_settings_path(), &settings)
-            .await
-            .map_err(|e| Status::internal(format!("failed to save app settings: {e}")))?;
+        self.set_current_keychain_with_available(&keychain, &available)
+            .await?;
         Ok(Response::new(()))
     }
 
@@ -2214,6 +2275,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_from_vault_error_with_events_emits_rebuild_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let status =
+            service.status_from_vault_error_with_events(vault::VaultError::MissingVaultKey);
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+                event: Some(pb::keychain_event::Event::RebuildKeychain(_)),
+            })) => {}
+            other => panic!("unexpected keychain rebuild event payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn mail_settings_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(MAIL_SETTINGS_FILE);
@@ -2617,6 +2697,7 @@ mod tests {
     async fn set_current_keychain_rejects_unknown_backend() {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
 
         let result = <BridgeService as pb::bridge_server::Bridge>::set_current_keychain(
             &service,
@@ -2626,12 +2707,21 @@ mod tests {
         let status = result.unwrap_err();
         assert_eq!(status.code(), tonic::Code::InvalidArgument);
         assert!(status.message().contains("unknown keychain backend"));
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+                event: Some(pb::keychain_event::Event::ChangeKeychainFinished(_)),
+            })) => {}
+            other => panic!("unexpected keychain event payload: {other:?}"),
+        }
     }
 
     #[tokio::test]
     async fn set_current_keychain_accepts_discovered_backend() {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
         let selected = vault::discover_available_keychains()
             .into_iter()
             .next()
@@ -2652,6 +2742,48 @@ mod tests {
         .unwrap()
         .into_inner();
         assert_eq!(current, selected);
+
+        let event = events.recv().await.unwrap();
+        match event.event {
+            Some(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+                event: Some(pb::keychain_event::Event::ChangeKeychainFinished(_)),
+            })) => {}
+            other => panic!("unexpected keychain event payload: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_current_keychain_known_but_unavailable_emits_has_no_keychain_and_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let err = service
+            .set_current_keychain_with_available(
+                vault::KEYCHAIN_BACKEND_KEYRING,
+                &[vault::KEYCHAIN_BACKEND_FILE.to_string()],
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("unavailable"));
+
+        let first = events.recv().await.unwrap();
+        match first.event {
+            Some(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+                event: Some(pb::keychain_event::Event::HasNoKeychain(_)),
+            })) => {}
+            other => panic!("unexpected first keychain event payload: {other:?}"),
+        }
+
+        let second = events.recv().await.unwrap();
+        match second.event {
+            Some(pb::stream_event::Event::Keychain(pb::KeychainEvent {
+                event: Some(pb::keychain_event::Event::ChangeKeychainFinished(_)),
+            })) => {}
+            other => panic!("unexpected second keychain event payload: {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -65,7 +65,7 @@ Notes:
 | `Hostname` | Exact | Returns configured bind host. |
 | `IsPortFree` | Exact | Checks local bind availability. |
 | `AvailableKeychains` | Partial | Runtime-discovered keychain backends with deterministic ordering; still missing full helper/OS parity semantics. |
-| `SetCurrentKeychain` | Exact | Persists selected keychain setting. |
+| `SetCurrentKeychain` | Partial | Persists selected keychain setting and emits `changeKeychainFinished`; known unavailable backends return `FailedPrecondition` + `hasNoKeychain`. |
 | `CurrentKeychain` | Exact | Returns selected keychain setting. |
 | `GetUserList` | Exact | Lists persisted sessions as users. |
 | `GetUser` | Exact | Resolves by account id or email. |
@@ -98,10 +98,13 @@ Notes:
 | `App.ReportBugFinished` | Exact | Emitted after `App.ReportBugSuccess`. |
 | `App.KnowledgeBaseSuggestions` | Exact | Emitted by `RequestKnowledgeBaseSuggestions` with suggestion payload. |
 | `App.ResetFinished` | Exact | Emitted after `TriggerReset` completes state cleanup. |
+| `Keychain.ChangeKeychainFinished` | Exact | Emitted for every `SetCurrentKeychain` attempt (success and error). |
+| `Keychain.HasNoKeychain` | Partial | Emitted when a known backend is unavailable on host during keychain selection. |
+| `Keychain.RebuildKeychain` | Partial | Emitted when vault keychain failures (`MissingVaultKey`/`KeychainAccess`) are surfaced to gRPC callers. |
 
 ## Current Blockers Toward Full Exact Parity
 
 - Updater workflow RPCs (`CheckUpdate`, `InstallUpdate`) are placeholders.
 - Bug reporting and KB suggestions remain reduced stubs.
 - Apple Mail auto-configuration remains unimplemented (validation + safe SMTP SSL side effect wired).
-- Keychain helper/OS integration semantics are still simplified compared to upstream Proton Bridge.
+- Keychain helper/OS integration and backend switching semantics are still simplified compared to upstream Proton Bridge.

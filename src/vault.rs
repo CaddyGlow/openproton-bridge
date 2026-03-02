@@ -27,6 +27,63 @@ pub const KEYCHAIN_BACKEND_FILE: &str = "file";
 const KEYCHAIN_SERVICE: &str = "protonmail/bridge-v3/users";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeychainFailureKind {
+    MissingEntry,
+    NoStorageAccess,
+    PlatformFailure,
+    InvalidData,
+    BadEncoding,
+    TooLong,
+    Ambiguous,
+    Other,
+}
+
+impl KeychainFailureKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingEntry => "missing_entry",
+            Self::NoStorageAccess => "no_storage_access",
+            Self::PlatformFailure => "platform_failure",
+            Self::InvalidData => "invalid_data",
+            Self::BadEncoding => "bad_encoding",
+            Self::TooLong => "too_long",
+            Self::Ambiguous => "ambiguous",
+            Self::Other => "other",
+        }
+    }
+}
+
+fn classify_keychain_failure(err: &keyring::Error) -> KeychainFailureKind {
+    match err {
+        keyring::Error::NoEntry => KeychainFailureKind::MissingEntry,
+        keyring::Error::NoStorageAccess(_) => KeychainFailureKind::NoStorageAccess,
+        keyring::Error::PlatformFailure(_) => KeychainFailureKind::PlatformFailure,
+        keyring::Error::Invalid(_, _) => KeychainFailureKind::InvalidData,
+        keyring::Error::BadEncoding(_) => KeychainFailureKind::BadEncoding,
+        keyring::Error::TooLong(_, _) => KeychainFailureKind::TooLong,
+        keyring::Error::Ambiguous(_) => KeychainFailureKind::Ambiguous,
+        _ => KeychainFailureKind::Other,
+    }
+}
+
+fn record_keychain_failure(
+    operation: &'static str,
+    vault_exists: bool,
+    fatal: bool,
+    err: &keyring::Error,
+) {
+    let kind = classify_keychain_failure(err);
+    tracing::warn!(
+        operation,
+        vault_exists,
+        fatal,
+        kind = kind.as_str(),
+        error = %err,
+        "vault keychain operation failed"
+    );
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum VaultError {
     #[error("IO error: {0}")]
@@ -514,10 +571,7 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
 
     // Also store in keychain for Go bridge interop (best-effort)
     if let Err(err) = try_keychain_set(&key) {
-        tracing::warn!(
-            error = %err,
-            "failed to store generated vault key in keychain; continuing with file-backed key"
-        );
+        record_keychain_failure("write", vault_exists, false, &err);
     }
 
     Ok(key)
@@ -531,19 +585,29 @@ fn resolve_keychain_key(
         Ok(Some(key)) => Ok(Some(key)),
         Ok(None) => {
             if vault_exists {
+                tracing::warn!(
+                    operation = "read",
+                    vault_exists,
+                    fatal = true,
+                    kind = KeychainFailureKind::MissingEntry.as_str(),
+                    "vault key is missing for existing vault"
+                );
                 Err(VaultError::MissingVaultKey)
             } else {
                 Ok(None)
             }
         }
         Err(err) => {
+            let kind = classify_keychain_failure(&err);
             if vault_exists {
-                Err(VaultError::KeychainAccess(err.to_string()))
+                record_keychain_failure("read", vault_exists, true, &err);
+                Err(VaultError::KeychainAccess(format!(
+                    "{}: {}",
+                    kind.as_str(),
+                    err
+                )))
             } else {
-                tracing::warn!(
-                    error = %err,
-                    "keychain read failed; continuing with file-backed key generation"
-                );
+                record_keychain_failure("read", vault_exists, false, &err);
                 Ok(None)
             }
         }
@@ -1059,6 +1123,49 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_keychain_key_new_vault_keychain_unavailable_falls_back() {
+        let err = std::io::Error::other("locked");
+        let resolved =
+            resolve_keychain_key(Err(keyring::Error::NoStorageAccess(Box::new(err))), false)
+                .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_resolve_keychain_key_new_vault_invalid_keychain_value_falls_back() {
+        let resolved = resolve_keychain_key(
+            Err(keyring::Error::Invalid(
+                "decode".to_string(),
+                "bad-value".to_string(),
+            )),
+            false,
+        )
+        .unwrap();
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn test_classify_keychain_failure_variants() {
+        assert_eq!(
+            classify_keychain_failure(&keyring::Error::NoEntry),
+            KeychainFailureKind::MissingEntry
+        );
+        assert_eq!(
+            classify_keychain_failure(&keyring::Error::Invalid(
+                "decode".to_string(),
+                "bad".to_string(),
+            )),
+            KeychainFailureKind::InvalidData
+        );
+        assert_eq!(
+            classify_keychain_failure(&keyring::Error::NoStorageAccess(Box::new(
+                std::io::Error::other("denied")
+            ))),
+            KeychainFailureKind::NoStorageAccess
+        );
+    }
+
+    #[test]
     fn test_keychain_backend_constants_match_grpc_names() {
         assert_eq!(KEYCHAIN_BACKEND_KEYRING, "keyring");
         assert_eq!(KEYCHAIN_BACKEND_FILE, "file");
@@ -1166,6 +1273,29 @@ mod tests {
         assert_eq!(loaded.display_name, session.display_name);
         assert_eq!(loaded.key_passphrase, session.key_passphrase);
         assert_eq!(loaded.bridge_password, session.bridge_password);
+    }
+
+    #[test]
+    fn test_save_session_first_run_generates_vault_artifacts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "uid-first-run".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "first-run@proton.me".to_string(),
+            display_name: "First Run".to_string(),
+            key_passphrase: Some("Zmlyc3QtcGFzcw==".to_string()),
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+
+        save_session(&session, tmp.path()).unwrap();
+
+        assert!(tmp.path().join(VAULT_FILE).exists());
+        assert!(tmp.path().join(KEY_FILE).exists());
+        assert!(tmp.path().join(DEFAULT_EMAIL_FILE).exists());
+        let loaded = load_session(tmp.path()).unwrap();
+        assert_eq!(loaded.uid, session.uid);
+        assert_eq!(loaded.email, session.email);
     }
 
     #[test]

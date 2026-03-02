@@ -45,7 +45,7 @@ dirs = "5"
 # Go-compatible vault (MessagePack + OS keychain)
 rmp-serde = "1"
 serde_bytes = "0.11"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
 
 # Password input
 rpassword = "7"

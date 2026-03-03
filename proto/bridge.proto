@@ -170,6 +170,7 @@ message LoginRequest {
   bytes password = 2;
   optional bool useHvDetails = 3;
   optional string humanVerificationToken = 4;
+  optional string apiMode = 5; // bridge or webmail; defaults to bridge
 }
 
 message LoginAbortRequest {

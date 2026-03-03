@@ -96,7 +96,14 @@ fn be020_loads_valid_gluon_bootstrap_bindings_for_accounts() {
     let bootstrap =
         vault::load_gluon_store_bootstrap(tmp.path(), &[session.uid.clone()]).expect("bootstrap");
 
-    assert_eq!(bootstrap.gluon_dir, "fixture-gluon");
+    if cfg!(target_os = "linux") {
+        assert_eq!(bootstrap.gluon_dir, "fixture-gluon");
+    } else {
+        assert_eq!(
+            bootstrap.gluon_dir,
+            tmp.path().join("fixture-gluon").display().to_string()
+        );
+    }
     assert_eq!(bootstrap.accounts.len(), 1);
     assert_eq!(bootstrap.accounts[0].account_id, session.uid);
     assert_eq!(bootstrap.accounts[0].storage_user_id, session.uid);

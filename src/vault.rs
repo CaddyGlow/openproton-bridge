@@ -143,6 +143,29 @@ fn normalized_non_empty(value: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
+
+fn normalize_gluon_dir_for_storage(vault_dir: &Path, configured: Option<&str>) -> String {
+    let raw = normalized_non_empty(configured).unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());
+    let path = PathBuf::from(&raw);
+
+    if path.is_absolute() || is_windows_absolute_path(&raw) {
+        return raw;
+    }
+
+    if cfg!(target_os = "linux") {
+        return raw;
+    }
+
+    vault_dir.join(path).display().to_string()
+}
+
 fn resolve_file_path(dir: &Path, value: Option<&str>) -> Option<PathBuf> {
     let raw = normalized_non_empty(value)?;
     let path = PathBuf::from(raw);
@@ -1664,6 +1687,11 @@ fn ensure_bridge_tls_keypair(data: &mut VaultData) -> Result<()> {
     Ok(())
 }
 
+fn ensure_compatible_gluon_dir(vault_dir: &Path, data: &mut VaultData) {
+    data.settings.gluon_dir =
+        normalize_gluon_dir_for_storage(vault_dir, Some(data.settings.gluon_dir.as_str()));
+}
+
 fn unmarshal_vault(raw: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultData> {
     let file: VaultFile = rmp_serde::from_slice(raw)?;
     let decrypted = decrypt(&file.data, key)?;
@@ -1703,6 +1731,7 @@ fn load_vault_data(dir: &Path) -> Result<Option<VaultData>> {
 
 fn save_vault_data(dir: &Path, data: &mut VaultData) -> Result<()> {
     std::fs::create_dir_all(dir)?;
+    ensure_compatible_gluon_dir(dir, data);
     ensure_bridge_tls_keypair(data)?;
     let mut key = get_or_create_vault_key(dir)?;
     let encoded = marshal_vault(data, &key);
@@ -1758,7 +1787,7 @@ pub fn load_vault_msgpack_value(dir: &Path) -> Result<MsgpackValue> {
 pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
     let mut data = load_vault_data(dir)?.unwrap_or_default();
     if data.settings.gluon_dir.trim().is_empty() {
-        data.settings.gluon_dir = DEFAULT_GLUON_DIR.to_string();
+        data.settings.gluon_dir = normalize_gluon_dir_for_storage(dir, None);
     }
     let session_email = normalize_email(&session.email);
 
@@ -2049,8 +2078,7 @@ pub fn load_gluon_store_bootstrap(
     account_ids: &[String],
 ) -> Result<GluonStoreBootstrap> {
     let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
-    let gluon_dir = normalized_non_empty(Some(data.settings.gluon_dir.as_str()))
-        .unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());
+    let gluon_dir = normalize_gluon_dir_for_storage(dir, Some(data.settings.gluon_dir.as_str()));
 
     let requested_accounts_source: Vec<String> = if account_ids.is_empty() {
         data.users
@@ -2113,8 +2141,7 @@ pub fn load_gluon_store_bootstrap(
 
 pub fn save_gluon_dir(dir: &Path, gluon_dir: &str) -> Result<()> {
     let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
-    data.settings.gluon_dir =
-        normalized_non_empty(Some(gluon_dir)).unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());
+    data.settings.gluon_dir = normalize_gluon_dir_for_storage(dir, Some(gluon_dir));
     save_vault_data(dir, &mut data)
 }
 
@@ -2716,10 +2743,32 @@ path = "custom-vault.key"
         assert!(tmp.path().join(KEY_FILE).exists());
         assert!(tmp.path().join(DEFAULT_EMAIL_FILE).exists());
         let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        if cfg!(target_os = "linux") {
+            assert_eq!(saved.settings.gluon_dir, "gluon");
+        } else {
+            assert_eq!(
+                saved.settings.gluon_dir,
+                tmp.path().join("gluon").display().to_string()
+            );
+        }
         assert!(saved.certs.bridge.has_valid_tls_keypair());
         let loaded = load_session(tmp.path()).unwrap();
         assert_eq!(loaded.uid, session.uid);
         assert_eq!(loaded.email, session.email);
+    }
+
+    #[test]
+    fn test_normalize_gluon_dir_for_storage_relative_path_matches_platform_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let normalized = normalize_gluon_dir_for_storage(tmp.path(), Some("fixture-gluon"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(normalized, "fixture-gluon");
+        } else {
+            assert_eq!(
+                normalized,
+                tmp.path().join("fixture-gluon").display().to_string()
+            );
+        }
     }
 
     #[test]

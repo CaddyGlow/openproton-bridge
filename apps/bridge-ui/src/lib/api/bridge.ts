@@ -22,6 +22,17 @@ export type UserSummary = {
   addresses: string[]
   used_bytes: number
   total_bytes: number
+  password?: string
+  name?: string
+  display_name?: string
+  max_upload?: number
+  credit?: number
+  currency?: string
+  calendar_used_bytes?: number
+  contact_used_bytes?: number
+  drive_used_bytes?: number
+  mail_used_bytes?: number
+  pass_used_bytes?: number
 }
 
 export type MailSettings = {

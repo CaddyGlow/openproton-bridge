@@ -21,7 +21,6 @@
     smtpPort = '1025',
     useSslImap = false,
     useSslSmtp = false,
-    clientPassword = 'generated app password',
     onConfigureClient = (_userId: string) => {},
     onToggleSplitMode = (_userId: string, _current: boolean) => {},
     onLogout = (_userId: string) => {},
@@ -39,7 +38,6 @@
     smtpPort?: string
     useSslImap?: boolean
     useSslSmtp?: boolean
-    clientPassword?: string
     onConfigureClient?: (userId: string) => void
     onToggleSplitMode?: (userId: string, current: boolean) => void
     onLogout?: (userId: string) => void
@@ -82,6 +80,11 @@
 
   function securityLabel(sslEnabled: boolean): string {
     return sslEnabled ? 'SSL/TLS' : 'STARTTLS'
+  }
+
+  function resolvePassword(user: UserSummary | null): string {
+    const candidate = user?.password?.trim() ?? ''
+    return candidate.length > 0 ? candidate : 'generated app password'
   }
 
   function syncProgressForUser(userId: string): number | null {
@@ -137,6 +140,7 @@
       users[0] ??
       null,
   )
+  const activeUserPassword = $derived(resolvePassword(activeUser))
 
   const activeUserSyncStatus = $derived(activeUser ? syncStatusForUser(activeUser) : '')
   const activeUserSyncProgress = $derived(activeUser ? syncProgressForUser(activeUser.id) : null)
@@ -156,7 +160,7 @@
           { label: 'Hostname', value: hostname || '127.0.0.1' },
           { label: 'Port', value: imapPort },
           { label: 'Username', value: activeUser.username },
-          { label: 'Password', value: clientPassword },
+          { label: 'Password', value: activeUserPassword },
           { label: 'Security', value: securityLabel(useSslImap) },
         ]
       : [],
@@ -168,7 +172,7 @@
           { label: 'Hostname', value: hostname || '127.0.0.1' },
           { label: 'Port', value: smtpPort },
           { label: 'Username', value: activeUser.username },
-          { label: 'Password', value: clientPassword },
+          { label: 'Password', value: activeUserPassword },
           { label: 'Security', value: securityLabel(useSslSmtp) },
         ]
       : [],

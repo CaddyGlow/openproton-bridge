@@ -139,7 +139,6 @@
   let clientConfigWizardOpen = $state(false)
   let clientConfigUserId = $state('')
   let selectedAccountKey = $state('')
-  let clientConfigPassword = $state('generated app password')
 
   function normalizeThemeMode(value: string | undefined): ThemeMode {
     if (value === 'light' || value === 'dark') {
@@ -274,9 +273,10 @@
     loginWizardOpen = false
   }
 
-  function resolveClientConfigPassword(): string {
-    if (mailboxPassword.trim().length > 0) {
-      return mailboxPassword.trim()
+  function resolveUserPassword(user: UserSummary | null | undefined): string {
+    const candidate = user?.password?.trim() ?? ''
+    if (candidate.length > 0) {
+      return candidate
     }
     return 'generated app password'
   }
@@ -289,7 +289,6 @@
     }
 
     clientConfigUserId = selectedUser.id
-    clientConfigPassword = resolveClientConfigPassword()
     clientConfigWizardOpen = true
     activeSection = 'accounts'
   }
@@ -1233,7 +1232,6 @@
               smtpPort={smtpPort}
               useSslImap={useSslImap}
               useSslSmtp={useSslSmtp}
-              clientPassword={resolveClientConfigPassword()}
               onConfigureClient={(userId) => openClientConfigWizard(userId)}
               onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
               onLogout={(userId) => logout(userId)}
@@ -1317,7 +1315,7 @@
       hostname={hostname || '127.0.0.1'}
       imapPort={imapPort}
       smtpPort={smtpPort}
-      password={clientConfigPassword}
+      password={resolveUserPassword(selectedClientConfigUser)}
       onClose={closeClientConfigWizard}
     />
   {/if}

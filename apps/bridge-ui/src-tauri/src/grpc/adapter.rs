@@ -18,7 +18,6 @@ use tokio::net::TcpStream;
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use tokio::time::Duration;
 use tokio_rustls::TlsConnector;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
@@ -156,6 +155,17 @@ pub struct UserSummary {
     pub addresses: Vec<String>,
     pub used_bytes: i64,
     pub total_bytes: i64,
+    pub password: String,
+    pub name: String,
+    pub display_name: String,
+    pub max_upload: i64,
+    pub credit: i64,
+    pub currency: String,
+    pub calendar_used_bytes: i64,
+    pub contact_used_bytes: i64,
+    pub drive_used_bytes: i64,
+    pub mail_used_bytes: i64,
+    pub pass_used_bytes: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -416,14 +426,28 @@ impl GrpcAdapter {
             .into_inner()
             .users
             .into_iter()
-            .map(|user| UserSummary {
-                id: user.id,
-                username: user.username,
-                state: user.state,
-                split_mode: user.split_mode,
-                addresses: user.addresses,
-                used_bytes: user.used_bytes,
-                total_bytes: user.total_bytes,
+            .map(|user| {
+                let password = String::from_utf8_lossy(&user.password).into_owned();
+                UserSummary {
+                    id: user.id,
+                    username: user.username,
+                    state: user.state,
+                    split_mode: user.split_mode,
+                    addresses: user.addresses,
+                    used_bytes: user.used_bytes,
+                    total_bytes: user.total_bytes,
+                    password,
+                    name: user.name,
+                    display_name: user.display_name,
+                    max_upload: user.max_upload,
+                    credit: user.credit,
+                    currency: user.currency,
+                    calendar_used_bytes: user.calendar_used_bytes,
+                    contact_used_bytes: user.contact_used_bytes,
+                    drive_used_bytes: user.drive_used_bytes,
+                    mail_used_bytes: user.mail_used_bytes,
+                    pass_used_bytes: user.pass_used_bytes,
+                }
             })
             .collect();
 

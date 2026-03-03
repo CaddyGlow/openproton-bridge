@@ -212,6 +212,16 @@ message User {
   int64 totalBytes = 7;
   bytes password = 8;
   repeated string addresses = 9;
+  string name = 10;
+  string displayName = 11;
+  int64 maxUpload = 12;
+  int64 credit = 13;
+  string currency = 14;
+  int64 calendarUsedBytes = 15;
+  int64 contactUsedBytes = 16;
+  int64 driveUsedBytes = 17;
+  int64 mailUsedBytes = 18;
+  int64 passUsedBytes = 19;
 }
 
 message UserSplitModeRequest {

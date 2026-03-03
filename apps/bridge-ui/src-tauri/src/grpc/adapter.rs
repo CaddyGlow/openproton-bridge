@@ -940,6 +940,12 @@ async fn connect_client_via_unix_socket(
 ) -> Result<BridgeClient, String> {
     let socket_path = PathBuf::from(socket_path);
     let socket_path_display = socket_path.display().to_string();
+    if !socket_path.exists() {
+        return Err(format!(
+            "grpc unix socket does not exist at {socket_path_display}; grpcServerConfig.json is likely stale, capture a fresh config from the currently running Bridge instance"
+        ));
+    }
+
     let tls_connector = build_bridge_tls_connector(&config.cert)?;
     let server_name = bridge_tls_server_name()?;
 

@@ -51,6 +51,14 @@ openproton-bridge accounts use other@proton.me
 # Start the bridge daemon (IMAP on 1143, SMTP on 1025)
 openproton-bridge serve
 
+# Start interactive shell (account and runtime commands)
+openproton-bridge cli
+
+# In interactive shell:
+#   serve            # start IMAP/SMTP in background
+#   serve-status     # inspect runtime state
+#   stop             # stop background runtime
+
 # Optional: tune per-account event poll interval
 openproton-bridge serve --event-poll-secs 10
 

@@ -12,6 +12,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::io::AsyncBufReadExt;
 
 mod api;
 mod bridge;
@@ -392,6 +393,12 @@ struct ServeCommandOverrides {
     event_poll_secs: Option<u64>,
 }
 
+struct InteractiveServeRuntime {
+    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    join_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    config: InteractiveServeConfig,
+}
+
 impl InteractiveServeConfig {
     fn with_overrides(&self, overrides: ServeCommandOverrides) -> Self {
         Self {
@@ -409,205 +416,275 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
     println!("Type `help` for commands, `quit` to exit.\n");
 
     let mut serve_config = InteractiveServeConfig::default();
+    let mut runtime_state: Option<InteractiveServeRuntime> = None;
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut completion_tick = tokio::time::interval(std::time::Duration::from_millis(500));
+    completion_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    completion_tick.tick().await;
+
+    print_cli_prompt()?;
 
     loop {
-        let Some(line) = read_cli_line("openproton> ")? else {
-            println!();
-            break;
-        };
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        let tokens = match split_shell_words(line) {
-            Ok(tokens) => tokens,
-            Err(err) => {
-                eprintln!("Error: {err}");
-                continue;
-            }
-        };
-
-        if tokens.is_empty() {
-            continue;
-        }
-
-        let command = tokens[0].to_ascii_lowercase();
-        match command.as_str() {
-            "quit" | "exit" => break,
-            "help" | "?" => {
-                print_interactive_help();
-            }
-            "list" | "ls" | "l" => {
-                if let Err(err) = execute_non_interactive_command(
-                    Command::Accounts {
-                        command: AccountsCommand::List,
-                    },
-                    dir,
-                    runtime_paths,
-                )
-                .await
-                {
-                    eprintln!("Error: {err:#}");
+        tokio::select! {
+            _ = completion_tick.tick() => {
+                if let Some(message) = maybe_collect_runtime_completion(&mut runtime_state).await {
+                    println!();
+                    println!("{message}");
+                    print_cli_prompt()?;
                 }
             }
-            "info" | "i" => {
-                if let Err(err) =
-                    execute_non_interactive_command(Command::Status, dir, runtime_paths).await
-                {
-                    eprintln!("Error: {err:#}");
+            maybe_event = event_rx.recv() => {
+                if let Some(event) = maybe_event {
+                    println!();
+                    println!("{event}");
+                    print_cli_prompt()?;
                 }
             }
-            "use" => {
-                if tokens.len() != 2 {
-                    eprintln!("Usage: use <email>");
+            maybe_line = lines.next_line() => {
+                let Some(line) = maybe_line.context("failed to read CLI input")? else {
+                    println!();
+                    break;
+                };
+
+                let line = line.trim();
+                if line.is_empty() {
+                    print_cli_prompt()?;
                     continue;
                 }
 
-                if let Err(err) = execute_non_interactive_command(
-                    Command::Accounts {
-                        command: AccountsCommand::Use {
-                            email: tokens[1].clone(),
-                        },
-                    },
-                    dir,
-                    runtime_paths,
-                )
-                .await
-                {
-                    eprintln!("Error: {err:#}");
-                }
-            }
-            "delete" | "del" | "rm" | "remove" => {
-                if tokens.len() != 2 {
-                    eprintln!("Usage: delete <email>");
-                    continue;
-                }
-
-                if let Err(err) = execute_non_interactive_command(
-                    Command::Logout {
-                        email: Some(tokens[1].clone()),
-                        all: false,
-                    },
-                    dir,
-                    runtime_paths,
-                )
-                .await
-                {
-                    eprintln!("Error: {err:#}");
-                }
-            }
-            "clear" | "cl" => {
-                let clear_target = tokens.get(1).map(|value| value.to_ascii_lowercase());
-                if clear_target
-                    .as_deref()
-                    .is_some_and(|target| target == "accounts")
-                    || clear_target
-                        .as_deref()
-                        .is_some_and(|target| target == "everything")
-                {
-                    if let Err(err) = execute_non_interactive_command(
-                        Command::Logout {
-                            email: None,
-                            all: true,
-                        },
-                        dir,
-                        runtime_paths,
-                    )
-                    .await
-                    {
-                        eprintln!("Error: {err:#}");
-                    }
-                } else {
-                    eprintln!("Usage: clear accounts | clear everything");
-                }
-            }
-            "change" | "ch" | "switch" => {
-                if let Err(err) = handle_interactive_change_command(&tokens[1..], &mut serve_config)
-                {
-                    eprintln!("Error: {err}");
-                }
-            }
-            "serve-config" => {
-                print_interactive_serve_config(&serve_config);
-            }
-            "serve" | "start" => {
-                if tokens
-                    .get(1)
-                    .is_some_and(|arg| arg == "--help" || arg == "-h")
-                {
-                    print_interactive_serve_help();
-                    continue;
-                }
-
-                let overrides = match parse_serve_overrides(&tokens[1..]) {
-                    Ok(overrides) => overrides,
+                let tokens = match split_shell_words(line) {
+                    Ok(tokens) => tokens,
                     Err(err) => {
                         eprintln!("Error: {err}");
-                        continue;
-                    }
-                };
-                let effective = serve_config.with_overrides(overrides);
-
-                if let Err(err) = cmd_serve(
-                    effective.imap_port,
-                    effective.smtp_port,
-                    &effective.bind,
-                    effective.no_tls,
-                    effective.event_poll_secs,
-                    dir,
-                    runtime_paths,
-                )
-                .await
-                {
-                    eprintln!("Error: {err:#}");
-                }
-            }
-            _ => {
-                let rewritten = rewrite_repl_aliases(tokens);
-                let parsed = match parse_repl_clap_command(&rewritten) {
-                    Ok(parsed) => parsed,
-                    Err(err) => {
-                        eprintln!("Error: {err:#}");
+                        print_cli_prompt()?;
                         continue;
                     }
                 };
 
-                if matches!(parsed, Command::Cli) {
-                    eprintln!("`cli` cannot be nested inside interactive mode.");
+                if tokens.is_empty() {
+                    print_cli_prompt()?;
                     continue;
                 }
 
-                if let Err(err) = execute_non_interactive_command(parsed, dir, runtime_paths).await
-                {
-                    eprintln!("Error: {err:#}");
+                let command = tokens[0].to_ascii_lowercase();
+                match command.as_str() {
+                    "quit" | "exit" => break,
+                    "help" | "?" => {
+                        print_interactive_help();
+                    }
+                    "list" | "ls" | "l" => {
+                        if let Err(err) = execute_non_interactive_command(
+                            Command::Accounts {
+                                command: AccountsCommand::List,
+                            },
+                            dir,
+                            runtime_paths,
+                        )
+                        .await
+                        {
+                            eprintln!("Error: {err:#}");
+                        }
+                    }
+                    "info" | "i" => {
+                        if let Err(err) =
+                            execute_non_interactive_command(Command::Status, dir, runtime_paths).await
+                        {
+                            eprintln!("Error: {err:#}");
+                        }
+                    }
+                    "use" => {
+                        if tokens.len() != 2 {
+                            eprintln!("Usage: use <email>");
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        if let Err(err) = execute_non_interactive_command(
+                            Command::Accounts {
+                                command: AccountsCommand::Use {
+                                    email: tokens[1].clone(),
+                                },
+                            },
+                            dir,
+                            runtime_paths,
+                        )
+                        .await
+                        {
+                            eprintln!("Error: {err:#}");
+                        }
+                    }
+                    "delete" | "del" | "rm" | "remove" => {
+                        if tokens.len() != 2 {
+                            eprintln!("Usage: delete <email>");
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        if let Err(err) = execute_non_interactive_command(
+                            Command::Logout {
+                                email: Some(tokens[1].clone()),
+                                all: false,
+                            },
+                            dir,
+                            runtime_paths,
+                        )
+                        .await
+                        {
+                            eprintln!("Error: {err:#}");
+                        }
+                    }
+                    "clear" | "cl" => {
+                        let clear_target = tokens.get(1).map(|value| value.to_ascii_lowercase());
+                        if clear_target
+                            .as_deref()
+                            .is_some_and(|target| target == "accounts")
+                            || clear_target
+                                .as_deref()
+                                .is_some_and(|target| target == "everything")
+                        {
+                            if let Err(err) = execute_non_interactive_command(
+                                Command::Logout {
+                                    email: None,
+                                    all: true,
+                                },
+                                dir,
+                                runtime_paths,
+                            )
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            }
+                        } else {
+                            eprintln!("Usage: clear accounts | clear everything");
+                        }
+                    }
+                    "change" | "ch" | "switch" => {
+                        if let Err(err) =
+                            handle_interactive_change_command(&tokens[1..], &mut serve_config)
+                        {
+                            eprintln!("Error: {err}");
+                        }
+                    }
+                    "serve-config" => {
+                        print_interactive_serve_config(&serve_config);
+                    }
+                    "serve-status" => {
+                        if let Some(state) = runtime_state.as_ref() {
+                            println!(
+                                "Serve runtime: running (bind={}, imap={}, smtp={}, tls={}, poll={}s)",
+                                state.config.bind,
+                                state.config.imap_port,
+                                state.config.smtp_port,
+                                if state.config.no_tls { "off" } else { "starttls" },
+                                state.config.event_poll_secs
+                            );
+                        } else {
+                            println!("Serve runtime: stopped");
+                        }
+                    }
+                    "stop" => {
+                        if let Some(state) = runtime_state.take() {
+                            println!("Stopping serve runtime...");
+                            match stop_interactive_runtime(state).await {
+                                Ok(()) => println!("Serve runtime stopped."),
+                                Err(err) => eprintln!("Error while stopping runtime: {err:#}"),
+                            }
+                        } else {
+                            println!("Serve runtime is not running.");
+                        }
+                    }
+                    "serve" | "start" => {
+                        if tokens
+                            .get(1)
+                            .is_some_and(|arg| arg == "--help" || arg == "-h")
+                        {
+                            print_interactive_serve_help();
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        if runtime_state.is_some() {
+                            eprintln!("Serve runtime is already running. Use `stop` first.");
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        let overrides = match parse_serve_overrides(&tokens[1..]) {
+                            Ok(overrides) => overrides,
+                            Err(err) => {
+                                eprintln!("Error: {err}");
+                                print_cli_prompt()?;
+                                continue;
+                            }
+                        };
+                        let effective = serve_config.with_overrides(overrides);
+
+                        match start_interactive_runtime(
+                            effective.clone(),
+                            dir,
+                            runtime_paths,
+                            event_tx.clone(),
+                        )
+                        .await
+                        {
+                            Ok(state) => {
+                                runtime_state = Some(state);
+                                println!("Serve runtime started in background.");
+                            }
+                            Err(err) => eprintln!("Error: {err:#}"),
+                        }
+                    }
+                    _ => {
+                        let rewritten = rewrite_repl_aliases(tokens);
+                        let parsed = match parse_repl_clap_command(&rewritten) {
+                            Ok(parsed) => parsed,
+                            Err(err) => {
+                                eprintln!("Error: {err:#}");
+                                print_cli_prompt()?;
+                                continue;
+                            }
+                        };
+
+                        if matches!(parsed, Command::Cli) {
+                            eprintln!("`cli` cannot be nested inside interactive mode.");
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        if let Err(err) =
+                            execute_non_interactive_command(parsed, dir, runtime_paths).await
+                        {
+                            eprintln!("Error: {err:#}");
+                        }
+                    }
                 }
+
+                if let Some(message) = maybe_collect_runtime_completion(&mut runtime_state).await {
+                    println!("{message}");
+                }
+                print_cli_prompt()?;
             }
         }
+    }
+
+    if let Some(state) = runtime_state.take() {
+        println!("Stopping serve runtime...");
+        let _ = stop_interactive_runtime(state).await;
     }
 
     Ok(())
 }
 
-fn read_cli_line(prompt: &str) -> anyhow::Result<Option<String>> {
+fn print_cli_prompt() -> anyhow::Result<()> {
     use std::io::Write;
 
-    print!("{prompt}");
+    print!("openproton> ");
     std::io::stdout()
         .flush()
         .context("failed to flush stdout")?;
-
-    let mut line = String::new();
-    let read = std::io::stdin()
-        .read_line(&mut line)
-        .context("failed to read CLI input")?;
-
-    if read == 0 {
-        return Ok(None);
-    }
-
-    Ok(Some(line))
+    Ok(())
 }
 
 fn split_shell_words(input: &str) -> anyhow::Result<Vec<String>> {
@@ -857,7 +934,9 @@ fn print_interactive_help() {
     println!("  vault-dump                       Dump decrypted vault msgpack structure");
     println!("  change <field> <value>           Update interactive serve defaults");
     println!("  serve-config                     Print interactive serve defaults");
-    println!("  serve [serve flags]              Start IMAP+SMTP server (blocking)");
+    println!("  serve-status                     Show background serve runtime status");
+    println!("  serve [serve flags]              Start IMAP+SMTP server (background)");
+    println!("  stop                             Stop background serve runtime");
     println!("  grpc [--bind <addr>]             Start gRPC frontend service (blocking)");
     println!();
     print_interactive_serve_help();
@@ -1826,7 +1905,43 @@ async fn cmd_serve(
     dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
-    // Reject --no-tls with non-loopback bind address
+    let context = prepare_serve_runtime(
+        imap_port,
+        smtp_port,
+        bind,
+        no_tls,
+        event_poll_secs,
+        dir,
+        runtime_paths,
+    )
+    .await?;
+
+    run_serve_runtime(context, None, None).await
+}
+
+struct ServeRuntimeContext {
+    imap_addr: String,
+    smtp_addr: String,
+    imap_config: Arc<imap::session::SessionConfig>,
+    smtp_config: Arc<smtp::session::SmtpSessionConfig>,
+    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
+    runtime_snapshot: Vec<bridge::accounts::RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: bridge::auth_router::AuthRouter,
+    event_store: Arc<dyn imap::store::MessageStore>,
+    checkpoint_store: bridge::events::SharedCheckpointStore,
+    poll_interval: std::time::Duration,
+}
+
+async fn prepare_serve_runtime(
+    imap_port: u16,
+    smtp_port: u16,
+    bind: &str,
+    no_tls: bool,
+    event_poll_secs: u64,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<ServeRuntimeContext> {
     if no_tls {
         let addr: std::net::IpAddr = bind.parse().context("invalid bind address")?;
         if !addr.is_loopback() {
@@ -1938,22 +2053,18 @@ async fn cmd_serve(
             .context("failed to initialize persistent IMAP store")?;
     let event_store = store.clone();
 
-    let imap_config = imap::session::SessionConfig {
+    let imap_config = Arc::new(imap::session::SessionConfig {
         api_base_url: api_base_url.clone(),
         auth_router: auth_router.clone(),
         runtime_accounts: runtime_accounts.clone(),
         store,
-    };
+    });
 
-    let imap_config = Arc::new(imap_config);
-
-    let smtp_config = smtp::session::SmtpSessionConfig {
+    let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {
         api_base_url: api_base_url.clone(),
         auth_router: auth_router.clone(),
         runtime_accounts: runtime_accounts.clone(),
-    };
-
-    let smtp_config = Arc::new(smtp_config);
+    });
 
     if !no_tls {
         let cert_dir = dir.join("tls");
@@ -1961,15 +2072,44 @@ async fn cmd_serve(
         let _smtp_server = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
     }
 
-    let imap_addr = format!("{}:{}", bind, imap_port);
-    let smtp_addr = format!("{}:{}", bind, smtp_port);
+    print_serve_configuration(
+        bind,
+        imap_port,
+        smtp_port,
+        no_tls,
+        &active_sessions,
+        &runtime_snapshot,
+    );
 
+    Ok(ServeRuntimeContext {
+        imap_addr: format!("{}:{}", bind, imap_port),
+        smtp_addr: format!("{}:{}", bind, smtp_port),
+        imap_config,
+        smtp_config,
+        runtime_accounts,
+        runtime_snapshot,
+        api_base_url,
+        auth_router,
+        event_store,
+        checkpoint_store: Arc::new(bridge::events::VaultCheckpointStore::new(dir.to_path_buf())),
+        poll_interval: std::time::Duration::from_secs(event_poll_secs),
+    })
+}
+
+fn print_serve_configuration(
+    bind: &str,
+    imap_port: u16,
+    smtp_port: u16,
+    no_tls: bool,
+    active_sessions: &[api::types::Session],
+    runtime_snapshot: &[bridge::accounts::RuntimeAccountInfo],
+) {
     println!("IMAP server configuration:");
     println!("  Server: {}", bind);
     println!("  Port: {}", imap_port);
     println!("  Security: {}", if no_tls { "None" } else { "STARTTLS" });
     println!("  Accounts:");
-    for session in &active_sessions {
+    for session in active_sessions {
         let password = session
             .bridge_password
             .as_deref()
@@ -1977,7 +2117,7 @@ async fn cmd_serve(
         println!("    {} / {}", session.email, password);
     }
     println!("  Health:");
-    for info in &runtime_snapshot {
+    for info in runtime_snapshot {
         println!(
             "    {} ({}) = {:?}",
             info.email, info.account_id.0, info.health
@@ -1989,7 +2129,7 @@ async fn cmd_serve(
     println!("  Port: {}", smtp_port);
     println!("  Security: {}", if no_tls { "None" } else { "STARTTLS" });
     println!("  Accounts:");
-    for session in &active_sessions {
+    for session in active_sessions {
         let password = session
             .bridge_password
             .as_deref()
@@ -1997,37 +2137,78 @@ async fn cmd_serve(
         println!("    {} / {}", session.email, password);
     }
     println!("  Health:");
-    for info in &runtime_snapshot {
+    for info in runtime_snapshot {
         println!(
             "    {} ({}) = {:?}",
             info.email, info.account_id.0, info.health
         );
     }
     println!();
+}
 
-    let checkpoint_store: bridge::events::SharedCheckpointStore =
-        Arc::new(bridge::events::VaultCheckpointStore::new(dir.to_path_buf()));
+async fn run_serve_runtime(
+    context: ServeRuntimeContext,
+    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    notify_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+) -> anyhow::Result<()> {
+    let ServeRuntimeContext {
+        imap_addr,
+        smtp_addr,
+        imap_config,
+        smtp_config,
+        runtime_accounts,
+        runtime_snapshot,
+        api_base_url,
+        auth_router,
+        event_store,
+        checkpoint_store,
+        poll_interval,
+    } = context;
+
+    let account_lookup: std::collections::HashMap<String, String> = runtime_snapshot
+        .iter()
+        .map(|info| (info.account_id.0.clone(), info.email.clone()))
+        .collect();
+    let notify_for_callback = notify_tx.clone();
     let sync_progress_callback: bridge::events::SyncProgressCallback =
-        Arc::new(|event| match event {
+        Arc::new(move |event| match event {
             bridge::events::SyncProgressUpdate::Started { user_id } => {
+                let label = account_lookup
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| user_id.clone());
                 tracing::info!(user_id = %user_id, "account sync started");
+                if let Some(tx) = notify_for_callback.as_ref() {
+                    let _ = tx.send(format!("[event] sync started: {label}"));
+                }
             }
             bridge::events::SyncProgressUpdate::Progress {
                 user_id,
                 progress,
-                elapsed_ms,
-                remaining_ms,
+                elapsed_ms: _,
+                remaining_ms: _,
             } => {
-                tracing::debug!(
-                    user_id = %user_id,
-                    progress,
-                    elapsed_ms,
-                    remaining_ms,
-                    "account sync progress"
-                );
+                tracing::debug!(user_id = %user_id, progress, "account sync progress");
+                if let Some(tx) = notify_for_callback.as_ref() {
+                    let label = account_lookup
+                        .get(&user_id)
+                        .cloned()
+                        .unwrap_or_else(|| user_id.clone());
+                    let _ = tx.send(format!(
+                        "[event] sync progress: {label} ({:.1}%)",
+                        progress * 100.0
+                    ));
+                }
             }
             bridge::events::SyncProgressUpdate::Finished { user_id } => {
+                let label = account_lookup
+                    .get(&user_id)
+                    .cloned()
+                    .unwrap_or_else(|| user_id.clone());
                 tracing::info!(user_id = %user_id, "account sync finished");
+                if let Some(tx) = notify_for_callback.as_ref() {
+                    let _ = tx.send(format!("[event] sync finished: {label}"));
+                }
             }
         });
 
@@ -2035,31 +2216,121 @@ async fn cmd_serve(
         runtime_accounts.clone(),
         runtime_snapshot.clone(),
         api_base_url,
-        auth_router.clone(),
+        auth_router,
         event_store,
         checkpoint_store,
         Some(sync_progress_callback),
-        std::time::Duration::from_secs(event_poll_secs),
+        poll_interval,
     );
 
-    let health_task = tokio::spawn(report_runtime_health_periodically(runtime_accounts.clone()));
+    let health_task = tokio::spawn(report_runtime_health_periodically(runtime_accounts));
+    let mut imap_task =
+        tokio::spawn(async move { imap::server::run_server(&imap_addr, imap_config).await });
+    let mut smtp_task =
+        tokio::spawn(async move { smtp::server::run_server(&smtp_addr, smtp_config).await });
 
-    let serve_result: anyhow::Result<()> = tokio::select! {
-        result = imap::server::run_server(&imap_addr, imap_config) => {
-            result.map_err(anyhow::Error::from)
-        }
-        result = smtp::server::run_server(&smtp_addr, smtp_config) => {
-            result.map_err(anyhow::Error::from)
+    let shutdown_wait = async move {
+        if let Some(rx) = shutdown_rx {
+            let _ = rx.await;
+        } else {
+            std::future::pending::<()>().await;
         }
     };
+    tokio::pin!(shutdown_wait);
+
+    let serve_result: anyhow::Result<()> = tokio::select! {
+        _ = &mut shutdown_wait => {
+            Ok(())
+        }
+        result = &mut imap_task => {
+            match result {
+                Ok(inner) => inner.map_err(anyhow::Error::from),
+                Err(err) => Err(anyhow::Error::new(err).context("IMAP server task failed")),
+            }
+        }
+        result = &mut smtp_task => {
+            match result {
+                Ok(inner) => inner.map_err(anyhow::Error::from),
+                Err(err) => Err(anyhow::Error::new(err).context("SMTP server task failed")),
+            }
+        }
+    };
+
+    if !imap_task.is_finished() {
+        imap_task.abort();
+    }
+    if !smtp_task.is_finished() {
+        smtp_task.abort();
+    }
+    let _ = imap_task.await;
+    let _ = smtp_task.await;
 
     health_task.abort();
     let _ = health_task.await;
     event_workers.shutdown().await;
 
-    serve_result?;
+    if let Some(tx) = notify_tx.as_ref() {
+        if serve_result.is_ok() {
+            let _ = tx.send("[event] serve runtime stopped".to_string());
+        }
+    }
 
-    Ok(())
+    serve_result
+}
+
+async fn start_interactive_runtime(
+    config: InteractiveServeConfig,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+    notify_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> anyhow::Result<InteractiveServeRuntime> {
+    let context = prepare_serve_runtime(
+        config.imap_port,
+        config.smtp_port,
+        &config.bind,
+        config.no_tls,
+        config.event_poll_secs,
+        dir,
+        runtime_paths,
+    )
+    .await?;
+
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+    let join_handle = tokio::spawn(run_serve_runtime(context, Some(stop_rx), Some(notify_tx)));
+    Ok(InteractiveServeRuntime {
+        stop_tx: Some(stop_tx),
+        join_handle,
+        config,
+    })
+}
+
+async fn stop_interactive_runtime(mut state: InteractiveServeRuntime) -> anyhow::Result<()> {
+    if let Some(stop_tx) = state.stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
+
+    match state.join_handle.await {
+        Ok(result) => result,
+        Err(err) => Err(anyhow::Error::new(err).context("serve runtime join failed")),
+    }
+}
+
+async fn maybe_collect_runtime_completion(
+    runtime_state: &mut Option<InteractiveServeRuntime>,
+) -> Option<String> {
+    let is_finished = runtime_state
+        .as_ref()
+        .is_some_and(|state| state.join_handle.is_finished());
+    if !is_finished {
+        return None;
+    }
+
+    let state = runtime_state.take()?;
+    Some(match state.join_handle.await {
+        Ok(Ok(())) => "Serve runtime exited.".to_string(),
+        Ok(Err(err)) => format!("Serve runtime exited with error: {err:#}"),
+        Err(err) => format!("Serve runtime task join error: {err}"),
+    })
 }
 
 async fn cmd_grpc(bind: &str, runtime_paths: &paths::RuntimePaths) -> anyhow::Result<()> {

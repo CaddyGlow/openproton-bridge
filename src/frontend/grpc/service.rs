@@ -422,7 +422,21 @@ impl BridgeService {
         let mut updated = session.clone();
         updated.access_token = refreshed.access_token.clone();
         updated.refresh_token = refreshed.refresh_token;
-        if let Err(err) = vault::save_session(&updated, self.settings_dir()) {
+        let canonical_user_id = match api::users::get_user(&client).await {
+            Ok(user_resp) => Some(user_resp.user.id),
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to fetch canonical user id after token refresh"
+                );
+                None
+            }
+        };
+
+        if let Err(err) =
+            vault::save_session_with_user_id(&updated, canonical_user_id.as_deref(), self.settings_dir())
+        {
             warn!(
                 user_id = %session.uid,
                 error = %err,
@@ -569,7 +583,7 @@ impl BridgeService {
             bridge_password: Some(bridge_password),
         };
 
-        vault::save_session(&session, self.settings_dir())
+        vault::save_session_with_user_id(&session, Some(user.id.as_str()), self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         vault::set_default_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;

@@ -466,15 +466,32 @@ impl RuntimeAccountRegistry {
             }
         };
 
-        let updated = Session {
+        let mut updated = Session {
             uid: refreshed.uid,
             access_token: refreshed.access_token,
             refresh_token: refreshed.refresh_token,
             ..session_for_refresh
         };
 
+        let canonical_user_id = match fetch_canonical_user_context(&updated).await {
+            Some((user_id, email, display_name)) => {
+                if !email.trim().is_empty() {
+                    updated.email = email;
+                }
+                if !display_name.trim().is_empty() {
+                    updated.display_name = display_name;
+                }
+                Some(user_id)
+            }
+            None => None,
+        };
+
         if let Some(vault_dir) = &self.vault_dir {
-            crate::vault::save_session(&updated, vault_dir)?;
+            crate::vault::save_session_with_user_id(
+                &updated,
+                canonical_user_id.as_deref(),
+                vault_dir,
+            )?;
         }
 
         {
@@ -497,6 +514,36 @@ async fn refresh_with_optional_access_token(
         None
     };
     auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, access).await
+}
+
+async fn fetch_canonical_user_context(session: &Session) -> Option<(String, String, String)> {
+    if session.uid.trim().is_empty() || session.access_token.trim().is_empty() {
+        return None;
+    }
+
+    let client = ProtonClient::authenticated_with_mode(
+        session.api_mode.base_url(),
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )
+    .ok()?;
+
+    match crate::api::users::get_user(&client).await {
+        Ok(user_resp) => Some((
+            user_resp.user.id,
+            user_resp.user.email,
+            user_resp.user.display_name,
+        )),
+        Err(err) => {
+            debug!(
+                user_id = %session.uid,
+                error = %err,
+                "failed to fetch canonical user context after refresh"
+            );
+            None
+        }
+    }
 }
 
 #[cfg(test)]

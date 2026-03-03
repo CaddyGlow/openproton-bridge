@@ -315,6 +315,8 @@ async fn maybe_start_grpc_sync_workers(
         sessions,
         runtime_paths.settings_dir().to_path_buf(),
     ));
+    repair_vault_user_ids_for_compatibility(runtime_paths.settings_dir(), &runtime_accounts).await;
+
     let runtime_snapshot = runtime_accounts.snapshot().await;
     if runtime_snapshot.is_empty() {
         return Ok(None);
@@ -388,6 +390,74 @@ async fn maybe_start_grpc_sync_workers(
             std::time::Duration::from_secs(30),
         ),
     ))
+}
+
+async fn repair_vault_user_ids_for_compatibility(
+    settings_dir: &Path,
+    runtime_accounts: &Arc<bridge::accounts::RuntimeAccountRegistry>,
+) {
+    let snapshot = runtime_accounts.snapshot().await;
+    for account in snapshot {
+        let session = match runtime_accounts
+            .with_valid_access_token(&account.account_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(err) => {
+                debug!(
+                    account_id = %account.account_id.0,
+                    error = %err,
+                    "skipping canonical user id repair: account token unavailable"
+                );
+                continue;
+            }
+        };
+
+        if session.uid.trim().is_empty() || session.access_token.trim().is_empty() {
+            continue;
+        }
+
+        let client = match ProtonClient::authenticated_with_mode(
+            session.api_mode.base_url(),
+            session.api_mode,
+            &session.uid,
+            &session.access_token,
+        ) {
+            Ok(client) => client,
+            Err(err) => {
+                debug!(
+                    account_id = %account.account_id.0,
+                    error = %err,
+                    "skipping canonical user id repair: failed to create authenticated client"
+                );
+                continue;
+            }
+        };
+
+        let user_resp = match api::users::get_user(&client).await {
+            Ok(user_resp) => user_resp,
+            Err(err) => {
+                debug!(
+                    account_id = %account.account_id.0,
+                    error = %err,
+                    "skipping canonical user id repair: failed to fetch user profile"
+                );
+                continue;
+            }
+        };
+
+        if let Err(err) = vault::save_session_with_user_id(
+            &session,
+            Some(user_resp.user.id.as_str()),
+            settings_dir,
+        ) {
+            warn!(
+                account_id = %account.account_id.0,
+                error = %err,
+                "failed to persist canonical user id during grpc startup repair"
+            );
+        }
+    }
 }
 
 fn status_from_api_error(err: ApiError) -> Status {

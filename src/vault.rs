@@ -1583,6 +1583,10 @@ fn try_pass_delete_with_config(
 // ---------------------------------------------------------------------------
 
 fn session_to_userdata(session: &Session) -> UserData {
+    session_to_userdata_with_user_id(session, None)
+}
+
+fn session_to_userdata_with_user_id(session: &Session, user_id_override: Option<&str>) -> UserData {
     // key_passphrase: our Session stores base64, Go stores raw bytes
     let key_pass = session
         .key_passphrase
@@ -1602,8 +1606,10 @@ fn session_to_userdata(session: &Session) -> UserData {
     use rand::RngCore;
     OsRng.fill_bytes(&mut gluon_key);
 
+    let user_id = normalized_non_empty(user_id_override).unwrap_or_else(|| session.uid.clone());
+
     UserData {
-        user_id: session.uid.clone(),
+        user_id,
         username: session.display_name.clone(),
         primary_email: session.email.clone(),
         gluon_key,
@@ -1785,6 +1791,14 @@ pub fn load_vault_msgpack_value(dir: &Path) -> Result<MsgpackValue> {
 }
 
 pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
+    save_session_with_user_id(session, None, dir)
+}
+
+pub fn save_session_with_user_id(
+    session: &Session,
+    canonical_user_id: Option<&str>,
+    dir: &Path,
+) -> Result<()> {
     let mut data = load_vault_data(dir)?.unwrap_or_default();
     if data.settings.gluon_dir.trim().is_empty() {
         data.settings.gluon_dir = normalize_gluon_dir_for_storage(dir, None);
@@ -1792,7 +1806,11 @@ pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
     let session_email = normalize_email(&session.email);
 
     // Find existing user by email, or append new
-    let ud = session_to_userdata(session);
+    let ud = if canonical_user_id.is_some() {
+        session_to_userdata_with_user_id(session, canonical_user_id)
+    } else {
+        session_to_userdata(session)
+    };
     if let Some(existing) = data
         .users
         .iter_mut()
@@ -1805,6 +1823,11 @@ pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
         existing.bridge_pass = ud.bridge_pass;
         existing.username = ud.username;
         existing.api_mode = ud.api_mode;
+        if let Some(user_id) = normalized_non_empty(canonical_user_id) {
+            existing.user_id = user_id;
+        } else if existing.user_id.trim().is_empty() {
+            existing.user_id = ud.user_id;
+        }
     } else {
         data.users.push(ud);
     }
@@ -3150,6 +3173,7 @@ path = "custom-vault.key"
 
         let ud = session_to_userdata(&session);
         assert_eq!(ud.auth_uid, "uid-abc");
+        assert_eq!(ud.user_id, "uid-abc");
         assert_eq!(ud.auth_ref, "refresh-xyz");
         assert_eq!(ud.primary_email, "user@proton.me");
         assert_eq!(ud.username, "User Name");
@@ -3167,6 +3191,28 @@ path = "custom-vault.key"
             Some(BASE64.encode(b"raw-passphrase").as_str())
         );
         assert_eq!(back.bridge_password.as_deref(), Some("mybridge123"));
+    }
+
+    #[test]
+    fn test_save_session_with_user_id_persists_canonical_user_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "auth-uid-1".to_string(),
+            access_token: "token".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "canon@proton.me".to_string(),
+            display_name: "Canonical".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+
+        save_session_with_user_id(&session, Some("canonical-user-id"), tmp.path()).unwrap();
+
+        let data = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert_eq!(data.users.len(), 1);
+        assert_eq!(data.users[0].user_id, "canonical-user-id");
+        assert_eq!(data.users[0].auth_uid, "auth-uid-1");
     }
 
     #[test]

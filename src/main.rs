@@ -2408,7 +2408,7 @@ async fn cmd_login(
         bridge_password: Some(bridge_password.clone()),
     };
 
-    vault::save_session(&session, dir)?;
+    vault::save_session_with_user_id(&session, Some(user.id.as_str()), dir)?;
     vault::set_default_email(dir, &session.email)?;
 
     println!(
@@ -3899,14 +3899,30 @@ async fn refresh_session(
     )
     .await?;
 
-    let refreshed = api::types::Session {
+    let mut refreshed = api::types::Session {
         uid: auth.uid,
         access_token: auth.access_token,
         refresh_token: auth.refresh_token,
         ..session
     };
 
-    vault::save_session(&refreshed, dir)?;
+    let mut canonical_user_id = None;
+    match api::users::get_user(&client).await {
+        Ok(user_resp) => {
+            canonical_user_id = Some(user_resp.user.id.clone());
+            if !user_resp.user.email.trim().is_empty() {
+                refreshed.email = user_resp.user.email.clone();
+            }
+            if !user_resp.user.display_name.trim().is_empty() {
+                refreshed.display_name = user_resp.user.display_name.clone();
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to refresh canonical user context after token refresh");
+        }
+    }
+
+    vault::save_session_with_user_id(&refreshed, canonical_user_id.as_deref(), dir)?;
     Ok(refreshed)
 }
 

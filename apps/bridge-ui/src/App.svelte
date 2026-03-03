@@ -237,11 +237,6 @@
   }
 
   function accountSummaryStatus(user: UserSummary): string {
-    const storageSummary = accountStorageSummary(user)
-    if (storageSummary) {
-      return storageSummary
-    }
-
     const parity = userParityById[user.id]
     if (parity?.disconnected) {
       return 'Disconnected'
@@ -255,6 +250,12 @@
     if (parity?.error) {
       return 'Needs attention'
     }
+
+    const storageSummary = accountStorageSummary(user)
+    if (storageSummary) {
+      return storageSummary
+    }
+
     if (Number(user.state) !== 2) {
       return 'Session paused'
     }

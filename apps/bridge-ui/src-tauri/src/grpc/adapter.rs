@@ -63,7 +63,8 @@ struct BridgePinnedCertVerifier {
 
 impl BridgePinnedCertVerifier {
     fn from_pem(cert_pem: &str) -> Result<Self, String> {
-        let mut certs = rustls_pemfile::certs(&mut Cursor::new(cert_pem.as_bytes()));
+        let mut pem_cursor = Cursor::new(cert_pem.as_bytes());
+        let mut certs = rustls_pemfile::certs(&mut pem_cursor);
         let expected_server_cert = certs
             .next()
             .transpose()

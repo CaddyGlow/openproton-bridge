@@ -975,7 +975,23 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         }
                     }
                     "change" | "ch" | "switch" => {
-                        if let Err(err) =
+                        if tokens
+                            .get(1)
+                            .is_some_and(|value| value.eq_ignore_ascii_case("mode"))
+                        {
+                            if tokens.len() < 4 {
+                                eprintln!("Usage: change mode <email> <split|combined>");
+                                print_cli_prompt()?;
+                                continue;
+                            }
+                            if let Err(err) = set_account_mode_by_email(
+                                dir,
+                                &tokens[2],
+                                &tokens[3],
+                            ) {
+                                eprintln!("Error: {err:#}");
+                            }
+                        } else if let Err(err) =
                             handle_interactive_change_command(&tokens[1..], &mut serve_config)
                         {
                             eprintln!("Error: {err}");
@@ -1432,6 +1448,7 @@ fn print_interactive_help() {
     );
     println!("  reset --force                    Clear sessions and grpc settings");
     println!("  change <field> <value>           Update interactive serve defaults");
+    println!("  change mode <email> <split|combined> Set account address mode");
     println!("  serve-config                     Print interactive serve defaults");
     println!("  serve-status                     Show background serve runtime status");
     println!("  serve [serve flags]              Start IMAP+SMTP server (background)");
@@ -1636,6 +1653,30 @@ async fn run_interactive_reset(
 
     let _ = tokio::fs::remove_file(runtime_paths.grpc_mail_settings_path()).await;
     let _ = tokio::fs::remove_file(runtime_paths.grpc_app_settings_path()).await;
+
+    Ok(())
+}
+
+fn set_account_mode_by_email(dir: &std::path::Path, email: &str, mode: &str) -> anyhow::Result<()> {
+    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
+    let session = sessions
+        .iter()
+        .find(|session| session.email.eq_ignore_ascii_case(email))
+        .ok_or_else(|| anyhow::anyhow!("unknown account email: {email}"))?;
+
+    let enabled = match mode.trim().to_ascii_lowercase().as_str() {
+        "split" => true,
+        "combined" => false,
+        other => anyhow::bail!("invalid mode `{other}`; expected split or combined"),
+    };
+
+    vault::save_split_mode_by_account_id(dir, &session.uid, enabled)
+        .with_context(|| format!("failed to update mode for {}", session.email))?;
+    println!(
+        "Address mode for {} set to {}.",
+        session.email,
+        if enabled { "split" } else { "combined" }
+    );
 
     Ok(())
 }

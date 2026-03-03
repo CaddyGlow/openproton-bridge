@@ -404,6 +404,41 @@ struct InteractiveGrpcRuntime {
     bind: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CliStoredAppSettings {
+    show_on_startup: bool,
+    is_autostart_on: bool,
+    is_beta_enabled: bool,
+    is_all_mail_visible: bool,
+    is_telemetry_disabled: bool,
+    disk_cache_path: String,
+    is_doh_enabled: bool,
+    color_scheme_name: String,
+    is_automatic_update_on: bool,
+    current_keychain: String,
+    main_executable: String,
+    forced_launcher: String,
+}
+
+impl CliStoredAppSettings {
+    fn defaults_for(runtime_paths: &paths::RuntimePaths) -> Self {
+        Self {
+            show_on_startup: true,
+            is_autostart_on: false,
+            is_beta_enabled: false,
+            is_all_mail_visible: true,
+            is_telemetry_disabled: false,
+            disk_cache_path: runtime_paths.disk_cache_dir().display().to_string(),
+            is_doh_enabled: true,
+            color_scheme_name: "system".to_string(),
+            is_automatic_update_on: true,
+            current_keychain: vault::KEYCHAIN_BACKEND_FILE.to_string(),
+            main_executable: String::new(),
+            forced_launcher: String::new(),
+        }
+    }
+}
+
 impl InteractiveServeConfig {
     fn with_overrides(&self, overrides: ServeCommandOverrides) -> Self {
         Self {
@@ -496,6 +531,277 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     "log-dir" | "log" | "logs" => {
                         println!("{}", runtime_paths.logs_dir().display());
                     }
+                    "telemetry" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
+                        Some(action) if action == "enable" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_telemetry_disabled = false;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Telemetry collection enabled.");
+                            }
+                        }
+                        Some(action) if action == "disable" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_telemetry_disabled = true;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Telemetry collection disabled.");
+                            }
+                        }
+                        Some(action) if action == "status" => {
+                            match load_app_settings_for_cli(runtime_paths).await {
+                                Ok(settings) => println!(
+                                    "Telemetry: {}",
+                                    if settings.is_telemetry_disabled {
+                                        "disabled"
+                                    } else {
+                                        "enabled"
+                                    }
+                                ),
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            }
+                        }
+                        _ => eprintln!("Usage: telemetry <enable|disable|status>"),
+                    },
+                    "proxy" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
+                        Some(action) if action == "allow" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_doh_enabled = true;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Proxy fallback (DoH) enabled.");
+                            }
+                        }
+                        Some(action) if action == "disallow" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_doh_enabled = false;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Proxy fallback (DoH) disabled.");
+                            }
+                        }
+                        Some(action) if action == "status" => {
+                            match load_app_settings_for_cli(runtime_paths).await {
+                                Ok(settings) => println!(
+                                    "Proxy fallback (DoH): {}",
+                                    if settings.is_doh_enabled {
+                                        "allowed"
+                                    } else {
+                                        "disallowed"
+                                    }
+                                ),
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            }
+                        }
+                        _ => eprintln!("Usage: proxy <allow|disallow|status>"),
+                    },
+                    "autostart" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
+                        Some(action) if action == "enable" || action == "on" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_autostart_on = true;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Autostart enabled.");
+                            }
+                        }
+                        Some(action) if action == "disable" || action == "off" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_autostart_on = false;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Autostart disabled.");
+                            }
+                        }
+                        Some(action) if action == "status" => {
+                            match load_app_settings_for_cli(runtime_paths).await {
+                                Ok(settings) => println!(
+                                    "Autostart: {}",
+                                    if settings.is_autostart_on {
+                                        "enabled"
+                                    } else {
+                                        "disabled"
+                                    }
+                                ),
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            }
+                        }
+                        _ => eprintln!("Usage: autostart <enable|disable|status>"),
+                    },
+                    "all-mail-visibility" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
+                        Some(action) if action == "show" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_all_mail_visible = true;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("All Mail folder visibility enabled.");
+                            }
+                        }
+                        Some(action) if action == "hide" => {
+                            if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                settings.is_all_mail_visible = false;
+                            })
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("All Mail folder visibility disabled.");
+                            }
+                        }
+                        Some(action) if action == "status" => {
+                            match load_app_settings_for_cli(runtime_paths).await {
+                                Ok(settings) => println!(
+                                    "All Mail visibility: {}",
+                                    if settings.is_all_mail_visible {
+                                        "shown"
+                                    } else {
+                                        "hidden"
+                                    }
+                                ),
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            }
+                        }
+                        _ => eprintln!("Usage: all-mail-visibility <show|hide|status>"),
+                    },
+                    "updates" => {
+                        let Some(scope) = tokens.get(1).map(|s| s.to_ascii_lowercase()) else {
+                            eprintln!(
+                                "Usage: updates <check|status|autoupdates <enable|disable|status>|channel <early|stable|status>>"
+                            );
+                            print_cli_prompt()?;
+                            continue;
+                        };
+
+                        match scope.as_str() {
+                            "check" => match load_app_settings_for_cli(runtime_paths).await {
+                                Ok(settings) => {
+                                    println!(
+                                        "Update check requested (headless mode): channel={}, autoupdates={}",
+                                        if settings.is_beta_enabled { "early" } else { "stable" },
+                                        if settings.is_automatic_update_on { "on" } else { "off" }
+                                    );
+                                }
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            },
+                            "status" => match load_app_settings_for_cli(runtime_paths).await {
+                                Ok(settings) => println!(
+                                    "Updates: channel={}, autoupdates={}",
+                                    if settings.is_beta_enabled { "early" } else { "stable" },
+                                    if settings.is_automatic_update_on { "on" } else { "off" }
+                                ),
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            },
+                            "autoupdates" => {
+                                let Some(action) = tokens.get(2).map(|s| s.to_ascii_lowercase()) else {
+                                    eprintln!("Usage: updates autoupdates <enable|disable|status>");
+                                    print_cli_prompt()?;
+                                    continue;
+                                };
+
+                                match action.as_str() {
+                                    "enable" => {
+                                        if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                            settings.is_automatic_update_on = true;
+                                        })
+                                        .await
+                                        {
+                                            eprintln!("Error: {err:#}");
+                                        } else {
+                                            println!("Automatic updates enabled.");
+                                        }
+                                    }
+                                    "disable" => {
+                                        if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                            settings.is_automatic_update_on = false;
+                                        })
+                                        .await
+                                        {
+                                            eprintln!("Error: {err:#}");
+                                        } else {
+                                            println!("Automatic updates disabled.");
+                                        }
+                                    }
+                                    "status" => match load_app_settings_for_cli(runtime_paths).await {
+                                        Ok(settings) => println!(
+                                            "Automatic updates: {}",
+                                            if settings.is_automatic_update_on {
+                                                "enabled"
+                                            } else {
+                                                "disabled"
+                                            }
+                                        ),
+                                        Err(err) => eprintln!("Error: {err:#}"),
+                                    },
+                                    _ => eprintln!("Usage: updates autoupdates <enable|disable|status>"),
+                                }
+                            }
+                            "channel" => {
+                                let Some(action) = tokens.get(2).map(|s| s.to_ascii_lowercase()) else {
+                                    eprintln!("Usage: updates channel <early|stable|status>");
+                                    print_cli_prompt()?;
+                                    continue;
+                                };
+
+                                match action.as_str() {
+                                    "early" => {
+                                        if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                            settings.is_beta_enabled = true;
+                                        })
+                                        .await
+                                        {
+                                            eprintln!("Error: {err:#}");
+                                        } else {
+                                            println!("Update channel set to early.");
+                                        }
+                                    }
+                                    "stable" => {
+                                        if let Err(err) = update_app_settings(runtime_paths, |settings| {
+                                            settings.is_beta_enabled = false;
+                                        })
+                                        .await
+                                        {
+                                            eprintln!("Error: {err:#}");
+                                        } else {
+                                            println!("Update channel set to stable.");
+                                        }
+                                    }
+                                    "status" => match load_app_settings_for_cli(runtime_paths).await {
+                                        Ok(settings) => println!(
+                                            "Update channel: {}",
+                                            if settings.is_beta_enabled { "early" } else { "stable" }
+                                        ),
+                                        Err(err) => eprintln!("Error: {err:#}"),
+                                    },
+                                    _ => eprintln!("Usage: updates channel <early|stable|status>"),
+                                }
+                            }
+                            _ => {
+                                eprintln!(
+                                    "Usage: updates <check|status|autoupdates <enable|disable|status>|channel <early|stable|status>>"
+                                );
+                            }
+                        }
+                    }
                     "list" | "ls" | "l" => {
                         if let Err(err) = execute_non_interactive_command(
                             Command::Accounts {
@@ -580,6 +886,92 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             }
                         } else {
                             eprintln!("Usage: clear accounts | clear everything");
+                        }
+                    }
+                    "cert" => {
+                        let Some(action) = tokens.get(1).map(|s| s.to_ascii_lowercase()) else {
+                            eprintln!("Usage: cert <status|install|export <dir>|import <dir>>");
+                            print_cli_prompt()?;
+                            continue;
+                        };
+
+                        match action.as_str() {
+                            "status" => {
+                                let (cert_path, key_path) = cli_tls_paths(dir);
+                                let installed = cert_path.exists() && key_path.exists();
+                                println!(
+                                    "TLS cert installed: {}",
+                                    if installed { "yes" } else { "no" }
+                                );
+                                println!("  cert: {}", cert_path.display());
+                                println!("  key: {}", key_path.display());
+                            }
+                            "install" => {
+                                if let Err(err) = ensure_cli_tls_certificate(dir) {
+                                    eprintln!("Error: {err:#}");
+                                } else {
+                                    println!("TLS certificate installed.");
+                                }
+                            }
+                            "export" => {
+                                let Some(target) = tokens.get(2) else {
+                                    eprintln!("Usage: cert export <directory>");
+                                    print_cli_prompt()?;
+                                    continue;
+                                };
+                                if let Err(err) = export_cli_tls_certificate(dir, target) {
+                                    eprintln!("Error: {err:#}");
+                                } else {
+                                    println!("TLS certificate exported to {}", target);
+                                }
+                            }
+                            "import" => {
+                                let Some(source) = tokens.get(2) else {
+                                    eprintln!("Usage: cert import <directory>");
+                                    print_cli_prompt()?;
+                                    continue;
+                                };
+                                if let Err(err) = import_cli_tls_certificate(dir, source) {
+                                    eprintln!("Error: {err:#}");
+                                } else {
+                                    println!("TLS certificate imported from {}", source);
+                                }
+                            }
+                            _ => eprintln!("Usage: cert <status|install|export <dir>|import <dir>>"),
+                        }
+                    }
+                    "repair" | "rep" => {
+                        if let Err(err) = run_interactive_repair(
+                            dir,
+                            runtime_paths,
+                            &mut runtime_state,
+                            event_tx.clone(),
+                        )
+                        .await
+                        {
+                            eprintln!("Error: {err:#}");
+                        }
+                    }
+                    "reset" => {
+                        if !tokens.get(1).is_some_and(|arg| arg == "--force") {
+                            eprintln!(
+                                "Refusing destructive reset. Use: reset --force"
+                            );
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        if let Err(err) = run_interactive_reset(
+                            dir,
+                            runtime_paths,
+                            &mut runtime_state,
+                            &mut grpc_state,
+                        )
+                        .await
+                        {
+                            eprintln!("Error: {err:#}");
+                        } else {
+                            println!("Reset complete: sessions and grpc settings cleared.");
                         }
                     }
                     "change" | "ch" | "switch" => {
@@ -1020,6 +1412,11 @@ fn print_interactive_help() {
     println!("  manual | man                     Print project manual URL");
     println!("  credits                          Print credits/dependency info");
     println!("  log-dir                          Print log directory path");
+    println!("  telemetry <enable|disable|status> Manage telemetry setting");
+    println!("  proxy <allow|disallow|status>    Manage DoH proxy fallback setting");
+    println!("  autostart <enable|disable|status> Manage autostart setting");
+    println!("  all-mail-visibility <show|hide|status> Manage All Mail visibility");
+    println!("  updates ...                      Manage update channel/autoupdates");
     println!("  status                           Show account/session status");
     println!("  list | ls                        List accounts");
     println!("  info                             Alias for status");
@@ -1029,6 +1426,11 @@ fn print_interactive_help() {
     println!("  use <email>                      Set default account");
     println!("  fetch [--limit <n>]              Fetch/decrypt inbox messages");
     println!("  vault-dump                       Dump decrypted vault msgpack structure");
+    println!("  cert <status|install|export|import> Manage TLS cert files");
+    println!(
+        "  repair                           Reset event checkpoints and restart serve runtime"
+    );
+    println!("  reset --force                    Clear sessions and grpc settings");
     println!("  change <field> <value>           Update interactive serve defaults");
     println!("  serve-config                     Print interactive serve defaults");
     println!("  serve-status                     Show background serve runtime status");
@@ -1085,6 +1487,157 @@ fn parse_grpc_bind(args: &[String]) -> anyhow::Result<String> {
     }
 
     anyhow::bail!("unsupported grpc option(s); supported: --bind <ip>")
+}
+
+async fn load_app_settings_for_cli(
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<CliStoredAppSettings> {
+    let path = runtime_paths.grpc_app_settings_path();
+    if !path.exists() {
+        return Ok(CliStoredAppSettings::defaults_for(runtime_paths));
+    }
+
+    let payload = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&payload).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+async fn save_app_settings_for_cli(
+    runtime_paths: &paths::RuntimePaths,
+    settings: &CliStoredAppSettings,
+) -> anyhow::Result<()> {
+    let path = runtime_paths.grpc_app_settings_path();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create settings dir {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_file_name("grpc_app_settings.json.tmp");
+    let payload = serde_json::to_vec_pretty(settings).context("failed to encode app settings")?;
+    tokio::fs::write(&tmp_path, payload)
+        .await
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, &path)
+        .await
+        .with_context(|| format!("failed to rename settings file {}", path.display()))?;
+    Ok(())
+}
+
+async fn update_app_settings<F>(
+    runtime_paths: &paths::RuntimePaths,
+    mutator: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut CliStoredAppSettings),
+{
+    let mut settings = load_app_settings_for_cli(runtime_paths).await?;
+    mutator(&mut settings);
+    save_app_settings_for_cli(runtime_paths, &settings).await
+}
+
+fn cli_tls_paths(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let tls_dir = dir.join("tls");
+    (tls_dir.join("cert.pem"), tls_dir.join("key.pem"))
+}
+
+fn ensure_cli_tls_certificate(dir: &std::path::Path) -> anyhow::Result<()> {
+    let cert_dir = dir.join("tls");
+    let _imap = imap::server::ImapServer::new().with_tls(&cert_dir)?;
+    let _smtp = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
+    Ok(())
+}
+
+fn export_cli_tls_certificate(dir: &std::path::Path, target_dir: &str) -> anyhow::Result<()> {
+    ensure_cli_tls_certificate(dir)?;
+    let (cert_path, key_path) = cli_tls_paths(dir);
+    let target = std::path::PathBuf::from(target_dir);
+    std::fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create export dir {}", target.display()))?;
+    std::fs::copy(&cert_path, target.join("cert.pem"))
+        .with_context(|| format!("failed to export {}", cert_path.display()))?;
+    std::fs::copy(&key_path, target.join("key.pem"))
+        .with_context(|| format!("failed to export {}", key_path.display()))?;
+    Ok(())
+}
+
+fn import_cli_tls_certificate(dir: &std::path::Path, source_dir: &str) -> anyhow::Result<()> {
+    let source = std::path::PathBuf::from(source_dir);
+    let source_cert = source.join("cert.pem");
+    let source_key = source.join("key.pem");
+    if !source_cert.exists() || !source_key.exists() {
+        anyhow::bail!(
+            "missing cert.pem/key.pem in import source directory {}",
+            source.display()
+        );
+    }
+
+    let (cert_path, key_path) = cli_tls_paths(dir);
+    if let Some(parent) = cert_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create tls dir {}", parent.display()))?;
+    }
+    std::fs::copy(&source_cert, &cert_path)
+        .with_context(|| format!("failed to import {}", source_cert.display()))?;
+    std::fs::copy(&source_key, &key_path)
+        .with_context(|| format!("failed to import {}", source_key.display()))?;
+    Ok(())
+}
+
+async fn run_interactive_repair(
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+    runtime_state: &mut Option<InteractiveServeRuntime>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<String>,
+) -> anyhow::Result<()> {
+    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
+    for session in &sessions {
+        let checkpoint = vault::StoredEventCheckpoint {
+            last_event_id: String::new(),
+            last_event_ts: None,
+            sync_state: None,
+        };
+        vault::save_event_checkpoint_by_account_id(dir, &session.uid, &checkpoint)
+            .with_context(|| format!("failed to reset event checkpoint for {}", session.email))?;
+    }
+    println!("Reset event checkpoints for {} account(s).", sessions.len());
+
+    if let Some(state) = runtime_state.take() {
+        let config = state.config.clone();
+        stop_interactive_runtime(state).await?;
+        let restarted =
+            start_interactive_runtime(config, dir, runtime_paths, event_tx.clone()).await?;
+        *runtime_state = Some(restarted);
+        println!("Serve runtime restarted after repair.");
+    } else {
+        println!("Serve runtime not running. Start `serve` to apply repair now.");
+    }
+
+    Ok(())
+}
+
+async fn run_interactive_reset(
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+    runtime_state: &mut Option<InteractiveServeRuntime>,
+    grpc_state: &mut Option<InteractiveGrpcRuntime>,
+) -> anyhow::Result<()> {
+    if let Some(state) = runtime_state.take() {
+        stop_interactive_runtime(state).await?;
+    }
+    if let Some(state) = grpc_state.take() {
+        stop_interactive_grpc(state).await?;
+    }
+
+    if vault::session_exists(dir) {
+        vault::remove_session(dir).context("failed to clear sessions")?;
+    }
+
+    let _ = tokio::fs::remove_file(runtime_paths.grpc_mail_settings_path()).await;
+    let _ = tokio::fs::remove_file(runtime_paths.grpc_app_settings_path()).await;
+
+    Ok(())
 }
 
 fn print_interactive_serve_config(config: &InteractiveServeConfig) {

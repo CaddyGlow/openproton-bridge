@@ -47,6 +47,11 @@ jobs:
       - name: Run backend parity integration gate
         run: cargo test --locked parity_integration_ --lib
 
+      - name: Run gluon parity and recovery gate
+        run: |
+          cargo test --locked --test gluon_parity_integration
+          cargo test --locked --test gluon_recovery_integration
+
   build-release-artifacts:
     name: Build release (${{ matrix.os }})
     if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && (inputs.build_artifacts || inputs.publish_release))

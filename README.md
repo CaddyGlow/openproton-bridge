@@ -105,6 +105,13 @@ Then configure your email client:
 
 ## Operator Runbook
 
+### Deployment and rollback (hard cut)
+
+Gluon rollout is hard-cut only (no migration/double-write path). Use:
+
+- [docs/release/gluon-hard-cut-checklist.md](docs/release/gluon-hard-cut-checklist.md)
+- [docs/runbooks/gluon-deployment-rollback.md](docs/runbooks/gluon-deployment-rollback.md)
+
 ### Common operations
 
 1. Add or refresh one account credentials:

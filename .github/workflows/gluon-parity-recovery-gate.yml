@@ -1,0 +1,44 @@
+name: Gluon Parity Recovery Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gluon-parity-recovery:
+    name: gluon parity + recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Discover parity suite tests
+        run: |
+          set -euo pipefail
+          parity_list="$(cargo test --locked --test gluon_parity_integration -- --list)"
+          echo "$parity_list"
+          printf '%s\n' "$parity_list" | grep -q '^be031_'
+
+      - name: Discover recovery suite tests
+        run: |
+          set -euo pipefail
+          recovery_list="$(cargo test --locked --test gluon_recovery_integration -- --list)"
+          echo "$recovery_list"
+          printf '%s\n' "$recovery_list" | grep -q '^be031_recovery_'
+
+      - name: Run gluon parity integration suite
+        run: cargo test --locked --test gluon_parity_integration
+
+      - name: Run gluon recovery integration suite
+        run: cargo test --locked --test gluon_recovery_integration

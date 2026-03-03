@@ -290,10 +290,12 @@ impl GrpcAdapter {
 
         self.stream_task = Some(tokio::spawn(async move {
             let mut stream_error: Option<String> = None;
+            let mut stop_requested = false;
 
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => {
+                        stop_requested = true;
                         break;
                     }
                     next_item = stream.message() => {
@@ -337,18 +339,35 @@ impl GrpcAdapter {
                 }
             }
 
+            let bridge_reachable = if stop_requested {
+                false
+            } else {
+                probe_bridge_reachable(&server_config).await
+            };
+
             let snapshot = state
                 .update(|snapshot| {
-                    snapshot.connected = false;
                     snapshot.stream_running = false;
+                    snapshot.connected = if stop_requested {
+                        false
+                    } else {
+                        bridge_reachable
+                    };
+
                     if let Some(err) = stream_error.clone() {
                         snapshot.last_error = Some(err);
+                    } else if !stop_requested && !bridge_reachable {
+                        snapshot.last_error =
+                            Some("event stream stopped and grpc probe failed".to_string());
                     }
                 })
                 .await;
 
             let _ = app.emit("bridge://state-changed", snapshot);
-            info!("grpc bridge stream stopped");
+            info!(
+                stop_requested,
+                bridge_reachable, "grpc bridge stream stopped"
+            );
         }));
 
         Ok(())
@@ -848,6 +867,15 @@ async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, Strin
     }
 
     Err("grpc config is missing a usable endpoint (fileSocketPath and non-zero port)".to_string())
+}
+
+async fn probe_bridge_reachable(config: &GrpcServerConfig) -> bool {
+    let mut client = match connect_client(config).await {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    client.hostname(()).await.is_ok()
 }
 
 async fn connect_client_via_tcp(

@@ -1791,12 +1791,21 @@ pub fn load_vault_msgpack_value(dir: &Path) -> Result<MsgpackValue> {
 }
 
 pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
-    save_session_with_user_id(session, None, dir)
+    save_session_internal(session, None, false, dir)
 }
 
 pub fn save_session_with_user_id(
     session: &Session,
     canonical_user_id: Option<&str>,
+    dir: &Path,
+) -> Result<()> {
+    save_session_internal(session, canonical_user_id, false, dir)
+}
+
+fn save_session_internal(
+    session: &Session,
+    canonical_user_id: Option<&str>,
+    overwrite_bridge_password: bool,
     dir: &Path,
 ) -> Result<()> {
     let mut data = load_vault_data(dir)?.unwrap_or_default();
@@ -1820,7 +1829,11 @@ pub fn save_session_with_user_id(
         existing.auth_uid = ud.auth_uid;
         existing.auth_ref = ud.auth_ref;
         existing.key_pass = ud.key_pass;
-        existing.bridge_pass = ud.bridge_pass;
+        if !ud.bridge_pass.is_empty()
+            && (existing.bridge_pass.is_empty() || overwrite_bridge_password)
+        {
+            existing.bridge_pass = ud.bridge_pass;
+        }
         existing.username = ud.username;
         existing.api_mode = ud.api_mode;
         if let Some(user_id) = normalized_non_empty(canonical_user_id) {
@@ -3213,6 +3226,110 @@ path = "custom-vault.key"
         assert_eq!(data.users.len(), 1);
         assert_eq!(data.users[0].user_id, "canonical-user-id");
         assert_eq!(data.users[0].auth_uid, "auth-uid-1");
+    }
+
+    #[test]
+    fn test_save_session_preserves_existing_bridge_password_for_existing_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x44u8; KEY_LEN];
+
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "user-bridge-preserve".to_string(),
+                username: "Before".to_string(),
+                primary_email: "preserve-pass@proton.me".to_string(),
+                gluon_key: vec![1u8; 32],
+                gluon_ids: HashMap::new(),
+                bridge_pass: b"bridge-old".to_vec(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
+                auth_uid: "uid-bridge-preserve".to_string(),
+                auth_ref: "refresh-before".to_string(),
+                key_pass: b"key-before".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+                extra_fields: HashMap::new(),
+            }],
+            ..VaultData::default()
+        };
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        std::fs::write(
+            tmp.path().join(DEFAULT_EMAIL_FILE),
+            b"preserve-pass@proton.me",
+        )
+        .unwrap();
+
+        let updated = Session {
+            uid: "uid-bridge-preserve".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-after".to_string(),
+            email: "preserve-pass@proton.me".to_string(),
+            display_name: "After".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: Some(BASE64.encode(b"key-after")),
+            bridge_password: Some("bridge-new".to_string()),
+        };
+        save_session(&updated, tmp.path()).unwrap();
+
+        let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert_eq!(saved.users.len(), 1);
+        assert_eq!(saved.users[0].bridge_pass, b"bridge-old");
+    }
+
+    #[test]
+    fn test_save_session_sets_bridge_password_when_existing_user_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x45u8; KEY_LEN];
+
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "user-bridge-empty".to_string(),
+                username: "Before".to_string(),
+                primary_email: "empty-pass@proton.me".to_string(),
+                gluon_key: vec![2u8; 32],
+                gluon_ids: HashMap::new(),
+                bridge_pass: Vec::new(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
+                auth_uid: "uid-bridge-empty".to_string(),
+                auth_ref: "refresh-before".to_string(),
+                key_pass: b"key-before".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+                extra_fields: HashMap::new(),
+            }],
+            ..VaultData::default()
+        };
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        std::fs::write(tmp.path().join(DEFAULT_EMAIL_FILE), b"empty-pass@proton.me").unwrap();
+
+        let updated = Session {
+            uid: "uid-bridge-empty".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-after".to_string(),
+            email: "empty-pass@proton.me".to_string(),
+            display_name: "After".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: Some(BASE64.encode(b"key-after")),
+            bridge_password: Some("bridge-populated".to_string()),
+        };
+        save_session(&updated, tmp.path()).unwrap();
+
+        let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert_eq!(saved.users.len(), 1);
+        assert_eq!(saved.users[0].bridge_pass, b"bridge-populated");
     }
 
     #[test]

@@ -2393,8 +2393,11 @@ async fn cmd_login(
         derived
     };
 
-    // Generate bridge password
-    let bridge_password = generate_bridge_password();
+    // Reuse existing bridge password for cross-bridge compatibility.
+    let bridge_password = vault::load_session_by_email(dir, &user.email)
+        .ok()
+        .and_then(|stored| stored.bridge_password)
+        .unwrap_or_else(generate_bridge_password);
 
     // Build session
     let session = api::types::Session {

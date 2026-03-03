@@ -766,7 +766,8 @@ async fn connect_client_via_tcp(
     let endpoint_url = format!("https://127.0.0.1:{port}");
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(config.cert.clone()))
-        .domain_name("127.0.0.1");
+        .domain_name("127.0.0.1")
+        .assume_http2(true);
 
     let endpoint = Endpoint::from_shared(endpoint_url.clone())
         .map_err(|err| format!("invalid grpc endpoint: {err}"))?
@@ -775,10 +776,9 @@ async fn connect_client_via_tcp(
         .tls_config(tls)
         .map_err(|err| format!("failed to configure grpc tls: {err}"))?;
 
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(|err| format!("failed to connect grpc tcp channel ({endpoint_url}): {err}"))?;
+    let channel = endpoint.connect().await.map_err(|err| {
+        format!("failed to connect grpc tcp channel ({endpoint_url}): {err} ({err:?})")
+    })?;
 
     let interceptor = TokenInterceptor::new(&config.token)?;
 
@@ -797,7 +797,8 @@ async fn connect_client_via_unix_socket(
     let socket_path_display = socket_path.display().to_string();
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(config.cert.clone()))
-        .domain_name("127.0.0.1");
+        .domain_name("127.0.0.1")
+        .assume_http2(true);
 
     let endpoint = Endpoint::from_static("https://127.0.0.1")
         .connect_timeout(std::time::Duration::from_secs(5))
@@ -817,7 +818,9 @@ async fn connect_client_via_unix_socket(
         .connect_with_connector(connector)
         .await
         .map_err(|err| {
-            format!("failed to connect grpc unix socket channel ({socket_path_display}): {err}")
+            format!(
+                "failed to connect grpc unix socket channel ({socket_path_display}): {err} ({err:?})"
+            )
         })?;
 
     let interceptor = TokenInterceptor::new(&config.token)?;

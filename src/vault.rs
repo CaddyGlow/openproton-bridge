@@ -476,6 +476,8 @@ pub enum VaultError {
         expected: String,
         actual: String,
     },
+    #[error("failed to generate bridge TLS certificate: {0}")]
+    BridgeTlsCertificateGeneration(String),
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -826,7 +828,7 @@ struct PasswordArchive {
     extra_fields: ExtraFields,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct VaultCerts {
     #[serde(deserialize_with = "deserialize_nullable_default")]
@@ -835,6 +837,17 @@ struct VaultCerts {
     custom_key_path: String,
     #[serde(flatten)]
     extra_fields: ExtraFields,
+}
+
+impl Default for VaultCerts {
+    fn default() -> Self {
+        Self {
+            bridge: VaultCert::default(),
+            custom_cert_path: String::new(),
+            custom_key_path: String::new(),
+            extra_fields: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -854,6 +867,33 @@ struct VaultCert {
     key: Vec<u8>,
     #[serde(flatten)]
     extra_fields: ExtraFields,
+}
+
+impl VaultCert {
+    fn has_valid_tls_keypair(&self) -> bool {
+        if self.cert.is_empty() || self.key.is_empty() {
+            return false;
+        }
+
+        let mut cert_reader = &self.cert[..];
+        let certs = match rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(certs) if !certs.is_empty() => certs,
+            _ => return false,
+        };
+
+        let mut key_reader = &self.key[..];
+        let key = match rustls_pemfile::private_key(&mut key_reader) {
+            Ok(Some(key)) => key,
+            _ => return false,
+        };
+
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .is_ok()
+    }
 }
 
 fn serialize_bytes<S>(value: &Vec<u8>, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -1603,6 +1643,27 @@ fn marshal_vault(data: &VaultData, key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
     Ok(rmp_serde::to_vec_named(&file)?)
 }
 
+fn generate_bridge_tls_keypair() -> Result<(Vec<u8>, Vec<u8>)> {
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string(), "localhost".to_string()])
+            .map_err(|err| VaultError::BridgeTlsCertificateGeneration(err.to_string()))?;
+    Ok((
+        cert.cert.pem().as_bytes().to_vec(),
+        cert.key_pair.serialize_pem().as_bytes().to_vec(),
+    ))
+}
+
+fn ensure_bridge_tls_keypair(data: &mut VaultData) -> Result<()> {
+    if data.certs.bridge.has_valid_tls_keypair() {
+        return Ok(());
+    }
+
+    let (cert, key) = generate_bridge_tls_keypair()?;
+    data.certs.bridge.cert = cert;
+    data.certs.bridge.key = key;
+    Ok(())
+}
+
 fn unmarshal_vault(raw: &[u8], key: &[u8; KEY_LEN]) -> Result<VaultData> {
     let file: VaultFile = rmp_serde::from_slice(raw)?;
     let decrypted = decrypt(&file.data, key)?;
@@ -1640,8 +1701,9 @@ fn load_vault_data(dir: &Path) -> Result<Option<VaultData>> {
     Ok(Some(data))
 }
 
-fn save_vault_data(dir: &Path, data: &VaultData) -> Result<()> {
+fn save_vault_data(dir: &Path, data: &mut VaultData) -> Result<()> {
     std::fs::create_dir_all(dir)?;
+    ensure_bridge_tls_keypair(data)?;
     let mut key = get_or_create_vault_key(dir)?;
     let encoded = marshal_vault(data, &key);
     key.zeroize();
@@ -1718,7 +1780,7 @@ pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
         data.users.push(ud);
     }
 
-    save_vault_data(dir, &data)?;
+    save_vault_data(dir, &mut data)?;
     if get_default_email(dir)?.is_none() {
         write_default_email(dir, &session.email)?;
     }
@@ -1806,7 +1868,7 @@ pub fn remove_session_by_email(dir: &Path, email: &str) -> Result<()> {
         return remove_session(dir);
     }
 
-    save_vault_data(dir, &data)?;
+    save_vault_data(dir, &mut data)?;
 
     let default_email = get_default_email(dir)?;
     let still_valid_default = default_email.is_some_and(|default_email| {
@@ -1921,7 +1983,7 @@ pub fn save_event_checkpoint_by_account_id(
     user.last_event_ts = checkpoint.last_event_ts;
     user.sync_state = checkpoint.sync_state.clone();
 
-    save_vault_data(dir, &data)
+    save_vault_data(dir, &mut data)
 }
 
 pub fn load_split_mode_by_account_id(dir: &Path, account_id: &str) -> Result<Option<bool>> {
@@ -1940,7 +2002,7 @@ pub fn save_split_mode_by_account_id(dir: &Path, account_id: &str, enabled: bool
         return Err(VaultError::AccountNotFound(account_id.to_string()));
     };
     user.address_mode = split_to_address_mode(enabled);
-    save_vault_data(dir, &data)
+    save_vault_data(dir, &mut data)
 }
 
 fn normalize_gluon_id_bindings(
@@ -2053,7 +2115,7 @@ pub fn save_gluon_dir(dir: &Path, gluon_dir: &str) -> Result<()> {
     let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
     data.settings.gluon_dir =
         normalized_non_empty(Some(gluon_dir)).unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());
-    save_vault_data(dir, &data)
+    save_vault_data(dir, &mut data)
 }
 
 pub fn set_gluon_key_by_account_id(dir: &Path, account_id: &str, gluon_key: Vec<u8>) -> Result<()> {
@@ -2062,7 +2124,7 @@ pub fn set_gluon_key_by_account_id(dir: &Path, account_id: &str, gluon_key: Vec<
         return Err(VaultError::AccountNotFound(account_id.to_string()));
     };
     user.gluon_key = gluon_key;
-    save_vault_data(dir, &data)
+    save_vault_data(dir, &mut data)
 }
 
 pub fn save_gluon_id_bindings_by_account_id(
@@ -2075,7 +2137,7 @@ pub fn save_gluon_id_bindings_by_account_id(
         return Err(VaultError::AccountNotFound(account_id.to_string()));
     };
     user.gluon_ids = bindings;
-    save_vault_data(dir, &data)
+    save_vault_data(dir, &mut data)
 }
 
 #[cfg(test)]
@@ -2653,9 +2715,71 @@ path = "custom-vault.key"
         assert!(tmp.path().join(VAULT_FILE).exists());
         assert!(tmp.path().join(KEY_FILE).exists());
         assert!(tmp.path().join(DEFAULT_EMAIL_FILE).exists());
+        let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert!(saved.certs.bridge.has_valid_tls_keypair());
         let loaded = load_session(tmp.path()).unwrap();
         assert_eq!(loaded.uid, session.uid);
         assert_eq!(loaded.email, session.email);
+    }
+
+    #[test]
+    fn test_save_session_repairs_missing_bridge_tls_keypair() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x21u8; KEY_LEN];
+
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "user-repair".to_string(),
+                username: "Repair User".to_string(),
+                primary_email: "repair@proton.me".to_string(),
+                gluon_key: vec![9u8; 32],
+                gluon_ids: HashMap::new(),
+                bridge_pass: b"bridge-before".to_vec(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
+                auth_uid: "uid-repair".to_string(),
+                auth_ref: "refresh-before".to_string(),
+                key_pass: b"key-before".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+                extra_fields: HashMap::new(),
+            }],
+            certs: VaultCerts {
+                bridge: VaultCert {
+                    cert: b"not-a-cert".to_vec(),
+                    key: b"not-a-key".to_vec(),
+                    extra_fields: HashMap::new(),
+                },
+                custom_cert_path: String::new(),
+                custom_key_path: String::new(),
+                extra_fields: HashMap::new(),
+            },
+            ..VaultData::default()
+        };
+
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+        std::fs::write(tmp.path().join(DEFAULT_EMAIL_FILE), b"repair@proton.me").unwrap();
+
+        let updated = Session {
+            uid: "uid-repair".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-after".to_string(),
+            email: "repair@proton.me".to_string(),
+            display_name: "Repair User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: Some(BASE64.encode(b"key-after")),
+            bridge_password: Some("bridge-after".to_string()),
+        };
+        save_session(&updated, tmp.path()).unwrap();
+
+        let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert!(saved.certs.bridge.has_valid_tls_keypair());
     }
 
     #[test]

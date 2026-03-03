@@ -286,7 +286,7 @@ impl GrpcAdapter {
 
         let (stop_tx, mut stop_rx) = oneshot::channel();
         self.stop_tx = Some(stop_tx);
-        self.server_config = Some(server_config);
+        self.server_config = Some(server_config.clone());
 
         self.stream_task = Some(tokio::spawn(async move {
             let mut stream_error: Option<String> = None;

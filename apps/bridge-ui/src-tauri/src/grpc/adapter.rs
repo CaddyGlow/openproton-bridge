@@ -4,22 +4,27 @@ use super::config::{
 };
 use super::pb;
 use crate::state::AppState;
-#[cfg(unix)]
 use hyper_util::rt::TokioIo;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_rustls::TlsConnector;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri};
+use tonic::transport::{Channel, Endpoint, Uri};
 use tonic::{Request, Status};
-#[cfg(unix)]
 use tower::service_fn;
 use tracing::{debug, info};
 use uuid::Uuid;
@@ -48,6 +53,91 @@ impl Interceptor for TokenInterceptor {
             .insert("server-token", self.token.clone());
         Ok(request)
     }
+}
+
+#[derive(Debug)]
+struct BridgePinnedCertVerifier {
+    expected_server_cert: Vec<u8>,
+    supported_schemes: Vec<SignatureScheme>,
+}
+
+impl BridgePinnedCertVerifier {
+    fn from_pem(cert_pem: &str) -> Result<Self, String> {
+        let mut certs = rustls_pemfile::certs(&mut Cursor::new(cert_pem.as_bytes()));
+        let expected_server_cert = certs
+            .next()
+            .transpose()
+            .map_err(|err| format!("failed to parse grpc tls certificate pem: {err}"))?
+            .ok_or_else(|| "grpc tls certificate pem is empty".to_string())?
+            .as_ref()
+            .to_vec();
+
+        let supported_schemes = rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes();
+
+        Ok(Self {
+            expected_server_cert,
+            supported_schemes,
+        })
+    }
+}
+
+impl ServerCertVerifier for BridgePinnedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        if end_entity.as_ref() == self.expected_server_cert.as_slice() {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(RustlsError::General(
+                "bridge tls certificate mismatch".to_string(),
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.supported_schemes.clone()
+    }
+}
+
+fn build_bridge_tls_connector(cert_pem: &str) -> Result<TlsConnector, String> {
+    let verifier = Arc::new(BridgePinnedCertVerifier::from_pem(cert_pem)?);
+    let mut tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    tls_config.alpn_protocols.push(b"h2".to_vec());
+    Ok(TlsConnector::from(Arc::new(tls_config)))
+}
+
+fn bridge_tls_server_name() -> Result<ServerName<'static>, String> {
+    ServerName::try_from("127.0.0.1")
+        .map(|name| name.to_owned())
+        .map_err(|err| format!("invalid grpc tls server name: {err}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -763,22 +853,39 @@ async fn connect_client_via_tcp(
     config: &GrpcServerConfig,
     port: u16,
 ) -> Result<BridgeClient, String> {
-    let endpoint_url = format!("https://127.0.0.1:{port}");
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(config.cert.clone()))
-        .domain_name("127.0.0.1")
-        .assume_http2(true);
+    let endpoint_url = format!("http://127.0.0.1:{port}");
+    let tls_connector = build_bridge_tls_connector(&config.cert)?;
+    let server_name = bridge_tls_server_name()?;
 
     let endpoint = Endpoint::from_shared(endpoint_url.clone())
         .map_err(|err| format!("invalid grpc endpoint: {err}"))?
         .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
-        .tls_config(tls)
-        .map_err(|err| format!("failed to configure grpc tls: {err}"))?;
+        .timeout(std::time::Duration::from_secs(30));
 
-    let channel = endpoint.connect().await.map_err(|err| {
-        format!("failed to connect grpc tcp channel ({endpoint_url}): {err} ({err:?})")
-    })?;
+    let connector = service_fn(move |_: Uri| {
+        let tls_connector = tls_connector.clone();
+        let server_name = server_name.clone();
+        async move {
+            let stream = TcpStream::connect(("127.0.0.1", port)).await?;
+            let tls_stream = tls_connector
+                .connect(server_name.clone(), stream)
+                .await
+                .map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("tls handshake failed: {err}"),
+                    )
+                })?;
+            Ok::<_, std::io::Error>(TokioIo::new(tls_stream))
+        }
+    });
+
+    let channel = endpoint
+        .connect_with_connector(connector)
+        .await
+        .map_err(|err| {
+            format!("failed to connect grpc tcp channel ({endpoint_url}): {err} ({err:?})")
+        })?;
 
     let interceptor = TokenInterceptor::new(&config.token)?;
 
@@ -795,22 +902,29 @@ async fn connect_client_via_unix_socket(
 ) -> Result<BridgeClient, String> {
     let socket_path = PathBuf::from(socket_path);
     let socket_path_display = socket_path.display().to_string();
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(config.cert.clone()))
-        .domain_name("127.0.0.1")
-        .assume_http2(true);
+    let tls_connector = build_bridge_tls_connector(&config.cert)?;
+    let server_name = bridge_tls_server_name()?;
 
-    let endpoint = Endpoint::from_static("https://127.0.0.1")
+    let endpoint = Endpoint::from_static("http://127.0.0.1")
         .connect_timeout(std::time::Duration::from_secs(5))
-        .timeout(std::time::Duration::from_secs(30))
-        .tls_config(tls)
-        .map_err(|err| format!("failed to configure grpc tls: {err}"))?;
+        .timeout(std::time::Duration::from_secs(30));
 
     let connector = service_fn(move |_: Uri| {
         let socket_path = socket_path.clone();
+        let tls_connector = tls_connector.clone();
+        let server_name = server_name.clone();
         async move {
             let stream = UnixStream::connect(socket_path).await?;
-            Ok::<_, std::io::Error>(TokioIo::new(stream))
+            let tls_stream = tls_connector
+                .connect(server_name.clone(), stream)
+                .await
+                .map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("tls handshake failed: {err}"),
+                    )
+                })?;
+            Ok::<_, std::io::Error>(TokioIo::new(tls_stream))
         }
     });
 

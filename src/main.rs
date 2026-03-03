@@ -868,9 +868,6 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         if clear_target
                             .as_deref()
                             .is_some_and(|target| target == "accounts")
-                            || clear_target
-                                .as_deref()
-                                .is_some_and(|target| target == "everything")
                         {
                             if let Err(err) = execute_non_interactive_command(
                                 Command::Logout {
@@ -884,8 +881,79 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             {
                                 eprintln!("Error: {err:#}");
                             }
+                        } else if clear_target
+                            .as_deref()
+                            .is_some_and(|target| target == "everything")
+                        {
+                            if let Err(err) = run_interactive_reset(
+                                dir,
+                                runtime_paths,
+                                &mut runtime_state,
+                                &mut grpc_state,
+                            )
+                            .await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Everything cleared: sessions and grpc settings removed.");
+                            }
                         } else {
                             eprintln!("Usage: clear accounts | clear everything");
+                        }
+                    }
+                    "bad-event" => {
+                        let Some(action) = tokens.get(1).map(|s| s.to_ascii_lowercase()) else {
+                            eprintln!("Usage: bad-event <synchronize|logout <email|--all>>");
+                            print_cli_prompt()?;
+                            continue;
+                        };
+
+                        match action.as_str() {
+                            "synchronize" => {
+                                if let Err(err) = run_interactive_repair(
+                                    dir,
+                                    runtime_paths,
+                                    &mut runtime_state,
+                                    event_tx.clone(),
+                                )
+                                .await
+                                {
+                                    eprintln!("Error: {err:#}");
+                                }
+                            }
+                            "logout" => {
+                                let target = tokens.get(2).cloned();
+                                if let Some(value) = target {
+                                    if value == "--all" || value.eq_ignore_ascii_case("all") {
+                                        if let Err(err) = execute_non_interactive_command(
+                                            Command::Logout {
+                                                email: None,
+                                                all: true,
+                                            },
+                                            dir,
+                                            runtime_paths,
+                                        )
+                                        .await
+                                        {
+                                            eprintln!("Error: {err:#}");
+                                        }
+                                    } else if let Err(err) = execute_non_interactive_command(
+                                        Command::Logout {
+                                            email: Some(value),
+                                            all: false,
+                                        },
+                                        dir,
+                                        runtime_paths,
+                                    )
+                                    .await
+                                    {
+                                        eprintln!("Error: {err:#}");
+                                    }
+                                } else {
+                                    eprintln!("Usage: bad-event logout <email|--all>");
+                                }
+                            }
+                            _ => eprintln!("Usage: bad-event <synchronize|logout <email|--all>>"),
                         }
                     }
                     "cert" => {
@@ -1442,6 +1510,7 @@ fn print_interactive_help() {
     println!("  use <email>                      Set default account");
     println!("  fetch [--limit <n>]              Fetch/decrypt inbox messages");
     println!("  vault-dump                       Dump decrypted vault msgpack structure");
+    println!("  bad-event <synchronize|logout>   Resolve bad-event flows");
     println!("  cert <status|install|export|import> Manage TLS cert files");
     println!(
         "  repair                           Reset event checkpoints and restart serve runtime"

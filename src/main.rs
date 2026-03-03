@@ -485,6 +485,14 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     "help" | "?" => {
                         print_interactive_help();
                     }
+                    "manual" | "man" => {
+                        println!("https://github.com/rickyslash/openproton-bridge");
+                    }
+                    "credits" => {
+                        println!("openproton-bridge credits:");
+                        println!("  - project: openproton-bridge");
+                        println!("  - deps/licenses: see Cargo.toml and Cargo.lock");
+                    }
                     "log-dir" | "log" | "logs" => {
                         println!("{}", runtime_paths.logs_dir().display());
                     }
@@ -1009,6 +1017,8 @@ fn print_interactive_help() {
     println!("Available commands:");
     println!("  help                             Show this help");
     println!("  quit | exit                      Exit interactive shell");
+    println!("  manual | man                     Print project manual URL");
+    println!("  credits                          Print credits/dependency info");
     println!("  log-dir                          Print log directory path");
     println!("  status                           Show account/session status");
     println!("  list | ls                        List accounts");

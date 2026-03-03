@@ -98,7 +98,7 @@ mod tests {
         Session {
             uid: uid.to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "test-refresh-token".to_string(),
             email: email.to_string(),
             display_name: uid.to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,

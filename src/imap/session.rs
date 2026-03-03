@@ -1694,7 +1694,11 @@ mod tests {
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("failed to unlock user keys"));
+        assert!(response.contains("a001 NO"), "response={response}");
+        assert!(
+            !response.contains("AUTHENTICATIONFAILED"),
+            "healthy account login should reach account-specific processing, response={response}"
+        );
     }
 
     #[tokio::test]

@@ -78,7 +78,11 @@ fn manifest_fixture_entries() -> Vec<(PathBuf, GluonFileFamily, Option<String>)>
             .and_then(Value::as_str)
             .expect("users[].storage.shm is required");
 
-        entries.push((root.join(primary_db), GluonFileFamily::SqlitePrimaryDb, None));
+        entries.push((
+            root.join(primary_db),
+            GluonFileFamily::SqlitePrimaryDb,
+            None,
+        ));
         entries.push((root.join(wal), GluonFileFamily::SqliteWalSidecar, None));
         entries.push((root.join(shm), GluonFileFamily::SqliteShmSidecar, None));
 
@@ -120,7 +124,10 @@ fn manifest_fixture_entries() -> Vec<(PathBuf, GluonFileFamily, Option<String>)>
 #[test]
 fn be021_decodes_required_file_families_from_be018_manifest() {
     let entries = manifest_fixture_entries();
-    assert!(!entries.is_empty(), "manifest fixture entries must not be empty");
+    assert!(
+        !entries.is_empty(),
+        "manifest fixture entries must not be empty"
+    );
 
     for (path, expected_family, expected_email) in entries {
         assert!(path.exists(), "fixture path must exist: {}", path.display());
@@ -157,7 +164,12 @@ fn be021_roundtrip_encoding_preserves_fixture_bytes() {
         let decoded = decode_file(&path)
             .unwrap_or_else(|err| panic!("decode failed for {}: {err}", path.display()));
 
-        assert_eq!(encode(&decoded), original, "roundtrip mismatch for {}", path.display());
+        assert_eq!(
+            encode(&decoded),
+            original,
+            "roundtrip mismatch for {}",
+            path.display()
+        );
     }
 }
 

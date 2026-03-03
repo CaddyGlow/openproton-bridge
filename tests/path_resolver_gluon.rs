@@ -35,11 +35,15 @@ fn be019_resolves_linux_style_gluon_layout_from_data_root() {
     );
     assert_eq!(
         gluon.account_db_wal_path("gluon-alpha"),
-        Path::new("/home/alice/.local/share/protonmail/bridge-v3/gluon/backend/db/gluon-alpha.db-wal")
+        Path::new(
+            "/home/alice/.local/share/protonmail/bridge-v3/gluon/backend/db/gluon-alpha.db-wal"
+        )
     );
     assert_eq!(
         gluon.account_db_shm_path("gluon-alpha"),
-        Path::new("/home/alice/.local/share/protonmail/bridge-v3/gluon/backend/db/gluon-alpha.db-shm")
+        Path::new(
+            "/home/alice/.local/share/protonmail/bridge-v3/gluon/backend/db/gluon-alpha.db-shm"
+        )
     );
     assert_eq!(
         gluon.deferred_delete_dir(),

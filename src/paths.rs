@@ -67,11 +67,13 @@ impl GluonPaths {
     }
 
     pub fn account_db_wal_path(&self, gluon_user_id: &str) -> PathBuf {
-        self.backend_db_dir().join(format!("{gluon_user_id}.db-wal"))
+        self.backend_db_dir()
+            .join(format!("{gluon_user_id}.db-wal"))
     }
 
     pub fn account_db_shm_path(&self, gluon_user_id: &str) -> PathBuf {
-        self.backend_db_dir().join(format!("{gluon_user_id}.db-shm"))
+        self.backend_db_dir()
+            .join(format!("{gluon_user_id}.db-shm"))
     }
 
     pub fn deferred_delete_dir(&self) -> PathBuf {

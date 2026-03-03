@@ -1,5 +1,5 @@
-use std::fs;
 use std::collections::HashSet;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -16,11 +16,7 @@ fn read_fixture_json(path: &Path) -> Value {
 }
 
 fn assert_iso_date(date: &str, field: &str) {
-    assert_eq!(
-        date.len(),
-        10,
-        "{field} should be YYYY-MM-DD, got {date}"
-    );
+    assert_eq!(date.len(), 10, "{field} should be YYYY-MM-DD, got {date}");
     let bytes = date.as_bytes();
     assert_eq!(bytes[4], b'-', "{field} should use YYYY-MM-DD");
     assert_eq!(bytes[7], b'-', "{field} should use YYYY-MM-DD");

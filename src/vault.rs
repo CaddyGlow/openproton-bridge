@@ -1982,7 +1982,10 @@ fn normalize_gluon_id_bindings(
     Ok(normalized)
 }
 
-pub fn load_gluon_store_bootstrap(dir: &Path, account_ids: &[String]) -> Result<GluonStoreBootstrap> {
+pub fn load_gluon_store_bootstrap(
+    dir: &Path,
+    account_ids: &[String],
+) -> Result<GluonStoreBootstrap> {
     let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
     let gluon_dir = normalized_non_empty(Some(data.settings.gluon_dir.as_str()))
         .unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());

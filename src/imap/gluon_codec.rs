@@ -122,7 +122,8 @@ pub fn decode_file(path: &Path) -> Result<GluonDecodedFile> {
 }
 
 pub fn decode_bytes(path: &Path, bytes: &[u8]) -> Result<GluonDecodedFile> {
-    let family = detect_family(path).ok_or_else(|| GluonCodecError::UnsupportedFamily(path.into()))?;
+    let family =
+        detect_family(path).ok_or_else(|| GluonCodecError::UnsupportedFamily(path.into()))?;
 
     let decoded = match family {
         GluonFileFamily::MessageStoreBlob => GluonDecodedFile::MessageStoreBlob(bytes.to_vec()),
@@ -131,22 +132,24 @@ pub fn decode_bytes(path: &Path, bytes: &[u8]) -> Result<GluonDecodedFile> {
         GluonFileFamily::SqliteShmSidecar => GluonDecodedFile::SqliteShmSidecar(bytes.to_vec()),
         GluonFileFamily::DeferredDeletePool => GluonDecodedFile::DeferredDeletePool(bytes.to_vec()),
         GluonFileFamily::ImapSyncStateStable => {
-            let json =
-                serde_json::from_slice(bytes).map_err(|source| GluonCodecError::InvalidSyncStateJson {
+            let json = serde_json::from_slice(bytes).map_err(|source| {
+                GluonCodecError::InvalidSyncStateJson {
                     path: path.into(),
                     source,
-                })?;
+                }
+            })?;
             GluonDecodedFile::ImapSyncStateStable {
                 bytes: bytes.to_vec(),
                 json,
             }
         }
         GluonFileFamily::ImapSyncStateTmp => {
-            let json =
-                serde_json::from_slice(bytes).map_err(|source| GluonCodecError::InvalidSyncStateJson {
+            let json = serde_json::from_slice(bytes).map_err(|source| {
+                GluonCodecError::InvalidSyncStateJson {
                     path: path.into(),
                     source,
-                })?;
+                }
+            })?;
             GluonDecodedFile::ImapSyncStateTmp {
                 bytes: bytes.to_vec(),
                 json,
@@ -162,7 +165,8 @@ pub fn encode(decoded: &GluonDecodedFile) -> Vec<u8> {
 }
 
 pub fn write_file(path: &Path, decoded: &GluonDecodedFile) -> Result<()> {
-    let expected = detect_family(path).ok_or_else(|| GluonCodecError::UnsupportedFamily(path.into()))?;
+    let expected =
+        detect_family(path).ok_or_else(|| GluonCodecError::UnsupportedFamily(path.into()))?;
     let actual = decoded.family();
     if expected != actual {
         return Err(GluonCodecError::PathFamilyMismatch {

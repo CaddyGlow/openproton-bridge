@@ -259,16 +259,18 @@ impl GrpcAdapter {
         let mut stream = match client.run_event_stream(Request::new(request.clone())).await {
             Ok(response) => response.into_inner(),
             Err(err) if err.code() == tonic::Code::AlreadyExists => {
-                info!("grpc stream already exists on server, requesting stop before reconnect");
-                let _ = client.stop_event_stream(()).await;
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                client
-                    .run_event_stream(Request::new(request))
-                    .await
-                    .map_err(|retry_err| {
-                        format!("RunEventStream failed after stop retry: {retry_err}")
-                    })?
-                    .into_inner()
+                info!("grpc stream already owned by another client; leaving existing stream untouched");
+                self.stop_tx = None;
+                self.server_config = Some(server_config);
+                self.stream_task = None;
+                state
+                    .update(|snapshot| {
+                        snapshot.connected = true;
+                        snapshot.stream_running = false;
+                        snapshot.config_path = Some(config_path.display().to_string());
+                    })
+                    .await;
+                return Ok(());
             }
             Err(err) => {
                 return Err(format!("RunEventStream failed: {err}"));
@@ -375,9 +377,11 @@ impl GrpcAdapter {
 
     pub async fn disconnect(&mut self) {
         info!("disconnect requested");
-        if let Some(config) = self.server_config.clone() {
-            if let Ok(mut client) = connect_client(&config).await {
-                let _ = client.stop_event_stream(()).await;
+        if self.stop_tx.is_some() {
+            if let Some(config) = self.server_config.clone() {
+                if let Ok(mut client) = connect_client(&config).await {
+                    let _ = client.stop_event_stream(()).await;
+                }
             }
         }
 

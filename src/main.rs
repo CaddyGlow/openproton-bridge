@@ -485,6 +485,9 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     "help" | "?" => {
                         print_interactive_help();
                     }
+                    "log-dir" | "log" | "logs" => {
+                        println!("{}", runtime_paths.logs_dir().display());
+                    }
                     "list" | "ls" | "l" => {
                         if let Err(err) = execute_non_interactive_command(
                             Command::Accounts {
@@ -1006,6 +1009,7 @@ fn print_interactive_help() {
     println!("Available commands:");
     println!("  help                             Show this help");
     println!("  quit | exit                      Exit interactive shell");
+    println!("  log-dir                          Print log directory path");
     println!("  status                           Show account/session status");
     println!("  list | ls                        List accounts");
     println!("  info                             Alias for status");
@@ -2330,7 +2334,10 @@ async fn run_serve_runtime(
         poll_interval,
     );
 
-    let health_task = tokio::spawn(report_runtime_health_periodically(runtime_accounts));
+    let health_task = tokio::spawn(report_runtime_health_periodically(
+        runtime_accounts,
+        notify_tx.clone(),
+    ));
     let mut imap_task =
         tokio::spawn(async move { imap::server::run_server(&imap_addr, imap_config).await });
     let mut smtp_task =
@@ -2638,12 +2645,14 @@ fn session_dir(override_dir: Option<&std::path::Path>) -> anyhow::Result<std::pa
 
 async fn report_runtime_health_periodically(
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
+    notify_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) {
     use tokio::time::{interval, Duration, MissedTickBehavior};
 
     let mut ticker = interval(Duration::from_secs(60));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
+    let mut previous_health = std::collections::HashMap::new();
 
     loop {
         ticker.tick().await;
@@ -2668,7 +2677,24 @@ async fn report_runtime_health_periodically(
             "runtime account health snapshot"
         );
 
+        let mut seen_account_ids = std::collections::HashSet::new();
+
         for info in &snapshot {
+            seen_account_ids.insert(info.account_id.0.clone());
+            let previous = previous_health.insert(info.account_id.0.clone(), info.health);
+            if let Some(tx) = notify_tx.as_ref() {
+                if previous != Some(info.health) {
+                    let is_baseline_healthy = previous.is_none()
+                        && matches!(info.health, bridge::accounts::AccountHealth::Healthy);
+                    if !is_baseline_healthy {
+                        let _ = tx.send(format!(
+                            "[event] account health: {} ({}) -> {:?}",
+                            info.email, info.account_id.0, info.health
+                        ));
+                    }
+                }
+            }
+
             if matches!(info.health, bridge::accounts::AccountHealth::Unavailable) {
                 tracing::warn!(
                     account_id = %info.account_id.0,
@@ -2685,6 +2711,8 @@ async fn report_runtime_health_periodically(
                 );
             }
         }
+
+        previous_health.retain(|account_id, _| seen_account_ids.contains(account_id));
     }
 }
 

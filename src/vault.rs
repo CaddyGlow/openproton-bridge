@@ -1641,6 +1641,24 @@ fn write_default_email(dir: &Path, email: &str) -> Result<()> {
 // Public API
 // ---------------------------------------------------------------------------
 
+pub fn load_vault_msgpack_value(dir: &Path) -> Result<MsgpackValue> {
+    let vault_path = dir.join(VAULT_FILE);
+    if !vault_path.exists() {
+        return Err(VaultError::NotLoggedIn);
+    }
+
+    let raw = std::fs::read(&vault_path)?;
+    let file: VaultFile = rmp_serde::from_slice(&raw)?;
+
+    let mut key = get_or_create_vault_key(dir)?;
+    let decrypted = decrypt(&file.data, &key);
+    key.zeroize();
+    let decrypted = decrypted?;
+
+    let value: MsgpackValue = rmp_serde::from_slice(&decrypted)?;
+    Ok(value)
+}
+
 pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
     let mut data = load_vault_data(dir)?.unwrap_or_default();
     let session_email = normalize_email(&session.email);
@@ -2344,6 +2362,25 @@ path = "custom-vault.key"
         assert_eq!(loaded.display_name, session.display_name);
         assert_eq!(loaded.key_passphrase, session.key_passphrase);
         assert_eq!(loaded.bridge_password, session.bridge_password);
+    }
+
+    #[test]
+    fn test_load_vault_msgpack_value_from_proton_profile_fixture() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_proton_golden_fixture(tmp.path());
+
+        let value = load_vault_msgpack_value(tmp.path()).unwrap();
+        match value {
+            MsgpackValue::Map(entries) => {
+                assert!(entries.iter().any(|(key, _)| {
+                    matches!(key, MsgpackValue::String(name) if name.as_str() == Some("Settings"))
+                }));
+                assert!(entries.iter().any(|(key, _)| {
+                    matches!(key, MsgpackValue::String(name) if name.as_str() == Some("Users"))
+                }));
+            }
+            other => panic!("expected msgpack map payload, got {other:?}"),
+        }
     }
 
     #[test]

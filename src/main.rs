@@ -136,6 +136,10 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
     },
+    /// Start interactive CLI shell
+    Cli,
+    /// Dump decrypted vault msgpack structure for debugging
+    VaultDump,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -189,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
     let runtime_paths = runtime_paths(resolved_vault_dir.as_deref())?;
     let dir = runtime_paths.settings_dir().to_path_buf();
     let _instance_lock = match &cli.command {
-        Command::Serve { .. } | Command::Grpc { .. } => {
+        Command::Serve { .. } | Command::Grpc { .. } | Command::Cli => {
             let lock = single_instance::acquire_bridge_instance_lock(&runtime_paths)?;
             tracing::info!(path = %lock.path().display(), "acquired bridge instance lock");
             Some(lock)
@@ -197,8 +201,27 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    match cli.command {
-        Command::Login { username } => cmd_login(username, &dir).await,
+    execute_command(cli.command, &dir, &runtime_paths).await
+}
+
+async fn execute_command(
+    command: Command,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<()> {
+    match command {
+        Command::Cli => cmd_cli(dir, runtime_paths).await,
+        other => execute_non_interactive_command(other, dir, runtime_paths).await,
+    }
+}
+
+async fn execute_non_interactive_command(
+    command: Command,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<()> {
+    match command {
+        Command::Login { username } => cmd_login(username, dir).await,
         Command::FidoAssert {
             auth_options_json,
             auth_options_file,
@@ -214,13 +237,13 @@ async fn main() -> anyhow::Result<()> {
             pin,
             provider,
         ),
-        Command::Status => cmd_status(&dir),
-        Command::Logout { email, all } => cmd_logout(email.as_deref(), all, &dir),
+        Command::Status => cmd_status(dir),
+        Command::Logout { email, all } => cmd_logout(email.as_deref(), all, dir),
         Command::Accounts { command } => match command {
-            AccountsCommand::List => cmd_accounts_list(&dir),
-            AccountsCommand::Use { email } => cmd_accounts_use(&email, &dir),
+            AccountsCommand::List => cmd_accounts_list(dir),
+            AccountsCommand::Use { email } => cmd_accounts_use(&email, dir),
         },
-        Command::Fetch { limit } => cmd_fetch(limit, &dir).await,
+        Command::Fetch { limit } => cmd_fetch(limit, dir).await,
         Command::Serve {
             imap_port,
             smtp_port,
@@ -234,12 +257,14 @@ async fn main() -> anyhow::Result<()> {
                 &bind,
                 no_tls,
                 event_poll_secs,
-                &dir,
-                &runtime_paths,
+                dir,
+                runtime_paths,
             )
             .await
         }
-        Command::Grpc { bind } => cmd_grpc(&bind, &runtime_paths).await,
+        Command::Grpc { bind } => cmd_grpc(&bind, runtime_paths).await,
+        Command::VaultDump => cmd_vault_dump(dir),
+        Command::Cli => anyhow::bail!("cannot execute nested cli command"),
     }
 }
 
@@ -335,6 +360,543 @@ fn resolve_credential_store_overrides(
     }
 
     Ok(overrides)
+}
+
+#[derive(Clone, Debug)]
+struct InteractiveServeConfig {
+    imap_port: u16,
+    smtp_port: u16,
+    bind: String,
+    no_tls: bool,
+    event_poll_secs: u64,
+}
+
+impl Default for InteractiveServeConfig {
+    fn default() -> Self {
+        Self {
+            imap_port: 1143,
+            smtp_port: 1025,
+            bind: "127.0.0.1".to_string(),
+            no_tls: false,
+            event_poll_secs: 30,
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+struct ServeCommandOverrides {
+    imap_port: Option<u16>,
+    smtp_port: Option<u16>,
+    bind: Option<String>,
+    no_tls: Option<bool>,
+    event_poll_secs: Option<u64>,
+}
+
+impl InteractiveServeConfig {
+    fn with_overrides(&self, overrides: ServeCommandOverrides) -> Self {
+        Self {
+            imap_port: overrides.imap_port.unwrap_or(self.imap_port),
+            smtp_port: overrides.smtp_port.unwrap_or(self.smtp_port),
+            bind: overrides.bind.unwrap_or_else(|| self.bind.clone()),
+            no_tls: overrides.no_tls.unwrap_or(self.no_tls),
+            event_poll_secs: overrides.event_poll_secs.unwrap_or(self.event_poll_secs),
+        }
+    }
+}
+
+async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> anyhow::Result<()> {
+    println!("Welcome to openproton-bridge interactive shell.");
+    println!("Type `help` for commands, `quit` to exit.\n");
+
+    let mut serve_config = InteractiveServeConfig::default();
+
+    loop {
+        let Some(line) = read_cli_line("openproton> ")? else {
+            println!();
+            break;
+        };
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let tokens = match split_shell_words(line) {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                eprintln!("Error: {err}");
+                continue;
+            }
+        };
+
+        if tokens.is_empty() {
+            continue;
+        }
+
+        let command = tokens[0].to_ascii_lowercase();
+        match command.as_str() {
+            "quit" | "exit" => break,
+            "help" | "?" => {
+                print_interactive_help();
+            }
+            "list" | "ls" | "l" => {
+                if let Err(err) = execute_non_interactive_command(
+                    Command::Accounts {
+                        command: AccountsCommand::List,
+                    },
+                    dir,
+                    runtime_paths,
+                )
+                .await
+                {
+                    eprintln!("Error: {err:#}");
+                }
+            }
+            "info" | "i" => {
+                if let Err(err) =
+                    execute_non_interactive_command(Command::Status, dir, runtime_paths).await
+                {
+                    eprintln!("Error: {err:#}");
+                }
+            }
+            "use" => {
+                if tokens.len() != 2 {
+                    eprintln!("Usage: use <email>");
+                    continue;
+                }
+
+                if let Err(err) = execute_non_interactive_command(
+                    Command::Accounts {
+                        command: AccountsCommand::Use {
+                            email: tokens[1].clone(),
+                        },
+                    },
+                    dir,
+                    runtime_paths,
+                )
+                .await
+                {
+                    eprintln!("Error: {err:#}");
+                }
+            }
+            "delete" | "del" | "rm" | "remove" => {
+                if tokens.len() != 2 {
+                    eprintln!("Usage: delete <email>");
+                    continue;
+                }
+
+                if let Err(err) = execute_non_interactive_command(
+                    Command::Logout {
+                        email: Some(tokens[1].clone()),
+                        all: false,
+                    },
+                    dir,
+                    runtime_paths,
+                )
+                .await
+                {
+                    eprintln!("Error: {err:#}");
+                }
+            }
+            "clear" | "cl" => {
+                let clear_target = tokens.get(1).map(|value| value.to_ascii_lowercase());
+                if clear_target
+                    .as_deref()
+                    .is_some_and(|target| target == "accounts")
+                    || clear_target
+                        .as_deref()
+                        .is_some_and(|target| target == "everything")
+                {
+                    if let Err(err) = execute_non_interactive_command(
+                        Command::Logout {
+                            email: None,
+                            all: true,
+                        },
+                        dir,
+                        runtime_paths,
+                    )
+                    .await
+                    {
+                        eprintln!("Error: {err:#}");
+                    }
+                } else {
+                    eprintln!("Usage: clear accounts | clear everything");
+                }
+            }
+            "change" | "ch" | "switch" => {
+                if let Err(err) = handle_interactive_change_command(&tokens[1..], &mut serve_config)
+                {
+                    eprintln!("Error: {err}");
+                }
+            }
+            "serve-config" => {
+                print_interactive_serve_config(&serve_config);
+            }
+            "serve" | "start" => {
+                if tokens
+                    .get(1)
+                    .is_some_and(|arg| arg == "--help" || arg == "-h")
+                {
+                    print_interactive_serve_help();
+                    continue;
+                }
+
+                let overrides = match parse_serve_overrides(&tokens[1..]) {
+                    Ok(overrides) => overrides,
+                    Err(err) => {
+                        eprintln!("Error: {err}");
+                        continue;
+                    }
+                };
+                let effective = serve_config.with_overrides(overrides);
+
+                if let Err(err) = cmd_serve(
+                    effective.imap_port,
+                    effective.smtp_port,
+                    &effective.bind,
+                    effective.no_tls,
+                    effective.event_poll_secs,
+                    dir,
+                    runtime_paths,
+                )
+                .await
+                {
+                    eprintln!("Error: {err:#}");
+                }
+            }
+            _ => {
+                let rewritten = rewrite_repl_aliases(tokens);
+                let parsed = match parse_repl_clap_command(&rewritten) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        eprintln!("Error: {err:#}");
+                        continue;
+                    }
+                };
+
+                if matches!(parsed, Command::Cli) {
+                    eprintln!("`cli` cannot be nested inside interactive mode.");
+                    continue;
+                }
+
+                if let Err(err) = execute_non_interactive_command(parsed, dir, runtime_paths).await
+                {
+                    eprintln!("Error: {err:#}");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_cli_line(prompt: &str) -> anyhow::Result<Option<String>> {
+    use std::io::Write;
+
+    print!("{prompt}");
+    std::io::stdout()
+        .flush()
+        .context("failed to flush stdout")?;
+
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut line)
+        .context("failed to read CLI input")?;
+
+    if read == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(line))
+}
+
+fn split_shell_words(input: &str) -> anyhow::Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(active_quote) => {
+                if ch == active_quote {
+                    quote = None;
+                    continue;
+                }
+
+                if ch == '\\' && active_quote == '"' {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                        continue;
+                    }
+                    anyhow::bail!("unterminated escape sequence");
+                }
+
+                current.push(ch);
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    } else {
+                        anyhow::bail!("unterminated escape sequence");
+                    }
+                }
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        tokens.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+        }
+    }
+
+    if quote.is_some() {
+        anyhow::bail!("unterminated quoted string");
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    Ok(tokens)
+}
+
+fn parse_repl_clap_command(tokens: &[String]) -> anyhow::Result<Command> {
+    let mut argv = Vec::with_capacity(tokens.len() + 1);
+    argv.push("openproton-bridge".to_string());
+    argv.extend(tokens.iter().cloned());
+
+    let parsed = Cli::try_parse_from(argv).map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    if parsed.vault_dir.is_some()
+        || parsed.credential_store.is_some()
+        || parsed.credential_store_namespace.is_some()
+        || parsed.credential_store_secret.is_some()
+        || parsed.credential_store_system_service.is_some()
+        || parsed.credential_store_pass_entry.is_some()
+        || parsed.credential_store_file_path.is_some()
+    {
+        anyhow::bail!(
+            "interactive mode does not accept global override flags; restart with the desired global flags"
+        );
+    }
+
+    Ok(parsed.command)
+}
+
+fn rewrite_repl_aliases(mut tokens: Vec<String>) -> Vec<String> {
+    if tokens.is_empty() {
+        return tokens;
+    }
+
+    let head = tokens[0].to_ascii_lowercase();
+    match head.as_str() {
+        "add" | "a" | "con" | "connect" => {
+            tokens[0] = "login".to_string();
+        }
+        "man" => {
+            tokens[0] = "help".to_string();
+        }
+        "d" | "disconnect" => {
+            tokens[0] = "logout".to_string();
+        }
+        _ => {}
+    }
+
+    let head = tokens[0].to_ascii_lowercase();
+    if head == "login" && tokens.len() == 2 && !tokens[1].starts_with('-') {
+        let username = tokens[1].clone();
+        tokens = vec!["login".to_string(), "--username".to_string(), username];
+    } else if head == "logout" && tokens.len() == 2 && !tokens[1].starts_with('-') {
+        if tokens[1].eq_ignore_ascii_case("all") {
+            tokens = vec!["logout".to_string(), "--all".to_string()];
+        } else {
+            let email = tokens[1].clone();
+            tokens = vec!["logout".to_string(), "--email".to_string(), email];
+        }
+    } else if head == "fetch" && tokens.len() == 2 && !tokens[1].starts_with('-') {
+        let limit = tokens[1].clone();
+        tokens = vec!["fetch".to_string(), "--limit".to_string(), limit];
+    }
+
+    tokens
+}
+
+fn parse_serve_overrides(args: &[String]) -> anyhow::Result<ServeCommandOverrides> {
+    let mut overrides = ServeCommandOverrides::default();
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        match args[idx].as_str() {
+            "--imap-port" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --imap-port")?
+                    .parse::<u16>()
+                    .context("invalid --imap-port value")?;
+                overrides.imap_port = Some(value);
+            }
+            "--smtp-port" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --smtp-port")?
+                    .parse::<u16>()
+                    .context("invalid --smtp-port value")?;
+                overrides.smtp_port = Some(value);
+            }
+            "--bind" => {
+                idx += 1;
+                let value = args.get(idx).context("missing value for --bind")?.trim();
+                if value.is_empty() {
+                    anyhow::bail!("invalid --bind value");
+                }
+                overrides.bind = Some(value.to_string());
+            }
+            "--event-poll-secs" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --event-poll-secs")?
+                    .parse::<u64>()
+                    .context("invalid --event-poll-secs value")?;
+                overrides.event_poll_secs = Some(value);
+            }
+            "--no-tls" => {
+                overrides.no_tls = Some(true);
+            }
+            "--tls" => {
+                overrides.no_tls = Some(false);
+            }
+            unknown => {
+                anyhow::bail!(
+                    "unsupported serve option `{unknown}`. supported: --imap-port, --smtp-port, --bind, --event-poll-secs, --no-tls, --tls"
+                );
+            }
+        }
+
+        idx += 1;
+    }
+
+    Ok(overrides)
+}
+
+fn handle_interactive_change_command(
+    args: &[String],
+    serve_config: &mut InteractiveServeConfig,
+) -> anyhow::Result<()> {
+    if args.len() < 2 {
+        anyhow::bail!(
+            "usage: change <imap-port|smtp-port|bind|event-poll-secs|imap-security|smtp-security> <value>"
+        );
+    }
+
+    let field = args[0].to_ascii_lowercase();
+    let value = args[1].trim();
+
+    match field.as_str() {
+        "imap-port" => {
+            serve_config.imap_port = value.parse::<u16>().context("invalid IMAP port")?;
+            println!("Updated IMAP port: {}", serve_config.imap_port);
+        }
+        "smtp-port" => {
+            serve_config.smtp_port = value.parse::<u16>().context("invalid SMTP port")?;
+            println!("Updated SMTP port: {}", serve_config.smtp_port);
+        }
+        "bind" => {
+            if value.is_empty() {
+                anyhow::bail!("bind cannot be empty");
+            }
+            serve_config.bind = value.to_string();
+            println!("Updated bind address: {}", serve_config.bind);
+        }
+        "event-poll-secs" => {
+            serve_config.event_poll_secs = value
+                .parse::<u64>()
+                .context("invalid event poll interval value")?;
+            println!(
+                "Updated event poll interval: {} seconds",
+                serve_config.event_poll_secs
+            );
+        }
+        "imap-security" | "smtp-security" => match value.to_ascii_lowercase().as_str() {
+            "none" | "off" | "plain" => {
+                serve_config.no_tls = true;
+                println!("Updated security mode: None (plaintext)");
+            }
+            "starttls" | "ssl" | "tls" => {
+                serve_config.no_tls = false;
+                println!("Updated security mode: STARTTLS");
+            }
+            _ => anyhow::bail!("invalid security value `{value}`; expected starttls or none"),
+        },
+        _ => anyhow::bail!(
+            "unknown change target `{}`; expected imap-port, smtp-port, bind, event-poll-secs, imap-security, smtp-security",
+            args[0]
+        ),
+    }
+
+    Ok(())
+}
+
+fn print_interactive_help() {
+    println!("Available commands:");
+    println!("  help                             Show this help");
+    println!("  quit | exit                      Exit interactive shell");
+    println!("  status                           Show account/session status");
+    println!("  list | ls                        List accounts");
+    println!("  info                             Alias for status");
+    println!("  login [email|--username <email>] Login to Proton");
+    println!("  logout [all|--all|--email <email>] Logout one account or all accounts");
+    println!("  delete <email>                   Remove one account");
+    println!("  use <email>                      Set default account");
+    println!("  fetch [--limit <n>]              Fetch/decrypt inbox messages");
+    println!("  vault-dump                       Dump decrypted vault msgpack structure");
+    println!("  change <field> <value>           Update interactive serve defaults");
+    println!("  serve-config                     Print interactive serve defaults");
+    println!("  serve [serve flags]              Start IMAP+SMTP server (blocking)");
+    println!("  grpc [--bind <addr>]             Start gRPC frontend service (blocking)");
+    println!();
+    print_interactive_serve_help();
+}
+
+fn cmd_vault_dump(dir: &std::path::Path) -> anyhow::Result<()> {
+    let value = vault::load_vault_msgpack_value(dir)
+        .context("failed to decrypt and decode vault msgpack payload")?;
+
+    match serde_json::to_string_pretty(&value) {
+        Ok(rendered) => println!("{rendered}"),
+        Err(err) => {
+            eprintln!("warning: failed to render JSON output ({err}); falling back to debug view");
+            println!("{value:#?}");
+        }
+    }
+
+    Ok(())
+}
+
+fn print_interactive_serve_help() {
+    println!("Serve flags:");
+    println!("  --imap-port <port>");
+    println!("  --smtp-port <port>");
+    println!("  --bind <ip>");
+    println!("  --event-poll-secs <seconds>");
+    println!("  --no-tls | --tls");
+}
+
+fn print_interactive_serve_config(config: &InteractiveServeConfig) {
+    println!("Interactive serve defaults:");
+    println!("  IMAP port: {}", config.imap_port);
+    println!("  SMTP port: {}", config.smtp_port);
+    println!("  Bind: {}", config.bind);
+    println!(
+        "  Security: {}",
+        if config.no_tls { "None" } else { "STARTTLS" }
+    );
+    println!("  Event poll secs: {}", config.event_poll_secs);
 }
 
 async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyhow::Result<()> {
@@ -1766,6 +2328,77 @@ mod tests {
             } => assert_eq!(event_poll_secs, 10),
             _ => panic!("expected serve command"),
         }
+    }
+
+    #[test]
+    fn parse_cli_subcommand() {
+        let cli = Cli::try_parse_from(["openproton-bridge", "cli"]).unwrap();
+        assert!(matches!(cli.command, Command::Cli));
+    }
+
+    #[test]
+    fn parse_vault_dump_subcommand() {
+        let cli = Cli::try_parse_from(["openproton-bridge", "vault-dump"]).unwrap();
+        assert!(matches!(cli.command, Command::VaultDump));
+    }
+
+    #[test]
+    fn rewrite_repl_aliases_supports_positional_login_logout_fetch_forms() {
+        assert_eq!(
+            rewrite_repl_aliases(vec!["login".into(), "user@proton.me".into()]),
+            vec![
+                "login".to_string(),
+                "--username".to_string(),
+                "user@proton.me".to_string()
+            ]
+        );
+        assert_eq!(
+            rewrite_repl_aliases(vec!["logout".into(), "all".into()]),
+            vec!["logout".to_string(), "--all".to_string()]
+        );
+        assert_eq!(
+            rewrite_repl_aliases(vec!["fetch".into(), "15".into()]),
+            vec!["fetch".to_string(), "--limit".to_string(), "15".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_shell_words_supports_quoted_segments() {
+        let parsed =
+            split_shell_words("login --username \"first last@proton.me\" --extra 'quoted value'")
+                .unwrap();
+        assert_eq!(
+            parsed,
+            vec![
+                "login".to_string(),
+                "--username".to_string(),
+                "first last@proton.me".to_string(),
+                "--extra".to_string(),
+                "quoted value".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_serve_overrides_accepts_expected_flags() {
+        let parsed = parse_serve_overrides(&[
+            "--imap-port".to_string(),
+            "2143".to_string(),
+            "--smtp-port".to_string(),
+            "2025".to_string(),
+            "--bind".to_string(),
+            "0.0.0.0".to_string(),
+            "--event-poll-secs".to_string(),
+            "12".to_string(),
+            "--no-tls".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.imap_port, Some(2143));
+        assert_eq!(parsed.smtp_port, Some(2025));
+        assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(parsed.event_poll_secs, Some(12));
+        assert_eq!(parsed.no_tls, Some(true));
     }
 
     #[test]

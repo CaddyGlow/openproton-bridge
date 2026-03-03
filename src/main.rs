@@ -548,9 +548,22 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         println!("  - project: openproton-bridge");
                         println!("  - deps/licenses: see Cargo.toml and Cargo.lock");
                     }
+                    "configure-apple-mail" => {
+                        eprintln!(
+                            "configure-apple-mail is not implemented in openproton-bridge CLI."
+                        );
+                    }
                     "log-dir" | "log" | "logs" => {
                         println!("{}", runtime_paths.logs_dir().display());
                     }
+                    "debug" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
+                        Some(action) if action == "mailbox-state" => {
+                            eprintln!(
+                                "debug mailbox-state is not implemented in openproton-bridge CLI."
+                            );
+                        }
+                        _ => eprintln!("Usage: debug mailbox-state"),
+                    },
                     "telemetry" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
                         Some(action) if action == "enable" => {
                             if let Err(err) = update_app_settings(runtime_paths, |settings| {
@@ -990,7 +1003,9 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     }
                     "cert" => {
                         let Some(action) = tokens.get(1).map(|s| s.to_ascii_lowercase()) else {
-                            eprintln!("Usage: cert <status|install|export <dir>|import <dir>>");
+                            eprintln!(
+                                "Usage: cert <status|install|uninstall|export <dir>|import <dir>>"
+                            );
                             print_cli_prompt()?;
                             continue;
                         };
@@ -1011,6 +1026,13 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                     eprintln!("Error: {err:#}");
                                 } else {
                                     println!("TLS certificate installed.");
+                                }
+                            }
+                            "uninstall" => {
+                                if let Err(err) = uninstall_cli_tls_certificate(dir) {
+                                    eprintln!("Error: {err:#}");
+                                } else {
+                                    println!("TLS certificate removed from local runtime paths.");
                                 }
                             }
                             "export" => {
@@ -1037,7 +1059,9 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                     println!("TLS certificate imported from {}", source);
                                 }
                             }
-                            _ => eprintln!("Usage: cert <status|install|export <dir>|import <dir>>"),
+                            _ => eprintln!(
+                                "Usage: cert <status|install|uninstall|export <dir>|import <dir>>"
+                            ),
                         }
                     }
                     "repair" | "rep" => {
@@ -1106,6 +1130,21 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                 &tokens[3],
                             ) {
                                 eprintln!("Error: {err:#}");
+                            }
+                        } else if tokens
+                            .get(1)
+                            .is_some_and(|value| value.eq_ignore_ascii_case("change-location"))
+                        {
+                            let Some(target) = tokens.get(2) else {
+                                eprintln!("Usage: change change-location <path>");
+                                print_cli_prompt()?;
+                                continue;
+                            };
+                            if let Err(err) = set_disk_cache_path_for_cli(runtime_paths, target).await
+                            {
+                                eprintln!("Error: {err:#}");
+                            } else {
+                                println!("Disk cache location updated to {}", target);
                             }
                         } else if let Err(err) =
                             handle_interactive_change_command(&tokens[1..], &mut serve_config)
@@ -1566,7 +1605,9 @@ fn print_interactive_help() {
     println!("  manual | man                     Print project manual URL");
     println!("  check-updates                    Alias for updates check");
     println!("  credits                          Print credits/dependency info");
+    println!("  configure-apple-mail             Placeholder (not yet implemented)");
     println!("  log-dir                          Print log directory path");
+    println!("  debug mailbox-state              Placeholder (not yet implemented)");
     println!("  telemetry <enable|disable|status> Manage telemetry setting");
     println!("  proxy <allow|disallow|status>    Manage DoH proxy fallback setting");
     println!("  autostart <enable|disable|status> Manage autostart setting");
@@ -1583,7 +1624,7 @@ fn print_interactive_help() {
     println!("  vault-dump                       Dump decrypted vault msgpack structure");
     println!("  change-location <path>           Change encrypted message cache location");
     println!("  bad-event <synchronize|logout>   Resolve bad-event flows");
-    println!("  cert <status|install|export|import> Manage TLS cert files");
+    println!("  cert <status|install|uninstall|export|import> Manage TLS cert files");
     println!(
         "  repair                           Reset event checkpoints and restart serve runtime"
     );
@@ -1855,6 +1896,21 @@ fn import_cli_tls_certificate(dir: &std::path::Path, source_dir: &str) -> anyhow
         .with_context(|| format!("failed to import {}", source_cert.display()))?;
     std::fs::copy(&source_key, &key_path)
         .with_context(|| format!("failed to import {}", source_key.display()))?;
+    Ok(())
+}
+
+fn uninstall_cli_tls_certificate(dir: &std::path::Path) -> anyhow::Result<()> {
+    let (cert_path, key_path) = cli_tls_paths(dir);
+
+    if cert_path.exists() {
+        std::fs::remove_file(&cert_path)
+            .with_context(|| format!("failed to remove {}", cert_path.display()))?;
+    }
+    if key_path.exists() {
+        std::fs::remove_file(&key_path)
+            .with_context(|| format!("failed to remove {}", key_path.display()))?;
+    }
+
     Ok(())
 }
 

@@ -420,6 +420,25 @@ struct CliStoredAppSettings {
     forced_launcher: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CliStoredMailSettings {
+    imap_port: i32,
+    smtp_port: i32,
+    use_ssl_for_imap: bool,
+    use_ssl_for_smtp: bool,
+}
+
+impl Default for CliStoredMailSettings {
+    fn default() -> Self {
+        Self {
+            imap_port: 1143,
+            smtp_port: 1025,
+            use_ssl_for_imap: false,
+            use_ssl_for_smtp: false,
+        }
+    }
+}
+
 impl CliStoredAppSettings {
     fn defaults_for(runtime_paths: &paths::RuntimePaths) -> Self {
         Self {
@@ -455,7 +474,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
     println!("Welcome to openproton-bridge interactive shell.");
     println!("Type `help` for commands, `quit` to exit.\n");
 
-    let mut serve_config = InteractiveServeConfig::default();
+    let mut serve_config = load_interactive_serve_config(runtime_paths).await;
     let mut runtime_state: Option<InteractiveServeRuntime> = None;
     let mut grpc_state: Option<InteractiveGrpcRuntime> = None;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -849,7 +868,11 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         }
                     }
                     "info" | "i" => {
-                        if let Err(err) =
+                        if let Some(selector) = tokens.get(1) {
+                            if let Err(err) = cmd_account_info(selector, dir, runtime_paths).await {
+                                eprintln!("Error: {err:#}");
+                            }
+                        } else if let Err(err) =
                             execute_non_interactive_command(Command::Status, dir, runtime_paths).await
                         {
                             eprintln!("Error: {err:#}");
@@ -857,15 +880,23 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     }
                     "use" => {
                         if tokens.len() != 2 {
-                            eprintln!("Usage: use <email>");
+                            eprintln!("Usage: use <email|index>");
                             print_cli_prompt()?;
                             continue;
                         }
+                        let target = match resolve_account_selector_session(dir, &tokens[1]) {
+                            Ok(session) => session.email,
+                            Err(err) => {
+                                eprintln!("Error: {err:#}");
+                                print_cli_prompt()?;
+                                continue;
+                            }
+                        };
 
                         if let Err(err) = execute_non_interactive_command(
                             Command::Accounts {
                                 command: AccountsCommand::Use {
-                                    email: tokens[1].clone(),
+                                    email: target,
                                 },
                             },
                             dir,
@@ -878,14 +909,22 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     }
                     "delete" | "del" | "rm" | "remove" => {
                         if tokens.len() != 2 {
-                            eprintln!("Usage: delete <email>");
+                            eprintln!("Usage: delete <email|index>");
                             print_cli_prompt()?;
                             continue;
                         }
+                        let target = match resolve_account_selector_session(dir, &tokens[1]) {
+                            Ok(session) => session.email,
+                            Err(err) => {
+                                eprintln!("Error: {err:#}");
+                                print_cli_prompt()?;
+                                continue;
+                            }
+                        };
 
                         if let Err(err) = execute_non_interactive_command(
                             Command::Logout {
-                                email: Some(tokens[1].clone()),
+                                email: Some(target),
                                 all: false,
                             },
                             dir,
@@ -948,7 +987,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     }
                     "bad-event" => {
                         let Some(action) = tokens.get(1).map(|s| s.to_ascii_lowercase()) else {
-                            eprintln!("Usage: bad-event <synchronize|logout <email|--all>>");
+                            eprintln!("Usage: bad-event <synchronize|logout [email|index|--all]>");
                             print_cli_prompt()?;
                             continue;
                         };
@@ -982,23 +1021,52 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                         {
                                             eprintln!("Error: {err:#}");
                                         }
-                                    } else if let Err(err) = execute_non_interactive_command(
-                                        Command::Logout {
-                                            email: Some(value),
-                                            all: false,
-                                        },
-                                        dir,
-                                        runtime_paths,
-                                    )
-                                    .await
-                                    {
-                                        eprintln!("Error: {err:#}");
+                                    } else {
+                                        let selected =
+                                            match resolve_account_selector_session(dir, &value) {
+                                                Ok(session) => session.email,
+                                                Err(err) => {
+                                                    eprintln!("Error: {err:#}");
+                                                    print_cli_prompt()?;
+                                                    continue;
+                                                }
+                                            };
+                                        if let Err(err) = execute_non_interactive_command(
+                                            Command::Logout {
+                                                email: Some(selected),
+                                                all: false,
+                                            },
+                                            dir,
+                                            runtime_paths,
+                                        )
+                                        .await
+                                        {
+                                            eprintln!("Error: {err:#}");
+                                        }
                                     }
                                 } else {
-                                    eprintln!("Usage: bad-event logout <email|--all>");
+                                    match vault::load_session(dir) {
+                                        Ok(active) => {
+                                            if let Err(err) = execute_non_interactive_command(
+                                                Command::Logout {
+                                                    email: Some(active.email),
+                                                    all: false,
+                                                },
+                                                dir,
+                                                runtime_paths,
+                                            )
+                                            .await
+                                            {
+                                                eprintln!("Error: {err:#}");
+                                            }
+                                        }
+                                        Err(err) => eprintln!("Error: {err:#}"),
+                                    }
                                 }
                             }
-                            _ => eprintln!("Usage: bad-event <synchronize|logout <email|--all>>"),
+                            _ => eprintln!(
+                                "Usage: bad-event <synchronize|logout [email|index|--all]>"
+                            ),
                         }
                     }
                     "cert" => {
@@ -1101,17 +1169,23 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     "imap-security" | "ssl-imap" | "starttls-imap" => {
                         let mut args = vec!["imap-security".to_string()];
                         args.extend(tokens.iter().skip(1).cloned());
-                        if let Err(err) = handle_interactive_change_command(&args, &mut serve_config)
-                        {
+                        if let Err(err) = handle_interactive_change_command(&args, &mut serve_config) {
                             eprintln!("Error: {err}");
+                        } else if let Err(err) =
+                            persist_mail_ports_from_serve_config(runtime_paths, &serve_config).await
+                        {
+                            eprintln!("Error: {err:#}");
                         }
                     }
                     "smtp-security" | "ssl-smtp" | "starttls-smtp" => {
                         let mut args = vec!["smtp-security".to_string()];
                         args.extend(tokens.iter().skip(1).cloned());
-                        if let Err(err) = handle_interactive_change_command(&args, &mut serve_config)
-                        {
+                        if let Err(err) = handle_interactive_change_command(&args, &mut serve_config) {
                             eprintln!("Error: {err}");
+                        } else if let Err(err) =
+                            persist_mail_ports_from_serve_config(runtime_paths, &serve_config).await
+                        {
+                            eprintln!("Error: {err:#}");
                         }
                     }
                     "change" | "ch" | "switch" => {
@@ -1120,15 +1194,11 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             .is_some_and(|value| value.eq_ignore_ascii_case("mode"))
                         {
                             if tokens.len() < 4 {
-                                eprintln!("Usage: change mode <email> <split|combined>");
+                                eprintln!("Usage: change mode <email|index> <split|combined>");
                                 print_cli_prompt()?;
                                 continue;
                             }
-                            if let Err(err) = set_account_mode_by_email(
-                                dir,
-                                &tokens[2],
-                                &tokens[3],
-                            ) {
+                            if let Err(err) = set_account_mode_by_selector(dir, &tokens[2], &tokens[3]) {
                                 eprintln!("Error: {err:#}");
                             }
                         } else if tokens
@@ -1150,6 +1220,10 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             handle_interactive_change_command(&tokens[1..], &mut serve_config)
                         {
                             eprintln!("Error: {err}");
+                        } else if let Err(err) =
+                            persist_mail_ports_from_serve_config(runtime_paths, &serve_config).await
+                        {
+                            eprintln!("Error: {err:#}");
                         }
                     }
                     "serve-config" => {
@@ -1615,15 +1689,15 @@ fn print_interactive_help() {
     println!("  updates ...                      Manage update channel/autoupdates");
     println!("  status                           Show account/session status");
     println!("  list | ls                        List accounts");
-    println!("  info                             Alias for status");
+    println!("  info [email|index]               Show account/session info");
     println!("  login [email|--username <email>] Login to Proton");
     println!("  logout [all|--all|--email <email>] Logout one account or all accounts");
-    println!("  delete <email>                   Remove one account");
-    println!("  use <email>                      Set default account");
+    println!("  delete <email|index>             Remove one account");
+    println!("  use <email|index>                Set default account");
     println!("  fetch [--limit <n>]              Fetch/decrypt inbox messages");
     println!("  vault-dump                       Dump decrypted vault msgpack structure");
     println!("  change-location <path>           Change encrypted message cache location");
-    println!("  bad-event <synchronize|logout>   Resolve bad-event flows");
+    println!("  bad-event <synchronize|logout>   Resolve bad-event flows (logout defaults to active account)");
     println!("  cert <status|install|uninstall|export|import> Manage TLS cert files");
     println!(
         "  repair                           Reset event checkpoints and restart serve runtime"
@@ -1634,7 +1708,7 @@ fn print_interactive_help() {
     println!("  ssl-imap | starttls-imap         Alias for imap-security");
     println!("  ssl-smtp | starttls-smtp         Alias for smtp-security");
     println!("  change <field> ...               Update interactive serve defaults");
-    println!("  change mode <email> <split|combined> Set account address mode");
+    println!("  change mode <email|index> <split|combined> Set account address mode");
     println!("  serve-config                     Print interactive serve defaults");
     println!("  serve-status                     Show background serve runtime status");
     println!("  serve [serve flags]              Start IMAP+SMTP server (background)");
@@ -1690,6 +1764,92 @@ fn parse_grpc_bind(args: &[String]) -> anyhow::Result<String> {
     }
 
     anyhow::bail!("unsupported grpc option(s); supported: --bind <ip>")
+}
+
+async fn load_interactive_serve_config(
+    runtime_paths: &paths::RuntimePaths,
+) -> InteractiveServeConfig {
+    let mut config = InteractiveServeConfig::default();
+    match load_mail_settings_for_cli(runtime_paths).await {
+        Ok(settings) => {
+            if let Ok(imap_port) = u16::try_from(settings.imap_port) {
+                if imap_port > 0 {
+                    config.imap_port = imap_port;
+                }
+            }
+            if let Ok(smtp_port) = u16::try_from(settings.smtp_port) {
+                if smtp_port > 0 {
+                    config.smtp_port = smtp_port;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to load mail settings for interactive defaults; using built-ins"
+            );
+        }
+    }
+    config
+}
+
+async fn load_mail_settings_for_cli(
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<CliStoredMailSettings> {
+    let path = runtime_paths.grpc_mail_settings_path();
+    if !path.exists() {
+        return Ok(CliStoredMailSettings::default());
+    }
+
+    let payload = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&payload).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+async fn save_mail_settings_for_cli(
+    runtime_paths: &paths::RuntimePaths,
+    settings: &CliStoredMailSettings,
+) -> anyhow::Result<()> {
+    let path = runtime_paths.grpc_mail_settings_path();
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create settings dir {}", parent.display()))?;
+    }
+
+    let tmp_path = path.with_file_name("grpc_mail_settings.json.tmp");
+    let payload = serde_json::to_vec_pretty(settings).context("failed to encode mail settings")?;
+    tokio::fs::write(&tmp_path, payload)
+        .await
+        .with_context(|| format!("failed to write {}", tmp_path.display()))?;
+    tokio::fs::rename(&tmp_path, &path)
+        .await
+        .with_context(|| format!("failed to rename settings file {}", path.display()))?;
+    Ok(())
+}
+
+async fn update_mail_settings<F>(
+    runtime_paths: &paths::RuntimePaths,
+    mutator: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut CliStoredMailSettings),
+{
+    let mut settings = load_mail_settings_for_cli(runtime_paths).await?;
+    mutator(&mut settings);
+    save_mail_settings_for_cli(runtime_paths, &settings).await
+}
+
+async fn persist_mail_ports_from_serve_config(
+    runtime_paths: &paths::RuntimePaths,
+    serve_config: &InteractiveServeConfig,
+) -> anyhow::Result<()> {
+    update_mail_settings(runtime_paths, |settings| {
+        settings.imap_port = i32::from(serve_config.imap_port);
+        settings.smtp_port = i32::from(serve_config.smtp_port);
+    })
+    .await
 }
 
 async fn load_app_settings_for_cli(
@@ -1969,12 +2129,41 @@ async fn run_interactive_reset(
     Ok(())
 }
 
-fn set_account_mode_by_email(dir: &std::path::Path, email: &str, mode: &str) -> anyhow::Result<()> {
+fn resolve_account_selector_session(
+    dir: &std::path::Path,
+    selector: &str,
+) -> anyhow::Result<api::types::Session> {
     let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
-    let session = sessions
+    if sessions.is_empty() {
+        anyhow::bail!("no accounts are configured");
+    }
+
+    if let Ok(index) = selector.trim().parse::<usize>() {
+        if let Some(session) = sessions.get(index) {
+            return Ok(session.clone());
+        }
+        anyhow::bail!(
+            "account index {index} is out of range (max {})",
+            sessions.len().saturating_sub(1)
+        );
+    }
+
+    sessions
         .iter()
-        .find(|session| session.email.eq_ignore_ascii_case(email))
-        .ok_or_else(|| anyhow::anyhow!("unknown account email: {email}"))?;
+        .find(|session| {
+            session.email.eq_ignore_ascii_case(selector)
+                || session.display_name.eq_ignore_ascii_case(selector)
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown account selector: {selector}"))
+}
+
+fn set_account_mode_by_selector(
+    dir: &std::path::Path,
+    selector: &str,
+    mode: &str,
+) -> anyhow::Result<()> {
+    let session = resolve_account_selector_session(dir, selector)?;
 
     let enabled = match mode.trim().to_ascii_lowercase().as_str() {
         "split" => true,
@@ -2736,6 +2925,46 @@ fn cmd_status(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn cmd_account_info(
+    selector: &str,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<()> {
+    let session = resolve_account_selector_session(dir, selector)?;
+    let mail_settings = load_mail_settings_for_cli(runtime_paths).await?;
+    let split_mode = vault::load_split_mode_by_account_id(dir, &session.uid)
+        .context("failed to load account mode")?
+        .unwrap_or(false);
+
+    println!("Account: {} ({})", session.display_name, session.email);
+    println!(
+        "Address mode: {}",
+        if split_mode { "split" } else { "combined" }
+    );
+    println!();
+    println!(
+        "IMAP Settings\nAddress:   127.0.0.1\nIMAP port: {}\nUsername:  {}\nPassword:  {}\nSecurity:  STARTTLS",
+        mail_settings.imap_port,
+        session.email,
+        session
+            .bridge_password
+            .as_deref()
+            .unwrap_or("<not set; re-login to generate>")
+    );
+    println!();
+    println!(
+        "SMTP Settings\nAddress:   127.0.0.1\nSMTP port: {}\nUsername:  {}\nPassword:  {}\nSecurity:  STARTTLS",
+        mail_settings.smtp_port,
+        session.email,
+        session
+            .bridge_password
+            .as_deref()
+            .unwrap_or("<not set; re-login to generate>")
+    );
+
+    Ok(())
+}
+
 fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::Result<()> {
     if !vault::session_exists(dir) {
         println!("Not logged in");
@@ -2756,7 +2985,30 @@ fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::
 }
 
 fn cmd_accounts_list(dir: &std::path::Path) -> anyhow::Result<()> {
-    cmd_status(dir)
+    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
+    if sessions.is_empty() {
+        println!("Not logged in");
+        return Ok(());
+    }
+
+    println!(
+        "{:<3} {:<30} {:<12} {:<12}",
+        "#", "account", "status", "address mode"
+    );
+    for (idx, session) in sessions.iter().enumerate() {
+        let split_mode = vault::load_split_mode_by_account_id(dir, &session.uid)
+            .context("failed to load account mode")?
+            .unwrap_or(false);
+        println!(
+            "{:<3} {:<30} {:<12} {:<12}",
+            idx,
+            session.email,
+            "connected",
+            if split_mode { "split" } else { "combined" }
+        );
+    }
+    println!();
+    Ok(())
 }
 
 fn cmd_accounts_use(email: &str, dir: &std::path::Path) -> anyhow::Result<()> {

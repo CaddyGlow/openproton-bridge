@@ -57,7 +57,9 @@ openproton-bridge cli
 # In interactive shell:
 #   serve            # start IMAP/SMTP in background
 #   serve-status     # inspect runtime state
-#   stop             # stop background runtime
+#   grpc            # start gRPC control service in background
+#   grpc-status     # inspect gRPC runtime state
+#   stop            # stop all background runtimes
 
 # Optional: tune per-account event poll interval
 openproton-bridge serve --event-poll-secs 10

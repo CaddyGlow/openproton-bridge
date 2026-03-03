@@ -399,6 +399,11 @@ struct InteractiveServeRuntime {
     config: InteractiveServeConfig,
 }
 
+struct InteractiveGrpcRuntime {
+    join_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    bind: String,
+}
+
 impl InteractiveServeConfig {
     fn with_overrides(&self, overrides: ServeCommandOverrides) -> Self {
         Self {
@@ -417,6 +422,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
 
     let mut serve_config = InteractiveServeConfig::default();
     let mut runtime_state: Option<InteractiveServeRuntime> = None;
+    let mut grpc_state: Option<InteractiveGrpcRuntime> = None;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
@@ -430,6 +436,11 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
         tokio::select! {
             _ = completion_tick.tick() => {
                 if let Some(message) = maybe_collect_runtime_completion(&mut runtime_state).await {
+                    println!();
+                    println!("{message}");
+                    print_cli_prompt()?;
+                }
+                if let Some(message) = maybe_collect_grpc_completion(&mut grpc_state).await {
                     println!();
                     println!("{message}");
                     print_cli_prompt()?;
@@ -584,15 +595,36 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             println!("Serve runtime: stopped");
                         }
                     }
+                    "grpc-status" => {
+                        if let Some(state) = grpc_state.as_ref() {
+                            println!("gRPC runtime: running (bind={})", state.bind);
+                        } else {
+                            println!("gRPC runtime: stopped");
+                        }
+                    }
                     "stop" => {
+                        let mut stopped_any = false;
+
                         if let Some(state) = runtime_state.take() {
                             println!("Stopping serve runtime...");
                             match stop_interactive_runtime(state).await {
                                 Ok(()) => println!("Serve runtime stopped."),
                                 Err(err) => eprintln!("Error while stopping runtime: {err:#}"),
                             }
-                        } else {
-                            println!("Serve runtime is not running.");
+                            stopped_any = true;
+                        }
+
+                        if let Some(state) = grpc_state.take() {
+                            println!("Stopping gRPC runtime...");
+                            match stop_interactive_grpc(state).await {
+                                Ok(()) => println!("gRPC runtime stopped."),
+                                Err(err) => eprintln!("Error while stopping gRPC runtime: {err:#}"),
+                            }
+                            stopped_any = true;
+                        }
+
+                        if !stopped_any {
+                            println!("No background runtime is running.");
                         }
                     }
                     "serve" | "start" => {
@@ -636,6 +668,50 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             Err(err) => eprintln!("Error: {err:#}"),
                         }
                     }
+                    "grpc-stop" => {
+                        if let Some(state) = grpc_state.take() {
+                            println!("Stopping gRPC runtime...");
+                            match stop_interactive_grpc(state).await {
+                                Ok(()) => println!("gRPC runtime stopped."),
+                                Err(err) => eprintln!("Error while stopping gRPC runtime: {err:#}"),
+                            }
+                        } else {
+                            println!("gRPC runtime is not running.");
+                        }
+                    }
+                    "grpc" | "grpc-start" => {
+                        if tokens
+                            .get(1)
+                            .is_some_and(|arg| arg == "--help" || arg == "-h")
+                        {
+                            print_interactive_grpc_help();
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        if grpc_state.is_some() {
+                            eprintln!("gRPC runtime is already running. Use `grpc-stop` first.");
+                            print_cli_prompt()?;
+                            continue;
+                        }
+
+                        let bind = match parse_grpc_bind(&tokens[1..]) {
+                            Ok(bind) => bind,
+                            Err(err) => {
+                                eprintln!("Error: {err}");
+                                print_cli_prompt()?;
+                                continue;
+                            }
+                        };
+
+                        match start_interactive_grpc(bind.clone(), runtime_paths).await {
+                            Ok(state) => {
+                                grpc_state = Some(state);
+                                println!("gRPC runtime started in background (bind={bind}).");
+                            }
+                            Err(err) => eprintln!("Error: {err:#}"),
+                        }
+                    }
                     _ => {
                         let rewritten = rewrite_repl_aliases(tokens);
                         let parsed = match parse_repl_clap_command(&rewritten) {
@@ -664,6 +740,9 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                 if let Some(message) = maybe_collect_runtime_completion(&mut runtime_state).await {
                     println!("{message}");
                 }
+                if let Some(message) = maybe_collect_grpc_completion(&mut grpc_state).await {
+                    println!("{message}");
+                }
                 print_cli_prompt()?;
             }
         }
@@ -672,6 +751,10 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
     if let Some(state) = runtime_state.take() {
         println!("Stopping serve runtime...");
         let _ = stop_interactive_runtime(state).await;
+    }
+    if let Some(state) = grpc_state.take() {
+        println!("Stopping gRPC runtime...");
+        let _ = stop_interactive_grpc(state).await;
     }
 
     Ok(())
@@ -936,10 +1019,13 @@ fn print_interactive_help() {
     println!("  serve-config                     Print interactive serve defaults");
     println!("  serve-status                     Show background serve runtime status");
     println!("  serve [serve flags]              Start IMAP+SMTP server (background)");
-    println!("  stop                             Stop background serve runtime");
-    println!("  grpc [--bind <addr>]             Start gRPC frontend service (blocking)");
+    println!("  grpc-status                      Show background gRPC runtime status");
+    println!("  grpc [grpc flags]                Start gRPC frontend service (background)");
+    println!("  grpc-stop                        Stop background gRPC runtime");
+    println!("  stop                             Stop all background runtimes");
     println!();
     print_interactive_serve_help();
+    print_interactive_grpc_help();
 }
 
 fn cmd_vault_dump(dir: &std::path::Path) -> anyhow::Result<()> {
@@ -964,6 +1050,27 @@ fn print_interactive_serve_help() {
     println!("  --bind <ip>");
     println!("  --event-poll-secs <seconds>");
     println!("  --no-tls | --tls");
+}
+
+fn print_interactive_grpc_help() {
+    println!("gRPC flags:");
+    println!("  --bind <ip>");
+}
+
+fn parse_grpc_bind(args: &[String]) -> anyhow::Result<String> {
+    if args.is_empty() {
+        return Ok("127.0.0.1".to_string());
+    }
+
+    if args.len() == 2 && args[0] == "--bind" {
+        let bind = args[1].trim();
+        if bind.is_empty() {
+            anyhow::bail!("invalid --bind value");
+        }
+        return Ok(bind.to_string());
+    }
+
+    anyhow::bail!("unsupported grpc option(s); supported: --bind <ip>")
 }
 
 fn print_interactive_serve_config(config: &InteractiveServeConfig) {
@@ -2333,6 +2440,46 @@ async fn maybe_collect_runtime_completion(
     })
 }
 
+async fn start_interactive_grpc(
+    bind: String,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<InteractiveGrpcRuntime> {
+    let runtime_paths = runtime_paths.clone();
+    let bind_for_task = bind.clone();
+    let join_handle = tokio::spawn(async move { cmd_grpc(&bind_for_task, &runtime_paths).await });
+    Ok(InteractiveGrpcRuntime { join_handle, bind })
+}
+
+async fn stop_interactive_grpc(state: InteractiveGrpcRuntime) -> anyhow::Result<()> {
+    if !state.join_handle.is_finished() {
+        state.join_handle.abort();
+    }
+
+    match state.join_handle.await {
+        Ok(result) => result,
+        Err(err) if err.is_cancelled() => Ok(()),
+        Err(err) => Err(anyhow::Error::new(err).context("gRPC runtime join failed")),
+    }
+}
+
+async fn maybe_collect_grpc_completion(
+    grpc_state: &mut Option<InteractiveGrpcRuntime>,
+) -> Option<String> {
+    let is_finished = grpc_state
+        .as_ref()
+        .is_some_and(|state| state.join_handle.is_finished());
+    if !is_finished {
+        return None;
+    }
+
+    let state = grpc_state.take()?;
+    Some(match state.join_handle.await {
+        Ok(Ok(())) => "gRPC runtime exited.".to_string(),
+        Ok(Err(err)) => format!("gRPC runtime exited with error: {err:#}"),
+        Err(err) => format!("gRPC runtime task join error: {err}"),
+    })
+}
+
 async fn cmd_grpc(bind: &str, runtime_paths: &paths::RuntimePaths) -> anyhow::Result<()> {
     frontend::grpc::run_server(runtime_paths.clone(), bind.to_string()).await
 }
@@ -2670,6 +2817,21 @@ mod tests {
         assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(parsed.event_poll_secs, Some(12));
         assert_eq!(parsed.no_tls, Some(true));
+    }
+
+    #[test]
+    fn parse_grpc_bind_defaults_and_accepts_bind_flag() {
+        assert_eq!(parse_grpc_bind(&[]).unwrap(), "127.0.0.1".to_string());
+        assert_eq!(
+            parse_grpc_bind(&["--bind".to_string(), "0.0.0.0".to_string()]).unwrap(),
+            "0.0.0.0".to_string()
+        );
+    }
+
+    #[test]
+    fn parse_grpc_bind_rejects_unsupported_args() {
+        assert!(parse_grpc_bind(&["--port".to_string(), "8080".to_string()]).is_err());
+        assert!(parse_grpc_bind(&["--bind".to_string()]).is_err());
     }
 
     #[test]

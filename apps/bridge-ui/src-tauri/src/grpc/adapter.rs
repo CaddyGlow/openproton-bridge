@@ -174,7 +174,9 @@ impl GrpcAdapter {
                 client
                     .run_event_stream(Request::new(request))
                     .await
-                    .map_err(|retry_err| format!("RunEventStream failed after stop retry: {retry_err}"))?
+                    .map_err(|retry_err| {
+                        format!("RunEventStream failed after stop retry: {retry_err}")
+                    })?
                     .into_inner()
             }
             Err(err) => {
@@ -710,6 +712,13 @@ impl GrpcAdapter {
 }
 
 async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, String> {
+    if config.cert.trim().is_empty() || config.token.trim().is_empty() {
+        return Err(
+            "grpc config is missing cert/token (likely grpcFocusServerConfig.json); bridge API requires grpcServerConfig.json"
+                .to_string(),
+        );
+    }
+
     let socket_path = config
         .file_socket_path
         .as_deref()
@@ -749,13 +758,16 @@ async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, Strin
     Err("grpc config is missing both port and fileSocketPath".to_string())
 }
 
-async fn connect_client_via_tcp(config: &GrpcServerConfig, port: u16) -> Result<BridgeClient, String> {
+async fn connect_client_via_tcp(
+    config: &GrpcServerConfig,
+    port: u16,
+) -> Result<BridgeClient, String> {
     let endpoint_url = format!("https://127.0.0.1:{port}");
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(config.cert.clone()))
         .domain_name("127.0.0.1");
 
-    let endpoint = Endpoint::from_shared(endpoint_url)
+    let endpoint = Endpoint::from_shared(endpoint_url.clone())
         .map_err(|err| format!("invalid grpc endpoint: {err}"))?
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(30))
@@ -765,7 +777,7 @@ async fn connect_client_via_tcp(config: &GrpcServerConfig, port: u16) -> Result<
     let channel = endpoint
         .connect()
         .await
-        .map_err(|err| format!("failed to connect grpc channel: {err}"))?;
+        .map_err(|err| format!("failed to connect grpc tcp channel ({endpoint_url}): {err}"))?;
 
     let interceptor = TokenInterceptor::new(&config.token)?;
 
@@ -781,6 +793,7 @@ async fn connect_client_via_unix_socket(
     socket_path: &str,
 ) -> Result<BridgeClient, String> {
     let socket_path = PathBuf::from(socket_path);
+    let socket_path_display = socket_path.display().to_string();
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(config.cert.clone()))
         .domain_name("127.0.0.1");
@@ -802,7 +815,9 @@ async fn connect_client_via_unix_socket(
     let channel = endpoint
         .connect_with_connector(connector)
         .await
-        .map_err(|err| format!("failed to connect grpc unix socket channel: {err}"))?;
+        .map_err(|err| {
+            format!("failed to connect grpc unix socket channel ({socket_path_display}): {err}")
+        })?;
 
     let interceptor = TokenInterceptor::new(&config.token)?;
 
@@ -1058,7 +1073,10 @@ fn stream_ui_event(event: &pb::StreamEvent) -> Option<UiEvent> {
                 level: "error".to_string(),
                 code: "user_bad_event".to_string(),
                 message: user_bad.error_message.clone(),
-                refresh_hints: vec!["users".to_string(), format!("sync_user:{}", user_bad.user_id)],
+                refresh_hints: vec![
+                    "users".to_string(),
+                    format!("sync_user:{}", user_bad.user_id),
+                ],
             }),
             Some(pb::user_event::Event::ImapLoginFailedEvent(imap_login_failed)) => Some(UiEvent {
                 level: "error".to_string(),
@@ -1272,7 +1290,10 @@ mod tests {
         assert_eq!(ui_event.code, "sync_progress");
         assert_eq!(ui_event.message, "Synchronizing (42%)");
         assert!(ui_event.refresh_hints.iter().any(|hint| hint == "users"));
-        assert!(ui_event.refresh_hints.iter().any(|hint| hint == "sync_user:u1"));
+        assert!(ui_event
+            .refresh_hints
+            .iter()
+            .any(|hint| hint == "sync_user:u1"));
         assert!(ui_event
             .refresh_hints
             .iter()

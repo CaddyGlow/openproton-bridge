@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+const BRIDGE_GRPC_CONFIG_FILE: &str = "grpcServerConfig.json";
+const FOCUS_GRPC_CONFIG_FILE: &str = "grpcFocusServerConfig.json";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GrpcServerConfig {
     pub port: Option<u16>,
@@ -41,7 +44,7 @@ pub fn resolve_server_config_paths(explicit: Option<&Path>) -> Result<Vec<PathBu
         };
     }
 
-    let candidates = default_server_config_candidates();
+    let candidates = default_bridge_config_candidates();
     let mut existing = Vec::new();
     for path in candidates {
         if path.exists() && !existing.iter().any(|candidate| candidate == &path) {
@@ -49,14 +52,40 @@ pub fn resolve_server_config_paths(explicit: Option<&Path>) -> Result<Vec<PathBu
         }
     }
 
-    if existing.is_empty() {
-        Err("could not resolve grpcServerConfig.json path".to_string())
-    } else {
-        Ok(existing)
+    if !existing.is_empty() {
+        return Ok(existing);
     }
+
+    let mut focus_only = Vec::new();
+    for path in default_focus_config_candidates() {
+        if path.exists() && !focus_only.iter().any(|candidate| candidate == &path) {
+            focus_only.push(path);
+        }
+    }
+
+    if !focus_only.is_empty() {
+        let found = focus_only
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "found {FOCUS_GRPC_CONFIG_FILE} ({found}) but missing {BRIDGE_GRPC_CONFIG_FILE}; focus config does not expose the bridge API"
+        ));
+    }
+
+    Err(format!("could not resolve {BRIDGE_GRPC_CONFIG_FILE} path"))
 }
 
-fn default_server_config_candidates() -> Vec<PathBuf> {
+fn default_bridge_config_candidates() -> Vec<PathBuf> {
+    default_config_candidates_for(BRIDGE_GRPC_CONFIG_FILE)
+}
+
+fn default_focus_config_candidates() -> Vec<PathBuf> {
+    default_config_candidates_for(FOCUS_GRPC_CONFIG_FILE)
+}
+
+fn default_config_candidates_for(file_name: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
     if let Ok(path) = std::env::var("OPENPROTON_BRIDGE_GRPC_CONFIG") {
@@ -69,16 +98,12 @@ fn default_server_config_candidates() -> Vec<PathBuf> {
             config_home
                 .join("protonmail")
                 .join("bridge-v3")
-                .join("grpcServerConfig.json"),
+                .join(file_name),
         );
-        candidates.push(
-            config_home
-                .join("openproton-bridge")
-                .join("grpcServerConfig.json"),
-        );
+        candidates.push(config_home.join("openproton-bridge").join(file_name));
     }
 
-    candidates.push(PathBuf::from("grpcServerConfig.json"));
+    candidates.push(PathBuf::from(file_name));
     candidates
 }
 

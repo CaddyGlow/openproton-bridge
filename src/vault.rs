@@ -1813,18 +1813,25 @@ fn save_session_internal(
         data.settings.gluon_dir = normalize_gluon_dir_for_storage(dir, None);
     }
     let session_email = normalize_email(&session.email);
+    let canonical_user_id = normalized_non_empty(canonical_user_id);
 
     // Find existing user by email, or append new
     let ud = if canonical_user_id.is_some() {
-        session_to_userdata_with_user_id(session, canonical_user_id)
+        session_to_userdata_with_user_id(session, canonical_user_id.as_deref())
     } else {
         session_to_userdata(session)
     };
-    if let Some(existing) = data
+    let existing_idx = data
         .users
-        .iter_mut()
-        .find(|u| normalize_email(&u.primary_email) == session_email)
-    {
+        .iter()
+        .position(|u| u.auth_uid == session.uid)
+        .or_else(|| {
+            data.users
+                .iter()
+                .position(|u| normalize_email(&u.primary_email) == session_email)
+        });
+    if let Some(existing_idx) = existing_idx {
+        let existing = &mut data.users[existing_idx];
         existing.primary_email = session.email.clone();
         existing.auth_uid = ud.auth_uid;
         existing.auth_ref = ud.auth_ref;
@@ -1836,8 +1843,8 @@ fn save_session_internal(
         }
         existing.username = ud.username;
         existing.api_mode = ud.api_mode;
-        if let Some(user_id) = normalized_non_empty(canonical_user_id) {
-            existing.user_id = user_id;
+        if let Some(user_id) = canonical_user_id.as_ref() {
+            existing.user_id = user_id.clone();
         } else if existing.user_id.trim().is_empty() {
             existing.user_id = ud.user_id;
         }
@@ -1873,6 +1880,22 @@ pub fn load_session_by_email(dir: &Path, email: &str) -> Result<Session> {
         .iter()
         .find(|u| normalize_email(&u.primary_email) == email)
         .ok_or_else(|| VaultError::AccountNotFound(email.clone()))?;
+    Ok(userdata_to_session(ud))
+}
+
+/// Load session for a specific account id (`AuthUID` in the vault).
+pub fn load_session_by_account_id(dir: &Path, account_id: &str) -> Result<Session> {
+    let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    }
+
+    let ud = data
+        .users
+        .iter()
+        .find(|u| u.auth_uid == account_id)
+        .ok_or_else(|| VaultError::AccountNotFound(account_id.to_string()))?;
     Ok(userdata_to_session(ud))
 }
 
@@ -3330,6 +3353,78 @@ path = "custom-vault.key"
         let saved = load_vault_data(tmp.path()).unwrap().unwrap();
         assert_eq!(saved.users.len(), 1);
         assert_eq!(saved.users[0].bridge_pass, b"bridge-populated");
+    }
+
+    #[test]
+    fn test_save_session_matches_existing_user_by_auth_uid_when_email_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x47u8; KEY_LEN];
+
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "user-auth-uid-match".to_string(),
+                username: "Before".to_string(),
+                primary_email: "old-email@proton.me".to_string(),
+                gluon_key: vec![4u8; 32],
+                gluon_ids: HashMap::new(),
+                bridge_pass: b"bridge-old".to_vec(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
+                auth_uid: "uid-auth-match".to_string(),
+                auth_ref: "refresh-before".to_string(),
+                key_pass: b"key-before".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+                extra_fields: HashMap::new(),
+            }],
+            ..VaultData::default()
+        };
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+
+        let updated = Session {
+            uid: "uid-auth-match".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-after".to_string(),
+            email: "new-email@proton.me".to_string(),
+            display_name: "After".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: Some(BASE64.encode(b"key-after")),
+            bridge_password: Some("bridge-new".to_string()),
+        };
+        save_session(&updated, tmp.path()).unwrap();
+
+        let saved = load_vault_data(tmp.path()).unwrap().unwrap();
+        assert_eq!(saved.users.len(), 1);
+        assert_eq!(saved.users[0].primary_email, "new-email@proton.me");
+        assert_eq!(saved.users[0].auth_uid, "uid-auth-match");
+        assert_eq!(saved.users[0].bridge_pass, b"bridge-old");
+    }
+
+    #[test]
+    fn test_load_session_by_account_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = Session {
+            uid: "uid-account-id".to_string(),
+            access_token: "token".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "account-id@proton.me".to_string(),
+            display_name: "Account Id".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        save_session(&session, tmp.path()).unwrap();
+
+        let loaded = load_session_by_account_id(tmp.path(), "uid-account-id").unwrap();
+        assert_eq!(loaded.uid, "uid-account-id");
+        assert_eq!(loaded.email, "account-id@proton.me");
+        assert_eq!(loaded.bridge_password.as_deref(), Some("bridge-pass"));
     }
 
     #[test]

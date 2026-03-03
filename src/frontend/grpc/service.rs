@@ -567,9 +567,14 @@ impl BridgeService {
             derived
         };
 
-        let bridge_password = vault::load_session_by_email(self.settings_dir(), &user.email)
+        let bridge_password = vault::load_session_by_account_id(self.settings_dir(), &uid)
             .ok()
             .and_then(|stored| stored.bridge_password)
+            .or_else(|| {
+                vault::load_session_by_email(self.settings_dir(), &user.email)
+                    .ok()
+                    .and_then(|stored| stored.bridge_password)
+            })
             .unwrap_or_else(generate_bridge_password);
         let session = Session {
             uid: uid.clone(),

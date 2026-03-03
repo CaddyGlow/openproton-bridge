@@ -883,6 +883,28 @@ async fn apply_message_delete(
     Ok(())
 }
 
+async fn run_startup_resync(config: &EventWorkerConfig) -> Result<(), EventWorkerError> {
+    let mut session = config
+        .runtime_accounts
+        .with_valid_access_token(&config.account_id)
+        .await?;
+
+    let base_url = resolve_api_base_url_for_mode(&config.api_base_url, session.api_mode);
+    let mut client = ProtonClient::authenticated_with_mode(
+        &base_url,
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )?;
+
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        "running startup bounded resync"
+    );
+    bounded_resync_account(config, &mut session, &mut client).await
+}
+
 pub async fn poll_account_once(
     config: &EventWorkerConfig,
     last_event_id: &str,
@@ -1030,6 +1052,7 @@ async fn run_event_worker_with_shutdown(
         .flatten()
         .map(|cp| cp.last_event_id)
         .unwrap_or_default();
+    let mut startup_resync_pending = true;
     let mut consecutive_failures = 0u32;
     let mut next_delay = compute_initial_poll_stagger(&config.account_id, poll_interval);
     let mut stats = EventWorkerStats::default();
@@ -1045,6 +1068,80 @@ async fn run_event_worker_with_shutdown(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(next_delay) => {
+                if startup_resync_pending {
+                    match run_startup_resync(&config).await {
+                        Ok(()) => {
+                            let now = unix_now();
+                            let failures_before_recovery = consecutive_failures;
+                            stats.record_success(now);
+                            startup_resync_pending = false;
+                            consecutive_failures = 0;
+                            next_delay = Duration::ZERO;
+                            let _ = config
+                                .runtime_accounts
+                                .set_health(&config.account_id, AccountHealth::Healthy)
+                                .await;
+                            if failures_before_recovery > 0 {
+                                info!(
+                                    account_id = %config.account_id.0,
+                                    account_email = %config.account_email,
+                                    recovered_after_failures = failures_before_recovery,
+                                    poll_attempts = stats.poll_attempts,
+                                    successful_polls = stats.successful_polls,
+                                    failed_polls = stats.failed_polls,
+                                    auth_failures = stats.auth_failures,
+                                    transient_failures = stats.transient_failures,
+                                    permanent_failures = stats.permanent_failures,
+                                    "event worker startup resync recovered"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            let now = unix_now();
+                            let failure_class = classify_worker_failure_class(&err);
+                            stats.record_failure(failure_class, now);
+                            consecutive_failures = consecutive_failures.saturating_add(1);
+                            if let Some(next_health) = classify_worker_health(&err) {
+                                let _ = config
+                                    .runtime_accounts
+                                    .set_health(&config.account_id, next_health)
+                                    .await;
+                            }
+                            let jitter_ms = rand::thread_rng().gen_range(0..=500_u64);
+                            next_delay =
+                                compute_failure_delay(poll_interval, consecutive_failures, jitter_ms);
+                            warn!(
+                                account_id = %config.account_id.0,
+                                account_email = %config.account_email,
+                                error = %err,
+                                failure_class = ?failure_class,
+                                consecutive_failures,
+                                retry_delay_ms = next_delay.as_millis() as u64,
+                                poll_attempts = stats.poll_attempts,
+                                failed_polls = stats.failed_polls,
+                                auth_failures = stats.auth_failures,
+                                transient_failures = stats.transient_failures,
+                                permanent_failures = stats.permanent_failures,
+                                "event worker startup resync failed"
+                            );
+                            if stats.poll_attempts % WORKER_STATS_LOG_EVERY_ATTEMPTS == 0 {
+                                warn!(
+                                    account_id = %config.account_id.0,
+                                    account_email = %config.account_email,
+                                    poll_attempts = stats.poll_attempts,
+                                    successful_polls = stats.successful_polls,
+                                    failed_polls = stats.failed_polls,
+                                    auth_failures = stats.auth_failures,
+                                    transient_failures = stats.transient_failures,
+                                    permanent_failures = stats.permanent_failures,
+                                    "event worker stats"
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 match poll_account_once(&config, &last_event_id).await {
                     Ok(next_event_id) => {
                         let now = unix_now();
@@ -2039,13 +2136,11 @@ mod tests {
 
         let next = poll_account_once(&config, "event-0").await.unwrap();
         assert_eq!(next, "event-1");
-        assert!(
-            store
-                .get_uid("uid-1::INBOX", "msg-page2-0")
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(store
+            .get_uid("uid-1::INBOX", "msg-page2-0")
+            .await
+            .unwrap()
+            .is_some());
 
         let checkpoint = checkpoints
             .load_checkpoint(&AccountId("uid-1".to_string()))
@@ -2612,6 +2707,16 @@ mod tests {
     #[tokio::test]
     async fn worker_group_isolates_unavailable_account_from_healthy_account() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 0,
+                "Messages": []
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/core/v4/events/latest"))
             .and(header("x-pm-uid", "uid-2"))
@@ -2841,6 +2946,16 @@ mod tests {
     async fn vault_checkpoint_restart_continuity_resumes_cursor() {
         let tmp = tempdir().unwrap();
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 0,
+                "Messages": []
+            })))
+            .mount(&server)
+            .await;
         Mock::given(method("GET"))
             .and(path("/core/v4/events/latest"))
             .and(header("x-pm-uid", "uid-1"))
@@ -2880,7 +2995,7 @@ mod tests {
         let checkpoint = wait_for_checkpoint(
             checkpoints.as_ref(),
             &AccountId("uid-1".to_string()),
-            Duration::from_secs(4),
+            Duration::from_secs(8),
         )
         .await
         .expect("first run should persist a checkpoint");
@@ -2929,7 +3044,7 @@ mod tests {
             checkpoints_after_restart.as_ref(),
             &AccountId("uid-1".to_string()),
             "event-2",
-            Duration::from_secs(4),
+            Duration::from_secs(8),
         )
         .await
         .expect("second run should advance checkpoint");

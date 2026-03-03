@@ -2394,9 +2394,14 @@ async fn cmd_login(
     };
 
     // Reuse existing bridge password for cross-bridge compatibility.
-    let bridge_password = vault::load_session_by_email(dir, &user.email)
+    let bridge_password = vault::load_session_by_account_id(dir, &auth.uid)
         .ok()
         .and_then(|stored| stored.bridge_password)
+        .or_else(|| {
+            vault::load_session_by_email(dir, &user.email)
+                .ok()
+                .and_then(|stored| stored.bridge_password)
+        })
         .unwrap_or_else(generate_bridge_password);
 
     // Build session

@@ -2132,6 +2132,21 @@ fn normalize_gluon_id_bindings(
     Ok(normalized)
 }
 
+fn storage_user_id_from_bindings_or_user(
+    user: &UserData,
+    bindings: &HashMap<String, String>,
+) -> String {
+    let mut unique_gluon_ids = bindings.values().cloned().collect::<Vec<_>>();
+    unique_gluon_ids.sort();
+    unique_gluon_ids.dedup();
+
+    if unique_gluon_ids.len() == 1 {
+        return unique_gluon_ids[0].clone();
+    }
+
+    normalized_non_empty(Some(user.user_id.as_str())).unwrap_or_else(|| user.auth_uid.clone())
+}
+
 pub fn load_gluon_store_bootstrap(
     dir: &Path,
     account_ids: &[String],
@@ -2181,8 +2196,7 @@ pub fn load_gluon_store_bootstrap(
 
         let normalized_bindings =
             normalize_gluon_id_bindings(&user.auth_uid, &user.gluon_ids, &mut seen_bindings)?;
-        let storage_user_id = normalized_non_empty(Some(user.user_id.as_str()))
-            .unwrap_or_else(|| user.auth_uid.clone());
+        let storage_user_id = storage_user_id_from_bindings_or_user(user, &normalized_bindings);
 
         accounts.push(GluonAccountBootstrap {
             account_id: user.auth_uid.clone(),
@@ -3425,6 +3439,95 @@ path = "custom-vault.key"
         assert_eq!(loaded.uid, "uid-account-id");
         assert_eq!(loaded.email, "account-id@proton.me");
         assert_eq!(loaded.bridge_password.as_deref(), Some("bridge-pass"));
+    }
+
+    #[test]
+    fn test_load_gluon_store_bootstrap_prefers_single_gluon_id_binding_as_storage_user_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x48u8; KEY_LEN];
+
+        let mut gluon_ids = HashMap::new();
+        gluon_ids.insert(
+            "addr-1".to_string(),
+            "8ba3a45e-7436-4e5e-beed-9f3e87586fa7".to_string(),
+        );
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "GSUTPJyoAwhFA4c53SDx6fp7jiuwGX4fEeFWYxOg-axWhXRbrPi1oSE2N6lDd4VZ26AXhbVhGmV_-q1QcoMISA==".to_string(),
+                username: "User".to_string(),
+                primary_email: "user@proton.me".to_string(),
+                gluon_key: vec![5u8; 32],
+                gluon_ids,
+                bridge_pass: b"bridge-pass".to_vec(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
+                auth_uid: "uid-gluon-binding".to_string(),
+                auth_ref: "refresh".to_string(),
+                key_pass: b"key".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+                extra_fields: HashMap::new(),
+            }],
+            ..VaultData::default()
+        };
+
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+
+        let bootstrap =
+            load_gluon_store_bootstrap(tmp.path(), &["uid-gluon-binding".to_string()]).unwrap();
+        assert_eq!(bootstrap.accounts.len(), 1);
+        assert_eq!(
+            bootstrap.accounts[0].storage_user_id,
+            "8ba3a45e-7436-4e5e-beed-9f3e87586fa7"
+        );
+    }
+
+    #[test]
+    fn test_load_gluon_store_bootstrap_falls_back_to_user_id_when_multiple_gluon_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = [0x49u8; KEY_LEN];
+
+        let mut gluon_ids = HashMap::new();
+        gluon_ids.insert("addr-1".to_string(), "gluon-a".to_string());
+        gluon_ids.insert("addr-2".to_string(), "gluon-b".to_string());
+        let fixture = VaultData {
+            users: vec![UserData {
+                user_id: "canonical-user-id".to_string(),
+                username: "User".to_string(),
+                primary_email: "user@proton.me".to_string(),
+                gluon_key: vec![6u8; 32],
+                gluon_ids,
+                bridge_pass: b"bridge-pass".to_vec(),
+                address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
+                auth_uid: "uid-multi-gluon".to_string(),
+                auth_ref: "refresh".to_string(),
+                key_pass: b"key".to_vec(),
+                sync_status: SyncStatus::default(),
+                event_id: String::new(),
+                last_event_ts: None,
+                sync_state: None,
+                uid_validity: HashMap::new(),
+                should_resync: false,
+                extra_fields: HashMap::new(),
+            }],
+            ..VaultData::default()
+        };
+
+        let encoded = marshal_vault(&fixture, &key).unwrap();
+        std::fs::write(tmp.path().join(VAULT_FILE), encoded).unwrap();
+        std::fs::write(tmp.path().join(KEY_FILE), key).unwrap();
+
+        let bootstrap =
+            load_gluon_store_bootstrap(tmp.path(), &["uid-multi-gluon".to_string()]).unwrap();
+        assert_eq!(bootstrap.accounts.len(), 1);
+        assert_eq!(bootstrap.accounts[0].storage_user_id, "canonical-user-id");
     }
 
     #[test]

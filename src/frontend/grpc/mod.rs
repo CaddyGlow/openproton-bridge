@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -165,6 +165,7 @@ struct GrpcState {
     active_stream_stop: Mutex<Option<watch::Sender<bool>>>,
     pending_login: Mutex<Option<PendingLogin>>,
     pending_hv: Mutex<Option<PendingHumanVerification>>,
+    session_access_tokens: Mutex<HashMap<String, String>>,
     shutdown_tx: watch::Sender<bool>,
     mail_settings: Mutex<StoredMailSettings>,
     app_settings: Mutex<StoredAppSettings>,
@@ -426,13 +427,58 @@ fn status_from_vault_error(err: vault::VaultError) -> Status {
     }
 }
 
-fn session_to_user(session: &Session, split_mode: bool) -> pb::User {
+#[derive(Debug, Clone, Default)]
+struct UserApiData {
+    name: String,
+    display_name: String,
+    used_bytes: i64,
+    total_bytes: i64,
+    max_upload: i64,
+    credit: i64,
+    currency: String,
+    calendar_used_bytes: i64,
+    contact_used_bytes: i64,
+    drive_used_bytes: i64,
+    mail_used_bytes: i64,
+    pass_used_bytes: i64,
+}
+
+impl From<api::types::User> for UserApiData {
+    fn from(user: api::types::User) -> Self {
+        Self {
+            name: user.name,
+            display_name: user.display_name,
+            used_bytes: user.used_space,
+            total_bytes: user.max_space,
+            max_upload: user.max_upload,
+            credit: user.credit,
+            currency: user.currency,
+            calendar_used_bytes: user.product_used_space.calendar,
+            contact_used_bytes: user.product_used_space.contact,
+            drive_used_bytes: user.product_used_space.drive,
+            mail_used_bytes: user.product_used_space.mail,
+            pass_used_bytes: user.product_used_space.pass,
+        }
+    }
+}
+
+fn session_to_user(
+    session: &Session,
+    split_mode: bool,
+    api_data: Option<&UserApiData>,
+) -> pb::User {
     let avatar_text = session
         .email
         .chars()
         .next()
         .map(|c| c.to_ascii_uppercase().to_string())
         .unwrap_or_else(|| "U".to_string());
+    let api_data = api_data.cloned().unwrap_or_default();
+    let display_name = if api_data.display_name.is_empty() {
+        session.display_name.clone()
+    } else {
+        api_data.display_name
+    };
 
     pb::User {
         id: session.uid.clone(),
@@ -440,8 +486,8 @@ fn session_to_user(session: &Session, split_mode: bool) -> pb::User {
         avatar_text,
         state: pb::UserState::Connected as i32,
         split_mode,
-        used_bytes: 0,
-        total_bytes: 0,
+        used_bytes: api_data.used_bytes,
+        total_bytes: api_data.total_bytes,
         password: session
             .bridge_password
             .as_deref()
@@ -449,6 +495,16 @@ fn session_to_user(session: &Session, split_mode: bool) -> pb::User {
             .as_bytes()
             .to_vec(),
         addresses: vec![session.email.clone()],
+        name: api_data.name,
+        display_name,
+        max_upload: api_data.max_upload,
+        credit: api_data.credit,
+        currency: api_data.currency,
+        calendar_used_bytes: api_data.calendar_used_bytes,
+        contact_used_bytes: api_data.contact_used_bytes,
+        drive_used_bytes: api_data.drive_used_bytes,
+        mail_used_bytes: api_data.mail_used_bytes,
+        pass_used_bytes: api_data.pass_used_bytes,
     }
 }
 
@@ -823,6 +879,7 @@ mod tests {
             active_stream_stop: Mutex::new(None),
             pending_login: Mutex::new(None),
             pending_hv: Mutex::new(None),
+            session_access_tokens: Mutex::new(HashMap::new()),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
             sync_workers_enabled: false,
@@ -920,6 +977,72 @@ mod tests {
             status_from_vault_error(vault::VaultError::KeychainAccess("denied".to_string()));
         assert_eq!(keychain_status.code(), tonic::Code::FailedPrecondition);
         assert!(keychain_status.message().contains("denied"));
+    }
+
+    #[test]
+    fn session_to_user_maps_api_metadata_fields() {
+        let session = Session {
+            uid: "uid-1".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-1".to_string(),
+            email: "alice@example.com".to_string(),
+            display_name: "Alice Session".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        let api_data = UserApiData {
+            name: "alice".to_string(),
+            display_name: "Alice API".to_string(),
+            used_bytes: 128,
+            total_bytes: 1024,
+            max_upload: 32,
+            credit: 7,
+            currency: "CHF".to_string(),
+            calendar_used_bytes: 1,
+            contact_used_bytes: 2,
+            drive_used_bytes: 3,
+            mail_used_bytes: 4,
+            pass_used_bytes: 5,
+        };
+
+        let user = session_to_user(&session, true, Some(&api_data));
+        assert_eq!(user.id, "uid-1");
+        assert_eq!(user.username, "alice@example.com");
+        assert!(user.split_mode);
+        assert_eq!(user.used_bytes, 128);
+        assert_eq!(user.total_bytes, 1024);
+        assert_eq!(user.max_upload, 32);
+        assert_eq!(user.credit, 7);
+        assert_eq!(user.currency, "CHF");
+        assert_eq!(user.calendar_used_bytes, 1);
+        assert_eq!(user.contact_used_bytes, 2);
+        assert_eq!(user.drive_used_bytes, 3);
+        assert_eq!(user.mail_used_bytes, 4);
+        assert_eq!(user.pass_used_bytes, 5);
+        assert_eq!(user.name, "alice");
+        assert_eq!(user.display_name, "Alice API");
+        assert_eq!(user.password, b"bridge-pass");
+    }
+
+    #[test]
+    fn session_to_user_falls_back_to_session_display_name_without_api_metadata() {
+        let session = Session {
+            uid: "uid-2".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-2".to_string(),
+            email: "bob@example.com".to_string(),
+            display_name: "Bob Session".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+
+        let user = session_to_user(&session, false, None);
+        assert_eq!(user.display_name, "Bob Session");
+        assert_eq!(user.used_bytes, 0);
+        assert_eq!(user.total_bytes, 0);
+        assert_eq!(user.password, b"");
     }
 
     #[tokio::test]

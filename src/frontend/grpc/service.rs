@@ -359,6 +359,161 @@ impl BridgeService {
         }));
     }
 
+    async fn cache_session_access_token(&self, session: &Session) {
+        if session.uid.trim().is_empty() || session.access_token.trim().is_empty() {
+            return;
+        }
+        self.state
+            .session_access_tokens
+            .lock()
+            .await
+            .insert(session.uid.clone(), session.access_token.clone());
+    }
+
+    async fn remove_session_access_token(&self, user_id: &str) {
+        self.state.session_access_tokens.lock().await.remove(user_id);
+    }
+
+    async fn clear_session_access_tokens(&self) {
+        self.state.session_access_tokens.lock().await.clear();
+    }
+
+    async fn resolve_session_access_token(&self, session: &Session) -> Option<String> {
+        if !session.access_token.trim().is_empty() {
+            return Some(session.access_token.clone());
+        }
+        self.state
+            .session_access_tokens
+            .lock()
+            .await
+            .get(&session.uid)
+            .cloned()
+    }
+
+    async fn refresh_session_access_token(&self, session: &Session) -> Option<String> {
+        if cfg!(test) || session.uid.trim().is_empty() || session.refresh_token.trim().is_empty() {
+            return None;
+        }
+
+        let mut client = ProtonClient::with_api_mode(session.api_mode).ok()?;
+        let refreshed = match api::auth::refresh_auth(
+            &mut client,
+            &session.uid,
+            &session.refresh_token,
+            None,
+        )
+        .await
+        {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to refresh access token for grpc user metadata"
+                );
+                return None;
+            }
+        };
+
+        if refreshed.access_token.trim().is_empty() {
+            return None;
+        }
+
+        let mut updated = session.clone();
+        updated.access_token = refreshed.access_token.clone();
+        updated.refresh_token = refreshed.refresh_token;
+        if let Err(err) = vault::save_session(&updated, self.settings_dir()) {
+            warn!(
+                user_id = %session.uid,
+                error = %err,
+                "failed to persist refreshed session context"
+            );
+        }
+
+        self.cache_session_access_token(&updated).await;
+        Some(updated.access_token)
+    }
+
+    async fn fetch_user_api_data(&self, session: &Session) -> Option<UserApiData> {
+        if cfg!(test) {
+            return None;
+        }
+
+        let mut access_token = self.resolve_session_access_token(session).await;
+        if access_token.is_none() {
+            access_token = self.refresh_session_access_token(session).await;
+        }
+        let Some(mut access_token) = access_token else {
+            return None;
+        };
+
+        let first_attempt = {
+            let mut client = match ProtonClient::with_api_mode(session.api_mode) {
+                Ok(client) => client,
+                Err(err) => {
+                    warn!(
+                        user_id = %session.uid,
+                        error = %err,
+                        "failed to initialize grpc metadata client"
+                    );
+                    return None;
+                }
+            };
+            client.set_auth(&session.uid, &access_token);
+            api::users::get_user(&client).await.map(|resp| resp.user.into())
+        };
+
+        match first_attempt {
+            Ok(api_data) => return Some(api_data),
+            Err(err) if api::error::is_auth_error(&err) => {
+                self.remove_session_access_token(&session.uid).await;
+                if let Some(refreshed_token) = self.refresh_session_access_token(session).await {
+                    access_token = refreshed_token;
+                } else {
+                    warn!(
+                        user_id = %session.uid,
+                        error = %err,
+                        "failed to fetch grpc user metadata with cached token"
+                    );
+                    return None;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to fetch grpc user metadata"
+                );
+                return None;
+            }
+        }
+
+        let mut client = match ProtonClient::with_api_mode(session.api_mode) {
+            Ok(client) => client,
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to initialize grpc metadata client after refresh"
+                );
+                return None;
+            }
+        };
+        client.set_auth(&session.uid, &access_token);
+
+        match api::users::get_user(&client).await.map(|resp| resp.user.into()) {
+            Ok(api_data) => Some(api_data),
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to fetch grpc user metadata after token refresh"
+                );
+                None
+            }
+        }
+    }
+
     async fn complete_login(
         &self,
         mut client: ProtonClient,
@@ -420,6 +575,7 @@ impl BridgeService {
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
 
         client.set_auth(&session.uid, &session.access_token);
+        self.cache_session_access_token(&session).await;
 
         self.emit_login_finished(&session.uid);
         self.emit_user_changed(&session.uid);

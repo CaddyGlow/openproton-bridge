@@ -100,6 +100,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
         let _ = tokio::fs::remove_file(self.grpc_app_settings_path()).await;
+        self.clear_session_access_tokens().await;
         *self.state.pending_login.lock().await = None;
         *self.state.pending_hv.lock().await = None;
         self.refresh_sync_workers_for_transition("trigger_reset")
@@ -709,17 +710,15 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<pb::UserListResponse>, Status> {
         let sessions = vault::list_sessions(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
-        let users = sessions
-            .iter()
-            .map(|session| {
-                let split_mode =
-                    vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
-                        .ok()
-                        .flatten()
-                        .unwrap_or(false);
-                session_to_user(session, split_mode)
-            })
-            .collect();
+        let mut users = Vec::with_capacity(sessions.len());
+        for session in &sessions {
+            let split_mode = vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
+                .ok()
+                .flatten()
+                .unwrap_or(false);
+            let api_data = self.fetch_user_api_data(session).await;
+            users.push(session_to_user(session, split_mode, api_data.as_ref()));
+        }
         Ok(Response::new(pb::UserListResponse { users }))
     }
 
@@ -735,7 +734,12 @@ impl pb::bridge_server::Bridge for BridgeService {
             .ok()
             .flatten()
             .unwrap_or(false);
-        Ok(Response::new(session_to_user(session, split_mode)))
+        let api_data = self.fetch_user_api_data(session).await;
+        Ok(Response::new(session_to_user(
+            session,
+            split_mode,
+            api_data.as_ref(),
+        )))
     }
 
     async fn set_user_split_mode(
@@ -792,6 +796,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        self.remove_session_access_token(&session.uid).await;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("send_bad_event_user_feedback_logout")
             .await;
@@ -809,6 +814,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        self.remove_session_access_token(&session.uid).await;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("logout_user")
             .await;

@@ -172,6 +172,18 @@ pub struct User {
     pub display_name: String,
     pub email: String,
     pub keys: Vec<UserKey>,
+    #[serde(default)]
+    pub used_space: i64,
+    #[serde(default)]
+    pub max_space: i64,
+    #[serde(default)]
+    pub max_upload: i64,
+    #[serde(default)]
+    pub credit: i64,
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default)]
+    pub product_used_space: ProductUsedSpace,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +193,21 @@ pub struct UserKey {
     pub id: String,
     pub private_key: String,
     pub active: i32,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ProductUsedSpace {
+    #[serde(default)]
+    pub calendar: i64,
+    #[serde(default)]
+    pub contact: i64,
+    #[serde(default)]
+    pub drive: i64,
+    #[serde(default)]
+    pub mail: i64,
+    #[serde(default)]
+    pub pass: i64,
 }
 
 /// API response from GET /core/v4/addresses

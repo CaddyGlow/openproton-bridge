@@ -82,6 +82,7 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         active_stream_stop: Mutex::new(None),
         pending_login: Mutex::new(None),
         pending_hv: Mutex::new(None),
+        session_access_tokens: Mutex::new(HashMap::new()),
         shutdown_tx: shutdown_tx.clone(),
         mail_settings: Mutex::new(settings),
         app_settings: Mutex::new(app_settings),

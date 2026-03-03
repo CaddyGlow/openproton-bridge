@@ -60,6 +60,18 @@ mod tests {
                     "Name": "testuser",
                     "DisplayName": "Test User",
                     "Email": "test@proton.me",
+                    "UsedSpace": 1024,
+                    "MaxSpace": 2048,
+                    "MaxUpload": 512,
+                    "Credit": 42,
+                    "Currency": "EUR",
+                    "ProductUsedSpace": {
+                        "Calendar": 11,
+                        "Contact": 12,
+                        "Drive": 13,
+                        "Mail": 14,
+                        "Pass": 15
+                    },
                     "Keys": []
                 }
             })))
@@ -70,6 +82,16 @@ mod tests {
         assert_eq!(resp.user.id, "user-123");
         assert_eq!(resp.user.name, "testuser");
         assert_eq!(resp.user.email, "test@proton.me");
+        assert_eq!(resp.user.used_space, 1024);
+        assert_eq!(resp.user.max_space, 2048);
+        assert_eq!(resp.user.max_upload, 512);
+        assert_eq!(resp.user.credit, 42);
+        assert_eq!(resp.user.currency, "EUR");
+        assert_eq!(resp.user.product_used_space.calendar, 11);
+        assert_eq!(resp.user.product_used_space.contact, 12);
+        assert_eq!(resp.user.product_used_space.drive, 13);
+        assert_eq!(resp.user.product_used_space.mail, 14);
+        assert_eq!(resp.user.product_used_space.pass, 15);
     }
 
     #[tokio::test]

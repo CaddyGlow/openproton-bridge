@@ -1,0 +1,145 @@
+{
+  "ticket": "BE-016",
+  "frozen_on": "2026-03-03",
+  "upstream": {
+    "proton_bridge": {
+      "repo": "https://github.com/ProtonMail/proton-bridge",
+      "branch": "master",
+      "commit": "92305960372cbe7a7e7acf3debb3c19c5e82bfb1",
+      "go_mod_gluon_requirement": "github.com/ProtonMail/gluon v0.17.1-0.20260112123503-2046c95ca745",
+      "evidence": [
+        "go.mod:10",
+        "internal/services/imapsmtpserver/imap.go:129",
+        "internal/services/imapsmtpserver/imap.go:130"
+      ]
+    },
+    "gluon": {
+      "repo": "https://github.com/ProtonMail/gluon",
+      "branch": "dev",
+      "commit": "2046c95ca7455812254eaef2f77da0aaaee3fae1",
+      "evidence": [
+        "internal/db_impl/sqlite3/client.go:57",
+        "internal/db_impl/sqlite3/client.go:274",
+        "store/disk.go:82",
+        "store/disk.go:316",
+        "db/client.go:25"
+      ]
+    }
+  },
+  "required_file_families": [
+    {
+      "family_id": "gluon_message_store_files",
+      "description": "Encrypted message blobs stored per Gluon user ID.",
+      "path_patterns": [
+        "<gluon_cache_root>/backend/store/<gluon_user_id>/<internal_message_id>"
+      ],
+      "required_for": [
+        "read",
+        "write",
+        "delete"
+      ],
+      "upstream_evidence": [
+        "gluon/store/disk.go:82",
+        "gluon/store/disk.go:157",
+        "gluon/store/disk.go:269",
+        "proton-bridge/internal/services/imapsmtpserver/imap.go:129"
+      ]
+    },
+    {
+      "family_id": "gluon_sqlite_primary_db",
+      "description": "Primary per-user SQLite database file used for mailbox and message metadata.",
+      "path_patterns": [
+        "<gluon_cache_root>/backend/db/<gluon_user_id>.db"
+      ],
+      "required_for": [
+        "read",
+        "write"
+      ],
+      "upstream_evidence": [
+        "gluon/internal/db_impl/sqlite3/client.go:274",
+        "proton-bridge/internal/services/imapsmtpserver/imap.go:130"
+      ]
+    },
+    {
+      "family_id": "gluon_sqlite_wal_sidecars",
+      "description": "SQLite WAL sidecars produced by mandatory WAL journal mode.",
+      "path_patterns": [
+        "<gluon_cache_root>/backend/db/<gluon_user_id>.db-wal",
+        "<gluon_cache_root>/backend/db/<gluon_user_id>.db-shm"
+      ],
+      "required_for": [
+        "read",
+        "write",
+        "recovery"
+      ],
+      "upstream_evidence": [
+        "gluon/internal/db_impl/sqlite3/client.go:57",
+        "gluon/internal/db_impl/sqlite3/client.go:290"
+      ]
+    },
+    {
+      "family_id": "gluon_deferred_delete_pool",
+      "description": "Deferred delete directory for sqlite files that cannot be removed immediately.",
+      "path_patterns": [
+        "<gluon_cache_root>/backend/db/deferred_delete/*"
+      ],
+      "required_for": [
+        "delete",
+        "recovery"
+      ],
+      "upstream_evidence": [
+        "gluon/db/client.go:25",
+        "gluon/db/deferred_delete.go:23"
+      ]
+    },
+    {
+      "family_id": "imap_sync_state_files",
+      "description": "Bridge IMAP sync state sidecar required for deterministic resume and bad-event handling.",
+      "path_patterns": [
+        "<settings_root>/sync-<user_id>",
+        "<settings_root>/sync-<user_id>.tmp"
+      ],
+      "required_for": [
+        "startup",
+        "recovery"
+      ],
+      "upstream_evidence": [
+        "proton-bridge/internal/services/imapservice/service.go:706",
+        "proton-bridge/internal/services/imapservice/sync_state_provider.go:178",
+        "proton-bridge/internal/services/imapservice/sync_state_provider.go:184"
+      ]
+    }
+  ],
+  "compatibility_matrix": [
+    {
+      "family_id": "gluon_message_store_files",
+      "openproton_target": "Required (Read/Write/Delete)",
+      "status": "Planned",
+      "notes": "Must preserve Gluon encrypted blob semantics; no JSON projection or migration path."
+    },
+    {
+      "family_id": "gluon_sqlite_primary_db",
+      "openproton_target": "Required (Read/Write)",
+      "status": "Planned",
+      "notes": "Must open existing per-user sqlite DBs directly from backend/db."
+    },
+    {
+      "family_id": "gluon_sqlite_wal_sidecars",
+      "openproton_target": "Required (Read/Write/Recovery)",
+      "status": "Planned",
+      "notes": "WAL sidecars are mandatory because upstream enables journal_mode=WAL at init."
+    },
+    {
+      "family_id": "gluon_deferred_delete_pool",
+      "openproton_target": "Required (Delete/Recovery)",
+      "status": "Planned",
+      "notes": "Delete flow must keep deferred-delete semantics for locked sqlite files."
+    },
+    {
+      "family_id": "imap_sync_state_files",
+      "openproton_target": "Required (Startup/Recovery)",
+      "status": "Planned",
+      "notes": "Sidecar controls sync resume invariants and bad-event recovery path."
+    }
+  ]
+}

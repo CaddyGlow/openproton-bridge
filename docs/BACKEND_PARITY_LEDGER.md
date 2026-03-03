@@ -1,6 +1,6 @@
 # Backend RPC/Event Parity Ledger
 
-Updated: 2026-03-02
+Updated: 2026-03-03
 
 Scope:
 - Proto: `proto/bridge.proto`
@@ -12,6 +12,25 @@ Notes:
 - `Partial` means callable but intentionally reduced behavior (known parity gap).
 - `Behavior Mismatch` means implemented but visible semantics still diverge from Proton Bridge.
 - `Missing` means not implemented (none currently for declared RPCs).
+
+## Gluon Compatibility Freeze (BE-016)
+
+Frozen metadata source:
+- `tests/fixtures/gluon_compatibility_target.json`
+
+Pinned upstream references:
+- `ProtonMail/proton-bridge@92305960372cbe7a7e7acf3debb3c19c5e82bfb1` (`master`)
+- `ProtonMail/gluon@2046c95ca7455812254eaef2f77da0aaaee3fae1` (pinned by upstream `go.mod`)
+
+Frozen family matrix:
+
+| Family | Status | Notes |
+| --- | --- | --- |
+| `gluon_message_store_files` | Planned | Required for encrypted message blob read/write/delete parity. |
+| `gluon_sqlite_primary_db` | Planned | Required for mailbox/message metadata parity. |
+| `gluon_sqlite_wal_sidecars` | Planned | Required for WAL-mode durability/recovery parity. |
+| `gluon_deferred_delete_pool` | Planned | Required for deferred cleanup semantics under DB lock contention. |
+| `imap_sync_state_files` | Planned | Required for sync resume and bad-event recovery parity. |
 
 ## RPC Ledger
 

@@ -1,0 +1,50 @@
+{
+  "ticket": "BE-017",
+  "captured_on": "2026-03-03",
+  "compatibility_target_fixture": "tests/fixtures/gluon_compatibility_target.json",
+  "fixture_name": "proton_profile_gluon_sanitized",
+  "fixture_root": "tests/fixtures/proton_profile_gluon_sanitized",
+  "sanitization": {
+    "redacted_patterns": [
+      "email addresses",
+      "secret key/value fields",
+      "hex-like long identifiers in filenames"
+    ],
+    "notes": "Fixture content is sanitized to support deterministic integration tests without leaking account secrets."
+  },
+  "captured_families": [
+    {
+      "family_id": "gluon_message_store_files",
+      "paths": [
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/store/user-redacted/00000001.msg"
+      ]
+    },
+    {
+      "family_id": "gluon_sqlite_primary_db",
+      "paths": [
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db"
+      ]
+    },
+    {
+      "family_id": "gluon_sqlite_wal_sidecars",
+      "paths": [
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db-shm",
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db-wal"
+      ]
+    },
+    {
+      "family_id": "gluon_deferred_delete_pool",
+      "paths": [
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/db/deferred_delete/user-redacted.db.1700000000"
+      ]
+    },
+    {
+      "family_id": "imap_sync_state_files",
+      "paths": [
+        "tests/fixtures/proton_profile_gluon_sanitized/sync-user-redacted",
+        "tests/fixtures/proton_profile_gluon_sanitized/sync-user-redacted.tmp"
+      ]
+    }
+  ],
+  "example_command": "python3 scripts/capture_gluon_fixture.py --source-profile /tmp/proton-profile --output-dir tests/fixtures/proton_profile_gluon_sanitized --manifest-out tests/fixtures/gluon_fixture_manifest.json"
+}

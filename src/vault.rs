@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,11 +19,13 @@ use crate::api::types::{ApiMode, Session};
 
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
+const GLUON_KEY_LEN: usize = 32;
 const VAULT_FILE: &str = "vault.enc";
 const KEY_FILE: &str = "vault.key";
 const DEFAULT_EMAIL_FILE: &str = "default_email";
 const KEYCHAIN_SETTINGS_FILE: &str = "keychain.json";
 const CREDENTIAL_STORE_CONFIG_FILE: &str = "credential_store.toml";
+const DEFAULT_GLUON_DIR: &str = "gluon";
 const VAULT_VERSION: i32 = 2;
 const ADDRESS_MODE_COMBINED: i32 = 0;
 const ADDRESS_MODE_SPLIT: i32 = 1;
@@ -460,6 +462,20 @@ pub enum VaultError {
     MissingVaultKey,
     #[error("keychain access failed: {0}")]
     KeychainAccess(String),
+    #[error("gluon key is missing for account: {0}")]
+    MissingGluonKey(String),
+    #[error("invalid gluon key length {length} for account {account_id}; expected 32 bytes")]
+    InvalidGluonKeyLength { account_id: String, length: usize },
+    #[error("invalid gluon id binding for account {account_id}: {reason}")]
+    InvalidGluonIdBinding { account_id: String, reason: String },
+    #[error(
+        "mismatched gluon id binding for address {address_id}: expected {expected}, found {actual}"
+    )]
+    MismatchedGluonIdBinding {
+        address_id: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, VaultError>;
@@ -469,6 +485,20 @@ pub struct StoredEventCheckpoint {
     pub last_event_id: String,
     pub last_event_ts: Option<i64>,
     pub sync_state: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GluonAccountBootstrap {
+    pub account_id: String,
+    pub storage_user_id: String,
+    pub gluon_key: [u8; GLUON_KEY_LEN],
+    pub gluon_ids: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GluonStoreBootstrap {
+    pub gluon_dir: String,
+    pub accounts: Vec<GluonAccountBootstrap>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1510,7 +1540,7 @@ fn session_to_userdata(session: &Session) -> UserData {
     OsRng.fill_bytes(&mut gluon_key);
 
     UserData {
-        user_id: String::new(),
+        user_id: session.uid.clone(),
         username: session.display_name.clone(),
         primary_email: session.email.clone(),
         gluon_key,
@@ -1665,6 +1695,9 @@ pub fn load_vault_msgpack_value(dir: &Path) -> Result<MsgpackValue> {
 
 pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
     let mut data = load_vault_data(dir)?.unwrap_or_default();
+    if data.settings.gluon_dir.trim().is_empty() {
+        data.settings.gluon_dir = DEFAULT_GLUON_DIR.to_string();
+    }
     let session_email = normalize_email(&session.email);
 
     // Find existing user by email, or append new
@@ -1907,6 +1940,138 @@ pub fn save_split_mode_by_account_id(dir: &Path, account_id: &str, enabled: bool
         return Err(VaultError::AccountNotFound(account_id.to_string()));
     };
     user.address_mode = split_to_address_mode(enabled);
+    save_vault_data(dir, &data)
+}
+
+fn normalize_gluon_id_bindings(
+    account_id: &str,
+    bindings: &HashMap<String, String>,
+    seen_bindings: &mut HashMap<String, String>,
+) -> Result<HashMap<String, String>> {
+    let mut normalized = HashMap::with_capacity(bindings.len());
+
+    for (address_id_raw, gluon_id_raw) in bindings {
+        let Some(address_id) = normalized_non_empty(Some(address_id_raw.as_str())) else {
+            return Err(VaultError::InvalidGluonIdBinding {
+                account_id: account_id.to_string(),
+                reason: "address id cannot be empty".to_string(),
+            });
+        };
+        let Some(gluon_id) = normalized_non_empty(Some(gluon_id_raw.as_str())) else {
+            return Err(VaultError::InvalidGluonIdBinding {
+                account_id: account_id.to_string(),
+                reason: format!("gluon id cannot be empty for address {address_id}"),
+            });
+        };
+
+        if let Some(expected) = seen_bindings.get(&address_id) {
+            if expected != &gluon_id {
+                return Err(VaultError::MismatchedGluonIdBinding {
+                    address_id,
+                    expected: expected.clone(),
+                    actual: gluon_id,
+                });
+            }
+        } else {
+            seen_bindings.insert(address_id.clone(), gluon_id.clone());
+        }
+
+        normalized.insert(address_id, gluon_id);
+    }
+
+    Ok(normalized)
+}
+
+pub fn load_gluon_store_bootstrap(dir: &Path, account_ids: &[String]) -> Result<GluonStoreBootstrap> {
+    let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let gluon_dir = normalized_non_empty(Some(data.settings.gluon_dir.as_str()))
+        .unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());
+
+    let requested_accounts_source: Vec<String> = if account_ids.is_empty() {
+        data.users
+            .iter()
+            .map(|user| user.auth_uid.clone())
+            .collect::<Vec<_>>()
+    } else {
+        account_ids.to_vec()
+    };
+
+    let mut requested_accounts = Vec::new();
+    let mut seen_accounts = HashSet::new();
+    for account_id_raw in requested_accounts_source {
+        if let Some(account_id) = normalized_non_empty(Some(account_id_raw.as_str())) {
+            if seen_accounts.insert(account_id.clone()) {
+                requested_accounts.push(account_id);
+            }
+        }
+    }
+
+    let mut seen_bindings = HashMap::new();
+    let mut accounts = Vec::with_capacity(requested_accounts.len());
+
+    for account_id in requested_accounts {
+        let Some(user) = data.users.iter().find(|user| user.auth_uid == account_id) else {
+            return Err(VaultError::AccountNotFound(account_id));
+        };
+
+        if user.gluon_key.is_empty() {
+            return Err(VaultError::MissingGluonKey(account_id));
+        }
+        if user.gluon_key.len() != GLUON_KEY_LEN {
+            return Err(VaultError::InvalidGluonKeyLength {
+                account_id,
+                length: user.gluon_key.len(),
+            });
+        }
+
+        let mut gluon_key = [0u8; GLUON_KEY_LEN];
+        gluon_key.copy_from_slice(&user.gluon_key);
+
+        let normalized_bindings =
+            normalize_gluon_id_bindings(&user.auth_uid, &user.gluon_ids, &mut seen_bindings)?;
+        let storage_user_id = normalized_non_empty(Some(user.user_id.as_str()))
+            .unwrap_or_else(|| user.auth_uid.clone());
+
+        accounts.push(GluonAccountBootstrap {
+            account_id: user.auth_uid.clone(),
+            storage_user_id,
+            gluon_key,
+            gluon_ids: normalized_bindings,
+        });
+    }
+
+    Ok(GluonStoreBootstrap {
+        gluon_dir,
+        accounts,
+    })
+}
+
+pub fn save_gluon_dir(dir: &Path, gluon_dir: &str) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    data.settings.gluon_dir =
+        normalized_non_empty(Some(gluon_dir)).unwrap_or_else(|| DEFAULT_GLUON_DIR.to_string());
+    save_vault_data(dir, &data)
+}
+
+pub fn set_gluon_key_by_account_id(dir: &Path, account_id: &str, gluon_key: Vec<u8>) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter_mut().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+    user.gluon_key = gluon_key;
+    save_vault_data(dir, &data)
+}
+
+pub fn save_gluon_id_bindings_by_account_id(
+    dir: &Path,
+    account_id: &str,
+    bindings: HashMap<String, String>,
+) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter_mut().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+    user.gluon_ids = bindings;
     save_vault_data(dir, &data)
 }
 

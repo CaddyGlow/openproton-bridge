@@ -4,6 +4,19 @@ use anyhow::Context;
 
 const PROTON_VENDOR_DIR: &str = "protonmail";
 const BRIDGE_CONFIG_DIR: &str = "bridge-v3";
+const GLUON_DIR: &str = "gluon";
+const GLUON_BACKEND_DIR: &str = "backend";
+const GLUON_STORE_DIR: &str = "store";
+const GLUON_DB_DIR: &str = "db";
+const GLUON_DEFERRED_DELETE_DIR: &str = "deferred_delete";
+
+fn is_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+}
 
 /// Runtime filesystem paths modeled after Proton Bridge locations.
 ///
@@ -21,6 +34,49 @@ pub struct RuntimePaths {
     settings_dir: PathBuf,
     data_dir: PathBuf,
     cache_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GluonPaths {
+    root: PathBuf,
+}
+
+impl GluonPaths {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn backend_store_dir(&self) -> PathBuf {
+        self.root.join(GLUON_BACKEND_DIR).join(GLUON_STORE_DIR)
+    }
+
+    pub fn backend_db_dir(&self) -> PathBuf {
+        self.root.join(GLUON_BACKEND_DIR).join(GLUON_DB_DIR)
+    }
+
+    pub fn account_store_dir(&self, gluon_user_id: &str) -> PathBuf {
+        self.backend_store_dir().join(gluon_user_id)
+    }
+
+    pub fn account_db_path(&self, gluon_user_id: &str) -> PathBuf {
+        self.backend_db_dir().join(format!("{gluon_user_id}.db"))
+    }
+
+    pub fn account_db_wal_path(&self, gluon_user_id: &str) -> PathBuf {
+        self.backend_db_dir().join(format!("{gluon_user_id}.db-wal"))
+    }
+
+    pub fn account_db_shm_path(&self, gluon_user_id: &str) -> PathBuf {
+        self.backend_db_dir().join(format!("{gluon_user_id}.db-shm"))
+    }
+
+    pub fn deferred_delete_dir(&self) -> PathBuf {
+        self.backend_db_dir().join(GLUON_DEFERRED_DELETE_DIR)
+    }
 }
 
 impl RuntimePaths {
@@ -93,6 +149,40 @@ impl RuntimePaths {
     pub fn disk_cache_dir(&self) -> PathBuf {
         self.settings_dir.join("cache")
     }
+
+    pub fn default_gluon_dir(&self) -> PathBuf {
+        self.data_dir.join(GLUON_DIR)
+    }
+
+    pub fn resolve_gluon_dir(&self, configured_gluon_dir: Option<&str>) -> PathBuf {
+        let configured = configured_gluon_dir
+            .map(str::trim)
+            .filter(|path| !path.is_empty());
+
+        match configured {
+            Some(raw) => {
+                let path = PathBuf::from(raw);
+                if path.is_absolute() || is_windows_absolute_path(raw) {
+                    path
+                } else {
+                    self.data_dir.join(path)
+                }
+            }
+            None => self.default_gluon_dir(),
+        }
+    }
+
+    pub fn gluon_paths(&self, configured_gluon_dir: Option<&str>) -> GluonPaths {
+        GluonPaths::new(self.resolve_gluon_dir(configured_gluon_dir))
+    }
+
+    pub fn sync_state_path(&self, account_id: &str) -> PathBuf {
+        self.settings_dir.join(format!("sync-{account_id}"))
+    }
+
+    pub fn sync_state_tmp_path(&self, account_id: &str) -> PathBuf {
+        self.settings_dir.join(format!("sync-{account_id}.tmp"))
+    }
 }
 
 #[cfg(test)]
@@ -163,6 +253,66 @@ mod tests {
         assert_eq!(
             paths.disk_cache_dir(),
             Path::new("/cfg/protonmail/bridge-v3/cache")
+        );
+    }
+
+    #[test]
+    fn gluon_paths_default_to_data_root_gluon_directory() {
+        let paths = RuntimePaths::from_bases(
+            PathBuf::from("/cfg"),
+            PathBuf::from("/data"),
+            PathBuf::from("/cache"),
+        );
+        let gluon = paths.gluon_paths(None);
+
+        assert_eq!(gluon.root(), Path::new("/data/protonmail/bridge-v3/gluon"));
+        assert_eq!(
+            gluon.backend_store_dir(),
+            Path::new("/data/protonmail/bridge-v3/gluon/backend/store")
+        );
+        assert_eq!(
+            gluon.backend_db_dir(),
+            Path::new("/data/protonmail/bridge-v3/gluon/backend/db")
+        );
+        assert_eq!(
+            gluon.account_db_path("user-1"),
+            Path::new("/data/protonmail/bridge-v3/gluon/backend/db/user-1.db")
+        );
+        assert_eq!(
+            gluon.deferred_delete_dir(),
+            Path::new("/data/protonmail/bridge-v3/gluon/backend/db/deferred_delete")
+        );
+    }
+
+    #[test]
+    fn sync_state_paths_are_account_scoped() {
+        let paths = RuntimePaths::from_bases(
+            PathBuf::from("/cfg"),
+            PathBuf::from("/data"),
+            PathBuf::from("/cache"),
+        );
+
+        assert_eq!(
+            paths.sync_state_path("uid-alpha"),
+            Path::new("/cfg/protonmail/bridge-v3/sync-uid-alpha")
+        );
+        assert_eq!(
+            paths.sync_state_tmp_path("uid-alpha"),
+            Path::new("/cfg/protonmail/bridge-v3/sync-uid-alpha.tmp")
+        );
+    }
+
+    #[test]
+    fn resolve_gluon_dir_accepts_windows_drive_override() {
+        let paths = RuntimePaths::from_bases(
+            PathBuf::from("/cfg"),
+            PathBuf::from("/data"),
+            PathBuf::from("/cache"),
+        );
+
+        assert_eq!(
+            paths.resolve_gluon_dir(Some("D:/BridgeCache/gluon")),
+            Path::new("D:/BridgeCache/gluon")
         );
     }
 }

@@ -3382,6 +3382,28 @@ async fn prepare_serve_runtime(
     let runtime_snapshot = runtime_accounts.snapshot().await;
     let api_base_url = "https://mail-api.proton.me".to_string();
 
+    let bootstrap_account_ids = active_sessions
+        .iter()
+        .map(|session| session.uid.clone())
+        .collect::<Vec<_>>();
+    let gluon_bootstrap = vault::load_gluon_store_bootstrap(dir, &bootstrap_account_ids)
+        .context("failed to resolve gluon vault bindings for store bootstrap")?;
+    let gluon_paths = runtime_paths.gluon_paths(Some(gluon_bootstrap.gluon_dir.as_str()));
+    tracing::debug!(
+        gluon_dir = %gluon_paths.root().display(),
+        accounts = gluon_bootstrap.accounts.len(),
+        "resolved gluon store bootstrap context"
+    );
+    for account in &gluon_bootstrap.accounts {
+        tracing::debug!(
+            account_id = %account.account_id,
+            storage_user_id = %account.storage_user_id,
+            store_path = %gluon_paths.account_store_dir(&account.storage_user_id).display(),
+            db_path = %gluon_paths.account_db_path(&account.storage_user_id).display(),
+            "resolved account-scoped gluon layout"
+        );
+    }
+
     let store_root = effective_disk_cache_path(runtime_paths).join("imap-store");
     let store: Arc<dyn imap::store::MessageStore> =
         imap::store::PersistentStore::new(store_root)

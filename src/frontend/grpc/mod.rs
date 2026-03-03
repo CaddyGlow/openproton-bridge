@@ -320,6 +320,31 @@ async fn maybe_start_grpc_sync_workers(
         return Ok(None);
     }
 
+    let bootstrap_account_ids = runtime_snapshot
+        .iter()
+        .map(|account| account.account_id.0.clone())
+        .collect::<Vec<_>>();
+    let gluon_bootstrap = vault::load_gluon_store_bootstrap(
+        runtime_paths.settings_dir(),
+        &bootstrap_account_ids,
+    )
+    .context("failed to resolve gluon vault bindings for grpc store bootstrap")?;
+    let gluon_paths = runtime_paths.gluon_paths(Some(gluon_bootstrap.gluon_dir.as_str()));
+    debug!(
+        gluon_dir = %gluon_paths.root().display(),
+        accounts = gluon_bootstrap.accounts.len(),
+        "resolved grpc gluon store bootstrap context"
+    );
+    for account in &gluon_bootstrap.accounts {
+        debug!(
+            account_id = %account.account_id,
+            storage_user_id = %account.storage_user_id,
+            store_path = %gluon_paths.account_store_dir(&account.storage_user_id).display(),
+            db_path = %gluon_paths.account_db_path(&account.storage_user_id).display(),
+            "resolved grpc account-scoped gluon layout"
+        );
+    }
+
     let store_root = active_disk_cache_path.join("imap-store");
     let store: Arc<dyn crate::imap::store::MessageStore> =
         crate::imap::store::PersistentStore::new(store_root)?;
@@ -422,6 +447,26 @@ fn status_from_vault_error(err: vault::VaultError) -> Status {
         ),
         vault::VaultError::KeychainAccess(message) => Status::failed_precondition(format!(
             "keychain access failed while loading existing vault: {message}"
+        )),
+        vault::VaultError::MissingGluonKey(account_id) => {
+            Status::failed_precondition(format!("gluon key is missing for account: {account_id}"))
+        }
+        vault::VaultError::InvalidGluonKeyLength { account_id, length } => {
+            Status::failed_precondition(format!(
+                "invalid gluon key length {length} for account {account_id}; expected 32 bytes"
+            ))
+        }
+        vault::VaultError::InvalidGluonIdBinding { account_id, reason } => {
+            Status::failed_precondition(format!(
+                "invalid gluon id binding for account {account_id}: {reason}"
+            ))
+        }
+        vault::VaultError::MismatchedGluonIdBinding {
+            address_id,
+            expected,
+            actual,
+        } => Status::failed_precondition(format!(
+            "mismatched gluon id binding for address {address_id}: expected {expected}, found {actual}"
         )),
         other => Status::internal(format!("vault error: {other}")),
     }

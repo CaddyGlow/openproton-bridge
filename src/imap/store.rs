@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -199,6 +199,369 @@ impl PersistentStore {
 
         Ok(())
     }
+}
+
+const GLUON_BACKEND_DIR: &str = "backend";
+const GLUON_STORE_DIR: &str = "store";
+const GLUON_INDEX_FILE_NAME: &str = ".openproton-mailbox-index.json";
+const GLUON_DEFAULT_ACCOUNT_SCOPE: &str = "__default__";
+const GLUON_DEFAULT_MAILBOX: &str = "INBOX";
+const GLUON_INDEX_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GluonMailboxData {
+    #[serde(default)]
+    uid_validity: u32,
+    #[serde(default)]
+    next_uid: u32,
+    #[serde(default)]
+    proton_to_uid: HashMap<String, u32>,
+    #[serde(default)]
+    uid_to_proton: HashMap<u32, String>,
+    #[serde(default)]
+    metadata: HashMap<u32, MessageMetadata>,
+    #[serde(default)]
+    flags: HashMap<u32, Vec<String>>,
+    #[serde(default)]
+    uid_order: Vec<u32>,
+    #[serde(default)]
+    mod_seq: u64,
+    #[serde(default)]
+    uid_to_blob: HashMap<u32, String>,
+}
+
+impl GluonMailboxData {
+    fn new() -> Self {
+        Self {
+            uid_validity: current_uid_validity(),
+            next_uid: 1,
+            proton_to_uid: HashMap::new(),
+            uid_to_proton: HashMap::new(),
+            metadata: HashMap::new(),
+            flags: HashMap::new(),
+            uid_order: Vec::new(),
+            mod_seq: 0,
+            uid_to_blob: HashMap::new(),
+        }
+    }
+
+    fn sanitize(&mut self) {
+        if self.uid_validity == 0 {
+            self.uid_validity = current_uid_validity();
+        }
+        if self.next_uid == 0 {
+            self.next_uid = 1;
+        }
+
+        let mut seen = HashSet::new();
+        self.uid_order.retain(|uid| seen.insert(*uid));
+
+        let max_uid = self
+            .uid_to_proton
+            .keys()
+            .chain(self.metadata.keys())
+            .chain(self.flags.keys())
+            .chain(self.uid_to_blob.keys())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        if max_uid >= self.next_uid {
+            self.next_uid = max_uid.saturating_add(1);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GluonAccountIndexFile {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    next_blob_id: u64,
+    #[serde(default)]
+    mailboxes: HashMap<String, GluonMailboxData>,
+}
+
+impl GluonAccountIndexFile {
+    fn new() -> Self {
+        Self {
+            version: GLUON_INDEX_VERSION,
+            next_blob_id: 1,
+            mailboxes: HashMap::new(),
+        }
+    }
+
+    fn sanitize(&mut self) {
+        if self.version == 0 {
+            self.version = GLUON_INDEX_VERSION;
+        }
+        if self.next_blob_id == 0 {
+            self.next_blob_id = 1;
+        }
+        for mailbox in self.mailboxes.values_mut() {
+            mailbox.sanitize();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GluonAccountState {
+    next_blob_id: u64,
+    mailboxes: HashMap<String, GluonMailboxData>,
+}
+
+pub struct GluonStore {
+    root: PathBuf,
+    account_storage_ids: HashMap<String, String>,
+    accounts: RwLock<HashMap<String, GluonAccountState>>,
+    txn_manager: super::gluon_txn::GluonTxnManager,
+}
+
+impl GluonStore {
+    pub fn new(root: PathBuf, account_storage_ids: HashMap<String, String>) -> Result<Arc<Self>> {
+        std::fs::create_dir_all(root.join(GLUON_BACKEND_DIR).join(GLUON_STORE_DIR))?;
+        let txn_manager = super::gluon_txn::GluonTxnManager::new(&root).map_err(|err| {
+            super::ImapError::Protocol(format!("failed to initialize gluon txn manager: {err}"))
+        })?;
+        if let Err(err) = txn_manager.recover_pending_all() {
+            warn!(error = %err, "failed to recover pending gluon transactions at startup");
+        }
+        Ok(Arc::new(Self {
+            root,
+            account_storage_ids,
+            accounts: RwLock::new(HashMap::new()),
+            txn_manager,
+        }))
+    }
+
+    fn split_scoped_mailbox(mailbox: &str) -> (String, String) {
+        match mailbox.split_once("::") {
+            Some((account_id, mailbox_name)) if !account_id.is_empty() => {
+                let mailbox_name = if mailbox_name.is_empty() {
+                    GLUON_DEFAULT_MAILBOX.to_string()
+                } else {
+                    mailbox_name.to_string()
+                };
+                (account_id.to_string(), mailbox_name)
+            }
+            _ => (GLUON_DEFAULT_ACCOUNT_SCOPE.to_string(), mailbox.to_string()),
+        }
+    }
+
+    fn storage_user_id_for_account(&self, account_id: &str) -> String {
+        self.account_storage_ids
+            .get(account_id)
+            .cloned()
+            .unwrap_or_else(|| account_id.to_string())
+    }
+
+    fn account_store_dir(&self, storage_user_id: &str) -> PathBuf {
+        self.root
+            .join(GLUON_BACKEND_DIR)
+            .join(GLUON_STORE_DIR)
+            .join(storage_user_id)
+    }
+
+    fn account_index_path(&self, storage_user_id: &str) -> PathBuf {
+        self.account_store_dir(storage_user_id)
+            .join(GLUON_INDEX_FILE_NAME)
+    }
+
+    fn account_rel_store_dir(storage_user_id: &str) -> PathBuf {
+        Path::new(GLUON_BACKEND_DIR)
+            .join(GLUON_STORE_DIR)
+            .join(storage_user_id)
+    }
+
+    fn account_index_rel_path(storage_user_id: &str) -> PathBuf {
+        Self::account_rel_store_dir(storage_user_id).join(GLUON_INDEX_FILE_NAME)
+    }
+
+    fn message_rel_path(storage_user_id: &str, blob_name: &str) -> PathBuf {
+        Self::account_rel_store_dir(storage_user_id).join(blob_name)
+    }
+
+    fn empty_account_state() -> GluonAccountState {
+        GluonAccountState {
+            next_blob_id: 1,
+            mailboxes: HashMap::new(),
+        }
+    }
+
+    fn to_index_file(account: &GluonAccountState) -> GluonAccountIndexFile {
+        GluonAccountIndexFile {
+            version: GLUON_INDEX_VERSION,
+            next_blob_id: account.next_blob_id,
+            mailboxes: account.mailboxes.clone(),
+        }
+    }
+
+    fn persist_account(
+        &self,
+        storage_user_id: &str,
+        account: &GluonAccountState,
+        message_writes: &[(PathBuf, Vec<u8>)],
+    ) -> Result<()> {
+        let mut txn = self.txn_manager.begin(storage_user_id).map_err(|err| {
+            super::ImapError::Protocol(format!("failed to begin gluon txn: {err}"))
+        })?;
+
+        for (relative_path, bytes) in message_writes {
+            txn.stage_write(relative_path, bytes).map_err(|err| {
+                super::ImapError::Protocol(format!(
+                    "failed to stage gluon message blob {}: {err}",
+                    relative_path.display()
+                ))
+            })?;
+        }
+
+        let index_payload = serde_json::to_vec(&Self::to_index_file(account)).map_err(|err| {
+            super::ImapError::Protocol(format!(
+                "failed to serialize gluon mailbox index for account {storage_user_id}: {err}"
+            ))
+        })?;
+        txn.stage_write(Self::account_index_rel_path(storage_user_id), index_payload)
+            .map_err(|err| {
+                super::ImapError::Protocol(format!(
+                    "failed to stage gluon mailbox index for account {storage_user_id}: {err}"
+                ))
+            })?;
+
+        txn.commit()
+            .map_err(|err| super::ImapError::Protocol(format!("failed to commit gluon txn: {err}")))
+    }
+
+    fn default_blob_name_for_uid(uid: u32) -> String {
+        format!("{uid:08}.msg")
+    }
+
+    fn blob_counter_from_name(name: &str) -> Option<u64> {
+        let path = Path::new(name);
+        let stem = path.file_stem()?.to_string_lossy();
+        stem.parse::<u64>().ok()
+    }
+
+    fn uid_from_blob_name(name: &str) -> Option<u32> {
+        let path = Path::new(name);
+        if path.extension().and_then(|ext| ext.to_str()) != Some("msg") {
+            return None;
+        }
+        let stem = path.file_stem()?.to_string_lossy();
+        stem.parse::<u32>().ok()
+    }
+
+    fn load_account_from_disk(&self, storage_user_id: &str) -> Result<GluonAccountState> {
+        let account_dir = self.account_store_dir(storage_user_id);
+        std::fs::create_dir_all(&account_dir)?;
+
+        let index_path = self.account_index_path(storage_user_id);
+        let mut index = if index_path.exists() {
+            let payload = std::fs::read(&index_path)?;
+            serde_json::from_slice::<GluonAccountIndexFile>(&payload).map_err(|err| {
+                super::ImapError::Protocol(format!(
+                    "failed to parse gluon mailbox index {}: {err}",
+                    index_path.display()
+                ))
+            })?
+        } else {
+            GluonAccountIndexFile::new()
+        };
+
+        index.sanitize();
+
+        if index.mailboxes.is_empty() {
+            let mut discovered = Vec::new();
+            for entry in std::fs::read_dir(&account_dir)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+                    continue;
+                };
+                let Some(uid) = Self::uid_from_blob_name(&name) else {
+                    continue;
+                };
+                discovered.push((uid, name));
+            }
+
+            discovered.sort_unstable_by_key(|(uid, _)| *uid);
+            if !discovered.is_empty() {
+                let mut inbox = GluonMailboxData::new();
+                for (uid, name) in discovered {
+                    inbox.uid_order.push(uid);
+                    inbox.uid_to_blob.insert(uid, name);
+                }
+                if let Some(last_uid) = inbox.uid_order.last().copied() {
+                    inbox.next_uid = last_uid.saturating_add(1);
+                }
+                index
+                    .mailboxes
+                    .insert(GLUON_DEFAULT_MAILBOX.to_string(), inbox);
+            }
+        }
+
+        let mut max_blob_id = index.next_blob_id;
+        for mailbox in index.mailboxes.values() {
+            for name in mailbox.uid_to_blob.values() {
+                if let Some(blob_id) = Self::blob_counter_from_name(name) {
+                    max_blob_id = max_blob_id.max(blob_id.saturating_add(1));
+                }
+            }
+        }
+        if max_blob_id == 0 {
+            max_blob_id = 1;
+        }
+
+        Ok(GluonAccountState {
+            next_blob_id: max_blob_id,
+            mailboxes: index.mailboxes,
+        })
+    }
+
+    async fn ensure_account_loaded(&self, storage_user_id: &str) -> Result<()> {
+        {
+            let accounts = self.accounts.read().await;
+            if accounts.contains_key(storage_user_id) {
+                return Ok(());
+            }
+        }
+
+        let loaded = self.load_account_from_disk(storage_user_id)?;
+
+        let mut accounts = self.accounts.write().await;
+        accounts
+            .entry(storage_user_id.to_string())
+            .or_insert(loaded);
+        Ok(())
+    }
+
+    async fn resolve_scope(&self, mailbox: &str) -> Result<(String, String)> {
+        let (account_id, mailbox_name) = Self::split_scoped_mailbox(mailbox);
+        let storage_user_id = self.storage_user_id_for_account(&account_id);
+        self.ensure_account_loaded(&storage_user_id).await?;
+        Ok((storage_user_id, mailbox_name))
+    }
+}
+
+fn current_uid_validity() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as u32
+}
+
+fn unseen_count(mailbox: &GluonMailboxData) -> u32 {
+    let explicit_unseen = mailbox
+        .flags
+        .values()
+        .filter(|flags| !flags.iter().any(|flag| flag == "\\Seen"))
+        .count() as u32;
+    let inferred_unseen = mailbox
+        .metadata
+        .iter()
+        .filter(|(uid, meta)| !mailbox.flags.contains_key(uid) && meta.unread != 0)
+        .count() as u32;
+    explicit_unseen + inferred_unseen
 }
 
 #[async_trait]
@@ -489,6 +852,352 @@ impl MessageStore for PersistentStore {
 
     async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
         self.inner.uid_to_seq(mailbox, uid).await
+    }
+}
+
+#[async_trait]
+impl MessageStore for GluonStore {
+    async fn store_metadata(
+        &self,
+        mailbox: &str,
+        proton_id: &str,
+        meta: MessageMetadata,
+    ) -> Result<u32> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let mut accounts = self.accounts.write().await;
+        let mut next_state = accounts
+            .get(&storage_user_id)
+            .cloned()
+            .unwrap_or_else(Self::empty_account_state);
+
+        let mailbox = next_state
+            .mailboxes
+            .entry(mailbox_name)
+            .or_insert_with(GluonMailboxData::new);
+
+        let uid = if let Some(existing_uid) = mailbox.proton_to_uid.get(proton_id).copied() {
+            mailbox.metadata.insert(existing_uid, meta);
+            mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+            existing_uid
+        } else {
+            let assigned_uid = mailbox.next_uid;
+            mailbox.next_uid = mailbox.next_uid.saturating_add(1);
+            mailbox
+                .proton_to_uid
+                .insert(proton_id.to_string(), assigned_uid);
+            mailbox
+                .uid_to_proton
+                .insert(assigned_uid, proton_id.to_string());
+            mailbox.uid_order.push(assigned_uid);
+            mailbox.metadata.insert(assigned_uid, meta);
+            mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+            assigned_uid
+        };
+
+        self.persist_account(&storage_user_id, &next_state, &[])?;
+        accounts.insert(storage_user_id, next_state);
+        Ok(uid)
+    }
+
+    async fn get_metadata(&self, mailbox: &str, uid: u32) -> Result<Option<MessageMetadata>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        Ok(accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+            .and_then(|mailbox| mailbox.metadata.get(&uid).cloned()))
+    }
+
+    async fn get_proton_id(&self, mailbox: &str, uid: u32) -> Result<Option<String>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        Ok(accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+            .and_then(|mailbox| mailbox.uid_to_proton.get(&uid).cloned()))
+    }
+
+    async fn get_uid(&self, mailbox: &str, proton_id: &str) -> Result<Option<u32>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        Ok(accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+            .and_then(|mailbox| mailbox.proton_to_uid.get(proton_id).copied()))
+    }
+
+    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let mut accounts = self.accounts.write().await;
+        let mut next_state = accounts
+            .get(&storage_user_id)
+            .cloned()
+            .unwrap_or_else(Self::empty_account_state);
+        let mut writes = Vec::new();
+
+        let mailbox = next_state
+            .mailboxes
+            .entry(mailbox_name)
+            .or_insert_with(GluonMailboxData::new);
+        if uid >= mailbox.next_uid {
+            mailbox.next_uid = uid.saturating_add(1);
+        }
+        if !mailbox.uid_order.contains(&uid) {
+            mailbox.uid_order.push(uid);
+        }
+
+        let blob_name = if let Some(existing) = mailbox.uid_to_blob.get(&uid).cloned() {
+            existing
+        } else {
+            let name = format!("{:08}.msg", next_state.next_blob_id);
+            next_state.next_blob_id = next_state.next_blob_id.saturating_add(1);
+            mailbox.uid_to_blob.insert(uid, name.clone());
+            name
+        };
+        mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        writes.push((Self::message_rel_path(&storage_user_id, &blob_name), data));
+
+        self.persist_account(&storage_user_id, &next_state, &writes)?;
+        accounts.insert(storage_user_id, next_state);
+        Ok(())
+    }
+
+    async fn get_rfc822(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let account_dir = self.account_store_dir(&storage_user_id);
+
+        let blob_path = {
+            let accounts = self.accounts.read().await;
+            accounts
+                .get(&storage_user_id)
+                .and_then(|account| account.mailboxes.get(&mailbox_name))
+                .and_then(|mailbox| mailbox.uid_to_blob.get(&uid).cloned())
+                .map(|name| account_dir.join(name))
+                .unwrap_or_else(|| account_dir.join(Self::default_blob_name_for_uid(uid)))
+        };
+
+        if !blob_path.exists() {
+            return Ok(None);
+        }
+
+        Ok(Some(std::fs::read(blob_path)?))
+    }
+
+    async fn list_uids(&self, mailbox: &str) -> Result<Vec<u32>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        Ok(accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+            .map(|mailbox| mailbox.uid_order.clone())
+            .unwrap_or_default())
+    }
+
+    async fn mailbox_status(&self, mailbox: &str) -> Result<MailboxStatus> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        let Some(account) = accounts.get(&storage_user_id) else {
+            return Ok(MailboxStatus {
+                uid_validity: current_uid_validity(),
+                next_uid: 1,
+                exists: 0,
+                unseen: 0,
+            });
+        };
+
+        let Some(mailbox) = account.mailboxes.get(&mailbox_name) else {
+            return Ok(MailboxStatus {
+                uid_validity: current_uid_validity(),
+                next_uid: 1,
+                exists: 0,
+                unseen: 0,
+            });
+        };
+
+        Ok(MailboxStatus {
+            uid_validity: mailbox.uid_validity,
+            next_uid: mailbox.next_uid,
+            exists: mailbox.uid_order.len() as u32,
+            unseen: unseen_count(mailbox),
+        })
+    }
+
+    async fn mailbox_snapshot(&self, mailbox: &str) -> Result<MailboxSnapshot> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        let Some(mailbox) = accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+        else {
+            return Ok(MailboxSnapshot {
+                exists: 0,
+                mod_seq: 0,
+            });
+        };
+
+        Ok(MailboxSnapshot {
+            exists: mailbox.uid_order.len() as u32,
+            mod_seq: mailbox.mod_seq,
+        })
+    }
+
+    async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let mut accounts = self.accounts.write().await;
+        let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
+            return Ok(());
+        };
+        let mut next_state = current_state;
+        if let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) {
+            mailbox.flags.insert(uid, flags);
+            mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        } else {
+            return Ok(());
+        }
+
+        self.persist_account(&storage_user_id, &next_state, &[])?;
+        accounts.insert(storage_user_id, next_state);
+        Ok(())
+    }
+
+    async fn add_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let mut accounts = self.accounts.write().await;
+        let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
+            return Ok(());
+        };
+        let mut next_state = current_state;
+        let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) else {
+            return Ok(());
+        };
+
+        let entry = mailbox.flags.entry(uid).or_default();
+        let before = entry.len();
+        for flag in flags {
+            if !entry.contains(flag) {
+                entry.push(flag.clone());
+            }
+        }
+        if entry.len() == before {
+            return Ok(());
+        }
+
+        mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        self.persist_account(&storage_user_id, &next_state, &[])?;
+        accounts.insert(storage_user_id, next_state);
+        Ok(())
+    }
+
+    async fn remove_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let mut accounts = self.accounts.write().await;
+        let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
+            return Ok(());
+        };
+        let mut next_state = current_state;
+        let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) else {
+            return Ok(());
+        };
+
+        let Some(current_flags) = mailbox.flags.get_mut(&uid) else {
+            return Ok(());
+        };
+        let before = current_flags.len();
+        current_flags.retain(|flag| !flags.contains(flag));
+        if current_flags.len() == before {
+            return Ok(());
+        }
+
+        mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        self.persist_account(&storage_user_id, &next_state, &[])?;
+        accounts.insert(storage_user_id, next_state);
+        Ok(())
+    }
+
+    async fn get_flags(&self, mailbox: &str, uid: u32) -> Result<Vec<String>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        if let Some(mailbox) = accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+        {
+            if let Some(flags) = mailbox.flags.get(&uid) {
+                return Ok(flags.clone());
+            }
+            if let Some(meta) = mailbox.metadata.get(&uid) {
+                let flags = super::mailbox::message_flags(meta)
+                    .iter()
+                    .map(|flag| flag.to_string())
+                    .collect();
+                return Ok(flags);
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    async fn remove_message(&self, mailbox: &str, uid: u32) -> Result<()> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let mut accounts = self.accounts.write().await;
+        let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
+            return Ok(());
+        };
+        let mut next_state = current_state;
+        let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) else {
+            return Ok(());
+        };
+
+        if let Some(proton_id) = mailbox.uid_to_proton.remove(&uid) {
+            mailbox.proton_to_uid.remove(&proton_id);
+        }
+        mailbox.metadata.remove(&uid);
+        mailbox.flags.remove(&uid);
+        let removed_blob = mailbox.uid_to_blob.remove(&uid);
+        mailbox.uid_order.retain(|known_uid| *known_uid != uid);
+        mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+
+        self.persist_account(&storage_user_id, &next_state, &[])?;
+        accounts.insert(storage_user_id.clone(), next_state);
+
+        if let Some(blob_name) = removed_blob {
+            let blob_path = self.account_store_dir(&storage_user_id).join(blob_name);
+            if let Err(err) = std::fs::remove_file(&blob_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        error = %err,
+                        path = %blob_path.display(),
+                        "failed to delete gluon message blob after commit"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn seq_to_uid(&self, mailbox: &str, seq: u32) -> Result<Option<u32>> {
+        if seq == 0 {
+            return Ok(None);
+        }
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        Ok(accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+            .and_then(|mailbox| mailbox.uid_order.get(seq as usize - 1).copied()))
+    }
+
+    async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
+        let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        let accounts = self.accounts.read().await;
+        Ok(accounts
+            .get(&storage_user_id)
+            .and_then(|account| account.mailboxes.get(&mailbox_name))
+            .and_then(|mailbox| {
+                mailbox
+                    .uid_order
+                    .iter()
+                    .position(|known| *known == uid)
+                    .map(|index| index as u32 + 1)
+            }))
     }
 }
 

@@ -719,6 +719,7 @@ async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, Strin
         );
     }
 
+    let tcp_port = config.port.filter(|port| *port != 0);
     let socket_path = config
         .file_socket_path
         .as_deref()
@@ -730,7 +731,7 @@ async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, Strin
         match connect_client_via_unix_socket(config, socket_path).await {
             Ok(client) => return Ok(client),
             Err(unix_err) => {
-                if let Some(port) = config.port {
+                if let Some(port) = tcp_port {
                     debug!(
                         socket_path,
                         port,
@@ -751,11 +752,11 @@ async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, Strin
         debug!("grpc unix socket configured but unsupported on this platform; using tcp");
     }
 
-    if let Some(port) = config.port {
+    if let Some(port) = tcp_port {
         return connect_client_via_tcp(config, port).await;
     }
 
-    Err("grpc config is missing both port and fileSocketPath".to_string())
+    Err("grpc config is missing a usable endpoint (fileSocketPath and non-zero port)".to_string())
 }
 
 async fn connect_client_via_tcp(

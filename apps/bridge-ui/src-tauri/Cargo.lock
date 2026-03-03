@@ -216,6 +216,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "tauri",

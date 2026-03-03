@@ -21,7 +21,10 @@ fn user_state_label(state: i32) -> &'static str {
     }
 }
 
-fn build_tray_menu<R: Runtime>(app: &AppHandle<R>, users: &[UserSummary]) -> tauri::Result<Menu<R>> {
+fn build_tray_menu<R: Runtime>(
+    app: &AppHandle<R>,
+    users: &[UserSummary],
+) -> tauri::Result<Menu<R>> {
     let menu = Menu::new(app)?;
 
     for user in users {
@@ -51,7 +54,10 @@ fn build_tray_menu<R: Runtime>(app: &AppHandle<R>, users: &[UserSummary]) -> tau
     Ok(menu)
 }
 
-pub fn refresh_tray_users<R: Runtime>(app: &AppHandle<R>, users: &[UserSummary]) -> tauri::Result<()> {
+pub fn refresh_tray_users<R: Runtime>(
+    app: &AppHandle<R>,
+    users: &[UserSummary],
+) -> tauri::Result<()> {
     let menu = build_tray_menu(app, users)?;
     if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
         tray.set_menu(Some(menu))?;

@@ -138,6 +138,7 @@
   let disconnectedUsernames = $state<Record<string, boolean>>({})
   let clientConfigWizardOpen = $state(false)
   let clientConfigUserId = $state('')
+  let selectedAccountKey = $state('')
   let clientConfigPassword = $state('generated app password')
 
   function normalizeThemeMode(value: string | undefined): ThemeMode {
@@ -214,7 +215,34 @@
     return trimmed.charAt(0).toUpperCase()
   }
 
+  function formatStorage(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes <= 0) {
+      return '0 B'
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB']
+    let value = bytes
+    let unitIndex = 0
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024
+      unitIndex += 1
+    }
+    const decimals = value >= 100 || unitIndex === 0 ? 0 : 1
+    return `${value.toFixed(decimals)} ${units[unitIndex]}`
+  }
+
+  function accountStorageSummary(user: UserSummary): string | null {
+    if (!Number.isFinite(user.total_bytes) || user.total_bytes <= 0) {
+      return null
+    }
+    return `${formatStorage(Math.max(0, user.used_bytes))} / ${formatStorage(user.total_bytes)}`
+  }
+
   function accountSummaryStatus(user: UserSummary): string {
+    const storageSummary = accountStorageSummary(user)
+    if (storageSummary) {
+      return storageSummary
+    }
+
     const parity = userParityById[user.id]
     if (parity?.disconnected) {
       return 'Disconnected'
@@ -254,7 +282,7 @@
   }
 
   function openClientConfigWizard(userId?: string) {
-    const selectedUser = (userId ? users.find((user) => user.id === userId) : users[0]) ?? null
+    const selectedUser = (userId ? users.find((user) => user.id === userId) : activeAccountSummary) ?? null
     if (!selectedUser) {
       settingsStatus = 'No account available for client configuration.'
       return
@@ -270,9 +298,20 @@
     clientConfigWizardOpen = false
   }
 
+  let userSelectionEntries = $derived(
+    users.map((user, index) => ({
+      key: `${user.id}:${index}`,
+      user,
+      index,
+    })),
+  )
+  let activeSidebarEntry = $derived(
+    userSelectionEntries.find((entry) => entry.key === selectedAccountKey) ?? userSelectionEntries[0] ?? null,
+  )
   let selectedClientConfigUser = $derived(users.find((user) => user.id === clientConfigUserId) ?? null)
   let userParityById = $derived(buildUserParityById(users, parityState, userRuntimeParityById, disconnectedUsernames))
-  let activeAccountSummary = $derived(users.find((user) => user.id === clientConfigUserId) ?? users[0] ?? null)
+  let activeAccountSummary = $derived(activeSidebarEntry?.user ?? null)
+  let activeAccountIndex = $derived(activeSidebarEntry?.index ?? -1)
   let showOnboardingOnlyWizard = $derived(onboardingOnlyMode && initialUsersLoadDone && users.length === 0)
 
   $effect(() => {
@@ -284,7 +323,13 @@
       if (clientConfigUserId !== '') {
         clientConfigUserId = ''
       }
+      if (selectedAccountKey !== '') {
+        selectedAccountKey = ''
+      }
       return
+    }
+    if (!userSelectionEntries.some((entry) => entry.key === selectedAccountKey)) {
+      selectedAccountKey = userSelectionEntries[0].key
     }
     if (!users.some((user) => user.id === clientConfigUserId)) {
       clientConfigUserId = users[0].id
@@ -605,9 +650,10 @@
   function handleTrayAction(action: TrayAction) {
     if (typeof action === 'object' && action.type === 'select_user') {
       activeSection = 'accounts'
-      const selectedUser = users.find((user) => user.id === action.userId)
-      if (selectedUser) {
-        clientConfigUserId = selectedUser.id
+      const selectedEntry = userSelectionEntries.find((entry) => entry.user.id === action.userId)
+      if (selectedEntry) {
+        selectedAccountKey = selectedEntry.key
+        clientConfigUserId = selectedEntry.user.id
       }
       return
     }
@@ -867,6 +913,10 @@
   }
 
   async function abortLoginFlow() {
+    if (loginUsername.trim().length === 0) {
+      loginStatus = 'No login in progress.'
+      return
+    }
     logger.info('app', 'abort login requested', { username: loginUsername })
     loginStatus = 'aborting login...'
     try {
@@ -1111,15 +1161,15 @@
           </div>
         </div>
 
-        <h2>Accounts</h2>
-        <div class="account-chip-list">
+        <h2 class="accounts-heading">Accounts</h2>
+        <div class="account-chip-list accounts-list">
           {#if users.length > 0}
-            {#each users as user}
+            {#each users as user, index}
               <button
-                class={`account-pane-chip ${activeAccountSummary?.id === user.id ? 'active' : ''}`}
+                class={`account-pane-chip ${selectedAccountKey === `${user.id}:${index}` ? 'active' : ''}`}
                 onclick={() => {
                   activeSection = 'accounts'
-                  clientConfigUserId = user.id
+                  selectedAccountKey = `${user.id}:${index}`
                 }}
               >
                 <span class="avatar">{avatarInitial(user.username)}</span>
@@ -1140,20 +1190,16 @@
           {/if}
         </div>
 
-        <div class="summary-metrics">
-          <span class="chip">Host: {hostname || '(not loaded)'}</span>
-          <span class="chip">Users: {users.length}</span>
-          <span class="chip">Stream: {parityState.snapshot.stream_running ? 'running' : 'stopped'}</span>
+        <div class="account-summary-footer">
+          <button
+            class="secondary add-account-btn"
+            aria-label="Open Sign-In Wizard"
+            title="Open Sign-In Wizard"
+            onclick={openLoginWizard}
+          >
+            +
+          </button>
         </div>
-
-        <button
-          class="secondary add-account-btn"
-          aria-label="Open Sign-In Wizard"
-          title="Open Sign-In Wizard"
-          onclick={openLoginWizard}
-        >
-          +
-        </button>
 
         {#if settingsOverflowOpen}
           <div class="settings-overflow-menu sidebar-overflow-menu" role="menu" data-testid="runtime-settings-overflow-menu">
@@ -1179,6 +1225,7 @@
               usersLoading={usersLoading}
               users={users}
               activeUserId={clientConfigUserId}
+              activeUserIndex={activeAccountIndex}
               userParityById={userParityById}
               syncPhase={parityState.sync.phase}
               syncProgressPercent={parityState.sync.progress_percent}

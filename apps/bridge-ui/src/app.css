@@ -1,28 +1,28 @@
 :root {
   --font-ui: "IBM Plex Sans", "SF Pro Text", "Segoe UI", system-ui, -apple-system, sans-serif;
 
-  --bg-1: #121223;
-  --bg-2: #15162a;
-  --panel: #1c1d31;
-  --panel-muted: #181a2c;
-  --panel-border: #2d3050;
-  --surface: #20223a;
+  --bg-1: #10111d;
+  --bg-2: #17182b;
+  --panel: #1a1c30;
+  --panel-muted: #151628;
+  --panel-border: #2a2d48;
+  --surface: #21223a;
 
-  --text: #f2f4ff;
-  --text-muted: #a2a8c6;
+  --text: #eff1ff;
+  --text-muted: #9ca2c0;
 
-  --brand: #6d4aff;
-  --brand-2: #7f65ff;
-  --brand-soft: rgba(120, 95, 255, 0.22);
+  --brand: #7255ff;
+  --brand-2: #886eff;
+  --brand-soft: rgba(114, 85, 255, 0.18);
   --danger: #e36f95;
 
   --success-text: #38d39f;
   --success-border: rgba(56, 211, 159, 0.45);
   --success-bg: rgba(56, 211, 159, 0.12);
 
-  --input-bg: #191b2f;
-  --input-border: #35385a;
-  --table-sep: #323555;
+  --input-bg: #191a2d;
+  --input-border: #323554;
+  --table-sep: #2a2d47;
 }
 
 :root[data-theme='light'] {
@@ -64,65 +64,68 @@ body {
   font-family: var(--font-ui);
   color: var(--text);
   background:
-    radial-gradient(120% 140% at 0% 0%, rgba(113, 85, 255, 0.14), transparent 52%),
-    radial-gradient(120% 160% at 100% 0%, rgba(77, 90, 200, 0.16), transparent 48%),
-    linear-gradient(165deg, var(--bg-1), var(--bg-2));
+    radial-gradient(120% 140% at 0% 0%, rgba(106, 85, 231, 0.16), transparent 55%),
+    radial-gradient(110% 130% at 100% 10%, rgba(58, 68, 153, 0.17), transparent 50%),
+    linear-gradient(160deg, var(--bg-1), var(--bg-2));
 }
 
 .app-shell {
-  max-width: 1500px;
+  max-width: 1320px;
   min-height: 100vh;
   margin: 0 auto;
-  padding: 14px;
+  padding: 12px;
 }
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(250px, 306px) minmax(0, 1fr);
-  gap: 14px;
+  grid-template-columns: minmax(250px, 288px) minmax(0, 1fr);
+  gap: 10px;
   align-items: start;
 }
 
 .left-rail,
 .main-pane {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .left-rail {
   position: sticky;
-  top: 14px;
+  top: 12px;
   align-self: start;
 }
 
 .section-stage {
   display: grid;
-  gap: 14px;
+  gap: 10px;
 }
 
 .account-summary-pane {
   display: grid;
-  gap: 12px;
-  padding: 14px;
-  min-height: calc(100vh - 28px);
+  gap: 10px;
+  padding: 10px;
+  min-height: calc(100vh - 24px);
   position: relative;
+  background: color-mix(in oklab, var(--panel-muted) 92%, #000 8%);
+  border-color: color-mix(in oklab, var(--panel-border) 92%, #000 8%);
+  overflow: hidden;
 }
 
 .status-inline {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  color: #1fc89c;
+  gap: 7px;
+  color: #1cb38d;
   font-weight: 600;
-  font-size: 1.45rem;
+  font-size: 1.08rem;
 }
 
 .status-dot {
-  width: 10px;
-  height: 10px;
+  width: 8px;
+  height: 8px;
   border-radius: 999px;
-  background: #1fc89c;
-  box-shadow: 0 0 0 4px rgba(31, 200, 156, 0.14);
+  background: #1cb38d;
+  box-shadow: 0 0 0 3px rgba(28, 179, 141, 0.14);
 }
 
 .shell-status-bar {
@@ -130,7 +133,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding-bottom: 8px;
+  padding: 4px 2px 10px;
   border-bottom: 1px solid var(--table-sep);
 }
 
@@ -140,15 +143,15 @@ body {
 }
 
 .icon-btn {
-  min-width: 34px;
-  min-height: 34px;
-  border: 1px solid transparent;
+  min-width: 28px;
+  min-height: 28px;
+  border: 1px solid var(--panel-border);
   border-radius: 8px;
-  background: transparent;
+  background: color-mix(in oklab, var(--panel) 76%, transparent);
   color: var(--text-muted);
   display: grid;
   place-items: center;
-  font-size: 0.95rem;
+  font-size: 0.82rem;
   font-weight: 600;
   padding: 0;
 }
@@ -162,6 +165,14 @@ body {
   background: color-mix(in oklab, var(--brand-soft) 55%, transparent);
   color: var(--text);
   border-color: color-mix(in oklab, var(--brand) 55%, var(--input-border));
+}
+
+.accounts-heading {
+  margin: 2px 2px 0;
+  font-size: 1.05rem;
+  text-transform: none;
+  letter-spacing: 0;
+  color: color-mix(in oklab, var(--text) 92%, var(--text-muted));
 }
 
 .summary-nav-chips {
@@ -189,12 +200,13 @@ body {
 .account-chip-list {
   display: grid;
   border-top: 1px solid var(--table-sep);
+  padding-top: 8px;
+  gap: 6px;
 }
 
 .account-pane-chip {
-  border: 0;
-  border-bottom: 1px solid var(--table-sep);
-  border-radius: 0;
+  border: 1px solid transparent;
+  border-radius: 10px;
   background: transparent;
   color: var(--text);
   text-align: left;
@@ -202,15 +214,17 @@ body {
   align-items: center;
   gap: 10px;
   width: 100%;
-  padding: 9px 2px;
+  padding: 9px 10px;
 }
 
 .account-pane-chip:hover {
-  background: color-mix(in oklab, var(--brand-soft) 22%, transparent);
+  background: color-mix(in oklab, var(--brand-soft) 34%, transparent);
+  border-color: color-mix(in oklab, var(--panel-border) 85%, var(--brand));
 }
 
 .account-pane-chip.active {
-  background: color-mix(in oklab, var(--brand-soft) 32%, transparent);
+  background: color-mix(in oklab, var(--brand-soft) 48%, transparent);
+  border-color: color-mix(in oklab, var(--brand) 45%, var(--panel-border));
 }
 
 .account-pane-chip.empty {
@@ -218,8 +232,8 @@ body {
 }
 
 .app-shell .avatar {
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   border-radius: 9px;
   display: grid;
   place-items: center;
@@ -246,22 +260,22 @@ body {
 
 .account-chip-meta {
   color: var(--text-muted);
-  font-size: 0.8rem;
+  font-size: 0.78rem;
+  letter-spacing: 0.01em;
 }
 
-.summary-metrics {
-  margin-top: 2px;
-  display: grid;
-  gap: 6px;
+.account-summary-footer {
+  margin-top: auto;
+  padding: 10px 2px 2px;
+  border-top: 1px solid var(--table-sep);
 }
 
 .add-account-btn {
-  margin-top: auto;
-  width: 36px;
-  min-width: 36px;
-  min-height: 36px;
-  border-radius: 10px;
-  font-size: 1.15rem;
+  width: 34px;
+  min-width: 34px;
+  min-height: 34px;
+  border-radius: 9px;
+  font-size: 1.1rem;
   line-height: 1;
   padding: 0;
 }
@@ -295,8 +309,8 @@ body {
 .card {
   background: var(--panel);
   border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  padding: 14px;
+  border-radius: 10px;
+  padding: 12px;
 }
 
 .status-pill {
@@ -481,46 +495,94 @@ td {
 .user-view-card {
   padding: 0;
   overflow: hidden;
+  border-radius: 10px;
 }
 
 .user-view-header {
-  padding: 16px;
+  padding: 20px 20px 16px;
   border-bottom: 1px solid var(--table-sep);
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 14px;
 }
 
 .user-view-identity {
   display: flex;
-  gap: 10px;
+  gap: 12px;
   min-width: 0;
+}
+
+.user-view-identity .avatar {
+  width: 46px;
+  height: 46px;
+  border-radius: 10px;
+  font-size: 1rem;
 }
 
 .user-view-identity-text {
   min-width: 0;
   display: grid;
-  gap: 3px;
+  gap: 4px;
 }
 
 .user-view-username {
   margin: 0;
-  font-size: 2rem;
+  font-size: 2.2rem;
   line-height: 1.1;
-  font-weight: 650;
+  font-weight: 630;
   letter-spacing: -0.01em;
 }
 
 .user-view-sync-status {
   margin: 0;
-  font-size: 0.96rem;
+  font-size: 0.92rem;
+  color: color-mix(in oklab, var(--success-text) 74%, var(--text));
+}
+
+.is-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  border: 0;
+}
+
+.user-view-storage-summary {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.3;
+}
+
+.user-view-storage-used {
+  color: color-mix(in oklab, var(--success-text) 72%, var(--text));
+}
+
+.user-view-storage-total {
   color: var(--text-muted);
 }
 
-.user-view-sync-track {
+.user-view-storage-track {
   margin-top: 2px;
-  width: min(260px, 100%);
+  width: min(172px, 100%);
+  height: 4px;
+  border-radius: 999px;
+  background: color-mix(in oklab, var(--panel-border) 78%, transparent);
+  overflow: hidden;
+}
+
+.user-view-storage-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--success-text), #41dba8);
+}
+
+.user-view-sync-track {
+  margin-top: 4px;
+  width: min(220px, 100%);
   height: 4px;
   border-radius: 999px;
   background: color-mix(in oklab, var(--panel-border) 70%, transparent);
@@ -536,19 +598,19 @@ td {
 .user-view-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 10px;
 }
 
 .icon-only {
-  width: 40px;
-  min-width: 40px;
-  min-height: 40px;
+  width: 38px;
+  min-width: 38px;
+  min-height: 38px;
   padding: 0;
-  font-size: 1rem;
+  font-size: 0;
 }
 
 .user-view-row {
-  padding: 16px;
+  padding: 16px 20px;
   border-bottom: 1px solid var(--table-sep);
   display: flex;
   align-items: center;
@@ -557,19 +619,20 @@ td {
 }
 
 .user-view-row .muted {
-  margin: 2px 0 0;
+  margin: 5px 0 0;
+  font-size: 0.85rem;
 }
 
 .user-view-row-title {
   margin: 0;
-  font-size: 1.1rem;
-  font-weight: 650;
+  font-size: 1.02rem;
+  font-weight: 620;
 }
 
 .switch {
-  width: 46px;
-  min-width: 46px;
-  min-height: 28px;
+  width: 44px;
+  min-width: 44px;
+  min-height: 26px;
   border-radius: 999px;
   border: 1px solid var(--input-border);
   background: var(--panel-muted);
@@ -585,47 +648,48 @@ td {
 }
 
 .switch-knob {
-  width: 22px;
-  height: 22px;
+  width: 20px;
+  height: 20px;
   border-radius: 50%;
   background: color-mix(in oklab, #fff 85%, var(--surface));
   transition: transform 140ms ease;
 }
 
 .switch.active .switch-knob {
-  transform: translateX(18px);
+  transform: translateX(17px);
 }
 
 .mailbox-section {
-  padding: 16px;
-  background: color-mix(in oklab, var(--surface) 52%, transparent);
+  padding: 14px 20px 18px;
+  background: color-mix(in oklab, var(--surface) 74%, transparent);
 }
 
 .mailbox-section h3 {
-  margin: 0 0 12px;
-  font-size: 1.9rem;
+  margin: 0 0 14px;
+  font-size: 1.96rem;
   line-height: 1.1;
-  font-weight: 650;
+  font-weight: 620;
   letter-spacing: -0.02em;
 }
 
 .mailbox-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  gap: 12px;
 }
 
 .mailbox-card {
-  background: color-mix(in oklab, var(--panel) 88%, #000 12%);
+  background: color-mix(in oklab, var(--panel) 90%, #000 10%);
   border: 1px solid var(--panel-border);
-  border-radius: 12px;
-  padding: 14px;
+  border-radius: 11px;
+  padding: 12px 14px;
 }
 
 .mailbox-card h4 {
-  margin: 0 0 10px;
-  font-size: 1.6rem;
-  font-weight: 650;
+  margin: 0 0 8px;
+  font-size: 1.52rem;
+  line-height: 1;
+  font-weight: 620;
   letter-spacing: -0.01em;
 }
 
@@ -634,32 +698,47 @@ td {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 8px 0;
+  padding: 7px 0;
   border-bottom: 1px solid var(--table-sep);
 }
 
 .mailbox-label {
   margin: 0;
-  font-size: 0.78rem;
+  font-size: 0.72rem;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
   color: var(--text-muted);
 }
 
 .mailbox-value {
   margin: 2px 0 0;
-  font-size: 1.1rem;
-  line-height: 1.2;
+  font-size: 1.05rem;
+  line-height: 1.16;
+  font-weight: 520;
+  letter-spacing: -0.01em;
 }
 
 .copy-btn {
-  min-width: 30px;
-  min-height: 30px;
+  min-width: 28px;
+  min-height: 28px;
   padding: 0;
   border: 1px solid var(--input-border);
   background: transparent;
   color: var(--text-muted);
-  border-radius: 8px;
+  border-radius: 7px;
+}
+
+.action-icon {
+  width: 13px;
+  height: 13px;
+}
+
+.action-icon path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .clipboard-notice {
@@ -763,19 +842,19 @@ tbody tr:hover {
 }
 
 button {
-  border: 1px solid var(--brand);
+  border: 1px solid color-mix(in oklab, var(--brand) 82%, var(--panel-border));
   background: linear-gradient(135deg, var(--brand), var(--brand-2));
   color: #fff;
-  border-radius: 9px;
-  padding: 7px 11px;
+  border-radius: 8px;
+  padding: 8px 13px;
   cursor: pointer;
   font-weight: 600;
-  font-size: 0.82rem;
+  font-size: 0.84rem;
   transition: filter 120ms ease, border-color 120ms ease, background 120ms ease;
 }
 
 button.secondary {
-  background: var(--panel-muted);
+  background: color-mix(in oklab, var(--panel) 72%, transparent);
   color: var(--text);
   border-color: var(--input-border);
 }

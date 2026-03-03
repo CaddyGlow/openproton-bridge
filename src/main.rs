@@ -2219,7 +2219,8 @@ async fn cmd_login(
     api_mode: Option<api::types::ApiMode>,
     dir: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let api_mode = api_mode.unwrap_or(api::types::ApiMode::Bridge);
+    let requested_api_mode = api_mode.unwrap_or(api::types::ApiMode::Bridge);
+    let mut effective_api_mode = requested_api_mode;
     let username = match username_arg {
         Some(u) => u,
         None => {
@@ -2238,7 +2239,8 @@ async fn cmd_login(
 
     let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
 
-    let mut client = api::client::ProtonClient::with_api_mode(api_mode)?;
+    let mut client = api::client::ProtonClient::with_api_mode(effective_api_mode)?;
+    let mut tried_mode_fallback = false;
 
     // SRP authentication with optional human-verification retries.
     let mut hv_details: Option<api::types::HumanVerificationDetails> = None;
@@ -2246,6 +2248,21 @@ async fn cmd_login(
         match api::auth::login(&mut client, &username, &password, hv_details.as_ref()).await {
             Ok(auth) => break auth,
             Err(err) => {
+                if !tried_mode_fallback
+                    && matches!(&err, api::error::ApiError::Api { code: 10004, .. })
+                {
+                    let fallback_mode = effective_api_mode.alternate();
+                    eprintln!(
+                        "Login mode {} is gated for this account; retrying with {}.",
+                        effective_api_mode.as_str(),
+                        fallback_mode.as_str()
+                    );
+                    client = api::client::ProtonClient::with_api_mode(fallback_mode)?;
+                    effective_api_mode = fallback_mode;
+                    tried_mode_fallback = true;
+                    continue;
+                }
+
                 let needs_hv = api::error::human_verification_details(&err).or_else(|| {
                     if matches!(&err, api::error::ApiError::Api { code: 12087, .. }) {
                         api::error::any_human_verification_details(&err)
@@ -2334,7 +2351,7 @@ async fn cmd_login(
         refresh_token: auth.refresh_token,
         email: user.email.clone(),
         display_name: user.display_name.clone(),
-        api_mode,
+        api_mode: effective_api_mode,
         key_passphrase,
         bridge_password: Some(bridge_password.clone()),
     };
@@ -2346,7 +2363,7 @@ async fn cmd_login(
         "Logged in as {} ({}) using API mode {}",
         user.display_name,
         user.email,
-        api_mode.as_str()
+        effective_api_mode.as_str()
     );
     if !addr_resp.addresses.is_empty() {
         println!("Addresses:");

@@ -377,7 +377,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         if password.is_empty() {
             return Err(Status::invalid_argument("password is required"));
         }
-        let api_mode = match req
+        let requested_api_mode = match req
             .api_mode
             .as_deref()
             .map(str::trim)
@@ -443,12 +443,29 @@ impl pb::bridge_server::Bridge for BridgeService {
             "starting grpc login attempt"
         );
 
-        let mut client = ProtonClient::with_api_mode(api_mode).map_err(status_from_api_error)?;
-        let auth = match api::auth::login(&mut client, &username, &password, hv_details.as_ref())
-            .await
-        {
-            Ok(auth) => auth,
-            Err(err) => {
+        let mut effective_api_mode = requested_api_mode;
+        let mut tried_mode_fallback = false;
+        let mut client =
+            ProtonClient::with_api_mode(effective_api_mode).map_err(status_from_api_error)?;
+        let auth = loop {
+            match api::auth::login(&mut client, &username, &password, hv_details.as_ref()).await {
+                Ok(auth) => break auth,
+                Err(err) => {
+                    if !tried_mode_fallback && matches!(&err, ApiError::Api { code: 10004, .. }) {
+                        let fallback_mode = effective_api_mode.alternate();
+                        warn!(
+                            username = %username,
+                            previous_mode = effective_api_mode.as_str(),
+                            fallback_mode = fallback_mode.as_str(),
+                            "grpc login mode gated by Proton, retrying with alternate mode"
+                        );
+                        effective_api_mode = fallback_mode;
+                        tried_mode_fallback = true;
+                        client = ProtonClient::with_api_mode(effective_api_mode)
+                            .map_err(status_from_api_error)?;
+                        continue;
+                    }
+
                 if let Some(hv) = human_verification_details(&err) {
                     let hv_url = hv.challenge_url();
                     info!(
@@ -490,6 +507,7 @@ impl pb::bridge_server::Bridge for BridgeService {
                 }
                 return Err(status_from_api_error(err));
             }
+            }
         };
         info!(username = %username, "grpc login auth phase completed");
         *self.state.pending_hv.lock().await = None;
@@ -498,7 +516,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             let pending = PendingLogin {
                 username: username.clone(),
                 password,
-                api_mode,
+                api_mode: effective_api_mode,
                 uid: auth.uid,
                 access_token: auth.access_token,
                 refresh_token: auth.refresh_token,
@@ -519,7 +537,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         let session = self
             .complete_login(
                 client,
-                api_mode,
+                effective_api_mode,
                 auth.uid,
                 auth.access_token,
                 auth.refresh_token,

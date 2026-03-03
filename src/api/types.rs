@@ -43,6 +43,13 @@ impl ApiMode {
             Self::Webmail => "https://mail.proton.me/api",
         }
     }
+
+    pub fn alternate(self) -> Self {
+        match self {
+            Self::Bridge => Self::Webmail,
+            Self::Webmail => Self::Bridge,
+        }
+    }
 }
 
 /// API response from POST /auth/v4/info

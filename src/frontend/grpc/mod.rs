@@ -269,7 +269,7 @@ include!("runtime.rs");
 async fn maybe_start_grpc_sync_workers(
     runtime_paths: &RuntimePaths,
     service: &BridgeService,
-    active_disk_cache_path: &Path,
+    _active_disk_cache_path: &Path,
 ) -> anyhow::Result<Option<bridge::events::EventWorkerGroup>> {
     let available_backends = vault::discover_available_keychains();
     let configured_helper = match vault::get_keychain_helper(runtime_paths.settings_dir()) {
@@ -324,11 +324,9 @@ async fn maybe_start_grpc_sync_workers(
         .iter()
         .map(|account| account.account_id.0.clone())
         .collect::<Vec<_>>();
-    let gluon_bootstrap = vault::load_gluon_store_bootstrap(
-        runtime_paths.settings_dir(),
-        &bootstrap_account_ids,
-    )
-    .context("failed to resolve gluon vault bindings for grpc store bootstrap")?;
+    let gluon_bootstrap =
+        vault::load_gluon_store_bootstrap(runtime_paths.settings_dir(), &bootstrap_account_ids)
+            .context("failed to resolve gluon vault bindings for grpc store bootstrap")?;
     let gluon_paths = runtime_paths.gluon_paths(Some(gluon_bootstrap.gluon_dir.as_str()));
     debug!(
         gluon_dir = %gluon_paths.root().display(),
@@ -345,9 +343,16 @@ async fn maybe_start_grpc_sync_workers(
         );
     }
 
-    let store_root = active_disk_cache_path.join("imap-store");
+    let account_storage_ids = gluon_bootstrap
+        .accounts
+        .iter()
+        .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
+        .collect();
     let store: Arc<dyn crate::imap::store::MessageStore> =
-        crate::imap::store::PersistentStore::new(store_root)?;
+        crate::imap::store::new_runtime_message_store(
+            gluon_paths.root().to_path_buf(),
+            account_storage_ids,
+        )?;
     let checkpoint_store: bridge::events::SharedCheckpointStore = Arc::new(
         bridge::events::VaultCheckpointStore::new(runtime_paths.settings_dir().to_path_buf()),
     );

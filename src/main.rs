@@ -3404,10 +3404,16 @@ async fn prepare_serve_runtime(
         );
     }
 
-    let store_root = effective_disk_cache_path(runtime_paths).join("imap-store");
-    let store: Arc<dyn imap::store::MessageStore> =
-        imap::store::PersistentStore::new(store_root)
-            .context("failed to initialize persistent IMAP store")?;
+    let account_storage_ids = gluon_bootstrap
+        .accounts
+        .iter()
+        .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
+        .collect();
+    let store: Arc<dyn imap::store::MessageStore> = imap::store::new_runtime_message_store(
+        gluon_paths.root().to_path_buf(),
+        account_storage_ids,
+    )
+    .context("failed to initialize runtime IMAP store")?;
     let event_store = store.clone();
 
     let imap_config = Arc::new(imap::session::SessionConfig {

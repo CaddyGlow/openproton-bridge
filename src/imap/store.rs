@@ -201,6 +201,14 @@ impl PersistentStore {
     }
 }
 
+pub fn new_runtime_message_store(
+    store_root: PathBuf,
+    account_storage_ids: HashMap<String, String>,
+) -> Result<Arc<dyn MessageStore>> {
+    let store: Arc<dyn MessageStore> = GluonStore::new(store_root, account_storage_ids)?;
+    Ok(store)
+}
+
 const GLUON_BACKEND_DIR: &str = "backend";
 const GLUON_STORE_DIR: &str = "store";
 const GLUON_INDEX_FILE_NAME: &str = ".openproton-mailbox-index.json";

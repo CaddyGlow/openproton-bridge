@@ -1930,7 +1930,8 @@ async fn set_disk_cache_path_for_cli(
     }
 
     let target_path = std::path::PathBuf::from(target);
-    let current_path = effective_disk_cache_path(runtime_paths);
+    let current_path = resolve_live_gluon_cache_root_for_cli(runtime_paths)
+        .unwrap_or_else(|| effective_disk_cache_path(runtime_paths));
 
     move_disk_cache_payload_for_cli(&current_path, &target_path).await?;
 
@@ -1939,7 +1940,58 @@ async fn set_disk_cache_path_for_cli(
     })
     .await?;
 
+    match vault::save_gluon_dir(
+        runtime_paths.settings_dir(),
+        &target_path.display().to_string(),
+    ) {
+        Ok(()) | Err(vault::VaultError::NotLoggedIn) => {}
+        Err(err) => {
+            anyhow::bail!("failed to persist gluon cache root after disk cache move: {err}");
+        }
+    }
+
     Ok(())
+}
+
+fn resolve_live_gluon_cache_root_for_cli(
+    runtime_paths: &paths::RuntimePaths,
+) -> Option<std::path::PathBuf> {
+    let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "failed to load sessions while resolving live gluon cache root"
+            );
+            return None;
+        }
+    };
+    if sessions.is_empty() {
+        return None;
+    }
+
+    let account_ids = sessions
+        .iter()
+        .map(|session| session.uid.clone())
+        .collect::<Vec<_>>();
+    let bootstrap =
+        match vault::load_gluon_store_bootstrap(runtime_paths.settings_dir(), &account_ids) {
+            Ok(bootstrap) => bootstrap,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load gluon bootstrap while resolving live cache root"
+                );
+                return None;
+            }
+        };
+
+    Some(
+        runtime_paths
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()))
+            .root()
+            .to_path_buf(),
+    )
 }
 
 async fn move_disk_cache_payload_for_cli(
@@ -4258,6 +4310,72 @@ mod tests {
         .unwrap();
 
         assert_eq!(effective_disk_cache_path(&runtime_paths), configured);
+    }
+
+    #[tokio::test]
+    async fn set_disk_cache_path_for_cli_moves_live_gluon_store_and_updates_bootstrap_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+
+        let session = api::types::Session {
+            uid: "uid-cli-cache-switch".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "cli-cache-switch@example.com".to_string(),
+            display_name: "CLI Cache Switch".to_string(),
+            api_mode: api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        vault::save_session(&session, runtime_paths.settings_dir()).unwrap();
+        vault::set_gluon_key_by_account_id(
+            runtime_paths.settings_dir(),
+            &session.uid,
+            vec![7u8; 32],
+        )
+        .unwrap();
+
+        let source_gluon_root = runtime_paths
+            .gluon_paths(Some("gluon"))
+            .root()
+            .to_path_buf();
+        let source_blob = source_gluon_root
+            .join("backend")
+            .join("store")
+            .join("live-user")
+            .join("00000001.msg");
+        tokio::fs::create_dir_all(source_blob.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&source_blob, b"gluon-cli-live")
+            .await
+            .unwrap();
+
+        let target_gluon_root = tmp.path().join("gluon-cli-moved");
+        set_disk_cache_path_for_cli(&runtime_paths, target_gluon_root.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let moved_blob = target_gluon_root
+            .join("backend")
+            .join("store")
+            .join("live-user")
+            .join("00000001.msg");
+        assert_eq!(
+            tokio::fs::read(&moved_blob).await.unwrap(),
+            b"gluon-cli-live"
+        );
+        assert!(!source_gluon_root.exists());
+
+        let bootstrap = vault::load_gluon_store_bootstrap(
+            runtime_paths.settings_dir(),
+            std::slice::from_ref(&session.uid),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_paths.gluon_paths(Some(&bootstrap.gluon_dir)).root(),
+            target_gluon_root
+        );
     }
 
     #[test]

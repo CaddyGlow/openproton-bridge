@@ -189,7 +189,10 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
 
         let target = PathBuf::from(path.trim());
-        let current = self.state.active_disk_cache_path.lock().await.clone();
+        let current = match resolve_live_gluon_cache_root(&self.state.runtime_paths) {
+            Some(path) => path,
+            None => self.state.active_disk_cache_path.lock().await.clone(),
+        };
         if let Err(err) = move_disk_cache_payload(&current, &target).await {
             self.emit_disk_cache_error(pb::DiskCacheErrorType::CantMoveDiskCacheError);
             self.emit_disk_cache_path_change_finished();
@@ -208,6 +211,16 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::internal(format!(
                 "failed to save app settings: {err}"
             )));
+        }
+
+        if let Err(err) = vault::save_gluon_dir(self.settings_dir(), &settings.disk_cache_path) {
+            if !matches!(err, vault::VaultError::NotLoggedIn) {
+                self.emit_disk_cache_error(pb::DiskCacheErrorType::CantMoveDiskCacheError);
+                self.emit_disk_cache_path_change_finished();
+                return Err(Status::internal(format!(
+                    "failed to persist gluon cache root after disk cache move: {err}"
+                )));
+            }
         }
 
         self.emit_disk_cache_path_changed(&settings.disk_cache_path);

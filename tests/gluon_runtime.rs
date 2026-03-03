@@ -65,3 +65,44 @@ async fn be026_runtime_store_writes_gluon_layout_without_json_mailbox_files() {
         "runtime store root should not contain JSON mailbox files: {root_json_files:?}"
     );
 }
+
+fn is_cfg_test_guarded(source: &str, marker: &str) -> bool {
+    let Some(index) = source.find(marker) else {
+        return false;
+    };
+    let prefix = &source[..index];
+    let mut lines = prefix.lines().rev();
+    let previous_non_empty = lines.find(|line| !line.trim().is_empty());
+    matches!(previous_non_empty, Some(line) if line.trim() == "#[cfg(test)]")
+}
+
+#[test]
+fn be028_persistent_json_store_paths_are_test_only() {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let store_src = fs::read_to_string(root.join("src/imap/store.rs")).expect("read store.rs");
+
+    assert!(
+        is_cfg_test_guarded(&store_src, "pub struct PersistentStore"),
+        "PersistentStore must be cfg(test)-guarded in src/imap/store.rs"
+    );
+    assert!(
+        is_cfg_test_guarded(&store_src, "impl PersistentStore"),
+        "PersistentStore impl must be cfg(test)-guarded in src/imap/store.rs"
+    );
+    assert!(
+        is_cfg_test_guarded(&store_src, "impl MessageStore for PersistentStore"),
+        "MessageStore impl for PersistentStore must be cfg(test)-guarded in src/imap/store.rs"
+    );
+
+    let main_src = fs::read_to_string(root.join("src/main.rs")).expect("read main.rs");
+    let grpc_src =
+        fs::read_to_string(root.join("src/frontend/grpc/mod.rs")).expect("read grpc/mod.rs");
+    assert!(
+        !main_src.contains("PersistentStore"),
+        "main runtime path must not reference PersistentStore"
+    );
+    assert!(
+        !grpc_src.contains("PersistentStore"),
+        "grpc runtime path must not reference PersistentStore"
+    );
+}

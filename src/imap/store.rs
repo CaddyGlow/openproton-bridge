@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+#[cfg(test)]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+#[cfg(test)]
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -66,6 +68,7 @@ struct MailboxData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg(test)]
 struct PersistentMailboxFile {
     mailbox: String,
     data: MailboxData,
@@ -103,11 +106,13 @@ impl InMemoryStore {
     }
 }
 
+#[cfg(test)]
 pub struct PersistentStore {
     root: PathBuf,
     inner: InMemoryStore,
 }
 
+#[cfg(test)]
 impl PersistentStore {
     pub fn new(root: PathBuf) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&root)?;
@@ -785,6 +790,7 @@ impl MessageStore for InMemoryStore {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl MessageStore for PersistentStore {
     async fn store_metadata(
         &self,

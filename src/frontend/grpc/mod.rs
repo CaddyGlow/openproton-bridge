@@ -763,6 +763,45 @@ fn effective_disk_cache_path(
     PathBuf::from(configured)
 }
 
+fn resolve_live_gluon_cache_root(runtime_paths: &RuntimePaths) -> Option<PathBuf> {
+    let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
+        Ok(sessions) => sessions,
+        Err(err) => {
+            warn!(
+                error = %err,
+                "failed to load sessions while resolving live gluon cache root"
+            );
+            return None;
+        }
+    };
+    if sessions.is_empty() {
+        return None;
+    }
+
+    let account_ids = sessions
+        .iter()
+        .map(|session| session.uid.clone())
+        .collect::<Vec<_>>();
+    let bootstrap =
+        match vault::load_gluon_store_bootstrap(runtime_paths.settings_dir(), &account_ids) {
+            Ok(bootstrap) => bootstrap,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "failed to load gluon bootstrap while resolving live cache root"
+                );
+                return None;
+            }
+        };
+
+    Some(
+        runtime_paths
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()))
+            .root()
+            .to_path_buf(),
+    )
+}
+
 async fn move_disk_cache_payload(current: &Path, target: &Path) -> anyhow::Result<()> {
     if current == target {
         tokio::fs::create_dir_all(target)
@@ -2141,11 +2180,23 @@ mod tests {
         let service = build_test_service_with_paths(runtime_paths.clone());
         let mut events = service.state.event_tx.subscribe();
 
-        let old_payload = old_path.join("nested").join("payload.txt");
+        let old_payload = old_path
+            .join("backend")
+            .join("store")
+            .join("uid-1")
+            .join("00000001.msg");
         tokio::fs::create_dir_all(old_payload.parent().unwrap())
             .await
             .unwrap();
         tokio::fs::write(&old_payload, b"cache-payload")
+            .await
+            .unwrap();
+        let old_index = old_path
+            .join("backend")
+            .join("store")
+            .join("uid-1")
+            .join(".openproton-mailbox-index.json");
+        tokio::fs::write(&old_index, b"{\"version\":1}")
             .await
             .unwrap();
 
@@ -2157,11 +2208,21 @@ mod tests {
         .await
         .unwrap();
 
-        let copied_payload = new_path.join("nested").join("payload.txt");
+        let copied_payload = new_path
+            .join("backend")
+            .join("store")
+            .join("uid-1")
+            .join("00000001.msg");
         assert_eq!(
             tokio::fs::read(&copied_payload).await.unwrap(),
             b"cache-payload"
         );
+        assert!(new_path
+            .join("backend")
+            .join("store")
+            .join("uid-1")
+            .join(".openproton-mailbox-index.json")
+            .exists());
         assert!(!old_path.exists());
 
         let effective = <BridgeService as pb::bridge_server::Bridge>::disk_cache_path(
@@ -2241,6 +2302,72 @@ mod tests {
         assert_eq!(
             effective,
             runtime_paths.disk_cache_dir().display().to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_disk_cache_path_moves_live_gluon_store_and_updates_bootstrap_path() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime_paths = RuntimePaths::resolve(Some(root.path())).unwrap();
+        let service = build_test_service_with_paths(runtime_paths.clone());
+
+        let session = Session {
+            uid: "uid-cache-switch".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "cache-switch@example.com".to_string(),
+            display_name: "Cache Switch".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+        vault::set_gluon_key_by_account_id(service.settings_dir(), &session.uid, vec![9u8; 32])
+            .unwrap();
+
+        let source_gluon_root = runtime_paths
+            .gluon_paths(Some("gluon"))
+            .root()
+            .to_path_buf();
+        let source_blob = source_gluon_root
+            .join("backend")
+            .join("store")
+            .join("live-user")
+            .join("00000001.msg");
+        tokio::fs::create_dir_all(source_blob.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&source_blob, b"gluon-live-message")
+            .await
+            .unwrap();
+
+        let target_gluon_root = root.path().join("gluon-cache-moved");
+        <BridgeService as pb::bridge_server::Bridge>::set_disk_cache_path(
+            &service,
+            Request::new(target_gluon_root.display().to_string()),
+        )
+        .await
+        .unwrap();
+
+        let moved_blob = target_gluon_root
+            .join("backend")
+            .join("store")
+            .join("live-user")
+            .join("00000001.msg");
+        assert_eq!(
+            tokio::fs::read(&moved_blob).await.unwrap(),
+            b"gluon-live-message"
+        );
+        assert!(!source_gluon_root.exists());
+
+        let bootstrap = vault::load_gluon_store_bootstrap(
+            service.settings_dir(),
+            std::slice::from_ref(&session.uid),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_paths.gluon_paths(Some(&bootstrap.gluon_dir)).root(),
+            target_gluon_root
         );
     }
 
@@ -2592,12 +2719,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
         let source_cache_root = runtime_paths.disk_cache_dir();
-        tokio::fs::create_dir_all(source_cache_root.join("uid-1"))
+        let source_blob = source_cache_root
+            .join("backend")
+            .join("store")
+            .join("uid-1")
+            .join("00000001.msg");
+        tokio::fs::create_dir_all(source_blob.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(source_cache_root.join("uid-1/message.eml"), b"hello")
-            .await
-            .unwrap();
+        tokio::fs::write(&source_blob, b"hello").await.unwrap();
+        tokio::fs::write(
+            source_cache_root
+                .join("backend")
+                .join("store")
+                .join("uid-1")
+                .join(".openproton-mailbox-index.json"),
+            b"{\"version\":1}",
+        )
+        .await
+        .unwrap();
 
         let service = build_test_service_with_paths(runtime_paths.clone());
         let target_cache_root = dir.path().join("cache-moved");
@@ -2631,11 +2771,23 @@ mod tests {
         .into_inner();
         assert_eq!(effective, target_cache_root.display().to_string());
         assert_eq!(
-            tokio::fs::read(target_cache_root.join("uid-1/message.eml"))
-                .await
-                .unwrap(),
+            tokio::fs::read(
+                target_cache_root
+                    .join("backend")
+                    .join("store")
+                    .join("uid-1")
+                    .join("00000001.msg")
+            )
+            .await
+            .unwrap(),
             b"hello"
         );
+        assert!(target_cache_root
+            .join("backend")
+            .join("store")
+            .join("uid-1")
+            .join(".openproton-mailbox-index.json")
+            .exists());
     }
 
     #[tokio::test]

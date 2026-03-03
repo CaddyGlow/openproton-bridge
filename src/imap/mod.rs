@@ -9,6 +9,8 @@ pub mod server;
 pub mod session;
 pub mod store;
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -29,6 +31,8 @@ pub enum ImapError {
     MailboxNotFound(String),
     #[error("message not found: uid {0}")]
     MessageNotFound(u32),
+    #[error("gluon artifact corruption detected at {path}: {reason}")]
+    GluonCorruption { path: PathBuf, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, ImapError>;

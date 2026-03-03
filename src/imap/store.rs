@@ -282,6 +282,37 @@ impl GluonMailboxData {
             self.next_uid = max_uid.saturating_add(1);
         }
     }
+
+    fn prune_missing_blob_refs(&mut self, account_dir: &Path) -> usize {
+        let mut missing_uids = self
+            .uid_to_blob
+            .iter()
+            .filter_map(|(uid, blob_name)| {
+                let blob_path = account_dir.join(blob_name);
+                (!blob_path.exists()).then_some(*uid)
+            })
+            .collect::<Vec<_>>();
+        if missing_uids.is_empty() {
+            return 0;
+        }
+
+        missing_uids.sort_unstable();
+        missing_uids.dedup();
+        let missing_uid_set: HashSet<u32> = missing_uids.iter().copied().collect();
+
+        self.uid_order.retain(|uid| !missing_uid_set.contains(uid));
+        self.metadata
+            .retain(|uid, _| !missing_uid_set.contains(uid));
+        self.flags.retain(|uid, _| !missing_uid_set.contains(uid));
+        self.uid_to_blob
+            .retain(|uid, _| !missing_uid_set.contains(uid));
+        self.uid_to_proton
+            .retain(|uid, _| !missing_uid_set.contains(uid));
+        self.proton_to_uid
+            .retain(|_, uid| !missing_uid_set.contains(uid));
+        self.mod_seq = self.mod_seq.saturating_add(missing_uids.len() as u64);
+        missing_uids.len()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -335,9 +366,12 @@ impl GluonStore {
         let txn_manager = super::gluon_txn::GluonTxnManager::new(&root).map_err(|err| {
             super::ImapError::Protocol(format!("failed to initialize gluon txn manager: {err}"))
         })?;
-        if let Err(err) = txn_manager.recover_pending_all() {
-            warn!(error = %err, "failed to recover pending gluon transactions at startup");
-        }
+        txn_manager
+            .recover_pending_all()
+            .map_err(|err| super::ImapError::GluonCorruption {
+                path: root.join(".gluon-txn"),
+                reason: format!("failed to recover pending gluon transactions: {err}"),
+            })?;
         Ok(Arc::new(Self {
             root,
             account_storage_ids,
@@ -467,19 +501,23 @@ impl GluonStore {
         std::fs::create_dir_all(&account_dir)?;
 
         let index_path = self.account_index_path(storage_user_id);
+        let mut repaired = false;
         let mut index = if index_path.exists() {
             let payload = std::fs::read(&index_path)?;
             serde_json::from_slice::<GluonAccountIndexFile>(&payload).map_err(|err| {
-                super::ImapError::Protocol(format!(
-                    "failed to parse gluon mailbox index {}: {err}",
-                    index_path.display()
-                ))
+                super::ImapError::GluonCorruption {
+                    path: index_path.clone(),
+                    reason: format!("failed to parse gluon mailbox index: {err}"),
+                }
             })?
         } else {
             GluonAccountIndexFile::new()
         };
 
         index.sanitize();
+        for mailbox in index.mailboxes.values_mut() {
+            repaired |= mailbox.prune_missing_blob_refs(&account_dir) > 0;
+        }
 
         if index.mailboxes.is_empty() {
             let mut discovered = Vec::new();
@@ -510,7 +548,19 @@ impl GluonStore {
                 index
                     .mailboxes
                     .insert(GLUON_DEFAULT_MAILBOX.to_string(), inbox);
+                repaired = true;
             }
+        }
+
+        if repaired {
+            let payload = serde_json::to_vec(&index).map_err(|err| {
+                super::ImapError::Protocol(format!(
+                    "failed to serialize repaired gluon mailbox index for account {storage_user_id}: {err}"
+                ))
+            })?;
+            let tmp_path = index_path.with_extension("json.tmp");
+            std::fs::write(&tmp_path, payload)?;
+            std::fs::rename(&tmp_path, &index_path)?;
         }
 
         let mut max_blob_id = index.next_blob_id;
@@ -531,27 +581,17 @@ impl GluonStore {
         })
     }
 
-    async fn ensure_account_loaded(&self, storage_user_id: &str) -> Result<()> {
-        {
-            let accounts = self.accounts.read().await;
-            if accounts.contains_key(storage_user_id) {
-                return Ok(());
-            }
-        }
-
+    async fn sync_account_from_disk(&self, storage_user_id: &str) -> Result<()> {
         let loaded = self.load_account_from_disk(storage_user_id)?;
-
         let mut accounts = self.accounts.write().await;
-        accounts
-            .entry(storage_user_id.to_string())
-            .or_insert(loaded);
+        accounts.insert(storage_user_id.to_string(), loaded);
         Ok(())
     }
 
     async fn resolve_scope(&self, mailbox: &str) -> Result<(String, String)> {
         let (account_id, mailbox_name) = Self::split_scoped_mailbox(mailbox);
         let storage_user_id = self.storage_user_id_for_account(&account_id);
-        self.ensure_account_loaded(&storage_user_id).await?;
+        self.sync_account_from_disk(&storage_user_id).await?;
         Ok((storage_user_id, mailbox_name))
     }
 }

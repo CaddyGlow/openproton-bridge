@@ -1,0 +1,36 @@
+{
+  "ticket": "BE-018",
+  "created_on": "2026-03-03",
+  "fixture_name": "proton_profile_gluon_sanitized",
+  "fixture_root": "tests/fixtures/proton_profile_gluon_sanitized",
+  "source_manifest": "tests/fixtures/gluon_fixture_manifest.json",
+  "compatibility_target_fixture": "tests/fixtures/gluon_compatibility_target.json",
+  "users": [
+    {
+      "user_id": "user-redacted",
+      "expected_email": "redacted@example.invalid",
+      "sync_state": {
+        "stable_path": "tests/fixtures/proton_profile_gluon_sanitized/sync-user-redacted",
+        "tmp_path": "tests/fixtures/proton_profile_gluon_sanitized/sync-user-redacted.tmp"
+      },
+      "storage": {
+        "store_dir": "tests/fixtures/proton_profile_gluon_sanitized/backend/store/user-redacted",
+        "primary_db": "tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db",
+        "wal": "tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db-wal",
+        "shm": "tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db-shm"
+      },
+      "deferred_delete": [
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/db/deferred_delete/user-redacted.db.1700000000"
+      ],
+      "mailboxes": [
+        {
+          "mailbox_id": "inbox-redacted",
+          "expected_message_count": 1,
+          "message_paths": [
+            "tests/fixtures/proton_profile_gluon_sanitized/backend/store/user-redacted/00000001.msg"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,4 +1,5 @@
 pub mod command;
+pub mod gluon_codec;
 pub mod mailbox;
 pub mod response;
 pub mod rfc822;

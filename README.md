@@ -38,6 +38,9 @@ cargo build --release
 # Log in to your Proton account
 openproton-bridge login
 
+# Optional: select API mode for this account (defaults to bridge)
+openproton-bridge login --api-mode webmail
+
 # Add another account (optional, repeat login)
 openproton-bridge login --username other@proton.me
 
@@ -108,6 +111,8 @@ Then configure your email client:
 
 ```
 openproton-bridge login --username user@proton.me
+# or force webmail mode for that account
+openproton-bridge login --username user@proton.me --api-mode webmail
 ```
 
 2. Keep one account active while removing another:

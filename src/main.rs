@@ -69,6 +69,9 @@ enum Command {
         /// Proton Mail username or email
         #[arg(short, long)]
         username: Option<String>,
+        /// Proton API mode to use for this account (default: bridge)
+        #[arg(long, value_enum)]
+        api_mode: Option<ApiModeArg>,
     },
     /// Generate FIDO assertion JSON using a hardware security key
     FidoAssert {
@@ -158,6 +161,21 @@ enum CredentialStoreBackendArg {
     File,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiModeArg {
+    Bridge,
+    Webmail,
+}
+
+impl From<ApiModeArg> for api::types::ApiMode {
+    fn from(value: ApiModeArg) -> Self {
+        match value {
+            ApiModeArg::Bridge => api::types::ApiMode::Bridge,
+            ApiModeArg::Webmail => api::types::ApiMode::Webmail,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum AccountsCommand {
     /// List all saved accounts
@@ -222,7 +240,9 @@ async fn execute_non_interactive_command(
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
     match command {
-        Command::Login { username } => cmd_login(username, dir).await,
+        Command::Login { username, api_mode } => {
+            cmd_login(username, api_mode.map(Into::into), dir).await
+        }
         Command::FidoAssert {
             auth_options_json,
             auth_options_file,
@@ -1690,7 +1710,7 @@ fn print_interactive_help() {
     println!("  status                           Show account/session status");
     println!("  list | ls                        List accounts");
     println!("  info [email|index]               Show account/session info");
-    println!("  login [email|--username <email>] Login to Proton");
+    println!("  login [email|--username <email>] [--api-mode bridge|webmail] Login to Proton");
     println!("  logout [all|--all|--email <email>] Logout one account or all accounts");
     println!("  delete <email|index>             Remove one account");
     println!("  use <email|index>                Set default account");
@@ -2194,7 +2214,12 @@ fn print_interactive_serve_config(config: &InteractiveServeConfig) {
     println!("  Event poll secs: {}", config.event_poll_secs);
 }
 
-async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyhow::Result<()> {
+async fn cmd_login(
+    username_arg: Option<String>,
+    api_mode: Option<api::types::ApiMode>,
+    dir: &std::path::Path,
+) -> anyhow::Result<()> {
+    let api_mode = api_mode.unwrap_or(api::types::ApiMode::Bridge);
     let username = match username_arg {
         Some(u) => u,
         None => {
@@ -2213,7 +2238,7 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
 
     let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
 
-    let mut client = api::client::ProtonClient::new()?;
+    let mut client = api::client::ProtonClient::with_api_mode(api_mode)?;
 
     // SRP authentication with optional human-verification retries.
     let mut hv_details: Option<api::types::HumanVerificationDetails> = None;
@@ -2309,6 +2334,7 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
         refresh_token: auth.refresh_token,
         email: user.email.clone(),
         display_name: user.display_name.clone(),
+        api_mode,
         key_passphrase,
         bridge_password: Some(bridge_password.clone()),
     };
@@ -2316,7 +2342,12 @@ async fn cmd_login(username_arg: Option<String>, dir: &std::path::Path) -> anyho
     vault::save_session(&session, dir)?;
     vault::set_default_email(dir, &session.email)?;
 
-    println!("Logged in as {} ({})", user.display_name, user.email);
+    println!(
+        "Logged in as {} ({}) using API mode {}",
+        user.display_name,
+        user.email,
+        api_mode.as_str()
+    );
     if !addr_resp.addresses.is_empty() {
         println!("Addresses:");
         for addr in &addr_resp.addresses {
@@ -2904,14 +2935,18 @@ fn cmd_status(dir: &std::path::Path) -> anyhow::Result<()> {
             .is_some_and(|email| email.eq_ignore_ascii_case(&session.email));
         let default_marker = if is_default { " (default)" } else { "" };
         println!(
-            "  {} ({}){}",
-            session.display_name, session.email, default_marker
+            "  {} ({}){} [{}]",
+            session.display_name,
+            session.email,
+            default_marker,
+            session.api_mode.as_str()
         );
     }
     println!();
 
     let active = vault::load_session(dir).context("failed to load active account")?;
     println!("Active account: {}", active.email);
+    println!("API mode: {}", active.api_mode.as_str());
     if active.key_passphrase.is_some() {
         println!("Key passphrase: stored");
     } else {
@@ -2937,6 +2972,7 @@ async fn cmd_account_info(
         .unwrap_or(false);
 
     println!("Account: {} ({})", session.display_name, session.email);
+    println!("API mode: {}", session.api_mode.as_str());
     println!(
         "Address mode: {}",
         if split_mode { "split" } else { "combined" }
@@ -2992,19 +3028,20 @@ fn cmd_accounts_list(dir: &std::path::Path) -> anyhow::Result<()> {
     }
 
     println!(
-        "{:<3} {:<30} {:<12} {:<12}",
-        "#", "account", "status", "address mode"
+        "{:<3} {:<30} {:<12} {:<12} {:<8}",
+        "#", "account", "status", "address mode", "api mode"
     );
     for (idx, session) in sessions.iter().enumerate() {
         let split_mode = vault::load_split_mode_by_account_id(dir, &session.uid)
             .context("failed to load account mode")?
             .unwrap_or(false);
         println!(
-            "{:<3} {:<30} {:<12} {:<12}",
+            "{:<3} {:<30} {:<12} {:<12} {:<8}",
             idx,
             session.email,
             "connected",
-            if split_mode { "split" } else { "combined" }
+            if split_mode { "split" } else { "combined" },
+            session.api_mode.as_str()
         );
     }
     println!();
@@ -3034,8 +3071,9 @@ async fn cmd_fetch(limit: usize, dir: &std::path::Path) -> anyhow::Result<()> {
         .decode(passphrase_b64)
         .context("invalid key passphrase encoding")?;
 
-    let client = api::client::ProtonClient::authenticated(
-        "https://mail-api.proton.me",
+    let client = api::client::ProtonClient::authenticated_with_mode(
+        session.api_mode.base_url(),
+        session.api_mode,
         &session.uid,
         &session.access_token,
     )?;
@@ -3285,8 +3323,9 @@ async fn prepare_serve_runtime(
         };
         let _ = account_registry.set_split_mode(&account_id, split_mode);
 
-        let client = match api::client::ProtonClient::authenticated(
-            "https://mail-api.proton.me",
+        let client = match api::client::ProtonClient::authenticated_with_mode(
+            session.api_mode.base_url(),
+            session.api_mode,
             &session.uid,
             &session.access_token,
         ) {
@@ -3754,7 +3793,7 @@ async fn refresh_session(
     dir: &std::path::Path,
 ) -> anyhow::Result<api::types::Session> {
     tracing::info!("access token missing, refreshing via stored refresh token");
-    let mut client = api::client::ProtonClient::new()?;
+    let mut client = api::client::ProtonClient::with_api_mode(session.api_mode)?;
     let auth = api::auth::refresh_auth(
         &mut client,
         &session.uid,

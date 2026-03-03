@@ -13,7 +13,7 @@ use crate::api::client::ProtonClient;
 use crate::api::error::{is_auth_error, ApiError};
 use crate::api::events as api_events;
 use crate::api::messages;
-use crate::api::types::{MessageFilter, MessageMetadata, Session};
+use crate::api::types::{ApiMode, MessageFilter, MessageMetadata, Session};
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
 use crate::imap::mailbox;
@@ -559,6 +559,14 @@ fn is_invalid_event_cursor_error(error: &ApiError) -> bool {
             || normalized.contains("expired"))
 }
 
+fn resolve_api_base_url_for_mode(configured_base_url: &str, api_mode: ApiMode) -> String {
+    if matches!(api_mode, ApiMode::Webmail) && configured_base_url == ApiMode::Bridge.base_url() {
+        ApiMode::Webmail.base_url().to_string()
+    } else {
+        configured_base_url.to_string()
+    }
+}
+
 async fn build_client_with_retry(
     config: &EventWorkerConfig,
     session: &mut Session,
@@ -568,8 +576,10 @@ async fn build_client_with_retry(
         .runtime_accounts
         .refresh_session_if_stale(&config.account_id, stale_access_token)
         .await?;
-    Ok(ProtonClient::authenticated(
-        &config.api_base_url,
+    let base_url = resolve_api_base_url_for_mode(&config.api_base_url, session.api_mode);
+    Ok(ProtonClient::authenticated_with_mode(
+        &base_url,
+        session.api_mode,
         &session.uid,
         &session.access_token,
     )?)
@@ -865,8 +875,13 @@ pub async fn poll_account_once(
         .with_valid_access_token(&config.account_id)
         .await?;
 
-    let mut client =
-        ProtonClient::authenticated(&config.api_base_url, &session.uid, &session.access_token)?;
+    let base_url = resolve_api_base_url_for_mode(&config.api_base_url, session.api_mode);
+    let mut client = ProtonClient::authenticated_with_mode(
+        &base_url,
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )?;
 
     let mut cursor = last_event_id.to_string();
     let mut pages = 0usize;
@@ -1152,10 +1167,11 @@ pub fn start_event_worker_group_with_sync_progress(
     let handles = accounts
         .into_iter()
         .map(|account| {
+            let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
             let mut config = EventWorkerConfig::new(
                 account.account_id,
                 account.email,
-                api_base_url.clone(),
+                account_base_url,
                 runtime_accounts.clone(),
                 auth_router.clone(),
                 store.clone(),
@@ -1214,10 +1230,11 @@ pub fn start_event_workers_with_sync_progress(
     accounts
         .into_iter()
         .map(|account| {
+            let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
             let mut config = EventWorkerConfig::new(
                 account.account_id,
                 account.email,
-                api_base_url.clone(),
+                account_base_url,
                 runtime_accounts.clone(),
                 auth_router.clone(),
                 store.clone(),
@@ -1252,6 +1269,7 @@ mod tests {
             refresh_token: format!("refresh-{uid}"),
             email: email.to_string(),
             display_name: email.to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some("dGVzdA==".to_string()),
             bridge_password: Some(bridge_password.to_string()),
         }
@@ -2358,11 +2376,13 @@ mod tests {
             RuntimeAccountInfo {
                 account_id: AccountId("uid-1".to_string()),
                 email: "a@proton.me".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
                 health: AccountHealth::Healthy,
             },
             RuntimeAccountInfo {
                 account_id: AccountId("uid-2".to_string()),
                 email: "b@proton.me".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
                 health: AccountHealth::Healthy,
             },
         ];
@@ -2400,11 +2420,13 @@ mod tests {
             RuntimeAccountInfo {
                 account_id: AccountId("uid-1".to_string()),
                 email: "a@proton.me".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
                 health: AccountHealth::Healthy,
             },
             RuntimeAccountInfo {
                 account_id: AccountId("uid-2".to_string()),
                 email: "b@proton.me".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
                 health: AccountHealth::Healthy,
             },
         ];
@@ -2484,11 +2506,13 @@ mod tests {
             RuntimeAccountInfo {
                 account_id: AccountId("uid-1".to_string()),
                 email: "a@proton.me".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
                 health: AccountHealth::Unavailable,
             },
             RuntimeAccountInfo {
                 account_id: AccountId("uid-2".to_string()),
                 email: "b@proton.me".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
                 health: AccountHealth::Healthy,
             },
         ];
@@ -2616,6 +2640,7 @@ mod tests {
         let accounts = vec![RuntimeAccountInfo {
             account_id: AccountId("uid-1".to_string()),
             email: "alice@proton.me".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             health: AccountHealth::Healthy,
         }];
         let progress_events = Arc::new(StdMutex::new(Vec::new()));

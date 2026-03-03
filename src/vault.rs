@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
-use crate::api::types::Session;
+use crate::api::types::{ApiMode, Session};
 
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
@@ -671,6 +671,8 @@ struct UserData {
     )]
     bridge_pass: Vec<u8>,
     address_mode: i32,
+    #[serde(default)]
+    api_mode: String,
 
     #[serde(rename = "AuthUID")]
     auth_uid: String,
@@ -1515,6 +1517,7 @@ fn session_to_userdata(session: &Session) -> UserData {
         gluon_ids: HashMap::new(),
         bridge_pass,
         address_mode: 0, // CombinedMode
+        api_mode: session.api_mode.as_str().to_string(),
         auth_uid: session.uid.clone(),
         auth_ref: session.refresh_token.clone(),
         key_pass,
@@ -1550,6 +1553,7 @@ fn userdata_to_session(ud: &UserData) -> Session {
         refresh_token: ud.auth_ref.clone(),
         email: ud.primary_email.clone(),
         display_name: ud.username.clone(),
+        api_mode: ApiMode::from_str_name(&ud.api_mode).unwrap_or_default(),
         key_passphrase,
         bridge_password,
     }
@@ -1676,6 +1680,7 @@ pub fn save_session(session: &Session, dir: &Path) -> Result<()> {
         existing.key_pass = ud.key_pass;
         existing.bridge_pass = ud.bridge_pass;
         existing.username = ud.username;
+        existing.api_mode = ud.api_mode;
     } else {
         data.users.push(ud);
     }
@@ -2310,6 +2315,7 @@ path = "custom-vault.key"
             gluon_ids: HashMap::new(),
             bridge_pass: b"bridgepass12345a".to_vec(),
             address_mode: 0,
+            api_mode: String::new(),
             auth_uid: "uid-123".to_string(),
             auth_ref: "refresh-456".to_string(),
             key_pass: b"rawkeypass".to_vec(),
@@ -2347,6 +2353,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-789".to_string(),
             email: "test@proton.me".to_string(),
             display_name: "Test".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some("cGFzcw==".to_string()),
             bridge_password: Some("bridgepass12345a".to_string()),
         };
@@ -2404,6 +2411,7 @@ path = "custom-vault.key"
             gluon_ids: HashMap::new(),
             bridge_pass: b"before-bridge".to_vec(),
             address_mode: ADDRESS_MODE_COMBINED,
+            api_mode: String::new(),
             auth_uid: "uid-preserve".to_string(),
             auth_ref: "refresh-before".to_string(),
             key_pass: b"before-key-pass".to_vec(),
@@ -2430,6 +2438,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-after".to_string(),
             email: "preserve@proton.me".to_string(),
             display_name: "After".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some(BASE64.encode(b"after-key-pass")),
             bridge_password: Some("after-bridge".to_string()),
         };
@@ -2466,6 +2475,7 @@ path = "custom-vault.key"
             refresh_token: "refresh".to_string(),
             email: "first-run@proton.me".to_string(),
             display_name: "First Run".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some("Zmlyc3QtcGFzcw==".to_string()),
             bridge_password: Some("bridge-pass".to_string()),
         };
@@ -2494,6 +2504,7 @@ path = "custom-vault.key"
                 gluon_ids: HashMap::new(),
                 bridge_pass: b"fixture-bridge-password".to_vec(),
                 address_mode: ADDRESS_MODE_COMBINED,
+                api_mode: String::new(),
                 auth_uid: "uid-fixture".to_string(),
                 auth_ref: "refresh-fixture".to_string(),
                 key_pass: b"fixture-key-passphrase".to_vec(),
@@ -2579,6 +2590,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-a".to_string(),
             email: "alice@proton.me".to_string(),
             display_name: "Alice".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-a".to_string()),
         };
@@ -2588,6 +2600,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-b".to_string(),
             email: "bob@proton.me".to_string(),
             display_name: "Bob".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-b".to_string()),
         };
@@ -2614,6 +2627,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-a".to_string(),
             email: "alice@proton.me".to_string(),
             display_name: "Alice".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-a".to_string()),
         };
@@ -2623,6 +2637,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-b".to_string(),
             email: "bob@proton.me".to_string(),
             display_name: "Bob".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-b".to_string()),
         };
@@ -2646,6 +2661,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-a".to_string(),
             email: "alice@proton.me".to_string(),
             display_name: "Alice".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-a".to_string()),
         };
@@ -2655,6 +2671,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-b".to_string(),
             email: "bob@proton.me".to_string(),
             display_name: "Bob".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-b".to_string()),
         };
@@ -2680,6 +2697,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-split".to_string(),
             email: "split@proton.me".to_string(),
             display_name: "Split".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge".to_string()),
         };
@@ -2712,6 +2730,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-checkpoint".to_string(),
             email: "checkpoint@proton.me".to_string(),
             display_name: "Checkpoint".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge".to_string()),
         };
@@ -2739,6 +2758,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-a".to_string(),
             email: "a@proton.me".to_string(),
             display_name: "A".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: None,
         };
@@ -2763,6 +2783,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-legacy".to_string(),
             email: "legacy@proton.me".to_string(),
             display_name: "Legacy".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: None,
         };
@@ -2781,6 +2802,7 @@ path = "custom-vault.key"
             refresh_token: "refresh-xyz".to_string(),
             email: "user@proton.me".to_string(),
             display_name: "User Name".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some(BASE64.encode(b"raw-passphrase")),
             bridge_password: Some("mybridge123".to_string()),
         };
@@ -2822,6 +2844,7 @@ path = "custom-vault.key"
             refresh_token: "ref".to_string(),
             email: "a@b.c".to_string(),
             display_name: "T".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: None,
         };
@@ -2869,6 +2892,7 @@ path = "custom-vault.key"
             gluon_ids: HashMap::new(),
             bridge_pass: vec![],
             address_mode: 0,
+            api_mode: String::new(),
             auth_uid: String::new(),
             auth_ref: String::new(),
             key_pass: vec![],

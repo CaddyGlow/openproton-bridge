@@ -59,6 +59,7 @@ pub struct RuntimeAccountRegistry {
 pub struct RuntimeAccountInfo {
     pub account_id: AccountId,
     pub email: String,
+    pub api_mode: crate::api::types::ApiMode,
     pub health: AccountHealth,
 }
 
@@ -336,6 +337,7 @@ impl RuntimeAccountRegistry {
             out.push(RuntimeAccountInfo {
                 account_id: account_id.clone(),
                 email: session.email.clone(),
+                api_mode: session.api_mode,
                 health: health
                     .get(account_id)
                     .copied()
@@ -488,7 +490,7 @@ async fn refresh_with_optional_access_token(
     session: &Session,
     include_access_token: bool,
 ) -> Result<crate::api::types::RefreshResponse, ApiError> {
-    let mut client = ProtonClient::new()?;
+    let mut client = ProtonClient::with_api_mode(session.api_mode)?;
     let access = if include_access_token {
         Some(session.access_token.as_str())
     } else {
@@ -508,6 +510,7 @@ mod tests {
             refresh_token: format!("refresh-{uid}"),
             email: email.to_string(),
             display_name: uid.to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some("bridge-password".to_string()),
         }

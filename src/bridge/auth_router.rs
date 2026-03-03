@@ -101,6 +101,7 @@ mod tests {
             refresh_token: String::new(),
             email: email.to_string(),
             display_name: uid.to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: None,
             bridge_password: Some(bridge_password.to_string()),
         }

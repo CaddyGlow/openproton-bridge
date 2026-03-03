@@ -244,8 +244,9 @@ where
         };
 
         // Create authenticated ProtonClient
-        let mut client = match ProtonClient::authenticated(
-            &self.config.api_base_url,
+        let mut client = match ProtonClient::authenticated_with_mode(
+            account_session.api_mode.base_url(),
+            account_session.api_mode,
             &account_session.uid,
             &account_session.access_token,
         ) {
@@ -304,8 +305,9 @@ where
                     }
                 };
                 account_session = refreshed;
-                client = match ProtonClient::authenticated(
-                    &self.config.api_base_url,
+                client = match ProtonClient::authenticated_with_mode(
+                    account_session.api_mode.base_url(),
+                    account_session.api_mode,
                     &account_session.uid,
                     &account_session.access_token,
                 ) {
@@ -375,8 +377,9 @@ where
                     }
                 };
                 account_session = refreshed;
-                client = match ProtonClient::authenticated(
-                    &self.config.api_base_url,
+                client = match ProtonClient::authenticated_with_mode(
+                    account_session.api_mode.base_url(),
+                    account_session.api_mode,
                     &account_session.uid,
                     &account_session.access_token,
                 ) {
@@ -630,6 +633,7 @@ mod tests {
             refresh_token: "test-refresh".to_string(),
             email: "test@proton.me".to_string(),
             display_name: "Test User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some("dGVzdA==".to_string()),
             bridge_password: Some("bridge-pass-1234".to_string()),
         }
@@ -652,6 +656,7 @@ mod tests {
             refresh_token: "refresh-a".to_string(),
             email: "alice@proton.me".to_string(),
             display_name: "Alice".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some("dGVzdA==".to_string()),
             bridge_password: Some("pass-a".to_string()),
         };
@@ -661,6 +666,7 @@ mod tests {
             refresh_token: "refresh-b".to_string(),
             email: "bob@proton.me".to_string(),
             display_name: "Bob".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
             key_passphrase: Some("dGVzdA==".to_string()),
             bridge_password: Some("pass-b".to_string()),
         };

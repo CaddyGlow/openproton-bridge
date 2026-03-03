@@ -13,6 +13,38 @@ pub const SENT_LABEL: &str = "7";
 pub const DRAFTS_LABEL: &str = "8";
 pub const STARRED_LABEL: &str = "10";
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiMode {
+    #[default]
+    Bridge,
+    Webmail,
+}
+
+impl ApiMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bridge => "bridge",
+            Self::Webmail => "webmail",
+        }
+    }
+
+    pub fn from_str_name(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "bridge" => Some(Self::Bridge),
+            "webmail" => Some(Self::Webmail),
+            _ => None,
+        }
+    }
+
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Self::Bridge => "https://mail-api.proton.me",
+            Self::Webmail => "https://mail.proton.me/api",
+        }
+    }
+}
+
 /// API response from POST /auth/v4/info
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -200,6 +232,8 @@ pub struct Session {
     pub refresh_token: String,
     pub email: String,
     pub display_name: String,
+    #[serde(default)]
+    pub api_mode: ApiMode,
     /// Base64-encoded derived key passphrase (31 bytes from mailbox_password).
     #[serde(default)]
     pub key_passphrase: Option<String>,
@@ -610,6 +644,7 @@ mod tests {
             refresh_token: "refresh-789".to_string(),
             email: "test@proton.me".to_string(),
             display_name: "Test User".to_string(),
+            api_mode: ApiMode::Bridge,
             key_passphrase: Some("cGFzc3BocmFzZQ==".to_string()),
             bridge_password: Some("abcd1234efgh5678".to_string()),
         };
@@ -622,6 +657,7 @@ mod tests {
         assert_eq!(session.refresh_token, restored.refresh_token);
         assert_eq!(session.email, restored.email);
         assert_eq!(session.display_name, restored.display_name);
+        assert_eq!(session.api_mode, restored.api_mode);
         assert_eq!(session.key_passphrase, restored.key_passphrase);
         assert_eq!(session.bridge_password, restored.bridge_password);
     }

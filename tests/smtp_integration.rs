@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use openproton_bridge::api::types::Session;
+use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
 use openproton_bridge::bridge::auth_router::AuthRouter;
 use openproton_bridge::smtp::server::run_server;
@@ -14,6 +14,7 @@ fn test_session() -> Session {
         refresh_token: "test-refresh".to_string(),
         email: "alice@proton.me".to_string(),
         display_name: "Alice".to_string(),
+        api_mode: ApiMode::Bridge,
         key_passphrase: Some(base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
             b"test-passphrase",

@@ -2,9 +2,12 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Client;
 
 use super::error::{ApiError, Result};
+use super::types::ApiMode;
 
-const BASE_URL: &str = "https://mail-api.proton.me";
 const DEFAULT_BRIDGE_APP_VERSION: &str = "3.22.0+git";
+const DEFAULT_WEBMAIL_APP_VERSION: &str = "web-mail@5.0.103.3";
+const DEFAULT_WEBMAIL_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 
 fn bridge_app_version() -> String {
     let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
@@ -29,6 +32,36 @@ fn bridge_user_agent() -> String {
     format!("ProtonMailBridge/{bridge_version}")
 }
 
+fn webmail_app_version() -> String {
+    std::env::var("OPENPROTON_PM_WEBMAIL_APP_VERSION")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| DEFAULT_WEBMAIL_APP_VERSION.to_string())
+}
+
+fn webmail_user_agent() -> String {
+    std::env::var("OPENPROTON_PM_WEBMAIL_USER_AGENT")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| DEFAULT_WEBMAIL_USER_AGENT.to_string())
+}
+
+fn mode_app_version(api_mode: ApiMode) -> String {
+    match api_mode {
+        ApiMode::Bridge => bridge_app_version(),
+        ApiMode::Webmail => webmail_app_version(),
+    }
+}
+
+fn mode_user_agent(api_mode: ApiMode) -> String {
+    match api_mode {
+        ApiMode::Bridge => bridge_user_agent(),
+        ApiMode::Webmail => webmail_user_agent(),
+    }
+}
+
 /// HTTP client preconfigured with Proton API headers.
 #[derive(Debug, Clone)]
 pub struct ProtonClient {
@@ -41,17 +74,27 @@ pub struct ProtonClient {
 impl ProtonClient {
     /// Create unauthenticated client (for login).
     pub fn new() -> Result<Self> {
-        Self::with_base_url(BASE_URL)
+        Self::with_api_mode(ApiMode::Bridge)
+    }
+
+    /// Create unauthenticated client with a specific API mode.
+    pub fn with_api_mode(api_mode: ApiMode) -> Result<Self> {
+        Self::with_base_url_and_mode(api_mode.base_url(), api_mode)
     }
 
     /// Create client pointing at a custom base URL (for testing with wiremock).
     pub fn with_base_url(base_url: &str) -> Result<Self> {
+        Self::with_base_url_and_mode(base_url, ApiMode::Bridge)
+    }
+
+    /// Create client pointing at a custom base URL and API mode.
+    pub fn with_base_url_and_mode(base_url: &str, api_mode: ApiMode) -> Result<Self> {
         let mut headers = HeaderMap::new();
-        let app_version = bridge_app_version();
+        let app_version = mode_app_version(api_mode);
         let app_version_header = HeaderValue::from_str(&app_version)
             .map_err(|err| ApiError::Auth(format!("invalid app version header value: {err}")))?;
         headers.insert("x-pm-appversion", app_version_header);
-        let user_agent = bridge_user_agent();
+        let user_agent = mode_user_agent(api_mode);
         let user_agent_header = HeaderValue::from_str(&user_agent)
             .map_err(|err| ApiError::Auth(format!("invalid user agent header value: {err}")))?;
         headers.insert("User-Agent", user_agent_header);
@@ -72,7 +115,17 @@ impl ProtonClient {
 
     /// Create authenticated client from saved session.
     pub fn authenticated(base_url: &str, uid: &str, access_token: &str) -> Result<Self> {
-        let mut client = Self::with_base_url(base_url)?;
+        Self::authenticated_with_mode(base_url, ApiMode::Bridge, uid, access_token)
+    }
+
+    /// Create authenticated client from saved session with explicit API mode.
+    pub fn authenticated_with_mode(
+        base_url: &str,
+        api_mode: ApiMode,
+        uid: &str,
+        access_token: &str,
+    ) -> Result<Self> {
+        let mut client = Self::with_base_url_and_mode(base_url, api_mode)?;
         client.set_auth(uid, access_token);
         Ok(client)
     }

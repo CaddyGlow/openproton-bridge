@@ -175,9 +175,45 @@ fn init_logging() -> Option<WorkerGuard> {
 }
 
 #[tauri::command]
-#[tracing::instrument(level = "debug", skip(state))]
-async fn bridge_status(state: State<'_, AppState>) -> Result<BridgeSnapshot, String> {
-    Ok(state.snapshot().await)
+#[tracing::instrument(level = "debug", skip(app, state, adapter_state))]
+async fn bridge_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    adapter_state: State<'_, AdapterState>,
+) -> Result<BridgeSnapshot, String> {
+    let snapshot = state.snapshot().await;
+    if snapshot.stream_running {
+        return Ok(snapshot);
+    }
+
+    let connect_err = {
+        let mut adapter = adapter_state.adapter.lock().await;
+        match adapter.connect(app.clone(), state.inner().clone()).await {
+            Ok(()) => return Ok(state.snapshot().await),
+            Err(err) => {
+                tracing::warn!("bridge_status stream connect failed: {err}");
+                let reachable = adapter.probe_connected(state.inner()).await;
+                if reachable {
+                    None
+                } else {
+                    Some(err)
+                }
+            }
+        }
+    };
+
+    let snapshot = state
+        .update(|snapshot| {
+            snapshot.connected = connect_err.is_none();
+            snapshot.stream_running = false;
+            if let Some(err) = connect_err.clone() {
+                snapshot.last_error = Some(err);
+            }
+        })
+        .await;
+
+    emit_state(&app, &snapshot);
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -272,10 +308,7 @@ async fn bridge_clear_error(
 
 #[tauri::command]
 #[tracing::instrument(level = "debug", skip(app, adapter_state))]
-async fn bridge_quit(
-    app: AppHandle,
-    adapter_state: State<'_, AdapterState>,
-) -> Result<(), String> {
+async fn bridge_quit(app: AppHandle, adapter_state: State<'_, AdapterState>) -> Result<(), String> {
     {
         let mut adapter = adapter_state.adapter.lock().await;
         adapter.disconnect().await;
@@ -414,13 +447,14 @@ async fn bridge_open_captcha_window(app: AppHandle, url: String) -> Result<(), S
         let _ = existing.close();
     }
 
-    let captcha_window = WebviewWindowBuilder::new(&app, CAPTCHA_WINDOW_LABEL, WebviewUrl::External(parsed))
-        .title("Proton CAPTCHA Verification")
-        .inner_size(520.0, 760.0)
-        .resizable(true)
-        .initialization_script(CAPTCHA_WINDOW_INIT_SCRIPT)
-        .build()
-        .map_err(|err| format!("failed to create captcha window: {err}"))?;
+    let captcha_window =
+        WebviewWindowBuilder::new(&app, CAPTCHA_WINDOW_LABEL, WebviewUrl::External(parsed))
+            .title("Proton CAPTCHA Verification")
+            .inner_size(520.0, 760.0)
+            .resizable(true)
+            .initialization_script(CAPTCHA_WINDOW_INIT_SCRIPT)
+            .build()
+            .map_err(|err| format!("failed to create captcha window: {err}"))?;
 
     let app_handle = app.clone();
     captcha_window.on_window_event(move |event| {

@@ -393,6 +393,15 @@ impl GrpcAdapter {
         info!("disconnect completed");
     }
 
+    pub async fn probe_connected(&self, state: &AppState) -> bool {
+        let config = match self.resolve_server_config(state).await {
+            Ok(config) => config,
+            Err(_) => return false,
+        };
+
+        probe_bridge_reachable(&config).await
+    }
+
     pub async fn fetch_users(&self, state: &AppState) -> Result<Vec<UserSummary>, String> {
         let config = self.resolve_server_config(state).await?;
         let mut client = connect_client(&config).await?;

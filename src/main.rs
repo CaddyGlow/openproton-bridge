@@ -523,6 +523,26 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     "manual" | "man" => {
                         println!("https://github.com/rickyslash/openproton-bridge");
                     }
+                    "check-updates" => {
+                        match load_app_settings_for_cli(runtime_paths).await {
+                            Ok(settings) => {
+                                println!(
+                                    "Update check requested (headless mode): channel={}, autoupdates={}",
+                                    if settings.is_beta_enabled {
+                                        "early"
+                                    } else {
+                                        "stable"
+                                    },
+                                    if settings.is_automatic_update_on {
+                                        "on"
+                                    } else {
+                                        "off"
+                                    }
+                                );
+                            }
+                            Err(err) => eprintln!("Error: {err:#}"),
+                        }
+                    }
                     "credits" => {
                         println!("openproton-bridge credits:");
                         println!("  - project: openproton-bridge");
@@ -901,6 +921,18 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             eprintln!("Usage: clear accounts | clear everything");
                         }
                     }
+                    "change-location" => {
+                        let Some(target) = tokens.get(1) else {
+                            eprintln!("Usage: change-location <path>");
+                            print_cli_prompt()?;
+                            continue;
+                        };
+                        if let Err(err) = set_disk_cache_path_for_cli(runtime_paths, target).await {
+                            eprintln!("Error: {err:#}");
+                        } else {
+                            println!("Disk cache location updated to {}", target);
+                        }
+                    }
                     "bad-event" => {
                         let Some(action) = tokens.get(1).map(|s| s.to_ascii_lowercase()) else {
                             eprintln!("Usage: bad-event <synchronize|logout <email|--all>>");
@@ -1040,6 +1072,22 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             eprintln!("Error: {err:#}");
                         } else {
                             println!("Reset complete: sessions and grpc settings cleared.");
+                        }
+                    }
+                    "imap-security" | "ssl-imap" | "starttls-imap" => {
+                        let mut args = vec!["imap-security".to_string()];
+                        args.extend(tokens.iter().skip(1).cloned());
+                        if let Err(err) = handle_interactive_change_command(&args, &mut serve_config)
+                        {
+                            eprintln!("Error: {err}");
+                        }
+                    }
+                    "smtp-security" | "ssl-smtp" | "starttls-smtp" => {
+                        let mut args = vec!["smtp-security".to_string()];
+                        args.extend(tokens.iter().skip(1).cloned());
+                        if let Err(err) = handle_interactive_change_command(&args, &mut serve_config)
+                        {
+                            eprintln!("Error: {err}");
                         }
                     }
                     "change" | "ch" | "switch" => {
@@ -1435,25 +1483,28 @@ fn handle_interactive_change_command(
     args: &[String],
     serve_config: &mut InteractiveServeConfig,
 ) -> anyhow::Result<()> {
-    if args.len() < 2 {
+    if args.is_empty() {
         anyhow::bail!(
-            "usage: change <imap-port|smtp-port|bind|event-poll-secs|imap-security|smtp-security> <value>"
+            "usage: change <imap-port|smtp-port|bind|event-poll-secs> <value> | change <imap-security|smtp-security> [starttls|none]"
         );
     }
 
     let field = args[0].to_ascii_lowercase();
-    let value = args[1].trim();
+    let value = args.get(1).map(|value| value.trim());
 
     match field.as_str() {
         "imap-port" => {
+            let value = value.context("missing IMAP port value")?;
             serve_config.imap_port = value.parse::<u16>().context("invalid IMAP port")?;
             println!("Updated IMAP port: {}", serve_config.imap_port);
         }
         "smtp-port" => {
+            let value = value.context("missing SMTP port value")?;
             serve_config.smtp_port = value.parse::<u16>().context("invalid SMTP port")?;
             println!("Updated SMTP port: {}", serve_config.smtp_port);
         }
         "bind" => {
+            let value = value.context("missing bind value")?;
             if value.is_empty() {
                 anyhow::bail!("bind cannot be empty");
             }
@@ -1461,6 +1512,7 @@ fn handle_interactive_change_command(
             println!("Updated bind address: {}", serve_config.bind);
         }
         "event-poll-secs" => {
+            let value = value.context("missing event poll interval value")?;
             serve_config.event_poll_secs = value
                 .parse::<u64>()
                 .context("invalid event poll interval value")?;
@@ -1469,17 +1521,35 @@ fn handle_interactive_change_command(
                 serve_config.event_poll_secs
             );
         }
-        "imap-security" | "smtp-security" => match value.to_ascii_lowercase().as_str() {
-            "none" | "off" | "plain" => {
-                serve_config.no_tls = true;
-                println!("Updated security mode: None (plaintext)");
+        "imap-security" | "smtp-security" => {
+            match value.map(|value| value.to_ascii_lowercase()) {
+                Some(mode) => match mode.as_str() {
+                    "none" | "off" | "plain" => {
+                        serve_config.no_tls = true;
+                        println!("Updated security mode: None (plaintext)");
+                    }
+                    "starttls" | "ssl" | "tls" => {
+                        serve_config.no_tls = false;
+                        println!("Updated security mode: STARTTLS");
+                    }
+                    _ => anyhow::bail!(
+                        "invalid security value `{mode}`; expected starttls or none"
+                    ),
+                },
+                None => {
+                    // Proton Bridge CLI toggles security mode when no explicit value is provided.
+                    serve_config.no_tls = !serve_config.no_tls;
+                    println!(
+                        "Updated security mode: {}",
+                        if serve_config.no_tls {
+                            "None (plaintext)"
+                        } else {
+                            "STARTTLS"
+                        }
+                    );
+                }
             }
-            "starttls" | "ssl" | "tls" => {
-                serve_config.no_tls = false;
-                println!("Updated security mode: STARTTLS");
-            }
-            _ => anyhow::bail!("invalid security value `{value}`; expected starttls or none"),
-        },
+        }
         _ => anyhow::bail!(
             "unknown change target `{}`; expected imap-port, smtp-port, bind, event-poll-secs, imap-security, smtp-security",
             args[0]
@@ -1494,6 +1564,7 @@ fn print_interactive_help() {
     println!("  help                             Show this help");
     println!("  quit | exit                      Exit interactive shell");
     println!("  manual | man                     Print project manual URL");
+    println!("  check-updates                    Alias for updates check");
     println!("  credits                          Print credits/dependency info");
     println!("  log-dir                          Print log directory path");
     println!("  telemetry <enable|disable|status> Manage telemetry setting");
@@ -1510,13 +1581,18 @@ fn print_interactive_help() {
     println!("  use <email>                      Set default account");
     println!("  fetch [--limit <n>]              Fetch/decrypt inbox messages");
     println!("  vault-dump                       Dump decrypted vault msgpack structure");
+    println!("  change-location <path>           Change encrypted message cache location");
     println!("  bad-event <synchronize|logout>   Resolve bad-event flows");
     println!("  cert <status|install|export|import> Manage TLS cert files");
     println!(
         "  repair                           Reset event checkpoints and restart serve runtime"
     );
     println!("  reset --force                    Clear sessions and grpc settings");
-    println!("  change <field> <value>           Update interactive serve defaults");
+    println!("  imap-security                    Toggle IMAP security mode");
+    println!("  smtp-security                    Toggle SMTP security mode");
+    println!("  ssl-imap | starttls-imap         Alias for imap-security");
+    println!("  ssl-smtp | starttls-smtp         Alias for smtp-security");
+    println!("  change <field> ...               Update interactive serve defaults");
     println!("  change mode <email> <split|combined> Set account address mode");
     println!("  serve-config                     Print interactive serve defaults");
     println!("  serve-status                     Show background serve runtime status");
@@ -1621,6 +1697,117 @@ where
     let mut settings = load_app_settings_for_cli(runtime_paths).await?;
     mutator(&mut settings);
     save_app_settings_for_cli(runtime_paths, &settings).await
+}
+
+async fn set_disk_cache_path_for_cli(
+    runtime_paths: &paths::RuntimePaths,
+    target: &str,
+) -> anyhow::Result<()> {
+    let target = target.trim();
+    if target.is_empty() {
+        anyhow::bail!("disk cache path cannot be empty");
+    }
+
+    let target_path = std::path::PathBuf::from(target);
+    let current_path = effective_disk_cache_path(runtime_paths);
+
+    move_disk_cache_payload_for_cli(&current_path, &target_path).await?;
+
+    update_app_settings(runtime_paths, |settings| {
+        settings.disk_cache_path = target_path.display().to_string();
+    })
+    .await?;
+
+    Ok(())
+}
+
+async fn move_disk_cache_payload_for_cli(
+    current: &std::path::Path,
+    target: &std::path::Path,
+) -> anyhow::Result<()> {
+    if current == target {
+        tokio::fs::create_dir_all(target)
+            .await
+            .with_context(|| format!("failed to create disk cache path {}", target.display()))?;
+        return Ok(());
+    }
+
+    if target.starts_with(current) {
+        anyhow::bail!(
+            "target disk cache path {} must not be inside current path {}",
+            target.display(),
+            current.display()
+        );
+    }
+
+    tokio::fs::create_dir_all(target)
+        .await
+        .with_context(|| format!("failed to create disk cache path {}", target.display()))?;
+
+    if tokio::fs::metadata(current).await.is_err() {
+        return Ok(());
+    }
+
+    copy_dir_contents_for_cli(current, target).await?;
+
+    if let Err(err) = tokio::fs::remove_dir_all(current).await {
+        tracing::warn!(
+            error = %err,
+            old_path = %current.display(),
+            "failed to clean old disk cache path after successful move"
+        );
+    }
+
+    Ok(())
+}
+
+async fn copy_dir_contents_for_cli(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut stack = vec![(src.to_path_buf(), dst.to_path_buf())];
+
+    while let Some((current_src, current_dst)) = stack.pop() {
+        tokio::fs::create_dir_all(&current_dst)
+            .await
+            .with_context(|| format!("failed to create directory {}", current_dst.display()))?;
+
+        let mut entries = tokio::fs::read_dir(&current_src)
+            .await
+            .with_context(|| format!("failed to read directory {}", current_src.display()))?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .with_context(|| format!("failed reading entries for {}", current_src.display()))?
+        {
+            let src_path = entry.path();
+            let dst_path = current_dst.join(entry.file_name());
+            let file_type = entry
+                .file_type()
+                .await
+                .with_context(|| format!("failed to read file type for {}", src_path.display()))?;
+
+            if file_type.is_dir() {
+                stack.push((src_path, dst_path));
+                continue;
+            }
+
+            if file_type.is_file() {
+                tokio::fs::copy(&src_path, &dst_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to copy file from {} to {}",
+                            src_path.display(),
+                            dst_path.display()
+                        )
+                    })?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn cli_tls_paths(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {

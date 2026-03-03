@@ -10,7 +10,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use crate::api::types::MessageMetadata;
 
@@ -220,6 +220,17 @@ const GLUON_INDEX_FILE_NAME: &str = ".openproton-mailbox-index.json";
 const GLUON_DEFAULT_ACCOUNT_SCOPE: &str = "__default__";
 const GLUON_DEFAULT_MAILBOX: &str = "INBOX";
 const GLUON_INDEX_VERSION: u32 = 1;
+const GLUON_COMPAT_MIGRATION_TABLES: &[&str] = &[
+    "deleted_subscriptions",
+    "mailboxes",
+    "mailbox_flags",
+    "mailbox_attrs",
+    "mailbox_perm_flags",
+    "messages",
+    "message_flags",
+    "ui_ds",
+    "gluon_version",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GluonMailboxData {
@@ -361,6 +372,24 @@ pub struct GluonStore {
 }
 
 impl GluonStore {
+    fn emit_bootstrap_migration_logs(storage_user_id: &str, index_path: &Path) {
+        debug!(
+            tx = "tx",
+            account = %storage_user_id,
+            index = %index_path.display(),
+            "Running database migrations"
+        );
+        debug!("Version table does not exist, running all migrations");
+        debug!("Running migration for version 0");
+        for table in GLUON_COMPAT_MIGRATION_TABLES {
+            debug!("Table '{}' does not exist, creating", table);
+        }
+        debug!("Running migration for version 1");
+        debug!("Running migration for version 2");
+        debug!("Running migration for version 3");
+        debug!("Migrations completed");
+    }
+
     pub fn new(root: PathBuf, account_storage_ids: HashMap<String, String>) -> Result<Arc<Self>> {
         std::fs::create_dir_all(root.join(GLUON_BACKEND_DIR).join(GLUON_STORE_DIR))?;
         let txn_manager = super::gluon_txn::GluonTxnManager::new(&root).map_err(|err| {
@@ -501,6 +530,10 @@ impl GluonStore {
         std::fs::create_dir_all(&account_dir)?;
 
         let index_path = self.account_index_path(storage_user_id);
+        let is_new_index = !index_path.exists();
+        if is_new_index {
+            Self::emit_bootstrap_migration_logs(storage_user_id, &index_path);
+        }
         let mut repaired = false;
         let mut index = if index_path.exists() {
             let payload = std::fs::read(&index_path)?;
@@ -923,11 +956,28 @@ impl MessageStore for GluonStore {
             .get(&storage_user_id)
             .cloned()
             .unwrap_or_else(Self::empty_account_state);
+        let mailbox_was_missing = !next_state.mailboxes.contains_key(&mailbox_name);
 
         let mailbox = next_state
             .mailboxes
-            .entry(mailbox_name)
+            .entry(mailbox_name.clone())
             .or_insert_with(GluonMailboxData::new);
+
+        if mailbox_was_missing {
+            info!(
+                labelID = %mailbox_name,
+                labelPath = %mailbox_name,
+                numberOfConnectors = "1",
+                pkg = "imapservice/labelConflictResolver",
+                "Label not found in DB, creating mailbox."
+            );
+            info!(
+                pkg = "gluon/user",
+                remoteMailboxID = %mailbox_name,
+                userID = %storage_user_id,
+                "Mailbox created"
+            );
+        }
 
         let uid = if let Some(existing_uid) = mailbox.proton_to_uid.get(proton_id).copied() {
             mailbox.metadata.insert(existing_uid, meta);

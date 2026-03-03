@@ -201,7 +201,6 @@ pub enum EventWorkerError {
 
 pub type SharedCheckpointStore = Arc<dyn EventCheckpointStore<Error = ()> + Send + Sync>;
 const RESYNC_PAGE_SIZE: i32 = 150;
-const RESYNC_MAX_PAGES_PER_MAILBOX: usize = 4;
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_STATS_LOG_EVERY_ATTEMPTS: u64 = 20;
 const MAX_INITIAL_POLL_STAGGER_MS: u64 = 2_000;
@@ -738,11 +737,10 @@ async fn bounded_resync_account(
     }
 
     let resync_started_at = Instant::now();
-    let total_steps = mailbox::system_mailboxes()
+    let mut total_steps = mailbox::system_mailboxes()
         .iter()
         .filter(|mb| mb.selectable)
         .count()
-        .saturating_mul(RESYNC_MAX_PAGES_PER_MAILBOX)
         .max(1);
     let mut completed_steps = 0usize;
     let mut synced_message_ids = HashSet::new();
@@ -753,9 +751,11 @@ async fn bounded_resync_account(
             continue;
         }
 
-        for page in 0..RESYNC_MAX_PAGES_PER_MAILBOX {
+        let mut end_id: Option<String> = None;
+        loop {
             let filter = MessageFilter {
                 label_id: Some(mb.label_id.to_string()),
+                end_id: end_id.clone(),
                 desc: 1,
                 ..Default::default()
             };
@@ -764,22 +764,29 @@ async fn bounded_resync_account(
                 session,
                 client,
                 &filter,
-                page as i32,
+                0,
                 RESYNC_PAGE_SIZE,
             )
             .await?;
+
             completed_steps = completed_steps.saturating_add(1);
+            let page_count = messages.len() as i32;
+            if page_count == RESYNC_PAGE_SIZE {
+                total_steps = total_steps.saturating_add(1);
+            }
             emit_sync_progress(
                 config,
                 completed_steps,
                 total_steps,
                 resync_started_at.elapsed(),
             );
+
             if messages.is_empty() {
                 break;
             }
 
-            let page_count = messages.len() as i32;
+            end_id = messages.last().map(|metadata| metadata.id.clone());
+
             for metadata in messages {
                 if synced_message_ids.insert(metadata.id.clone()) {
                     apply_metadata_to_store(config, &metadata).await?;
@@ -790,6 +797,16 @@ async fn bounded_resync_account(
             if page_count < RESYNC_PAGE_SIZE {
                 break;
             }
+
+            if end_id.is_none() {
+                warn!(
+                    account_id = %config.account_id.0,
+                    account_email = %config.account_email,
+                    label_id = %mb.label_id,
+                    "resync page was full but did not contain a terminal message id; stopping mailbox pagination"
+                );
+                break;
+            }
         }
     }
 
@@ -797,7 +814,7 @@ async fn bounded_resync_account(
         account_id = %config.account_id.0,
         account_email = %config.account_email,
         total_applied,
-        "completed bounded refresh resync"
+        "completed refresh resync"
     );
 
     emit_sync_progress(
@@ -1259,7 +1276,7 @@ mod tests {
     use crate::bridge::accounts::AccountRegistry;
     use crate::imap::store::InMemoryStore;
     use tempfile::tempdir;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn sample_session(uid: &str, email: &str, bridge_password: &str) -> Session {
@@ -1892,6 +1909,142 @@ mod tests {
                 .await
                 .unwrap(),
             Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_refresh_paginates_until_end_id_exhausted() {
+        let server = MockServer::start().await;
+        let selectable_mailboxes = mailbox::system_mailboxes()
+            .iter()
+            .filter(|mb| mb.selectable)
+            .count();
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let first_page_messages: Vec<serde_json::Value> = (0..RESYNC_PAGE_SIZE)
+            .map(|idx| {
+                let id = format!("msg-page1-{idx}");
+                serde_json::json!({
+                    "ID": id,
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": format!("Recovered message {idx}"),
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000 + idx as i64,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                })
+            })
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .and(body_partial_json(serde_json::json!({
+                "EndID": serde_json::Value::Null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": RESYNC_PAGE_SIZE,
+                "Messages": first_page_messages
+            })))
+            .expect(selectable_mailboxes as u64)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .and(body_partial_json(serde_json::json!({
+                "EndID": format!("msg-page1-{}", RESYNC_PAGE_SIZE - 1)
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-page2-0",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered page two message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700001000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .expect(selectable_mailboxes as u64)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert!(
+            store
+                .get_uid("uid-1::INBOX", "msg-page2-0")
+                .await
+                .unwrap()
+                .is_some()
         );
 
         let checkpoint = checkpoints

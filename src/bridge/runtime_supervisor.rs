@@ -1,5 +1,4 @@
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
 
 use super::mail_runtime::{
     self, MailRuntimeConfig, MailRuntimeHandle, MailRuntimeStartError, MailRuntimeTransition,
@@ -108,10 +107,6 @@ impl RuntimeSupervisor {
         }
 
         if self.is_running().await {
-            info!(
-                transition = ?transition,
-                "runtime supervisor start skipped: runtime already running"
-            );
             return Ok(());
         }
 
@@ -123,27 +118,17 @@ impl RuntimeSupervisor {
         };
         *self.handle.lock().await = Some(SupervisorRuntimeHandle::Live(handle));
         *self.start_snapshot.lock().await = Some(start_snapshot);
-        info!(
-            transition = ?transition,
-            "runtime supervisor started mail runtime"
-        );
         Ok(())
     }
 
-    async fn stop_locked(&self, reason: &str) -> anyhow::Result<()> {
+    async fn stop_locked(&self, _reason: &str) -> anyhow::Result<()> {
         let existing = self.handle.lock().await.take();
         let Some(runtime) = existing else {
-            info!(
-                reason,
-                "runtime supervisor stop skipped: runtime not running"
-            );
             return Ok(());
         };
 
-        info!(reason, "runtime supervisor stopping mail runtime");
         self.start_snapshot.lock().await.take();
         runtime.stop().await?;
-        info!(reason, "runtime supervisor stopped mail runtime");
         Ok(())
     }
 

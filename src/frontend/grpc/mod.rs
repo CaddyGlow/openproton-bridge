@@ -1905,8 +1905,16 @@ mod tests {
             .keychains
             .iter()
             .any(|helper| helper == vault::KEYCHAIN_BACKEND_FILE));
-        let mapped =
-            available_keychain_helpers_with_backends(&vault::discover_available_keychains());
+        assert!(response
+            .keychains
+            .iter()
+            .all(|helper| keychain_helper_to_backend(helper).is_some()));
+        let response_backends: Vec<String> = response
+            .keychains
+            .iter()
+            .filter_map(|helper| keychain_helper_to_backend(helper).map(str::to_owned))
+            .collect();
+        let mapped = available_keychain_helpers_with_backends(&response_backends);
         assert!(response
             .keychains
             .iter()

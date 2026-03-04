@@ -588,21 +588,24 @@ impl BridgeService {
             return None;
         }
 
-        let mut client = ProtonClient::with_api_mode(session.api_mode).ok()?;
-        let refreshed =
-            match api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None)
-                .await
-            {
-                Ok(refreshed) => refreshed,
-                Err(err) => {
-                    warn!(
-                        user_id = %session.uid,
-                        error = %err,
-                        "failed to refresh access token for grpc user metadata"
-                    );
-                    return None;
-                }
-            };
+        let (refreshed, refreshed_api_mode) = match api::auth::refresh_auth_with_mode_fallback(
+            session.api_mode,
+            &session.uid,
+            &session.refresh_token,
+            None,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to refresh access token for grpc user metadata"
+                );
+                return None;
+            }
+        };
 
         if refreshed.access_token.trim().is_empty() {
             return None;
@@ -611,6 +614,15 @@ impl BridgeService {
         let mut updated = session.clone();
         updated.access_token = refreshed.access_token.clone();
         updated.refresh_token = refreshed.refresh_token;
+        updated.api_mode = refreshed_api_mode;
+
+        let client = ProtonClient::authenticated_with_mode(
+            updated.api_mode.base_url(),
+            updated.api_mode,
+            &updated.uid,
+            &updated.access_token,
+        )
+        .ok()?;
         let canonical_user_id = match api::users::get_user(&client).await {
             Ok(user_resp) => Some(user_resp.user.id),
             Err(err) => {

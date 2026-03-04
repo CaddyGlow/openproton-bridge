@@ -9,8 +9,12 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          config = {};
+        };
         lib = pkgs.lib;
+        bunPkg = if pkgs ? bun-bin then pkgs.bun-bin else pkgs.bun;
 
         webkitgtkPkg =
           if pkgs ? webkitgtk_4_1 then pkgs.webkitgtk_4_1 else pkgs.webkitgtk;
@@ -42,7 +46,7 @@
       {
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
-            pkgs.bun
+            bunPkg
             pkgs.cargo
             pkgs.clippy
             pkgs.pkg-config
@@ -55,16 +59,10 @@
             [
               pkgs.openssl
             ]
-            ++ lib.optionals pkgs.stdenv.isLinux linuxUiLibs
-            ++ lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.darwin.apple_sdk.frameworks.AppKit
-              pkgs.darwin.apple_sdk.frameworks.Cocoa
-              pkgs.darwin.apple_sdk.frameworks.CoreFoundation
-              pkgs.darwin.apple_sdk.frameworks.Security
-              pkgs.darwin.apple_sdk.frameworks.WebKit
-            ];
+            ++ lib.optionals pkgs.stdenv.isLinux linuxUiLibs;
 
-          LD_LIBRARY_PATH = lib.makeLibraryPath linuxUiLibs;
+          LD_LIBRARY_PATH =
+            if pkgs.stdenv.isLinux then lib.makeLibraryPath linuxUiLibs else "";
 
           shellHook = ''
             export BUN_INSTALL="${"$"}PWD/.bun"

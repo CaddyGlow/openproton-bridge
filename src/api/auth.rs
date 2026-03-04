@@ -121,6 +121,20 @@ fn build_refresh_body(
     body
 }
 
+fn finalize_refresh_response(
+    uid: &str,
+    refresh_token: &str,
+    mut auth: RefreshResponse,
+) -> RefreshResponse {
+    if auth.refresh_token.trim().is_empty() {
+        auth.refresh_token = refresh_token.to_string();
+    }
+    if auth.uid.is_empty() {
+        auth.uid = uid.to_string();
+    }
+    auth
+}
+
 /// Refresh an expired access token using the refresh token.
 ///
 /// On success, updates the client's auth credentials in-place
@@ -137,10 +151,8 @@ pub async fn refresh_auth(
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
 
-    let mut auth: RefreshResponse = serde_json::from_value(json)?;
-    if auth.uid.is_empty() {
-        auth.uid = uid.to_string();
-    }
+    let auth: RefreshResponse = serde_json::from_value(json)?;
+    let auth = finalize_refresh_response(uid, refresh_token, auth);
     client.set_auth(&auth.uid, &auth.access_token);
 
     Ok(auth)
@@ -293,7 +305,10 @@ fn decode_base64_flexible(input: &str) -> std::result::Result<Vec<u8>, base64::D
 
 #[cfg(test)]
 mod tests {
-    use super::{build_refresh_body, decode_base64_flexible, extract_first_binary};
+    use super::{
+        build_refresh_body, decode_base64_flexible, extract_first_binary,
+        finalize_refresh_response, RefreshResponse,
+    };
     use serde_json::json;
 
     #[test]
@@ -318,6 +333,25 @@ mod tests {
     fn test_build_refresh_body_with_access_token() {
         let body = build_refresh_body("uid-1", "refresh-1", Some("access-1"));
         assert_eq!(body["AccessToken"], "access-1");
+    }
+
+    #[test]
+    fn test_build_refresh_body_with_empty_access_token_omits_access_token() {
+        let body = build_refresh_body("uid-1", "refresh-1", Some(""));
+        assert!(body.get("AccessToken").is_none());
+    }
+
+    #[test]
+    fn test_finalize_refresh_response_preserves_fallback_fields() {
+        let auth = RefreshResponse {
+            uid: String::new(),
+            access_token: "access-new".to_string(),
+            refresh_token: String::new(),
+        };
+        let finalized = finalize_refresh_response("uid-1", "refresh-old", auth);
+        assert_eq!(finalized.uid, "uid-1");
+        assert_eq!(finalized.refresh_token, "refresh-old");
+        assert_eq!(finalized.access_token, "access-new");
     }
 
     #[test]

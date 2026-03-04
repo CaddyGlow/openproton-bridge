@@ -514,13 +514,13 @@ impl RuntimeAccountRegistry {
         }
 
         if let Err(err) = &refresh_result {
-            if is_invalid_refresh_token_error(err)
+            if is_auth_error(err)
                 && !session_for_refresh.access_token.is_empty()
                 && register_refresh_attempt(&mut refresh_attempts, &session_for_refresh, false)
             {
                 debug!(
                     account_id = %account_id.0,
-                    "retrying refresh without access token after invalid refresh token"
+                    "retrying refresh without access token after auth refresh failure"
                 );
                 refresh_result =
                     refresh_with_optional_access_token(&session_for_refresh, false).await;

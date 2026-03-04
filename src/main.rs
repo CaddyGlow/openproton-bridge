@@ -3978,13 +3978,8 @@ async fn refresh_session(
 ) -> anyhow::Result<api::types::Session> {
     tracing::info!("access token missing, refreshing via stored refresh token");
     let mut client = api::client::ProtonClient::with_api_mode(session.api_mode)?;
-    let auth = api::auth::refresh_auth(
-        &mut client,
-        &session.uid,
-        &session.refresh_token,
-        Some(&session.access_token),
-    )
-    .await?;
+    let auth =
+        api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None).await?;
 
     let mut refreshed = api::types::Session {
         uid: auth.uid,

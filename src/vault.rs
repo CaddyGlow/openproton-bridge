@@ -1086,6 +1086,7 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
         if let Some(key) =
             resolve_keychain_key(try_secure_backend_get(&store_config), vault_exists)?
         {
+            cache_vault_key_file_if_missing(&key_path, &key);
             return Ok(key);
         }
     } else if vault_exists {
@@ -1105,6 +1106,20 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     }
 
     Ok(key)
+}
+
+fn cache_vault_key_file_if_missing(path: &Path, key: &[u8; KEY_LEN]) {
+    if path.exists() {
+        return;
+    }
+
+    if let Err(err) = write_vault_key_file(path, key) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %err,
+            "failed to cache vault key file after keychain lookup"
+        );
+    }
 }
 
 fn read_vault_key_file(path: &Path) -> Result<Option<[u8; KEY_LEN]>> {
@@ -2339,6 +2354,32 @@ mod tests {
         let key2 = get_or_create_vault_key(tmp.path()).unwrap();
         assert_eq!(key1, key2);
         assert_ne!(key1, [0u8; KEY_LEN]);
+    }
+
+    #[test]
+    fn test_cache_vault_key_file_if_missing_creates_key_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join(KEY_FILE);
+        let key = [0x44; KEY_LEN];
+
+        cache_vault_key_file_if_missing(&key_path, &key);
+
+        let written = std::fs::read(&key_path).unwrap();
+        assert_eq!(written, key);
+    }
+
+    #[test]
+    fn test_cache_vault_key_file_if_missing_keeps_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join(KEY_FILE);
+        let existing = [0x11; KEY_LEN];
+        let replacement = [0x22; KEY_LEN];
+        std::fs::write(&key_path, existing).unwrap();
+
+        cache_vault_key_file_if_missing(&key_path, &replacement);
+
+        let written = std::fs::read(&key_path).unwrap();
+        assert_eq!(written, existing);
     }
 
     #[test]

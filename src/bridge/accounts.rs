@@ -530,14 +530,11 @@ impl RuntimeAccountRegistry {
         let refreshed = match refresh_result {
             Ok(auth) => auth,
             Err(err) => {
-                let next_health = if is_auth_error(&err) {
-                    AccountHealth::Unavailable
-                } else {
-                    AccountHealth::Degraded
-                };
+                let next_health = refresh_failure_health(&err);
                 debug!(
                     account_id = %account_id.0,
                     is_auth_error = is_auth_error(&err),
+                    is_invalid_refresh_token_error = is_invalid_refresh_token_error(&err),
                     "refresh failed; updating account health"
                 );
                 let _ = self.set_health(account_id, next_health).await;
@@ -622,6 +619,14 @@ async fn fetch_canonical_user_context(session: &Session) -> Option<(String, Stri
             );
             None
         }
+    }
+}
+
+fn refresh_failure_health(err: &ApiError) -> AccountHealth {
+    if is_invalid_refresh_token_error(err) {
+        AccountHealth::Unavailable
+    } else {
+        AccountHealth::Degraded
     }
 }
 
@@ -854,6 +859,25 @@ mod tests {
         assert!(
             !register_refresh_attempt(&mut attempts, &sess, false),
             "duplicate fallback context should be suppressed"
+        );
+    }
+
+    #[test]
+    fn refresh_failure_health_only_marks_invalid_refresh_token_unavailable() {
+        let invalid_refresh = ApiError::Api {
+            code: 10013,
+            message: "Invalid refresh token".to_string(),
+            details: None,
+        };
+        assert_eq!(
+            refresh_failure_health(&invalid_refresh),
+            AccountHealth::Unavailable
+        );
+
+        let generic_auth = ApiError::Auth("auth failed".to_string());
+        assert_eq!(
+            refresh_failure_health(&generic_auth),
+            AccountHealth::Degraded
         );
     }
 }

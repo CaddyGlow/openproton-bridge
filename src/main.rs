@@ -1383,6 +1383,13 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             print_cli_prompt()?;
                             continue;
                         }
+                        if grpc_state.is_some() {
+                            eprintln!(
+                                "Cannot start serve runtime while gRPC runtime is running. Use `grpc-stop` first."
+                            );
+                            print_cli_prompt()?;
+                            continue;
+                        }
 
                         let overrides = match parse_serve_overrides(&tokens[1..]) {
                             Ok(overrides) => overrides,
@@ -1432,6 +1439,13 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
 
                         if grpc_state.is_some() {
                             eprintln!("gRPC runtime is already running. Use `grpc-stop` first.");
+                            print_cli_prompt()?;
+                            continue;
+                        }
+                        if runtime_state.is_some() {
+                            eprintln!(
+                                "Cannot start gRPC runtime while serve runtime is running. Use `stop` first."
+                            );
                             print_cli_prompt()?;
                             continue;
                         }
@@ -1813,6 +1827,7 @@ fn print_interactive_help() {
     println!("  grpc-status                      Show background gRPC runtime status");
     println!("  grpc [grpc flags]                Start gRPC frontend service (background)");
     println!("  grpc-stop                        Stop background gRPC runtime");
+    println!("  note                             `serve` and `grpc` are mutually exclusive");
     println!("  stop                             Stop all background runtimes");
     println!("  mutt-config [flags]              Generate mutt/neomutt config snippet");
     println!();

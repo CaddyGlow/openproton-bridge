@@ -8,6 +8,7 @@ fn make_meta(id: &str, unread: i32, subject: &str) -> MessageMetadata {
         id: id.to_string(),
         address_id: "addr-1".to_string(),
         label_ids: vec!["0".to_string()],
+        external_id: None,
         subject: subject.to_string(),
         sender: EmailAddress {
             name: "Alice".to_string(),
@@ -16,9 +17,14 @@ fn make_meta(id: &str, unread: i32, subject: &str) -> MessageMetadata {
         to_list: vec![],
         cc_list: vec![],
         bcc_list: vec![],
+        reply_tos: vec![],
+        flags: 0,
         time: 1700000000,
         size: 128,
         unread,
+        is_replied: 0,
+        is_replied_all: 0,
+        is_forwarded: 0,
         num_attachments: 0,
     }
 }

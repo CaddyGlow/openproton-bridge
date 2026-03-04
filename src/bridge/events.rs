@@ -489,7 +489,72 @@ fn is_delete_action(
     false
 }
 
-fn parse_message_deltas(payload: &serde_json::Value, out: &mut Vec<EventDelta>) {
+fn push_typed_message_delta(
+    item: &crate::api::types::TypedEventItem,
+    fallback_id: Option<&str>,
+    payload: &serde_json::Value,
+    out: &mut Vec<EventDelta>,
+) {
+    let message_id = if item.id.is_empty() {
+        fallback_id.unwrap_or_default().to_string()
+    } else {
+        item.id.clone()
+    };
+    if message_id.is_empty() {
+        return;
+    }
+
+    let mut entry_fields = serde_json::Map::new();
+    entry_fields.insert(
+        "ID".to_string(),
+        serde_json::Value::String(message_id.clone()),
+    );
+    if let Some(action) = item.action.clone() {
+        entry_fields.insert("Action".to_string(), action);
+    }
+    for (key, value) in &item.extra {
+        entry_fields.insert(key.clone(), value.clone());
+    }
+    let entry = serde_json::Value::Object(entry_fields);
+
+    if is_delete_action(&entry, Some(payload)) {
+        out.push(EventDelta::MessageDelete(message_id));
+    } else {
+        out.push(EventDelta::MessageUpsert(message_id));
+    }
+}
+
+fn parse_typed_event_deltas(payload: &serde_json::Value) -> Option<Vec<EventDelta>> {
+    let typed = api_events::parse_typed_event_payload(payload)?;
+    if !typed.has_recognized_event_fields() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+
+    if let Some(messages) = typed.messages.as_ref() {
+        for item in messages {
+            push_typed_message_delta(item, None, payload, &mut out);
+        }
+    }
+
+    if let Some(message) = typed.message.as_ref() {
+        let fallback_id = payload.get("ID").and_then(|value| value.as_str());
+        push_typed_message_delta(message, fallback_id, payload, &mut out);
+    }
+
+    if typed.labels.is_some() || typed.label.is_some() {
+        out.push(EventDelta::LabelsChanged);
+    }
+
+    if typed.addresses.is_some() || typed.address.is_some() {
+        out.push(EventDelta::AddressesChanged);
+    }
+
+    Some(out)
+}
+
+fn parse_message_deltas_heuristic(payload: &serde_json::Value, out: &mut Vec<EventDelta>) {
     let mut push_message_delta =
         |entry: &serde_json::Value,
          fallback_key: Option<&str>,
@@ -528,9 +593,9 @@ fn parse_message_deltas(payload: &serde_json::Value, out: &mut Vec<EventDelta>) 
     }
 }
 
-fn parse_event_deltas(payload: &serde_json::Value) -> Vec<EventDelta> {
+fn parse_event_deltas_heuristic(payload: &serde_json::Value) -> Vec<EventDelta> {
     let mut out = Vec::new();
-    parse_message_deltas(payload, &mut out);
+    parse_message_deltas_heuristic(payload, &mut out);
 
     if payload.get("Labels").is_some() || payload.get("Label").is_some() {
         out.push(EventDelta::LabelsChanged);
@@ -541,6 +606,13 @@ fn parse_event_deltas(payload: &serde_json::Value) -> Vec<EventDelta> {
     }
 
     out
+}
+
+fn parse_event_deltas(payload: &serde_json::Value) -> Vec<EventDelta> {
+    if let Some(deltas) = parse_typed_event_deltas(payload) {
+        return deltas;
+    }
+    parse_event_deltas_heuristic(payload)
 }
 
 fn is_invalid_event_cursor_error(error: &ApiError) -> bool {
@@ -795,6 +867,7 @@ async fn bounded_resync_account(
                 label_id: Some(mb.label_id.to_string()),
                 end_id: end_id.clone(),
                 desc: 1,
+                ..Default::default()
             };
             let messages = fetch_message_metadata_page_with_retry(
                 config,
@@ -1866,6 +1939,7 @@ mod tests {
                     id: "msg-1".to_string(),
                     address_id: "addr-1".to_string(),
                     label_ids: vec!["0".to_string()],
+                    external_id: None,
                     subject: "x".to_string(),
                     sender: crate::api::types::EmailAddress {
                         name: "A".to_string(),
@@ -1874,9 +1948,14 @@ mod tests {
                     to_list: vec![],
                     cc_list: vec![],
                     bcc_list: vec![],
+                    reply_tos: vec![],
+                    flags: 0,
                     time: 0,
                     size: 1,
                     unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
                     num_attachments: 0,
                 },
             )

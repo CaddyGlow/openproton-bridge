@@ -9,6 +9,27 @@ use super::types::{
     SendDraftReq, SendDraftResponse,
 };
 
+fn build_message_metadata_body(
+    filter: &MessageFilter,
+    page: i32,
+    page_size: i32,
+) -> Result<serde_json::Value> {
+    let mut body = match serde_json::to_value(filter)? {
+        serde_json::Value::Object(object) => object,
+        _ => serde_json::Map::new(),
+    };
+
+    body.entry("LabelID".to_string())
+        .or_insert(serde_json::Value::Null);
+    body.entry("EndID".to_string())
+        .or_insert(serde_json::Value::Null);
+    body.insert("Page".to_string(), serde_json::json!(page));
+    body.insert("PageSize".to_string(), serde_json::json!(page_size));
+    body.insert("Sort".to_string(), serde_json::json!("ID"));
+
+    Ok(serde_json::Value::Object(body))
+}
+
 /// Fetch a full message including encrypted body and attachment metadata.
 ///
 /// Reference: go-proton-api/message.go GetMessage
@@ -41,14 +62,7 @@ pub async fn get_message_metadata(
         "fetching message metadata"
     );
 
-    let body = serde_json::json!({
-        "LabelID": filter.label_id,
-        "EndID": filter.end_id,
-        "Desc": filter.desc,
-        "Page": page,
-        "PageSize": page_size,
-        "Sort": "ID",
-    });
+    let body = build_message_metadata_body(filter, page, page_size)?;
 
     for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
         let resp = client
@@ -395,6 +409,44 @@ mod tests {
         assert_eq!(resp.messages[1].subject, "Second");
     }
 
+    #[test]
+    fn test_build_message_metadata_body_serializes_extended_filter_fields() {
+        let filter = MessageFilter {
+            id: Some(vec!["msg-1".to_string()]),
+            subject: Some("hello".to_string()),
+            address_id: Some("addr-1".to_string()),
+            external_id: Some("ext-1".to_string()),
+            label_id: Some("0".to_string()),
+            end_id: Some("msg-0".to_string()),
+            desc: 1,
+        };
+
+        let body = build_message_metadata_body(&filter, 3, 25).unwrap();
+        assert_eq!(body["ID"], serde_json::json!(["msg-1"]));
+        assert_eq!(body["Subject"], "hello");
+        assert_eq!(body["AddressID"], "addr-1");
+        assert_eq!(body["ExternalID"], "ext-1");
+        assert_eq!(body["LabelID"], "0");
+        assert_eq!(body["EndID"], "msg-0");
+        assert_eq!(body["Desc"], 1);
+        assert_eq!(body["Page"], 3);
+        assert_eq!(body["PageSize"], 25);
+        assert_eq!(body["Sort"], "ID");
+    }
+
+    #[test]
+    fn test_build_message_metadata_body_preserves_null_end_cursor_compatibility() {
+        let filter = MessageFilter {
+            label_id: Some("0".to_string()),
+            desc: 1,
+            ..Default::default()
+        };
+
+        let body = build_message_metadata_body(&filter, 0, 50).unwrap();
+        assert_eq!(body["LabelID"], "0");
+        assert!(body["EndID"].is_null());
+    }
+
     #[tokio::test]
     async fn test_mark_messages_read() {
         let server = MockServer::start().await;
@@ -527,7 +579,9 @@ mod tests {
                 body: "encrypted body".to_string(),
                 mime_type: "text/plain".to_string(),
                 unread: 0,
+                external_id: None,
             },
+            attachment_key_packets: None,
             parent_id: None,
             action: 0,
         };
@@ -566,7 +620,9 @@ mod tests {
                 body: "".to_string(),
                 mime_type: "text/plain".to_string(),
                 unread: 0,
+                external_id: None,
             },
+            attachment_key_packets: None,
             parent_id: None,
             action: 0,
         };

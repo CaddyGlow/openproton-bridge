@@ -2758,7 +2758,10 @@ path = "custom-vault.key"
         assert_eq!(loaded.email, session.email);
         assert_eq!(loaded.display_name, session.display_name);
         assert_eq!(loaded.key_passphrase, session.key_passphrase);
-        assert_eq!(loaded.bridge_password, session.bridge_password);
+        assert_eq!(
+            loaded.bridge_password,
+            Some(BASE64_URL_NO_PAD.encode("bridgepass12345a".as_bytes()))
+        );
     }
 
     #[test]
@@ -3010,7 +3013,7 @@ path = "custom-vault.key"
         );
         assert_eq!(
             session.bridge_password,
-            Some("fixture-bridge-password".to_string())
+            Some(BASE64_URL_NO_PAD.encode("fixture-bridge-password".as_bytes()))
         );
     }
 
@@ -3031,7 +3034,7 @@ path = "custom-vault.key"
         );
         assert_eq!(
             session.bridge_password,
-            Some("beta-bridge-pass".to_string())
+            Some(BASE64_URL_NO_PAD.encode("beta-bridge-pass".as_bytes()))
         );
     }
 
@@ -3052,7 +3055,10 @@ path = "custom-vault.key"
         let alpha = load_session_by_email(tmp.path(), "alpha@proton.me").unwrap();
         assert_eq!(alpha.refresh_token, "refresh-alpha");
         assert_eq!(alpha.key_passphrase, Some(BASE64.encode(b"alpha-key-pass")));
-        assert_eq!(alpha.bridge_password, Some("alpha-bridge-pass".to_string()));
+        assert_eq!(
+            alpha.bridge_password,
+            Some(BASE64_URL_NO_PAD.encode("alpha-bridge-pass".as_bytes()))
+        );
     }
 
     #[test]
@@ -3300,7 +3306,10 @@ path = "custom-vault.key"
             back.key_passphrase.as_deref(),
             Some(BASE64.encode(b"raw-passphrase").as_str())
         );
-        assert_eq!(back.bridge_password.as_deref(), Some("mybridge123"));
+        assert_eq!(
+            back.bridge_password,
+            Some(BASE64_URL_NO_PAD.encode("mybridge123".as_bytes()))
+        );
     }
 
     #[test]
@@ -3498,7 +3507,10 @@ path = "custom-vault.key"
         let loaded = load_session_by_account_id(tmp.path(), "uid-account-id").unwrap();
         assert_eq!(loaded.uid, "uid-account-id");
         assert_eq!(loaded.email, "account-id@proton.me");
-        assert_eq!(loaded.bridge_password.as_deref(), Some("bridge-pass"));
+        assert_eq!(
+            loaded.bridge_password,
+            Some(BASE64_URL_NO_PAD.encode("bridge-pass".as_bytes()))
+        );
     }
 
     #[test]

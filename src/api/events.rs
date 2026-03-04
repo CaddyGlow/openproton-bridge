@@ -4,7 +4,7 @@ use super::client::{
     check_api_response, is_transient_http_status, retry_delay_from_headers, ProtonClient,
 };
 use super::error::{ApiError, Result};
-use super::types::EventsResponse;
+use super::types::{EventsResponse, TypedEventPayload};
 
 const MAX_TRANSIENT_ATTEMPTS: usize = 2;
 
@@ -48,6 +48,10 @@ pub async fn get_events(client: &ProtonClient, last_event_id: &str) -> Result<Ev
     }
 
     Err(ApiError::Auth("exhausted transient retries".to_string()))
+}
+
+pub fn parse_typed_event_payload(value: &serde_json::Value) -> Option<TypedEventPayload> {
+    serde_json::from_value(value.clone()).ok()
 }
 
 #[cfg(test)]
@@ -153,5 +157,20 @@ mod tests {
         assert_eq!(resp.event_id, "event-2");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         server.await.unwrap();
+    }
+
+    #[test]
+    fn parse_typed_event_payload_supports_canonical_event_shapes() {
+        let payload = serde_json::json!({
+            "Messages": [{"ID": "msg-1", "Action": 1}],
+            "Labels": {"label-1": {"Action": 2}},
+            "Addresses": ["addr-1"]
+        });
+
+        let parsed = parse_typed_event_payload(&payload).unwrap();
+        assert!(parsed.has_recognized_event_fields());
+        assert_eq!(parsed.messages.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(parsed.labels.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(parsed.addresses.as_ref().map(|v| v.len()), Some(1));
     }
 }

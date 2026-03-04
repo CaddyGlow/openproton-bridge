@@ -1206,7 +1206,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         }
                     }
                     "reset" => {
-                        if !tokens.get(1).is_some_and(|arg| arg == "--force") {
+                        if tokens.get(1).is_none_or(|arg| arg != "--force") {
                             eprintln!(
                                 "Refusing destructive reset. Use: reset --force"
                             );

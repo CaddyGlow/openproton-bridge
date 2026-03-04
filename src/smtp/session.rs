@@ -1045,6 +1045,7 @@ mod tests {
             receive: 1,
             send: 1,
             address_type: 1,
+            order: 0,
             display_name: "Test User".to_string(),
             keys: vec![],
         }]);
@@ -1072,6 +1073,7 @@ mod tests {
             receive: 1,
             send: 1,
             address_type: 1,
+            order: 0,
             display_name: "Test User".to_string(),
             keys: vec![],
         }]);

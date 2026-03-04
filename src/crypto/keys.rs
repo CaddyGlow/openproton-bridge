@@ -235,7 +235,18 @@ pub fn unlock_address_keys(
     let mut unlocked = Vec::new();
 
     for key in addr_keys.iter().filter(|k| k.active == 1) {
-        let (cert, pw) = if key.token.is_some() && key.signature.is_some() {
+        let has_token_material = key
+            .token
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+            && key
+                .signature
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+
+        let (cert, pw) = if has_token_material {
             // Token-based: decrypt the token with user keys to get the real passphrase
             let token_armored = key.token.as_deref().unwrap();
             match user_keyring.decrypt_armored(token_armored) {
@@ -511,6 +522,10 @@ mod tests {
         let user_keys = vec![UserKey {
             id: "key-1".to_string(),
             private_key: armored,
+            token: None,
+            signature: None,
+            primary: None,
+            flags: None,
             active: 1,
         }];
 
@@ -526,6 +541,10 @@ mod tests {
         let user_keys = vec![UserKey {
             id: "key-1".to_string(),
             private_key: armored,
+            token: None,
+            signature: None,
+            primary: None,
+            flags: None,
             active: 0,
         }];
 
@@ -544,6 +563,10 @@ mod tests {
         let user_keys = vec![UserKey {
             id: "key-1".to_string(),
             private_key: armored,
+            token: None,
+            signature: None,
+            primary: None,
+            flags: None,
             active: 1,
         }];
 

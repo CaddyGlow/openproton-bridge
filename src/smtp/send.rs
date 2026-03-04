@@ -233,6 +233,16 @@ pub async fn send_message(
         return Err(SmtpError::NoRecipients);
     }
 
+    struct PreparedAttachmentUpload {
+        filename: String,
+        mime_type: String,
+        disposition: String,
+        content_id: String,
+        key_packets: Vec<u8>,
+        data_packet: Vec<u8>,
+        signature: Vec<u8>,
+    }
+
     // 3. Create draft with encrypted body
     let encrypted_body = sender_keyring
         .encrypt_armored(parsed.body.as_bytes())
@@ -268,6 +278,24 @@ pub async fn send_message(
         })
         .collect();
 
+    let mut prepared_attachments = Vec::new();
+    let mut draft_attachment_key_packets = Vec::new();
+    for att in &parsed.attachments {
+        let (key_pkts, data_pkts) =
+            encrypt_attachment(sender_keyring, &att.data).map_err(SmtpError::Crypto)?;
+        draft_attachment_key_packets.push(BASE64.encode(&key_pkts));
+        let signature = sign_detached(sender_keyring, &att.data).map_err(SmtpError::Crypto)?;
+        prepared_attachments.push(PreparedAttachmentUpload {
+            filename: att.filename.clone(),
+            mime_type: att.mime_type.clone(),
+            disposition: att.disposition.clone(),
+            content_id: att.content_id.clone(),
+            key_packets: key_pkts,
+            data_packet: data_pkts,
+            signature,
+        });
+    }
+
     let draft_req = CreateDraftReq {
         message: DraftTemplate {
             subject: parsed.subject.clone(),
@@ -281,6 +309,12 @@ pub async fn send_message(
             body: encrypted_body,
             mime_type: parsed.mime_type.clone(),
             unread: 0,
+            external_id: None,
+        },
+        attachment_key_packets: if draft_attachment_key_packets.is_empty() {
+            None
+        } else {
+            Some(draft_attachment_key_packets)
         },
         parent_id: None,
         action: 0,
@@ -294,30 +328,28 @@ pub async fn send_message(
 
     // 4. Upload attachments (if any)
     let mut att_keys: HashMap<String, crate::crypto::encrypt::SessionKeyData> = HashMap::new();
-    for att in &parsed.attachments {
-        let (key_pkts, data_pkts) =
-            encrypt_attachment(sender_keyring, &att.data).map_err(SmtpError::Crypto)?;
-        let sig = sign_detached(sender_keyring, &att.data).map_err(SmtpError::Crypto)?;
-
+    for att in prepared_attachments {
         let att_resp = crate::api::messages::upload_attachment(
             client,
             UploadAttachmentReq {
                 message_id: draft_id.clone(),
-                filename: att.filename.clone(),
-                mime_type: att.mime_type.clone(),
-                disposition: att.disposition.clone(),
-                content_id: att.content_id.clone(),
-                key_packets: key_pkts.clone(),
-                data_packet: data_pkts,
-                signature: sig,
+                filename: att.filename,
+                mime_type: att.mime_type,
+                disposition: att.disposition,
+                content_id: att.content_id,
+                key_packets: att.key_packets.clone(),
+                data_packet: att.data_packet,
+                signature: att.signature,
             },
         )
         .await
         .map_err(SmtpError::Api)?;
 
         // Extract session key from attachment for the send package
-        let session_key_data =
-            crate::crypto::encrypt::extract_attachment_session_key(sender_keyring, &key_pkts)?;
+        let session_key_data = crate::crypto::encrypt::extract_attachment_session_key(
+            sender_keyring,
+            &att.key_packets,
+        )?;
         att_keys.insert(att_resp.attachment.id, session_key_data);
     }
 
@@ -530,6 +562,7 @@ AAAA\r\n\
                 receive: 1,
                 send: 1,
                 address_type: 1,
+                order: 0,
                 display_name: "Alice".to_string(),
                 keys: vec![],
             },
@@ -540,6 +573,7 @@ AAAA\r\n\
                 receive: 0,
                 send: 0,
                 address_type: 1,
+                order: 0,
                 display_name: "Disabled".to_string(),
                 keys: vec![],
             },

@@ -1437,6 +1437,7 @@ mod tests {
             id: id.to_string(),
             address_id: "addr-1".to_string(),
             label_ids: vec!["0".to_string()],
+            external_id: None,
             subject: format!("Subject {}", id),
             sender: EmailAddress {
                 name: "Alice".to_string(),
@@ -1448,9 +1449,14 @@ mod tests {
             }],
             cc_list: vec![],
             bcc_list: vec![],
+            reply_tos: vec![],
+            flags: 0,
             time: 1700000000,
             size: 1024,
             unread,
+            is_replied: 0,
+            is_replied_all: 0,
+            is_forwarded: 0,
             num_attachments: 0,
         }
     }

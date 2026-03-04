@@ -1,4 +1,7 @@
-use crate::api::types::{self, MessageMetadata, ALL_DRAFTS_LABEL, DRAFTS_LABEL, STARRED_LABEL};
+use crate::api::types::{
+    self, MessageMetadata, ALL_DRAFTS_LABEL, DRAFTS_LABEL, MESSAGE_FLAG_FORWARDED,
+    MESSAGE_FLAG_REPLIED, MESSAGE_FLAG_REPLIED_ALL, STARRED_LABEL,
+};
 
 #[derive(Clone, Copy)]
 pub struct ImapMailbox {
@@ -89,6 +92,17 @@ pub fn message_flags(meta: &MessageMetadata) -> Vec<&'static str> {
         flags.push("\\Draft");
     }
 
+    if meta.is_replied != 0
+        || meta.is_replied_all != 0
+        || (meta.flags & (MESSAGE_FLAG_REPLIED | MESSAGE_FLAG_REPLIED_ALL)) != 0
+    {
+        flags.push("\\Answered");
+    }
+
+    if meta.is_forwarded != 0 || (meta.flags & MESSAGE_FLAG_FORWARDED) != 0 {
+        flags.push("$Forwarded");
+    }
+
     flags
 }
 
@@ -102,6 +116,7 @@ mod tests {
             id: "msg-1".to_string(),
             address_id: "addr-1".to_string(),
             label_ids: label_ids.into_iter().map(|s| s.to_string()).collect(),
+            external_id: None,
             subject: "Test".to_string(),
             sender: EmailAddress {
                 name: "Alice".to_string(),
@@ -110,9 +125,14 @@ mod tests {
             to_list: vec![],
             cc_list: vec![],
             bcc_list: vec![],
+            reply_tos: vec![],
+            flags: 0,
             time: 1700000000,
             size: 1024,
             unread,
+            is_replied: 0,
+            is_replied_all: 0,
+            is_forwarded: 0,
             num_attachments: 0,
         }
     }
@@ -196,6 +216,22 @@ mod tests {
         assert!(flags.contains(&"\\Seen"));
         assert!(flags.contains(&"\\Flagged"));
         assert!(flags.contains(&"\\Draft"));
+    }
+
+    #[test]
+    fn test_message_flags_answered_from_boolean_fields() {
+        let mut meta = make_meta(1, vec!["0"]);
+        meta.is_replied = 1;
+        let flags = message_flags(&meta);
+        assert!(flags.contains(&"\\Answered"));
+    }
+
+    #[test]
+    fn test_message_flags_forwarded_from_bitmask_fallback() {
+        let mut meta = make_meta(1, vec!["0"]);
+        meta.flags = MESSAGE_FLAG_FORWARDED;
+        let flags = message_flags(&meta);
+        assert!(flags.contains(&"$Forwarded"));
     }
 
     #[test]

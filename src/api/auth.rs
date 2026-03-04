@@ -347,6 +347,10 @@ mod tests {
             uid: String::new(),
             access_token: "access-new".to_string(),
             refresh_token: String::new(),
+            server_proof: None,
+            scope: None,
+            two_factor: None,
+            password_mode: None,
         };
         let finalized = finalize_refresh_response("uid-1", "refresh-old", auth);
         assert_eq!(finalized.uid, "uid-1");

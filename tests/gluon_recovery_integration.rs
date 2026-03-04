@@ -186,6 +186,7 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
                 id: "msg-1".to_string(),
                 address_id: "addr-1".to_string(),
                 label_ids: vec!["0".to_string()],
+                external_id: None,
                 subject: "seed".to_string(),
                 sender: openproton_bridge::api::types::EmailAddress {
                     name: "Seed".to_string(),
@@ -194,9 +195,14 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
                 to_list: vec![],
                 cc_list: vec![],
                 bcc_list: vec![],
+                reply_tos: vec![],
+                flags: 0,
                 time: 1_700_000_000,
                 size: 100,
                 unread: 1,
+                is_replied: 0,
+                is_replied_all: 0,
+                is_forwarded: 0,
                 num_attachments: 0,
             },
         )

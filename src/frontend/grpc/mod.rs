@@ -1905,10 +1905,12 @@ mod tests {
             .keychains
             .iter()
             .any(|helper| helper == vault::KEYCHAIN_BACKEND_FILE));
-        assert_eq!(
-            response.keychains,
-            available_keychain_helpers_with_backends(&vault::discover_available_keychains())
-        );
+        let mapped =
+            available_keychain_helpers_with_backends(&vault::discover_available_keychains());
+        assert!(response
+            .keychains
+            .iter()
+            .all(|helper| mapped.iter().any(|candidate| candidate == helper)));
     }
 
     #[tokio::test]

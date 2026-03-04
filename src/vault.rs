@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
@@ -98,6 +98,7 @@ struct CredentialStorePathFileConfig {
 }
 
 static PROCESS_CREDENTIAL_STORE_OVERRIDES: OnceLock<CredentialStoreOverrides> = OnceLock::new();
+static VAULT_KEY_CACHE: OnceLock<Mutex<HashMap<PathBuf, [u8; KEY_LEN]>>> = OnceLock::new();
 
 pub fn set_process_credential_store_overrides(overrides: CredentialStoreOverrides) {
     let _ = PROCESS_CREDENTIAL_STORE_OVERRIDES.set(overrides);
@@ -1068,6 +1069,10 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     let store_config = resolve_credential_store_config(dir);
     let key_path = store_config.file_path.clone();
 
+    if let Some(key) = get_cached_vault_key(&key_path) {
+        return Ok(key);
+    }
+
     // 1. Try vault.key file (preferred: local, deterministic, no race conditions)
     if key_path.exists() {
         let data = std::fs::read(&key_path)?;
@@ -1076,6 +1081,7 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
         }
         let mut key = [0u8; KEY_LEN];
         key.copy_from_slice(&data);
+        cache_vault_key_in_memory(&key_path, &key);
         return Ok(key);
     }
 
@@ -1086,7 +1092,7 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
         if let Some(key) =
             resolve_keychain_key(try_secure_backend_get(&store_config), vault_exists)?
         {
-            cache_vault_key_file_if_missing(&key_path, &key);
+            cache_vault_key_in_memory(&key_path, &key);
             return Ok(key);
         }
     } else if vault_exists {
@@ -1104,21 +1110,21 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     if let Err(err) = try_secure_backend_set(&store_config, &key) {
         record_keychain_failure("write", vault_exists, false, &err);
     }
+    cache_vault_key_in_memory(&key_path, &key);
 
     Ok(key)
 }
 
-fn cache_vault_key_file_if_missing(path: &Path, key: &[u8; KEY_LEN]) {
-    if path.exists() {
-        return;
-    }
+fn get_cached_vault_key(path: &Path) -> Option<[u8; KEY_LEN]> {
+    let cache = VAULT_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = cache.lock().ok()?;
+    cache.get(path).copied()
+}
 
-    if let Err(err) = write_vault_key_file(path, key) {
-        tracing::warn!(
-            path = %path.display(),
-            error = %err,
-            "failed to cache vault key file after keychain lookup"
-        );
+fn cache_vault_key_in_memory(path: &Path, key: &[u8; KEY_LEN]) {
+    let cache = VAULT_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(path.to_path_buf(), *key);
     }
 }
 
@@ -2357,29 +2363,21 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_vault_key_file_if_missing_creates_key_file() {
+    fn test_cache_vault_key_in_memory_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join(KEY_FILE);
         let key = [0x44; KEY_LEN];
 
-        cache_vault_key_file_if_missing(&key_path, &key);
-
-        let written = std::fs::read(&key_path).unwrap();
-        assert_eq!(written, key);
+        cache_vault_key_in_memory(&key_path, &key);
+        let loaded = get_cached_vault_key(&key_path);
+        assert_eq!(loaded, Some(key));
     }
 
     #[test]
-    fn test_cache_vault_key_file_if_missing_keeps_existing_file() {
+    fn test_cache_vault_key_in_memory_miss_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let key_path = tmp.path().join(KEY_FILE);
-        let existing = [0x11; KEY_LEN];
-        let replacement = [0x22; KEY_LEN];
-        std::fs::write(&key_path, existing).unwrap();
-
-        cache_vault_key_file_if_missing(&key_path, &replacement);
-
-        let written = std::fs::read(&key_path).unwrap();
-        assert_eq!(written, existing);
+        assert_eq!(get_cached_vault_key(&key_path), None);
     }
 
     #[test]

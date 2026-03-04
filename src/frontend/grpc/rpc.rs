@@ -998,6 +998,8 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn check_update(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        self.emit_update_is_latest_version();
+        self.emit_update_check_finished();
         Ok(Response::new(()))
     }
 

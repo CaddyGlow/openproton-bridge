@@ -68,7 +68,7 @@ async fn be034_gluon_store_persists_mailbox_index_to_sqlite_db() {
 }
 
 #[tokio::test]
-async fn be034_gluon_store_reloads_from_sqlite_when_index_json_is_missing() {
+async fn be034_gluon_store_reloads_from_sqlite_on_restart_without_json_index() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mailbox = "account-1::INBOX";
     let storage_user_id = "user-1";
@@ -84,16 +84,6 @@ async fn be034_gluon_store_reloads_from_sqlite_when_index_json_is_missing() {
         .await
         .expect("store metadata");
     assert_eq!(uid, 1);
-
-    let index_path = temp
-        .path()
-        .join("backend")
-        .join("store")
-        .join(storage_user_id)
-        .join(".openproton-mailbox-index.json");
-    assert!(index_path.exists(), "expected index json before delete");
-    std::fs::remove_file(&index_path).expect("remove index json");
-    assert!(!index_path.exists(), "index json should be removed");
 
     let reloaded = GluonStore::new(
         temp.path().to_path_buf(),

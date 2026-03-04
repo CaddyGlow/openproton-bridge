@@ -386,6 +386,22 @@ impl BridgeService {
         ));
     }
 
+    fn emit_update_is_latest_version(&self) {
+        self.emit_event(pb::stream_event::Event::Update(pb::UpdateEvent {
+            event: Some(pb::update_event::Event::IsLatestVersion(
+                pb::UpdateIsLatestVersion {},
+            )),
+        }));
+    }
+
+    fn emit_update_check_finished(&self) {
+        self.emit_event(pb::stream_event::Event::Update(pb::UpdateEvent {
+            event: Some(pb::update_event::Event::CheckFinished(
+                pb::UpdateCheckFinished {},
+            )),
+        }));
+    }
+
     fn emit_keychain_change_finished(&self) {
         self.emit_event(pb::stream_event::Event::Keychain(pb::KeychainEvent {
             event: Some(pb::keychain_event::Event::ChangeKeychainFinished(

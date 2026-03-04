@@ -376,8 +376,25 @@ pub struct EventsResponse {
     pub more: i32,
     #[serde(default)]
     pub refresh: i32,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "Event",
+        deserialize_with = "deserialize_events_payload"
+    )]
     pub events: Vec<Value>,
+}
+
+fn deserialize_events_payload<'de, D>(deserializer: D) -> std::result::Result<Vec<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let events = match value {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(events)) => events,
+        Some(single_event) => vec![single_event],
+    };
+    Ok(events)
 }
 
 #[derive(Debug, Clone, Serialize)]

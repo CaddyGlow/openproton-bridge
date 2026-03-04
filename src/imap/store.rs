@@ -218,7 +218,6 @@ pub fn new_runtime_message_store(
 const GLUON_BACKEND_DIR: &str = "backend";
 const GLUON_DB_DIR: &str = "db";
 const GLUON_STORE_DIR: &str = "store";
-const GLUON_INDEX_FILE_NAME: &str = ".openproton-mailbox-index.json";
 const GLUON_SQLITE_INDEX_TABLE: &str = "openproton_mailbox_index";
 const GLUON_DEFAULT_ACCOUNT_SCOPE: &str = "__default__";
 const GLUON_DEFAULT_MAILBOX: &str = "INBOX";
@@ -378,11 +377,11 @@ pub struct GluonStore {
 }
 
 impl GluonStore {
-    fn emit_bootstrap_migration_logs(storage_user_id: &str, index_path: &Path) {
+    fn emit_bootstrap_migration_logs(storage_user_id: &str, db_path: &Path) {
         debug!(
             tx = "tx",
             account = %storage_user_id,
-            index = %index_path.display(),
+            db = %db_path.display(),
             "Running database migrations"
         );
         debug!("Version table does not exist, running all migrations");
@@ -451,19 +450,10 @@ impl GluonStore {
             .join(format!("{storage_user_id}.db"))
     }
 
-    fn account_index_path(&self, storage_user_id: &str) -> PathBuf {
-        self.account_store_dir(storage_user_id)
-            .join(GLUON_INDEX_FILE_NAME)
-    }
-
     fn account_rel_store_dir(storage_user_id: &str) -> PathBuf {
         Path::new(GLUON_BACKEND_DIR)
             .join(GLUON_STORE_DIR)
             .join(storage_user_id)
-    }
-
-    fn account_index_rel_path(storage_user_id: &str) -> PathBuf {
-        Self::account_rel_store_dir(storage_user_id).join(GLUON_INDEX_FILE_NAME)
     }
 
     fn message_rel_path(storage_user_id: &str, blob_name: &str) -> PathBuf {
@@ -495,12 +485,17 @@ impl GluonStore {
             return Ok(None);
         }
 
-        let conn = rusqlite::Connection::open(&db_path).map_err(|err| {
-            super::ImapError::GluonCorruption {
-                path: db_path.clone(),
-                reason: format!("failed to open sqlite db: {err}"),
+        let conn = match rusqlite::Connection::open(&db_path) {
+            Ok(conn) => conn,
+            Err(err) => {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to open sqlite db for gluon index, falling back to empty index"
+                );
+                return Ok(None);
             }
-        })?;
+        };
         conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_INDEX_TABLE} (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -508,10 +503,24 @@ impl GluonStore {
                 updated_at_ms INTEGER NOT NULL
             );"
         ))
-        .map_err(|err| super::ImapError::GluonCorruption {
-            path: db_path.clone(),
-            reason: format!("failed to initialize sqlite schema: {err}"),
-        })?;
+        .map_err(|err| {
+            warn!(
+                path = %db_path.display(),
+                error = %err,
+                "failed to initialize sqlite schema for gluon index, falling back to empty index"
+            );
+            super::ImapError::Protocol("sqlite index schema init failed".to_string())
+        })
+        .ok();
+
+        if conn
+            .prepare(&format!(
+                "SELECT payload, updated_at_ms FROM {GLUON_SQLITE_INDEX_TABLE} WHERE id = 1"
+            ))
+            .is_err()
+        {
+            return Ok(None);
+        }
 
         let row = conn
             .query_row(
@@ -522,22 +531,32 @@ impl GluonStore {
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
-            .map_err(|err| super::ImapError::GluonCorruption {
-                path: db_path.clone(),
-                reason: format!("failed to read sqlite index row: {err}"),
-            })?;
+            .map_err(|err| {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to read sqlite index row, falling back to empty index"
+                );
+                super::ImapError::Protocol("sqlite index row read failed".to_string())
+            })
+            .ok()
+            .flatten();
 
         let Some((payload, updated_at_ms)) = row else {
             return Ok(None);
         };
 
-        let mut parsed =
-            serde_json::from_slice::<GluonAccountIndexFile>(&payload).map_err(|err| {
-                super::ImapError::GluonCorruption {
-                    path: db_path.clone(),
-                    reason: format!("failed to parse sqlite index payload: {err}"),
-                }
-            })?;
+        let mut parsed = match serde_json::from_slice::<GluonAccountIndexFile>(&payload) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to parse sqlite index payload, falling back to empty index"
+                );
+                return Ok(None);
+            }
+        };
         if parsed.updated_at_ms == 0 && updated_at_ms > 0 {
             parsed.updated_at_ms = updated_at_ms as u64;
         }
@@ -622,31 +641,11 @@ impl GluonStore {
             })?;
         }
 
-        let index_payload = serde_json::to_vec(&index).map_err(|err| {
-            super::ImapError::Protocol(format!(
-                "failed to serialize gluon mailbox index for account {storage_user_id}: {err}"
-            ))
-        })?;
-        txn.stage_write(Self::account_index_rel_path(storage_user_id), index_payload)
-            .map_err(|err| {
-                super::ImapError::Protocol(format!(
-                    "failed to stage gluon mailbox index for account {storage_user_id}: {err}"
-                ))
-            })?;
-
         txn.commit().map_err(|err| {
             super::ImapError::Protocol(format!("failed to commit gluon txn: {err}"))
         })?;
 
-        // Keep a sqlite mirror of mailbox index state so backend/db is actively used.
-        if let Err(err) = self.persist_index_to_sqlite(storage_user_id, &index) {
-            warn!(
-                account = %storage_user_id,
-                error = %err,
-                "failed to mirror gluon mailbox index into sqlite db"
-            );
-        }
-        Ok(())
+        self.persist_index_to_sqlite(storage_user_id, &index)
     }
 
     fn default_blob_name_for_uid(uid: u32) -> String {
@@ -672,49 +671,15 @@ impl GluonStore {
         let account_dir = self.account_store_dir(storage_user_id);
         std::fs::create_dir_all(&account_dir)?;
 
-        let index_path = self.account_index_path(storage_user_id);
-        let mut json_index: Option<GluonAccountIndexFile> = None;
-        if index_path.exists() {
-            let payload = std::fs::read(&index_path)?;
-            json_index = Some(
-                serde_json::from_slice::<GluonAccountIndexFile>(&payload).map_err(|err| {
-                    super::ImapError::GluonCorruption {
-                        path: index_path.clone(),
-                        reason: format!("failed to parse gluon mailbox index: {err}"),
-                    }
-                })?,
-            );
-        }
-        let db_index = self.load_index_from_sqlite(storage_user_id)?;
-
-        let mut loaded_from_db = false;
-        let mut prefer_db_over_json = false;
-        let mut index = match (db_index, json_index) {
-            (Some(db), Some(json)) => {
-                if db.updated_at_ms > 0 && db.updated_at_ms >= json.updated_at_ms {
-                    loaded_from_db = true;
-                    prefer_db_over_json = db.updated_at_ms > json.updated_at_ms;
-                    db
-                } else {
-                    json
-                }
-            }
-            (Some(db), None) => {
-                loaded_from_db = true;
-                db
-            }
-            (None, Some(json)) => json,
-            (None, None) => GluonAccountIndexFile::new(),
-        };
-
-        let is_new_index = !index_path.exists() && !loaded_from_db;
+        let db_path = self.account_db_path(storage_user_id);
+        let mut index = self
+            .load_index_from_sqlite(storage_user_id)?
+            .unwrap_or_else(GluonAccountIndexFile::new);
+        let is_new_index = index.mailboxes.is_empty() && !db_path.exists();
         if is_new_index {
-            Self::emit_bootstrap_migration_logs(storage_user_id, &index_path);
+            Self::emit_bootstrap_migration_logs(storage_user_id, &db_path);
         }
         let mut repaired = false;
-        if loaded_from_db && (!index_path.exists() || prefer_db_over_json) {
-            repaired = true;
-        }
 
         index.sanitize();
         for mailbox in index.mailboxes.values_mut() {
@@ -755,14 +720,7 @@ impl GluonStore {
         }
 
         if repaired {
-            let payload = serde_json::to_vec(&index).map_err(|err| {
-                super::ImapError::Protocol(format!(
-                    "failed to serialize repaired gluon mailbox index for account {storage_user_id}: {err}"
-                ))
-            })?;
-            let tmp_path = index_path.with_extension("json.tmp");
-            std::fs::write(&tmp_path, payload)?;
-            std::fs::rename(&tmp_path, &index_path)?;
+            self.persist_index_to_sqlite(storage_user_id, &index)?;
         }
 
         let mut max_blob_id = index.next_blob_id;

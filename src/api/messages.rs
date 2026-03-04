@@ -1,6 +1,7 @@
 use tracing::info;
 
 use super::client::{check_api_response, ProtonClient};
+use super::error::ApiError;
 use super::error::Result;
 use super::types::{
     AttachmentResponse, CreateDraftReq, MessageFilter, MessageResponse, MessagesMetadataResponse,
@@ -66,7 +67,26 @@ pub async fn get_attachment(client: &ProtonClient, attachment_id: &str) -> Resul
     info!(attachment_id = %attachment_id, "fetching attachment");
     let path = format!("/mail/v4/attachments/{}", attachment_id);
     let resp = client.get(&path).send().await?;
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     let bytes = resp.bytes().await?;
+
+    if !status.is_success() || content_type.contains("json") {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            check_api_response(&json)?;
+        } else if !status.is_success() {
+            return Err(ApiError::Auth(format!(
+                "attachment request failed with HTTP {}",
+                status.as_u16()
+            )));
+        }
+    }
+
     Ok(bytes.to_vec())
 }
 

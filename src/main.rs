@@ -3884,23 +3884,19 @@ async fn refresh_session(
         email = %session.email,
         "access token missing, refreshing via stored refresh token"
     );
-    let (auth, refreshed_api_mode) = api::auth::refresh_auth_with_mode_fallback(
-        session.api_mode,
-        &session.uid,
-        &session.refresh_token,
-        None,
-    )
-    .await
-    .map_err(|err| {
-        tracing::warn!(
-            pkg = "bridge/token",
-            user_id = %session.uid,
-            email = %session.email,
-            error = %err,
-            "stored refresh token exchange failed"
-        );
-        err
-    })?;
+    let mut client = api::client::ProtonClient::with_api_mode(session.api_mode)?;
+    let auth = api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                pkg = "bridge/token",
+                user_id = %session.uid,
+                email = %session.email,
+                error = %err,
+                "stored refresh token exchange failed"
+            );
+            err
+        })?;
     tracing::info!(
         pkg = "bridge/token",
         user_id = %auth.uid,
@@ -3911,17 +3907,10 @@ async fn refresh_session(
         uid: auth.uid,
         access_token: auth.access_token,
         refresh_token: auth.refresh_token,
-        api_mode: refreshed_api_mode,
         ..session
     };
 
     let mut canonical_user_id = None;
-    let client = api::client::ProtonClient::authenticated_with_mode(
-        refreshed.api_mode.base_url(),
-        refreshed.api_mode,
-        &refreshed.uid,
-        &refreshed.access_token,
-    )?;
     match api::users::get_user(&client).await {
         Ok(user_resp) => {
             canonical_user_id = Some(user_resp.user.id.clone());

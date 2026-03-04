@@ -527,7 +527,7 @@ impl RuntimeAccountRegistry {
             }
         }
 
-        let (refreshed, refreshed_api_mode) = match refresh_result {
+        let refreshed = match refresh_result {
             Ok(auth) => auth,
             Err(err) => {
                 let next_health = refresh_failure_health(&err);
@@ -546,7 +546,6 @@ impl RuntimeAccountRegistry {
             uid: refreshed.uid,
             access_token: refreshed.access_token,
             refresh_token: refreshed.refresh_token,
-            api_mode: refreshed_api_mode,
             ..session_for_refresh
         };
 
@@ -583,25 +582,14 @@ impl RuntimeAccountRegistry {
 async fn refresh_with_optional_access_token(
     session: &Session,
     include_access_token: bool,
-) -> Result<
-    (
-        crate::api::types::RefreshResponse,
-        crate::api::types::ApiMode,
-    ),
-    ApiError,
-> {
+) -> Result<crate::api::types::RefreshResponse, ApiError> {
+    let mut client = ProtonClient::with_api_mode(session.api_mode)?;
     let access = if include_access_token {
         Some(session.access_token.as_str())
     } else {
         None
     };
-    auth::refresh_auth_with_mode_fallback(
-        session.api_mode,
-        &session.uid,
-        &session.refresh_token,
-        access,
-    )
-    .await
+    auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, access).await
 }
 
 async fn fetch_canonical_user_context(session: &Session) -> Option<(String, String, String)> {

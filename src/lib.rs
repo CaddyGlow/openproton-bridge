@@ -5,5 +5,6 @@ pub mod frontend;
 pub mod imap;
 pub mod observability;
 pub mod paths;
+pub mod single_instance;
 pub mod smtp;
 pub mod vault;

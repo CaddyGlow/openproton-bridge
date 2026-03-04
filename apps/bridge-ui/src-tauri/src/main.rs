@@ -2,6 +2,43 @@ mod grpc;
 mod state;
 mod tray;
 
+#[cfg(feature = "embed-backend")]
+mod embedded_backend {
+    use openproton_bridge::paths::RuntimePaths;
+    use openproton_bridge::single_instance::InstanceLock;
+    use openproton_bridge::vault::{self, CredentialStoreOverrides};
+    use tokio::task::JoinHandle;
+
+    pub struct BackendHandle {
+        _instance_lock: InstanceLock,
+        _server_task: JoinHandle<()>,
+    }
+
+    pub async fn start_backend() -> Result<BackendHandle, String> {
+        vault::set_process_credential_store_overrides(CredentialStoreOverrides::default());
+        let runtime_paths =
+            RuntimePaths::resolve(None).map_err(|err| format!("resolve paths: {err:#}"))?;
+        let instance_lock =
+            openproton_bridge::single_instance::acquire_bridge_instance_lock(&runtime_paths)
+                .map_err(|err| format!("instance lock: {err:#}"))?;
+
+        let paths = runtime_paths.clone();
+        let server_task = tokio::spawn(async move {
+            if let Err(err) =
+                openproton_bridge::frontend::grpc::run_server(paths, "127.0.0.1".into()).await
+            {
+                tracing::error!("embedded backend exited with error: {err:#}");
+            }
+        });
+
+        tracing::info!("embedded backend started");
+        Ok(BackendHandle {
+            _instance_lock: instance_lock,
+            _server_task: server_task,
+        })
+    }
+}
+
 use crate::grpc::adapter::{AppSettings, GrpcAdapter, MailSettings, UserSummary};
 use crate::state::{AppState, BridgeSnapshot};
 use std::path::PathBuf;
@@ -775,6 +812,9 @@ async fn bridge_set_current_keychain(
     adapter.set_current_keychain(state.inner(), &name).await
 }
 
+#[cfg(feature = "embed-backend")]
+type EmbeddedBackendState = std::sync::Arc<Mutex<Option<embedded_backend::BackendHandle>>>;
+
 fn main() {
     let _log_guard = init_logging();
     let frontend_log_state = FrontendLogState::new();
@@ -783,12 +823,35 @@ fn main() {
         "frontend log sink initialized"
     );
 
-    tauri::Builder::default()
+    #[allow(unused_mut)]
+    let mut builder = tauri::Builder::default()
         .manage(AppState::default())
         .manage(AdapterState::default())
-        .manage(frontend_log_state)
+        .manage(frontend_log_state);
+
+    #[cfg(feature = "embed-backend")]
+    {
+        builder = builder.manage(EmbeddedBackendState::default());
+    }
+
+    builder
         .setup(|app| {
             tray::build_tray(app.handle())?;
+
+            #[cfg(feature = "embed-backend")]
+            {
+                let state = app.state::<EmbeddedBackendState>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    match embedded_backend::start_backend().await {
+                        Ok(handle) => {
+                            *state.lock().await = Some(handle);
+                        }
+                        Err(err) => {
+                            tracing::error!("failed to start embedded backend: {err}");
+                        }
+                    }
+                });
+            }
 
             if let Some(window) = app.get_webview_window("main") {
                 let app_handle = app.handle().clone();

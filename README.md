@@ -28,8 +28,26 @@ Active development. Core bridge flows are implemented, including multi-account r
 
 ## Building
 
-```
+```bash
+# Backend only (IMAP/SMTP/gRPC server)
 cargo build --release
+
+# Frontend only (Tauri GUI, connects to a running backend via gRPC)
+cd apps/bridge-ui && bun install && bun run tauri:build
+
+# Combined binary (GUI with embedded backend -- single process)
+cd apps/bridge-ui/src-tauri && cargo build --release --features embed-backend
+```
+
+The combined binary starts the gRPC backend in-process before the GUI connects,
+so no separate `openproton-bridge grpc` process is needed. The instance lock
+prevents a standalone backend from running at the same time.
+
+A Nix flake is provided for reproducible builds with all system dependencies
+(GTK, WebKitGTK, libsoup, protoc, bun):
+
+```bash
+nix develop
 ```
 
 ## Usage

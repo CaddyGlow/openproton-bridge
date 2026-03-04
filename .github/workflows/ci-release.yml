@@ -121,6 +121,12 @@ jobs:
           cp "target/release/openproton-bridge${{ matrix.bin_ext }}" dist/package/
           cp "target/release/bridge-ui-tauri${{ matrix.bin_ext }}" dist/package/
 
+      - name: Build combined binary (embed-backend)
+        run: cargo build --manifest-path apps/bridge-ui/src-tauri/Cargo.toml --release --locked --features embed-backend
+
+      - name: Copy combined binary
+        run: cp "target/release/bridge-ui-tauri${{ matrix.bin_ext }}" "dist/package/bridge-ui-combined${{ matrix.bin_ext }}"
+
       - name: Archive package (unix)
         if: matrix.os != 'windows-latest'
         run: |

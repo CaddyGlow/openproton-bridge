@@ -4,12 +4,18 @@ on:
   pull_request:
     paths:
       - "apps/bridge-ui/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/bridge-ui-desktop-build.yml"
   push:
     branches:
       - main
     paths:
       - "apps/bridge-ui/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/bridge-ui-desktop-build.yml"
   workflow_dispatch:
 
@@ -58,3 +64,6 @@ jobs:
 
       - name: Tauri desktop compile
         run: bun run tauri:build --debug --no-bundle --ci
+
+      - name: Tauri combined (embed-backend) compile
+        run: cargo build --manifest-path src-tauri/Cargo.toml --features embed-backend

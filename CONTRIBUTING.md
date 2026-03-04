@@ -2,10 +2,39 @@
 
 ## Development Setup
 
+### With Nix (recommended)
+
+A `flake.nix` is provided that supplies Rust, protoc, bun, and all Linux UI
+libraries (GTK3, WebKitGTK, libsoup, cairo, pango, appindicator):
+
+```bash
+nix develop
+cargo build
+cargo test
+```
+
+### Without Nix
+
 1. Install Rust 1.75+ via [rustup](https://rustup.rs/)
-2. Clone the repository
-3. `cargo build` to verify the toolchain works
-4. `cargo test` to run the test suite
+2. Install system dependencies for the Tauri frontend:
+   - **Linux:** `libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev`
+   - **macOS/Windows:** no extra system packages needed
+3. Install [bun](https://bun.sh/) for the frontend JS tooling
+4. Clone the repository
+5. `cargo build` to verify the toolchain works
+6. `cargo test` to run the test suite
+
+### Build Targets
+
+| Target | Command | Description |
+|--------|---------|-------------|
+| Backend binary | `cargo build --release` | Standalone IMAP/SMTP/gRPC server |
+| Frontend binary | `cd apps/bridge-ui && bun install && bun run tauri:build` | Standalone Tauri GUI (connects via gRPC) |
+| Combined binary | `cd apps/bridge-ui/src-tauri && cargo build --release --features embed-backend` | GUI with embedded backend in one process |
+
+The `embed-backend` feature adds `openproton-bridge` as a dependency of the
+Tauri crate. The embedded backend acquires the instance lock on startup, so it
+cannot run alongside a standalone `openproton-bridge grpc` process.
 
 ## Code Style
 

@@ -32,6 +32,8 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    env:
+      OPENPROTON_CREDENTIAL_STORE: file
     steps:
       - name: Checkout
         uses: actions/checkout@v4

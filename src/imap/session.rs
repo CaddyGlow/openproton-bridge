@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -40,6 +41,8 @@ pub struct SessionConfig {
     pub store: Arc<dyn MessageStore>,
 }
 
+static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Sentinel returned to the caller to signal STARTTLS upgrade is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
@@ -60,6 +63,7 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     selected_mailbox_mod_seq: Option<u64>,
     authenticated_account_id: Option<String>,
     starttls_available: bool,
+    connection_id: u64,
 }
 
 impl<R, W> ImapSession<R, W>
@@ -89,6 +93,7 @@ where
             selected_mailbox_mod_seq: None,
             authenticated_account_id: None,
             starttls_available,
+            connection_id: NEXT_IMAP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -105,7 +110,7 @@ where
             let mut line = String::new();
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
-                debug!("client disconnected");
+                debug!(connection_id = self.connection_id, "client disconnected");
                 return Ok(SessionAction::Close);
             }
 
@@ -114,7 +119,7 @@ where
                 continue;
             }
 
-            debug!(line = %line, "received command");
+            debug!(connection_id = self.connection_id, line = %line, "received command");
 
             match self.handle_line(&line).await? {
                 SessionAction::Continue => {}
@@ -465,7 +470,11 @@ where
         self.authenticated_account_id = Some(auth_route.account_id.0.clone());
         self.state = State::Authenticated;
 
-        info!(email = %auth_route.primary_email, "IMAP login successful");
+        info!(
+            connection_id = self.connection_id,
+            email = %auth_route.primary_email,
+            "IMAP login successful"
+        );
         self.writer.tagged_ok(tag, None, "LOGIN completed").await
     }
 

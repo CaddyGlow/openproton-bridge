@@ -402,6 +402,12 @@ impl BridgeService {
         }));
     }
 
+    fn emit_generic_error(&self, code: pb::ErrorCode) {
+        self.emit_event(pb::stream_event::Event::GenericError(
+            pb::GenericErrorEvent { code: code as i32 },
+        ));
+    }
+
     fn emit_keychain_change_finished(&self) {
         self.emit_event(pb::stream_event::Event::Keychain(pb::KeychainEvent {
             event: Some(pb::keychain_event::Event::ChangeKeychainFinished(

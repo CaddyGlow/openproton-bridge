@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::process::Command as ProcessCommand;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use anyhow::Context;
 use base64::engine::general_purpose::{
@@ -195,6 +195,7 @@ const ENV_OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE: &str =
     "OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE";
 const ENV_OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY: &str = "OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY";
 const ENV_OPENPROTON_CREDENTIAL_STORE_FILE_PATH: &str = "OPENPROTON_CREDENTIAL_STORE_FILE_PATH";
+static PANIC_HOOK_INSTALLED: Once = Once::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -210,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
     vault::set_process_credential_store_overrides(credential_store_overrides);
     let resolved_vault_dir = resolve_vault_dir(&cli);
     let runtime_paths = runtime_paths(resolved_vault_dir.as_deref())?;
+    install_crash_capture_hook(runtime_paths.clone());
     let dir = runtime_paths.settings_dir().to_path_buf();
     let _instance_lock = match &cli.command {
         Command::Serve { .. } | Command::Grpc { .. } | Command::Cli => {
@@ -597,9 +599,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     }
                     "debug" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
                         Some(action) if action == "mailbox-state" => {
-                            eprintln!(
-                                "debug mailbox-state is not implemented in openproton-bridge CLI."
-                            );
+                            println!("{}", render_mailbox_state_diagnostics(dir, runtime_paths));
                         }
                         _ => eprintln!("Usage: debug mailbox-state"),
                     },
@@ -1701,7 +1701,7 @@ fn print_interactive_help() {
     println!("  credits                          Print credits/dependency info");
     println!("  configure-apple-mail             Placeholder (not yet implemented)");
     println!("  log-dir                          Print log directory path");
-    println!("  debug mailbox-state              Placeholder (not yet implemented)");
+    println!("  debug mailbox-state              Print deterministic mailbox diagnostics");
     println!("  telemetry <enable|disable|status> Manage telemetry setting");
     println!("  proxy <allow|disallow|status>    Manage DoH proxy fallback setting");
     println!("  autostart <enable|disable|status> Manage autostart setting");
@@ -1739,6 +1739,87 @@ fn print_interactive_help() {
     println!();
     print_interactive_serve_help();
     print_interactive_grpc_help();
+}
+
+fn crash_reports_dir(runtime_paths: &paths::RuntimePaths) -> std::path::PathBuf {
+    runtime_paths.crash_reports_dir()
+}
+
+fn write_crash_report_artifact(
+    runtime_paths: &paths::RuntimePaths,
+    details: &str,
+) -> anyhow::Result<std::path::PathBuf> {
+    let crash_dir = crash_reports_dir(runtime_paths);
+    std::fs::create_dir_all(&crash_dir)
+        .with_context(|| format!("failed to create crash reports dir {}", crash_dir.display()))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = crash_dir.join(format!("panic-{}-{}.log", std::process::id(), timestamp));
+    std::fs::write(&path, details)
+        .with_context(|| format!("failed to write crash report {}", path.display()))?;
+    Ok(path)
+}
+
+fn install_crash_capture_hook(runtime_paths: paths::RuntimePaths) {
+    PANIC_HOOK_INSTALLED.call_once(move || {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let location = panic_info
+                .location()
+                .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let payload = panic_info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic_info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic payload unavailable".to_string());
+            let report = format!("panic_location={location}\npanic_payload={payload}\n");
+            if let Err(err) = write_crash_report_artifact(&runtime_paths, &report) {
+                eprintln!("failed to persist crash report: {err:#}");
+            }
+            previous_hook(panic_info);
+        }));
+    });
+}
+
+fn render_mailbox_state_diagnostics(
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> String {
+    let mut lines = Vec::new();
+    lines.push("mailbox-state diagnostics".to_string());
+    lines.push(format!(
+        "settings_dir={}",
+        runtime_paths.settings_dir().display()
+    ));
+    lines.push(format!("data_dir={}", runtime_paths.data_dir().display()));
+    lines.push(format!("cache_dir={}", runtime_paths.cache_dir().display()));
+    lines.push(format!("logs_dir={}", runtime_paths.logs_dir().display()));
+    lines.push(format!(
+        "crash_reports_dir={}",
+        crash_reports_dir(runtime_paths).display()
+    ));
+    lines.push(format!(
+        "disk_cache_dir={}",
+        effective_disk_cache_path(runtime_paths).display()
+    ));
+
+    let mut sessions = vault::list_sessions(dir).unwrap_or_default();
+    sessions.sort_by(|left, right| left.uid.cmp(&right.uid));
+    lines.push(format!("accounts={}", sessions.len()));
+    for session in sessions {
+        lines.push(format!(
+            "account uid={} email={} api_mode={}",
+            session.uid,
+            session.email,
+            session.api_mode.as_str()
+        ));
+    }
+
+    lines.join("\n")
 }
 
 fn cmd_vault_dump(dir: &std::path::Path) -> anyhow::Result<()> {
@@ -4337,6 +4418,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(effective_disk_cache_path(&runtime_paths), configured);
+    }
+
+    #[test]
+    fn render_mailbox_state_diagnostics_is_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+        let dir = runtime_paths.settings_dir();
+
+        let session_b = api::types::Session {
+            uid: "uid-b".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-b".to_string(),
+            email: "b@proton.me".to_string(),
+            display_name: "B".to_string(),
+            api_mode: api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let session_a = api::types::Session {
+            uid: "uid-a".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-a".to_string(),
+            email: "a@proton.me".to_string(),
+            display_name: "A".to_string(),
+            api_mode: api::types::ApiMode::Webmail,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        vault::save_session(&session_b, dir).unwrap();
+        vault::save_session(&session_a, dir).unwrap();
+
+        let report = render_mailbox_state_diagnostics(dir, &runtime_paths);
+        assert!(report.contains("mailbox-state diagnostics"));
+        assert!(report.contains("accounts=2"));
+        let pos_a = report.find("account uid=uid-a").unwrap();
+        let pos_b = report.find("account uid=uid-b").unwrap();
+        assert!(pos_a < pos_b, "accounts should be sorted by uid");
+        assert!(report.contains("crash_reports_dir="));
+    }
+
+    #[test]
+    fn write_crash_report_artifact_persists_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+        let path = write_crash_report_artifact(&runtime_paths, "panic_payload=test").unwrap();
+        assert!(path.exists());
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.contains("panic_payload=test"));
     }
 
     #[tokio::test]

@@ -42,6 +42,22 @@ fn decode_login_password_bytes(raw: Vec<u8>) -> Result<DecodedLoginPassword, Sta
     })
 }
 
+fn handle_stream_recv_error(
+    service: &BridgeService,
+    err: tokio::sync::broadcast::error::RecvError,
+) {
+    match err {
+        tokio::sync::broadcast::error::RecvError::Lagged(skipped) => {
+            warn!(
+                skipped,
+                "grpc event stream lagged; emitting generic error marker"
+            );
+            service.emit_generic_error(pb::ErrorCode::UnknownError);
+        }
+        tokio::sync::broadcast::error::RecvError::Closed => {}
+    }
+}
+
 impl BridgeService {
     async fn stage_two_password_login(&self, pending: PendingLogin) {
         let username = pending.username.clone();
@@ -1196,6 +1212,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         };
         let (out_tx, out_rx) = mpsc::channel::<Result<pb::StreamEvent, Status>>(32);
         let state = self.state.clone();
+        let service = self.clone();
 
         tokio::spawn(async move {
             for buffered in buffered_events {
@@ -1222,8 +1239,13 @@ impl pb::bridge_server::Bridge for BridgeService {
                                     break;
                                 }
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                            Err(err @ tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                handle_stream_recv_error(&service, err);
+                            }
+                            Err(err @ tokio::sync::broadcast::error::RecvError::Closed) => {
+                                handle_stream_recv_error(&service, err);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1454,5 +1476,25 @@ mod parity_grpc_wire_tests {
             session.key_passphrase,
             Some(BASE64.encode(expected_passphrase))
         );
+    }
+
+    #[tokio::test]
+    async fn parity_grpc_wire_lagged_stream_emits_generic_error_event() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        handle_stream_recv_error(
+            &service,
+            tokio::sync::broadcast::error::RecvError::Lagged(4),
+        );
+
+        let emitted = events.recv().await.expect("lagged event emission");
+        match emitted.event {
+            Some(pb::stream_event::Event::GenericError(event)) => {
+                assert_eq!(event.code, pb::ErrorCode::UnknownError as i32);
+            }
+            other => panic!("unexpected lagged event payload: {other:?}"),
+        }
     }
 }

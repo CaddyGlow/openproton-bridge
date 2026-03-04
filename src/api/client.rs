@@ -62,6 +62,25 @@ fn mode_user_agent(api_mode: ApiMode) -> String {
     }
 }
 
+/// Redact sensitive values (tokens/password-like content) before logging.
+///
+/// The helper defaults to redaction; callers should not log secrets directly.
+pub fn redact_sensitive_for_log(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "<redacted>".to_string();
+    }
+
+    let chars = trimmed.chars().collect::<Vec<_>>();
+    if chars.len() <= 4 {
+        return "<redacted>".to_string();
+    }
+
+    let prefix: String = chars[..2].iter().collect();
+    let suffix: String = chars[chars.len() - 2..].iter().collect();
+    format!("{prefix}…{suffix}")
+}
+
 /// HTTP client preconfigured with Proton API headers.
 #[derive(Debug, Clone)]
 pub struct ProtonClient {
@@ -205,6 +224,16 @@ mod tests {
     use super::*;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_redact_sensitive_for_log_defaults_to_redaction() {
+        assert_eq!(redact_sensitive_for_log(""), "<redacted>");
+        assert_eq!(redact_sensitive_for_log("abc"), "<redacted>");
+        assert_eq!(
+            redact_sensitive_for_log("super-secret-access-token"),
+            "su…en"
+        );
+    }
 
     #[test]
     fn test_check_api_response_success() {

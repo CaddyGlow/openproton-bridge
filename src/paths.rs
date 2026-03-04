@@ -9,6 +9,8 @@ const GLUON_BACKEND_DIR: &str = "backend";
 const GLUON_STORE_DIR: &str = "store";
 const GLUON_DB_DIR: &str = "db";
 const GLUON_DEFERRED_DELETE_DIR: &str = "deferred_delete";
+const SESSION_LOGS_DIR: &str = "sessions";
+const CRASH_REPORTS_DIR: &str = "crash_reports";
 
 fn is_windows_absolute_path(path: &str) -> bool {
     let bytes = path.as_bytes();
@@ -128,6 +130,14 @@ impl RuntimePaths {
         self.data_dir.join("logs")
     }
 
+    pub fn session_logs_dir(&self) -> PathBuf {
+        self.logs_dir().join(SESSION_LOGS_DIR)
+    }
+
+    pub fn crash_reports_dir(&self) -> PathBuf {
+        self.logs_dir().join(CRASH_REPORTS_DIR)
+    }
+
     pub fn imap_sync_dir(&self) -> PathBuf {
         self.settings_dir.join("imap-sync")
     }
@@ -234,6 +244,14 @@ mod tests {
         assert_eq!(
             paths.logs_dir(),
             Path::new("/data/protonmail/bridge-v3/logs")
+        );
+        assert_eq!(
+            paths.session_logs_dir(),
+            Path::new("/data/protonmail/bridge-v3/logs/sessions")
+        );
+        assert_eq!(
+            paths.crash_reports_dir(),
+            Path::new("/data/protonmail/bridge-v3/logs/crash_reports")
         );
         assert_eq!(
             paths.imap_sync_dir(),

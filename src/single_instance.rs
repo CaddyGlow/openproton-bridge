@@ -42,6 +42,7 @@ fn acquire_lock(lock_path: &Path) -> anyhow::Result<InstanceLock> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(false)
         .open(lock_path)
         .with_context(|| format!("failed to open lock file {}", lock_path.display()))?;
 

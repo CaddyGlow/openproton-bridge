@@ -197,6 +197,14 @@ impl BridgeService {
         }));
     }
 
+    fn emit_all_users_loaded(&self) {
+        self.emit_event(pb::stream_event::Event::App(pb::AppEvent {
+            event: Some(pb::app_event::Event::AllUsersLoaded(
+                pb::AllUsersLoadedEvent {},
+            )),
+        }));
+    }
+
     fn emit_login_tfa_requested(&self, username: &str) {
         self.emit_event(pb::stream_event::Event::Login(pb::LoginEvent {
             event: Some(pb::login_event::Event::TfaRequested(

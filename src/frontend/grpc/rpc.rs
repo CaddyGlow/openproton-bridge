@@ -127,6 +127,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         _request: Request<()>,
     ) -> Result<Response<pb::GuiReadyResponse>, Status> {
         let settings = self.state.app_settings.lock().await;
+        self.emit_all_users_loaded();
         self.emit_show_main_window();
         Ok(Response::new(pb::GuiReadyResponse {
             show_splash_screen: settings.show_on_startup,

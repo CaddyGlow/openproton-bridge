@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   parity-suite:
-    name: backend parity suite (soft gate)
+    name: backend parity suite
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
@@ -39,27 +39,22 @@ jobs:
 
       - name: parity_store_interop
         id: parity_store_interop
-        continue-on-error: true
         run: cargo test parity_store_interop -- --nocapture
 
       - name: parity_api_event
         id: parity_api_event
-        continue-on-error: true
         run: cargo test parity_api_event -- --nocapture
 
       - name: parity_grpc_wire
         id: parity_grpc_wire
-        continue-on-error: true
         run: cargo test parity_grpc_wire -- --nocapture
 
       - name: parity_imap_smtp_tls
         id: parity_imap_smtp_tls
-        continue-on-error: true
         run: cargo test parity_imap_smtp_tls -- --nocapture
 
       - name: parity_observability
         id: parity_observability
-        continue-on-error: true
         run: cargo test parity_observability -- --nocapture
 
       - name: Build parity baseline report

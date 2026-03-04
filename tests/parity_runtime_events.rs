@@ -148,6 +148,22 @@ async fn next_mail_settings_event(
     }
 }
 
+async fn next_app_event(stream: &mut tonic::Streaming<pb::StreamEvent>) -> pb::app_event::Event {
+    loop {
+        let next = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("event stream timeout")
+            .expect("event stream status")
+            .expect("event stream ended unexpectedly");
+
+        if let Some(pb::stream_event::Event::App(app)) = next.event {
+            if let Some(event) = app.event {
+                return event;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn parity_runtime_events_check_update_emits_is_latest_then_finished() {
     let runtime = start_runtime().await;
@@ -206,7 +222,7 @@ async fn parity_runtime_events_mail_settings_changed_then_finished_in_order() {
     };
 
     control_client
-        .set_mail_server_settings(req_with_token(requested.clone(), &runtime.token))
+        .set_mail_server_settings(req_with_token(requested, &runtime.token))
         .await
         .expect("set mail server settings");
 
@@ -227,6 +243,40 @@ async fn parity_runtime_events_mail_settings_changed_then_finished_in_order() {
         second,
         pb::mail_server_settings_event::Event::ChangeMailServerSettingsFinished(_)
     ));
+
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn parity_runtime_events_gui_ready_emits_all_users_loaded_then_main_window() {
+    let runtime = start_runtime().await;
+
+    let mut event_client = runtime.connect().await;
+    let mut control_client = runtime.connect().await;
+
+    let mut stream = event_client
+        .run_event_stream(req_with_token(
+            pb::EventStreamRequest {
+                client_platform: String::new(),
+            },
+            &runtime.token,
+        ))
+        .await
+        .expect("run event stream")
+        .into_inner();
+
+    let response = control_client
+        .gui_ready(req_with_token((), &runtime.token))
+        .await
+        .expect("gui ready call")
+        .into_inner();
+    assert!(response.show_splash_screen);
+
+    let first = next_app_event(&mut stream).await;
+    assert!(matches!(first, pb::app_event::Event::AllUsersLoaded(_)));
+
+    let second = next_app_event(&mut stream).await;
+    assert!(matches!(second, pb::app_event::Event::ShowMainWindow(_)));
 
     runtime.shutdown().await;
 }

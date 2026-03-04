@@ -26,14 +26,16 @@ fn be020_rejects_missing_or_invalid_gluon_key_during_bootstrap() {
         .expect("set empty gluon key");
 
     let missing_err =
-        vault::load_gluon_store_bootstrap(tmp.path(), &[session.uid.clone()]).unwrap_err();
+        vault::load_gluon_store_bootstrap(tmp.path(), std::slice::from_ref(&session.uid))
+            .unwrap_err();
     assert!(matches!(missing_err, VaultError::MissingGluonKey(account) if account == session.uid));
 
     vault::set_gluon_key_by_account_id(tmp.path(), &session.uid, vec![7u8; 7])
         .expect("set invalid gluon key");
 
     let invalid_err =
-        vault::load_gluon_store_bootstrap(tmp.path(), &[session.uid.clone()]).unwrap_err();
+        vault::load_gluon_store_bootstrap(tmp.path(), std::slice::from_ref(&session.uid))
+            .unwrap_err();
     assert!(matches!(
         invalid_err,
         VaultError::InvalidGluonKeyLength { account_id, length }
@@ -94,7 +96,8 @@ fn be020_loads_valid_gluon_bootstrap_bindings_for_accounts() {
     .expect("save bindings");
 
     let bootstrap =
-        vault::load_gluon_store_bootstrap(tmp.path(), &[session.uid.clone()]).expect("bootstrap");
+        vault::load_gluon_store_bootstrap(tmp.path(), std::slice::from_ref(&session.uid))
+            .expect("bootstrap");
 
     if cfg!(target_os = "linux") {
         assert_eq!(bootstrap.gluon_dir, "fixture-gluon");

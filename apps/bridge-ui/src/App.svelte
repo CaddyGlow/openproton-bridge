@@ -9,6 +9,7 @@
     exportTlsCertificates,
     fetchUsers,
     getAppSettings,
+    getBridgeStatus,
     getHostname,
     getMailSettings,
     installTlsCertificate,
@@ -810,6 +811,30 @@
     }
   }
 
+  async function syncParitySnapshotFromBackend() {
+    const snapshot = await getBridgeStatus()
+    parityStore.dispatch({
+      type: 'bridge.snapshot.received',
+      snapshot,
+    })
+    configPathInput = snapshot.config_path ?? ''
+    return snapshot
+  }
+
+  async function waitForGrpcReadySnapshot() {
+    const maxAttempts = 8
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const snapshot = await syncParitySnapshotFromBackend()
+      if (snapshot.connected || (snapshot.last_error?.trim().length ?? 0) > 0) {
+        return snapshot
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, 120)
+      })
+    }
+    return syncParitySnapshotFromBackend()
+  }
+
   async function establishGrpcConnection(
     reason: GrpcConnectReason,
     options: { refreshData?: boolean } = {},
@@ -830,6 +855,10 @@
 
     try {
       await connect()
+      const snapshot = await waitForGrpcReadySnapshot()
+      if (!snapshot.connected) {
+        throw new Error(snapshot.last_error?.trim() || 'Bridge gRPC connection did not come up.')
+      }
       if (options.refreshData) {
         await refreshBridgeData({ throwOnError: true })
         initialUsersLoadDone = true
@@ -871,6 +900,7 @@
     grpcActionInFlight = true
     try {
       await disconnect()
+      await syncParitySnapshotFromBackend()
       grpcLifecycleState = 'disconnected'
       grpcErrorMessage = ''
       loginWizardOpen = false

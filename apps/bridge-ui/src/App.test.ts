@@ -167,10 +167,12 @@ describe('App bootstrap and connection flow', () => {
     bridgeApi.getBridgeStatus.mockResolvedValue({ ...disconnectedSnapshot })
     bridgeApi.fetchUsers.mockResolvedValue([] as any)
     bridgeApi.connectBridge.mockImplementation(async () => {
+      bridgeApi.getBridgeStatus.mockResolvedValue({ ...connectedSnapshot })
       bridgeApi.emitBridgeState({ ...connectedSnapshot })
       return { ...connectedSnapshot }
     })
     bridgeApi.disconnectBridge.mockImplementation(async () => {
+      bridgeApi.getBridgeStatus.mockResolvedValue({ ...disconnectedSnapshot })
       bridgeApi.emitBridgeState({ ...disconnectedSnapshot })
       return { ...disconnectedSnapshot }
     })
@@ -178,7 +180,10 @@ describe('App bootstrap and connection flow', () => {
 
   it('shows startup loading while grpc connection is still pending', async () => {
     const pendingConnection = deferred<typeof connectedSnapshot>()
-    bridgeApi.connectBridge.mockImplementation(() => pendingConnection.promise)
+    bridgeApi.connectBridge.mockImplementation(() => {
+      bridgeApi.getBridgeStatus.mockResolvedValue({ ...connectedSnapshot })
+      return pendingConnection.promise
+    })
 
     render(App)
 

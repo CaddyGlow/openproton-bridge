@@ -1,0 +1,21 @@
+S: 220 localhost ESMTP OpenProton
+C: EHLO localhost
+S: 250-localhost
+S: 250-STARTTLS
+S: 250 AUTH PLAIN LOGIN
+
+C: STARTTLS
+S: 220 Ready to start TLS
+
+<tls-handshake>
+client_hello
+server_hello
+encrypted_extensions
+certificate
+certificate_verify
+finished
+</tls-handshake>
+
+C: EHLO localhost
+S: 250-localhost
+S: 250 AUTH PLAIN LOGIN

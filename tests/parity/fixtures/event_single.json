@@ -1,0 +1,10 @@
+{
+  "Code": 1000,
+  "EventID": "event-2",
+  "More": 0,
+  "Refresh": 0,
+  "Event": {
+    "ID": "evt-single",
+    "Action": 1
+  }
+}

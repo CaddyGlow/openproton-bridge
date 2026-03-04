@@ -1,0 +1,6 @@
+{
+  "username": "user@example.com",
+  "password": "cGFyaXR5LXBhc3N3b3Jk",
+  "password_encoding": "base64",
+  "expected_decoded_password": "parity-password"
+}

@@ -1,0 +1,83 @@
+name: Backend Parity Gate
+
+on:
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backend-parity-gate.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/backend-parity-gate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity-suite:
+    name: backend parity suite (soft gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: parity_store_interop
+        id: parity_store_interop
+        continue-on-error: true
+        run: cargo test parity_store_interop -- --nocapture
+
+      - name: parity_api_event
+        id: parity_api_event
+        continue-on-error: true
+        run: cargo test parity_api_event -- --nocapture
+
+      - name: parity_grpc_wire
+        id: parity_grpc_wire
+        continue-on-error: true
+        run: cargo test parity_grpc_wire -- --nocapture
+
+      - name: parity_imap_smtp_tls
+        id: parity_imap_smtp_tls
+        continue-on-error: true
+        run: cargo test parity_imap_smtp_tls -- --nocapture
+
+      - name: parity_observability
+        id: parity_observability
+        continue-on-error: true
+        run: cargo test parity_observability -- --nocapture
+
+      - name: Build parity baseline report
+        if: always()
+        run: |
+          cat > parity-baseline-report.txt <<'EOF'
+          backend parity gate baseline
+          date=${{ github.run_id }}
+          parity_store_interop=${{ steps.parity_store_interop.outcome }}
+          parity_api_event=${{ steps.parity_api_event.outcome }}
+          parity_grpc_wire=${{ steps.parity_grpc_wire.outcome }}
+          parity_imap_smtp_tls=${{ steps.parity_imap_smtp_tls.outcome }}
+          parity_observability=${{ steps.parity_observability.outcome }}
+          EOF
+
+      - name: Upload parity baseline report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-parity-baseline
+          path: parity-baseline-report.txt

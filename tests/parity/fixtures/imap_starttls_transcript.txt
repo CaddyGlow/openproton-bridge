@@ -1,0 +1,19 @@
+C: A001 CAPABILITY
+S: * CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN AUTH=LOGIN
+S: A001 OK CAPABILITY completed
+
+C: A002 STARTTLS
+S: A002 OK Begin TLS negotiation now
+
+<tls-handshake>
+client_hello
+server_hello
+encrypted_extensions
+certificate
+certificate_verify
+finished
+</tls-handshake>
+
+C: A003 CAPABILITY
+S: * CAPABILITY IMAP4rev1 AUTH=PLAIN AUTH=LOGIN
+S: A003 OK CAPABILITY completed

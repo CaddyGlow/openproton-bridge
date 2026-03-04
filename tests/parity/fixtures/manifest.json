@@ -1,0 +1,19 @@
+{
+  "vault_samples": {
+    "v2_3": "tests/fixtures/proton_profile_golden/vault.enc",
+    "v2_4": "tests/fixtures/proton_profile_golden/vault.key",
+    "current": "tests/fixtures/proton_profile_golden/default_email"
+  },
+  "event_payloads": {
+    "single_event": "tests/parity/fixtures/events_single_object.json",
+    "events_array": "tests/parity/fixtures/events_array.json"
+  },
+  "grpc_login_payloads": {
+    "base64_password": "tests/parity/fixtures/grpc_login_base64.json",
+    "two_passwords": "tests/parity/fixtures/grpc_login_two_passwords.json"
+  },
+  "tls_handshakes": {
+    "imap_starttls": "tests/parity/fixtures/imap_starttls_transcript.txt",
+    "smtp_starttls": "tests/parity/fixtures/smtp_starttls_transcript.txt"
+  }
+}

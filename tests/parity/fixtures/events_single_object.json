@@ -1,0 +1,14 @@
+{
+  "Code": 1000,
+  "EventID": "evt-single-0001",
+  "Event": {
+    "ID": "evt-single-0001",
+    "Refresh": 0,
+    "Messages": [
+      {
+        "ID": "msg-001",
+        "Action": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gluon Hard-Cut Delivery"
+  short_description: "Plan and execute Gluon parity hard cut"
+  default_prompt: "Use $gluon-hardcut-delivery to execute Gluon full-file support tickets in parallel with strict Red-Green-Refactor gates."

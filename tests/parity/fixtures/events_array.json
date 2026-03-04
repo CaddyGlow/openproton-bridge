@@ -1,0 +1,21 @@
+{
+  "Code": 1000,
+  "EventID": "evt-array-0001",
+  "Events": [
+    {
+      "ID": "evt-array-0001",
+      "Refresh": 1,
+      "Messages": [
+        {
+          "ID": "msg-101",
+          "Action": 2
+        }
+      ]
+    },
+    {
+      "ID": "evt-array-0002",
+      "Refresh": 0,
+      "Messages": []
+    }
+  ]
+}

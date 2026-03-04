@@ -688,11 +688,11 @@ fn validate_port(port: i32) -> Option<Status> {
 }
 
 async fn is_port_free(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).await.is_ok()
+    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }
 
 async fn is_bind_port_free(bind_host: &str, port: u16) -> bool {
-    TcpListener::bind((bind_host, port)).await.is_ok()
+    std::net::TcpListener::bind((bind_host, port)).is_ok()
 }
 
 fn generate_server_token() -> String {
@@ -1092,6 +1092,42 @@ mod tests {
     fn build_test_service(vault_dir: PathBuf) -> BridgeService {
         let runtime_paths = RuntimePaths::resolve(Some(&vault_dir)).unwrap();
         build_test_service_with_paths(runtime_paths)
+    }
+
+    #[tokio::test]
+    async fn startup_mail_runtime_port_conflict_emits_startup_error_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
+        let service = build_test_service_with_paths(runtime_paths);
+        let mut events = service.state.event_tx.subscribe();
+
+        let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let occupied_port = occupied.local_addr().unwrap().port();
+        {
+            let mut settings = service.state.mail_settings.lock().await;
+            settings.imap_port = i32::from(occupied_port);
+            settings.smtp_port = i32::from(occupied_port + 1);
+        }
+
+        service.start_mail_runtime_on_startup().await;
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("startup event timeout")
+            .expect("startup event");
+        match event.event {
+            Some(pb::stream_event::Event::MailServerSettings(pb::MailServerSettingsEvent {
+                event: Some(pb::mail_server_settings_event::Event::Error(err)),
+            })) => {
+                assert_eq!(
+                    err.r#type,
+                    pb::MailServerSettingsErrorType::ImapPortStartupError as i32
+                );
+            }
+            other => panic!("unexpected startup conflict event: {other:?}"),
+        }
     }
 
     async fn call_login_fido(

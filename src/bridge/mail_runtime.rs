@@ -128,18 +128,20 @@ pub async fn start(
     let imap_addr = format!("{}:{}", config.bind_host, config.imap_port);
     let smtp_addr = format!("{}:{}", config.bind_host, config.smtp_port);
 
-    let imap_listener = TcpListener::bind(&imap_addr)
-        .await
-        .map_err(|source| MailRuntimeStartError::ImapBind {
-            addr: imap_addr.clone(),
-            source,
-        })?;
-    let smtp_listener = TcpListener::bind(&smtp_addr)
-        .await
-        .map_err(|source| MailRuntimeStartError::SmtpBind {
-            addr: smtp_addr.clone(),
-            source,
-        })?;
+    let imap_listener =
+        TcpListener::bind(&imap_addr)
+            .await
+            .map_err(|source| MailRuntimeStartError::ImapBind {
+                addr: imap_addr.clone(),
+                source,
+            })?;
+    let smtp_listener =
+        TcpListener::bind(&smtp_addr)
+            .await
+            .map_err(|source| MailRuntimeStartError::SmtpBind {
+                addr: smtp_addr.clone(),
+                source,
+            })?;
 
     log_protocol_start(MailProtocol::Imap, &config, transition);
     log_protocol_start(MailProtocol::Smtp, &config, transition);
@@ -406,7 +408,10 @@ async fn run_runtime(
                         .get(&user_id)
                         .cloned()
                         .unwrap_or_else(|| user_id.clone());
-                    let _ = tx.send(format!("[event] sync progress: {label} ({:.1}%)", progress * 100.0));
+                    let _ = tx.send(format!(
+                        "[event] sync progress: {label} ({:.1}%)",
+                        progress * 100.0
+                    ));
                 }
             }
             super::events::SyncProgressUpdate::Finished { user_id } => {
@@ -587,7 +592,10 @@ pub fn log_bridge_start_failure(protocol: MailProtocol, config: &MailRuntimeConf
     }
 }
 
-async fn refresh_session(session: Session, settings_dir: &std::path::Path) -> anyhow::Result<Session> {
+async fn refresh_session(
+    session: Session,
+    settings_dir: &std::path::Path,
+) -> anyhow::Result<Session> {
     tracing::info!(
         pkg = "bridge/token",
         user_id = %session.uid,
@@ -704,8 +712,8 @@ async fn report_runtime_health_periodically(
             let previous = previous_health.insert(info.account_id.0.clone(), info.health);
             if let Some(tx) = notify_tx.as_ref() {
                 if previous != Some(info.health) {
-                    let is_baseline_healthy =
-                        previous.is_none() && matches!(info.health, super::accounts::AccountHealth::Healthy);
+                    let is_baseline_healthy = previous.is_none()
+                        && matches!(info.health, super::accounts::AccountHealth::Healthy);
                     if !is_baseline_healthy {
                         let _ = tx.send(format!(
                             "[event] account health: {} ({}) -> {:?}",

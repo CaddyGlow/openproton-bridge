@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Once};
+use std::sync::Once;
 
 use anyhow::Context;
 use base64::engine::general_purpose::{
@@ -3718,10 +3718,7 @@ async fn start_interactive_runtime(
         handle.runtime_snapshot(),
     );
 
-    Ok(InteractiveServeRuntime {
-        handle,
-        config,
-    })
+    Ok(InteractiveServeRuntime { handle, config })
 }
 
 async fn stop_interactive_runtime(state: InteractiveServeRuntime) -> anyhow::Result<()> {

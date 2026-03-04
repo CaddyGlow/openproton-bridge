@@ -31,37 +31,35 @@ impl BridgeService {
     fn mail_runtime_config_from_settings(
         &self,
         settings: &StoredMailSettings,
-        transition: &'static str,
     ) -> anyhow::Result<bridge::mail_runtime::MailRuntimeConfig> {
         let imap_port = u16::try_from(settings.imap_port)
             .with_context(|| format!("invalid IMAP port in grpc settings: {}", settings.imap_port))?;
         let smtp_port = u16::try_from(settings.smtp_port)
             .with_context(|| format!("invalid SMTP port in grpc settings: {}", settings.smtp_port))?;
         Ok(bridge::mail_runtime::MailRuntimeConfig {
-            bind: self.state.bind_host.clone(),
+            bind_host: self.state.bind_host.clone(),
             imap_port,
             smtp_port,
-            no_tls: false,
+            disable_tls: false,
             use_ssl_for_imap: settings.use_ssl_for_imap,
             use_ssl_for_smtp: settings.use_ssl_for_smtp,
             event_poll_interval: std::time::Duration::from_secs(30),
-            transition,
         })
     }
 
     async fn start_mail_runtime_with_settings(
         &self,
         settings: &StoredMailSettings,
-        transition: &'static str,
+        transition: bridge::mail_runtime::MailRuntimeTransition,
     ) -> Result<bridge::mail_runtime::MailRuntimeHandle, bridge::mail_runtime::MailRuntimeStartError>
     {
         let config = self
-            .mail_runtime_config_from_settings(settings, transition)
-            .map_err(bridge::mail_runtime::MailRuntimeStartError::Other)?;
+            .mail_runtime_config_from_settings(settings)
+            .map_err(bridge::mail_runtime::MailRuntimeStartError::Prepare)?;
         bridge::mail_runtime::start(
-            self.settings_dir(),
-            &self.state.runtime_paths,
+            self.state.runtime_paths.clone(),
             config,
+            transition,
             None,
         )
         .await
@@ -73,7 +71,7 @@ impl BridgeService {
         err: &bridge::mail_runtime::MailRuntimeStartError,
     ) {
         match err.protocol() {
-            Some(bridge::mail_runtime::MailRuntimeProtocol::Imap) => {
+            Some(bridge::mail_runtime::MailProtocol::Imap) => {
                 warn!(
                     pkg = "grpc/bridge",
                     transition = "startup",
@@ -84,7 +82,7 @@ impl BridgeService {
                 );
                 self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortStartupError);
             }
-            Some(bridge::mail_runtime::MailRuntimeProtocol::Smtp) => {
+            Some(bridge::mail_runtime::MailProtocol::Smtp) => {
                 warn!(
                     pkg = "grpc/bridge",
                     transition = "startup",
@@ -112,7 +110,7 @@ impl BridgeService {
         err: &bridge::mail_runtime::MailRuntimeStartError,
     ) {
         match err.protocol() {
-            Some(bridge::mail_runtime::MailRuntimeProtocol::Imap) => {
+            Some(bridge::mail_runtime::MailProtocol::Imap) => {
                 warn!(
                     pkg = "grpc/bridge",
                     transition = "settings_change",
@@ -123,7 +121,7 @@ impl BridgeService {
                 );
                 self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortChangeError);
             }
-            Some(bridge::mail_runtime::MailRuntimeProtocol::Smtp) => {
+            Some(bridge::mail_runtime::MailProtocol::Smtp) => {
                 warn!(
                     pkg = "grpc/bridge",
                     transition = "settings_change",
@@ -211,7 +209,34 @@ impl BridgeService {
             return;
         }
 
-        match self.start_mail_runtime_with_settings(&settings, "startup").await {
+        let has_sessions = match vault::list_sessions(self.settings_dir()) {
+            Ok(sessions) => !sessions.is_empty(),
+            Err(err) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "startup",
+                    error = %err,
+                    "failed to load sessions while deciding grpc mail runtime startup"
+                );
+                false
+            }
+        };
+        if !has_sessions {
+            info!(
+                pkg = "grpc/bridge",
+                transition = "startup",
+                "skipping grpc mail runtime startup; no logged-in sessions"
+            );
+            return;
+        }
+
+        match self
+            .start_mail_runtime_with_settings(
+                &settings,
+                bridge::mail_runtime::MailRuntimeTransition::Startup,
+            )
+            .await
+        {
             Ok(runtime) => {
                 *self.state.mail_runtime.lock().await = Some(runtime);
             }
@@ -247,6 +272,18 @@ impl BridgeService {
             return Ok(());
         }
 
+        let has_sessions = vault::list_sessions(self.settings_dir())
+            .map(|sessions| !sessions.is_empty())
+            .unwrap_or(false);
+        if !has_sessions {
+            info!(
+                pkg = "grpc/bridge",
+                transition = "settings_change",
+                "skipping grpc mail runtime restart because no sessions are available"
+            );
+            return Ok(());
+        }
+
         let existing = self.state.mail_runtime.lock().await.take();
         if let Some(runtime) = existing {
             if let Err(err) = runtime.stop().await {
@@ -260,7 +297,10 @@ impl BridgeService {
         }
 
         match self
-            .start_mail_runtime_with_settings(&next, "settings_change")
+            .start_mail_runtime_with_settings(
+                &next,
+                bridge::mail_runtime::MailRuntimeTransition::SettingsChange,
+            )
             .await
         {
             Ok(runtime) => {
@@ -271,7 +311,10 @@ impl BridgeService {
                 self.emit_mail_runtime_change_error(&next, &err);
 
                 match self
-                    .start_mail_runtime_with_settings(&previous, "settings_change_rollback")
+                    .start_mail_runtime_with_settings(
+                        &previous,
+                        bridge::mail_runtime::MailRuntimeTransition::Startup,
+                    )
                     .await
                 {
                     Ok(previous_runtime) => {
@@ -288,10 +331,10 @@ impl BridgeService {
                 }
 
                 match err.protocol() {
-                    Some(bridge::mail_runtime::MailRuntimeProtocol::Imap) => {
+                    Some(bridge::mail_runtime::MailProtocol::Imap) => {
                         Err(Status::failed_precondition("IMAP port is not available"))
                     }
-                    Some(bridge::mail_runtime::MailRuntimeProtocol::Smtp) => {
+                    Some(bridge::mail_runtime::MailProtocol::Smtp) => {
                         Err(Status::failed_precondition("SMTP port is not available"))
                     }
                     None => Err(Status::internal(format!(

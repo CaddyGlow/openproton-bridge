@@ -5,6 +5,13 @@ use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::vault;
 use serde_json::Value;
 
+fn decode_bridge_password(raw: Option<&str>) -> Option<String> {
+    let encoded = raw?;
+    base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, encoded)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -71,7 +78,7 @@ fn parity_store_interop_loads_proton_profile_fixture() {
     assert_eq!(default_session.email, "beta@proton.me");
     assert_eq!(default_session.display_name, "Beta Display");
     assert_eq!(
-        default_session.bridge_password.as_deref(),
+        decode_bridge_password(default_session.bridge_password.as_deref()).as_deref(),
         Some("beta-bridge-pass")
     );
 
@@ -80,7 +87,7 @@ fn parity_store_interop_loads_proton_profile_fixture() {
     assert_eq!(secondary_session.uid, "uid-alpha");
     assert_eq!(secondary_session.api_mode, ApiMode::Bridge);
     assert_eq!(
-        secondary_session.bridge_password.as_deref(),
+        decode_bridge_password(secondary_session.bridge_password.as_deref()).as_deref(),
         Some("alpha-bridge-pass")
     );
 }

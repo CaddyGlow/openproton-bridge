@@ -55,6 +55,7 @@ pub struct SmtpSession<R, W> {
     starttls_available: bool,
     tls_active: bool,
     connection_id: u64,
+    correlation_id: String,
 }
 
 static NEXT_SMTP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -75,6 +76,7 @@ where
         starttls_available: bool,
         tls_active: bool,
     ) -> Self {
+        let connection_id = NEXT_SMTP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             reader: BufReader::new(reader),
             writer,
@@ -89,7 +91,8 @@ where
             hostname: "openproton-bridge".to_string(),
             starttls_available,
             tls_active,
-            connection_id: NEXT_SMTP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            connection_id,
+            correlation_id: format!("smtp-{connection_id}"),
         }
     }
 
@@ -141,6 +144,7 @@ where
             if n == 0 {
                 debug!(
                     connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
                     "SMTP client disconnected"
                 );
                 return Ok(SessionAction::Close);
@@ -151,7 +155,12 @@ where
                 continue;
             }
 
-            debug!(connection_id = self.connection_id, line = %line, "SMTP received");
+            debug!(
+                connection_id = self.connection_id,
+                correlation_id = %self.correlation_id,
+                line = %line,
+                "SMTP received"
+            );
 
             match self.handle_command(&line).await? {
                 SessionAction::Continue => {}
@@ -297,6 +306,8 @@ where
             Ok(session) => session,
             Err(AccountRuntimeError::AccountUnavailable(_)) => {
                 warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
                     account_id = %auth_route.account_id.0,
                     "account unavailable during SMTP auth"
                 );
@@ -304,6 +315,8 @@ where
             }
             Err(e) => {
                 warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
                     account_id = %auth_route.account_id.0,
                     error = %e,
                     "failed to load account session"
@@ -323,7 +336,12 @@ where
         ) {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "failed to create ProtonClient");
+                warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
+                    error = %e,
+                    "failed to create ProtonClient"
+                );
                 return self
                     .write_line(454, "Temporary authentication failure")
                     .await;
@@ -343,7 +361,12 @@ where
         let mut passphrase = match BASE64.decode(&passphrase_b64) {
             Ok(p) => p,
             Err(e) => {
-                warn!(error = %e, "invalid key passphrase encoding");
+                warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
+                    error = %e,
+                    "invalid key passphrase encoding"
+                );
                 return self
                     .write_line(454, "Temporary authentication failure")
                     .await;
@@ -366,6 +389,8 @@ where
                     Err(refresh_err) => {
                         passphrase.zeroize();
                         warn!(
+                            connection_id = self.connection_id,
+                            correlation_id = %self.correlation_id,
                             account_id = %auth_route.account_id.0,
                             error = %refresh_err,
                             "token refresh failed during SMTP auth"
@@ -385,7 +410,12 @@ where
                     Ok(c) => c,
                     Err(err) => {
                         passphrase.zeroize();
-                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                        warn!(
+                            connection_id = self.connection_id,
+                            correlation_id = %self.correlation_id,
+                            error = %err,
+                            "failed to recreate ProtonClient after refresh"
+                        );
                         return self
                             .write_line(454, "Temporary authentication failure")
                             .await;
@@ -395,7 +425,12 @@ where
                     Ok(r) => r,
                     Err(err) => {
                         passphrase.zeroize();
-                        warn!(error = %err, "failed to fetch user info after refresh");
+                        warn!(
+                            connection_id = self.connection_id,
+                            correlation_id = %self.correlation_id,
+                            error = %err,
+                            "failed to fetch user info after refresh"
+                        );
                         return self
                             .write_line(454, "Temporary authentication failure")
                             .await;
@@ -404,7 +439,12 @@ where
             }
             Err(e) => {
                 passphrase.zeroize();
-                warn!(error = %e, "failed to fetch user info");
+                warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
+                    error = %e,
+                    "failed to fetch user info"
+                );
                 return self
                     .write_line(454, "Temporary authentication failure")
                     .await;
@@ -415,7 +455,12 @@ where
             Ok(kr) => kr,
             Err(e) => {
                 passphrase.zeroize();
-                warn!(error = %e, "failed to unlock user keys");
+                warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
+                    error = %e,
+                    "failed to unlock user keys"
+                );
                 return self
                     .write_line(454, "Temporary authentication failure")
                     .await;
@@ -438,6 +483,8 @@ where
                     Err(refresh_err) => {
                         passphrase.zeroize();
                         warn!(
+                            connection_id = self.connection_id,
+                            correlation_id = %self.correlation_id,
                             account_id = %auth_route.account_id.0,
                             error = %refresh_err,
                             "token refresh failed while fetching addresses"
@@ -457,7 +504,12 @@ where
                     Ok(c) => c,
                     Err(err) => {
                         passphrase.zeroize();
-                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                        warn!(
+                            connection_id = self.connection_id,
+                            correlation_id = %self.correlation_id,
+                            error = %err,
+                            "failed to recreate ProtonClient after refresh"
+                        );
                         return self
                             .write_line(454, "Temporary authentication failure")
                             .await;
@@ -467,7 +519,12 @@ where
                     Ok(r) => r,
                     Err(err) => {
                         passphrase.zeroize();
-                        warn!(error = %err, "failed to fetch addresses after refresh");
+                        warn!(
+                            connection_id = self.connection_id,
+                            correlation_id = %self.correlation_id,
+                            error = %err,
+                            "failed to fetch addresses after refresh"
+                        );
                         return self
                             .write_line(454, "Temporary authentication failure")
                             .await;
@@ -476,7 +533,12 @@ where
             }
             Err(e) => {
                 passphrase.zeroize();
-                warn!(error = %e, "failed to fetch addresses");
+                warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
+                    error = %e,
+                    "failed to fetch addresses"
+                );
                 return self
                     .write_line(454, "Temporary authentication failure")
                     .await;
@@ -493,7 +555,13 @@ where
                     addr_keyrings.insert(addr.id.clone(), kr);
                 }
                 Err(e) => {
-                    warn!(address = %addr.email, error = %e, "could not unlock address keys");
+                    warn!(
+                        connection_id = self.connection_id,
+                        correlation_id = %self.correlation_id,
+                        address = %addr.email,
+                        error = %e,
+                        "could not unlock address keys"
+                    );
                 }
             }
         }
@@ -514,6 +582,7 @@ where
 
         info!(
             connection_id = self.connection_id,
+            correlation_id = %self.correlation_id,
             email = %auth_route.primary_email,
             "SMTP authentication successful"
         );
@@ -643,7 +712,12 @@ where
                 self.write_line(250, "OK message sent").await?;
             }
             Err(e) => {
-                warn!(error = %e, "failed to send message");
+                warn!(
+                    connection_id = self.connection_id,
+                    correlation_id = %self.correlation_id,
+                    error = %e,
+                    "failed to send message"
+                );
                 self.write_line(451, &format!("Send failed: {}", e)).await?;
             }
         }
@@ -791,6 +865,17 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let n = tokio::io::AsyncReadExt::read(read, &mut buf).await.unwrap();
         String::from_utf8_lossy(&buf[..n]).to_string()
+    }
+
+    #[tokio::test]
+    async fn smtp_session_assigns_connection_correlation_id() {
+        let config = test_config();
+        let (session, _client_read, _client_write) = create_session_pair(config).await;
+        assert!(session.correlation_id.starts_with("smtp-"));
+        assert_eq!(
+            session.correlation_id,
+            format!("smtp-{}", session.connection_id)
+        );
     }
 
     #[tokio::test]

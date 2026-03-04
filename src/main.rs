@@ -19,6 +19,7 @@ mod bridge;
 mod crypto;
 mod frontend;
 mod imap;
+mod observability;
 mod paths;
 mod single_instance;
 mod smtp;
@@ -212,6 +213,14 @@ async fn main() -> anyhow::Result<()> {
     let resolved_vault_dir = resolve_vault_dir(&cli);
     let runtime_paths = runtime_paths(resolved_vault_dir.as_deref())?;
     install_crash_capture_hook(runtime_paths.clone());
+    if let Ok(session_log) = observability::create_session_log(&runtime_paths) {
+        let _ = observability::append_session_log_line(
+            &session_log,
+            &format!("startup_command={}", command_name(&cli.command)),
+        );
+    } else if let Err(err) = observability::initialize_observability_dirs(&runtime_paths) {
+        eprintln!("failed to initialize observability directories: {err:#}");
+    }
     let dir = runtime_paths.settings_dir().to_path_buf();
     let _instance_lock = match &cli.command {
         Command::Serve { .. } | Command::Grpc { .. } | Command::Cli => {
@@ -233,6 +242,21 @@ async fn execute_command(
     match command {
         Command::Cli => cmd_cli(dir, runtime_paths).await,
         other => execute_non_interactive_command(other, dir, runtime_paths).await,
+    }
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Login { .. } => "login",
+        Command::FidoAssert { .. } => "fido-assert",
+        Command::Status => "status",
+        Command::Logout { .. } => "logout",
+        Command::Accounts { .. } => "accounts",
+        Command::Fetch { .. } => "fetch",
+        Command::Serve { .. } => "serve",
+        Command::Grpc { .. } => "grpc",
+        Command::Cli => "cli",
+        Command::VaultDump => "vault-dump",
     }
 }
 
@@ -601,7 +625,17 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         Some(action) if action == "mailbox-state" => {
                             println!("{}", render_mailbox_state_diagnostics(dir, runtime_paths));
                         }
-                        _ => eprintln!("Usage: debug mailbox-state"),
+                        Some(action) if action == "support-bundle" => {
+                            let diagnostics = render_mailbox_state_diagnostics(dir, runtime_paths);
+                            match observability::generate_support_log_bundle(
+                                runtime_paths,
+                                &diagnostics,
+                            ) {
+                                Ok(bundle) => println!("{}", bundle.display()),
+                                Err(err) => eprintln!("Error: {err:#}"),
+                            }
+                        }
+                        _ => eprintln!("Usage: debug <mailbox-state|support-bundle>"),
                     },
                     "telemetry" => match tokens.get(1).map(|s| s.to_ascii_lowercase()) {
                         Some(action) if action == "enable" => {
@@ -1702,6 +1736,7 @@ fn print_interactive_help() {
     println!("  configure-apple-mail             Placeholder (not yet implemented)");
     println!("  log-dir                          Print log directory path");
     println!("  debug mailbox-state              Print deterministic mailbox diagnostics");
+    println!("  debug support-bundle             Build a support diagnostics bundle path");
     println!("  telemetry <enable|disable|status> Manage telemetry setting");
     println!("  proxy <allow|disallow|status>    Manage DoH proxy fallback setting");
     println!("  autostart <enable|disable|status> Manage autostart setting");
@@ -1801,6 +1836,10 @@ fn render_mailbox_state_diagnostics(
     lines.push(format!(
         "crash_reports_dir={}",
         crash_reports_dir(runtime_paths).display()
+    ));
+    lines.push(format!(
+        "support_bundles_dir={}",
+        runtime_paths.support_bundles_dir().display()
     ));
     lines.push(format!(
         "disk_cache_dir={}",
@@ -4446,6 +4485,7 @@ mod tests {
         let pos_b = report.find("account uid=uid-b").unwrap();
         assert!(pos_a < pos_b, "accounts should be sorted by uid");
         assert!(report.contains("crash_reports_dir="));
+        assert!(report.contains("support_bundles_dir="));
     }
 
     #[test]

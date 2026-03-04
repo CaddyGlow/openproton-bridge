@@ -92,6 +92,16 @@ Then configure your email client:
 - **Password:** the bridge password printed during login for that account
 - **Security:** STARTTLS by default (`--no-tls` is restricted to loopback bind addresses)
 
+For `mutt`/`neomutt`, generate a ready-to-paste draft:
+
+```bash
+# prints config to stdout (password placeholders by default)
+openproton-bridge mutt-config --account user@proton.me
+
+# write config file with inline password (file mode 0600 on Unix)
+openproton-bridge mutt-config --account user@proton.me --include-password --output ~/.mutt/openproton.muttrc
+```
+
 ## Runtime Behavior
 
 - `serve` loads all saved accounts from vault and starts one event worker per account.

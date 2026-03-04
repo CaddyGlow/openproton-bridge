@@ -16,6 +16,7 @@ use tokio::io::AsyncBufReadExt;
 
 mod api;
 mod bridge;
+mod client_config;
 mod crypto;
 mod frontend;
 mod imap;
@@ -145,6 +146,21 @@ enum Command {
     Cli,
     /// Dump decrypted vault msgpack structure for debugging
     VaultDump,
+    /// Generate mutt/neomutt account configuration
+    MuttConfig {
+        /// Account selector (email, display name, or index). Defaults to active account.
+        #[arg(long)]
+        account: Option<String>,
+        /// Override username/from address used by mutt.
+        #[arg(long)]
+        address: Option<String>,
+        /// Write output to a file instead of stdout.
+        #[arg(long)]
+        output: Option<std::path::PathBuf>,
+        /// Include bridge password directly in output.
+        #[arg(long, default_value_t = false)]
+        include_password: bool,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -264,6 +280,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Grpc { .. } => "grpc",
         Command::Cli => "cli",
         Command::VaultDump => "vault-dump",
+        Command::MuttConfig { .. } => "mutt-config",
     }
 }
 
@@ -318,6 +335,22 @@ async fn execute_non_interactive_command(
         }
         Command::Grpc { bind } => cmd_grpc(&bind, runtime_paths).await,
         Command::VaultDump => cmd_vault_dump(dir),
+        Command::MuttConfig {
+            account,
+            address,
+            output,
+            include_password,
+        } => {
+            cmd_mutt_config(
+                account.as_deref(),
+                address.as_deref(),
+                output.as_deref(),
+                include_password,
+                dir,
+                runtime_paths,
+            )
+            .await
+        }
         Command::Cli => anyhow::bail!("cannot execute nested cli command"),
     }
 }
@@ -1565,6 +1598,9 @@ fn rewrite_repl_aliases(mut tokens: Vec<String>) -> Vec<String> {
         "add" | "a" | "con" | "connect" => {
             tokens[0] = "login".to_string();
         }
+        "configure-mutt" => {
+            tokens[0] = "mutt-config".to_string();
+        }
         "man" => {
             tokens[0] = "help".to_string();
         }
@@ -1741,6 +1777,7 @@ fn print_interactive_help() {
     println!("  check-updates                    Alias for updates check");
     println!("  credits                          Print credits/dependency info");
     println!("  configure-apple-mail             Placeholder (not yet implemented)");
+    println!("  configure-mutt [flags]           Generate mutt/neomutt config snippet");
     println!("  log-dir                          Print log directory path");
     println!("  debug mailbox-state              Print deterministic mailbox diagnostics");
     println!("  debug support-bundle             Build a support diagnostics bundle path");
@@ -1778,6 +1815,7 @@ fn print_interactive_help() {
     println!("  grpc [grpc flags]                Start gRPC frontend service (background)");
     println!("  grpc-stop                        Stop background gRPC runtime");
     println!("  stop                             Stop all background runtimes");
+    println!("  mutt-config [flags]              Generate mutt/neomutt config snippet");
     println!();
     print_interactive_serve_help();
     print_interactive_grpc_help();
@@ -3252,6 +3290,95 @@ async fn cmd_account_info(
     Ok(())
 }
 
+async fn cmd_mutt_config(
+    account_selector: Option<&str>,
+    address_override: Option<&str>,
+    output: Option<&std::path::Path>,
+    include_password: bool,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<()> {
+    let session = if let Some(selector) = account_selector {
+        resolve_account_selector_session(dir, selector)?
+    } else {
+        vault::load_session(dir)
+            .map_err(anyhow::Error::new)
+            .context("no active account found; pass --account or login first")?
+    };
+    let mail_settings = load_mail_settings_for_cli(runtime_paths).await?;
+
+    let account_address = address_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(session.email.as_str())
+        .to_string();
+    let bridge_password = session
+        .bridge_password
+        .clone()
+        .filter(|value| !value.trim().is_empty());
+    if include_password && bridge_password.is_none() {
+        anyhow::bail!(
+            "bridge password is missing for {}; re-login to regenerate it or omit --include-password",
+            session.email
+        );
+    }
+
+    let imap_port = u16::try_from(mail_settings.imap_port)
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid IMAP port in mail settings: {}",
+                mail_settings.imap_port
+            )
+        })?;
+    let smtp_port = u16::try_from(mail_settings.smtp_port)
+        .ok()
+        .filter(|port| *port > 0)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid SMTP port in mail settings: {}",
+                mail_settings.smtp_port
+            )
+        })?;
+
+    let rendered = client_config::render_mutt_config(
+        &client_config::MuttConfigTemplate {
+            account_address,
+            display_name: session.display_name,
+            hostname: "127.0.0.1".to_string(),
+            imap_port,
+            smtp_port,
+            use_ssl_for_imap: mail_settings.use_ssl_for_imap,
+            use_ssl_for_smtp: mail_settings.use_ssl_for_smtp,
+            bridge_password,
+        },
+        include_password,
+    );
+
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+        }
+        std::fs::write(path, rendered.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        }
+        println!("Wrote mutt config to {}", path.display());
+    } else {
+        print!("{rendered}");
+    }
+
+    Ok(())
+}
+
 fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::Result<()> {
     if !vault::session_exists(dir) {
         tracing::info!(
@@ -4321,6 +4448,37 @@ mod tests {
     }
 
     #[test]
+    fn parse_mutt_config_subcommand() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "mutt-config",
+            "--account",
+            "alice@proton.me",
+            "--address",
+            "alias@proton.me",
+            "--output",
+            "/tmp/muttrc",
+            "--include-password",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::MuttConfig {
+                account,
+                address,
+                output,
+                include_password,
+            } => {
+                assert_eq!(account.as_deref(), Some("alice@proton.me"));
+                assert_eq!(address.as_deref(), Some("alias@proton.me"));
+                assert_eq!(output.as_deref(), Some(std::path::Path::new("/tmp/muttrc")));
+                assert!(include_password);
+            }
+            _ => panic!("expected mutt-config command"),
+        }
+    }
+
+    #[test]
     fn rewrite_repl_aliases_supports_positional_login_logout_fetch_forms() {
         assert_eq!(
             rewrite_repl_aliases(vec!["login".into(), "user@proton.me".into()]),
@@ -4337,6 +4495,18 @@ mod tests {
         assert_eq!(
             rewrite_repl_aliases(vec!["fetch".into(), "15".into()]),
             vec!["fetch".to_string(), "--limit".to_string(), "15".to_string()]
+        );
+        assert_eq!(
+            rewrite_repl_aliases(vec![
+                "configure-mutt".into(),
+                "--account".into(),
+                "0".into()
+            ]),
+            vec![
+                "mutt-config".to_string(),
+                "--account".to_string(),
+                "0".to_string()
+            ]
         );
     }
 
@@ -4587,6 +4757,75 @@ mod tests {
         assert!(path.exists());
         let content = std::fs::read_to_string(path).unwrap();
         assert!(content.contains("panic_payload=test"));
+    }
+
+    #[tokio::test]
+    async fn cmd_mutt_config_writes_template_file_without_inline_password_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+        let dir = runtime_paths.settings_dir();
+        let session = api::types::Session {
+            uid: "uid-mutt-1".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            api_mode: api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, dir).unwrap();
+
+        let output_path = tmp.path().join("muttrc");
+        cmd_mutt_config(
+            Some("alice@proton.me"),
+            Some("alias@proton.me"),
+            Some(output_path.as_path()),
+            false,
+            dir,
+            &runtime_paths,
+        )
+        .await
+        .unwrap();
+
+        let rendered = std::fs::read_to_string(&output_path).unwrap();
+        assert!(rendered.contains("set from = \"alias@proton.me\""));
+        assert!(rendered.contains("set imap_user = \"alias@proton.me\""));
+        assert!(rendered.contains("set folder = \"imap://127.0.0.1:1143/\""));
+        assert!(rendered.contains("set smtp_url = \"smtp://alias%40proton.me@127.0.0.1:1025/\""));
+        assert!(rendered.contains("# set imap_pass = \"<bridge-password>\""));
+        assert!(!rendered.contains("set imap_pass = \"bridge-pass\""));
+    }
+
+    #[tokio::test]
+    async fn cmd_mutt_config_rejects_include_password_when_bridge_password_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_paths = paths::RuntimePaths::resolve(Some(tmp.path())).unwrap();
+        let dir = runtime_paths.settings_dir();
+        let session = api::types::Session {
+            uid: "uid-mutt-2".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            api_mode: api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        vault::save_session(&session, dir).unwrap();
+
+        let err = cmd_mutt_config(
+            Some("alice@proton.me"),
+            None,
+            None,
+            true,
+            dir,
+            &runtime_paths,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("bridge password is missing"));
     }
 
     #[tokio::test]

@@ -44,7 +44,7 @@ pub fn resolve_server_config_paths(explicit: Option<&Path>) -> Result<Vec<PathBu
         };
     }
 
-    let candidates = default_bridge_config_candidates();
+    let candidates = resolve_server_config_candidates(None);
     let mut existing = Vec::new();
     for path in candidates {
         if path.exists() && !existing.iter().any(|candidate| candidate == &path) {
@@ -77,6 +77,13 @@ pub fn resolve_server_config_paths(explicit: Option<&Path>) -> Result<Vec<PathBu
     Err(format!("could not resolve {BRIDGE_GRPC_CONFIG_FILE} path"))
 }
 
+pub fn resolve_server_config_candidates(explicit: Option<&Path>) -> Vec<PathBuf> {
+    if let Some(path) = explicit {
+        return vec![path.to_path_buf()];
+    }
+    dedupe_paths(default_bridge_config_candidates())
+}
+
 fn default_bridge_config_candidates() -> Vec<PathBuf> {
     default_config_candidates_for(BRIDGE_GRPC_CONFIG_FILE)
 }
@@ -105,6 +112,16 @@ fn default_config_candidates_for(file_name: &str) -> Vec<PathBuf> {
 
     candidates.push(PathBuf::from(file_name));
     candidates
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut deduped = Vec::new();
+    for path in paths {
+        if !deduped.iter().any(|candidate| candidate == &path) {
+            deduped.push(path);
+        }
+    }
+    deduped
 }
 
 pub fn write_temp_client_token_file(token: &str) -> Result<PathBuf, String> {

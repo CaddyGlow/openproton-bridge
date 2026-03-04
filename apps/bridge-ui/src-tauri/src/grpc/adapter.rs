@@ -1,17 +1,20 @@
 use super::config::{
-    resolve_server_config_path, resolve_server_config_paths, write_temp_client_token_file,
-    GrpcServerConfig,
+    resolve_server_config_candidates, resolve_server_config_path, resolve_server_config_paths,
+    write_temp_client_token_file, GrpcServerConfig,
 };
 use super::pb;
 use crate::state::AppState;
 use hyper_util::rt::TokioIo;
+use notify::Watcher;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 use tokio::net::TcpStream;
 #[cfg(unix)]
@@ -29,6 +32,7 @@ use tracing::{debug, info};
 use uuid::Uuid;
 
 type BridgeClient = pb::bridge_client::BridgeClient<InterceptedService<Channel, TokenInterceptor>>;
+const CONFIG_CREATION_WAIT_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Clone)]
 struct TokenInterceptor {
@@ -220,7 +224,33 @@ impl GrpcAdapter {
         }
 
         let explicit_path = state.snapshot().await.config_path;
-        let candidate_paths = resolve_server_config_paths(explicit_path.as_deref().map(Path::new))?;
+        let explicit_path_ref = explicit_path.as_deref().map(Path::new);
+        let candidate_paths = match resolve_server_config_paths(explicit_path_ref) {
+            Ok(paths) => paths,
+            Err(initial_error) => {
+                let candidate_paths = resolve_server_config_candidates(explicit_path_ref);
+                let created_path =
+                    wait_for_any_config_creation(&candidate_paths, CONFIG_CREATION_WAIT_TIMEOUT)
+                        .await?;
+                if let Some(path) = created_path.as_ref() {
+                    info!(
+                        config_path = %path.display(),
+                        timeout_secs = CONFIG_CREATION_WAIT_TIMEOUT.as_secs(),
+                        "detected grpc server config creation event"
+                    );
+                }
+
+                resolve_server_config_paths(explicit_path_ref).map_err(|resolve_error| {
+                    if created_path.is_some() {
+                        format!("{initial_error}; {resolve_error}")
+                    } else {
+                        format!(
+                            "{initial_error}; timed out waiting for grpc config creation; {resolve_error}"
+                        )
+                    }
+                })?
+            }
+        };
         let mut attempt_errors = Vec::new();
         let mut selected: Option<(std::path::PathBuf, GrpcServerConfig, BridgeClient)> = None;
 
@@ -855,6 +885,82 @@ impl GrpcAdapter {
         let explicit_path = state.snapshot().await.config_path;
         let config_path = resolve_server_config_path(explicit_path.as_deref().map(Path::new))?;
         GrpcServerConfig::from_json_file(&config_path)
+    }
+}
+
+async fn wait_for_any_config_creation(
+    candidate_paths: &[PathBuf],
+    timeout: Duration,
+) -> Result<Option<PathBuf>, String> {
+    let candidate_paths = candidate_paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        wait_for_any_config_creation_blocking(candidate_paths, timeout)
+    })
+    .await
+    .map_err(|err| format!("failed to join config watcher task: {err}"))?
+}
+
+fn wait_for_any_config_creation_blocking(
+    candidate_paths: Vec<PathBuf>,
+    timeout: Duration,
+) -> Result<Option<PathBuf>, String> {
+    let missing_paths: Vec<PathBuf> = candidate_paths
+        .into_iter()
+        .filter(|path| !path.exists())
+        .collect();
+
+    if missing_paths.is_empty() {
+        return Ok(None);
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = tx.send(event);
+    })
+    .map_err(|err| format!("failed to initialize grpc config watcher: {err}"))?;
+
+    let mut watched_dirs = HashSet::new();
+    for path in &missing_paths {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if watched_dirs.insert(parent.clone()) {
+            watcher
+                .watch(&parent, notify::RecursiveMode::NonRecursive)
+                .map_err(|err| format!("failed to watch {}: {err}", parent.display()))?;
+        }
+    }
+
+    if let Some(existing) = missing_paths.iter().find(|path| path.exists()) {
+        return Ok(Some(existing.clone()));
+    }
+
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(_)) => {
+                if let Some(existing) = missing_paths.iter().find(|path| path.exists()) {
+                    return Ok(Some(existing.clone()));
+                }
+            }
+            Ok(Err(err)) => {
+                debug!(error = %err, "grpc config watcher emitted an error event");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+            Err(err) => {
+                return Err(format!("grpc config watcher channel failed: {err}"));
+            }
+        }
     }
 }
 
@@ -1506,5 +1612,49 @@ mod tests {
             .refresh_hints
             .iter()
             .any(|hint| hint == "sync_username:alice@proton.me"));
+    }
+
+    #[test]
+    fn wait_for_any_config_creation_blocking_detects_created_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "bridge-ui-adapter-config-watch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp directory");
+        let config_path = temp_dir.join("grpcServerConfig.json");
+
+        let delayed_path = config_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::write(&delayed_path, "{}").expect("write grpc config fixture");
+        });
+
+        let detected = wait_for_any_config_creation_blocking(
+            vec![config_path.clone()],
+            Duration::from_secs(2),
+        )
+        .expect("watcher should not fail");
+        writer.join().expect("writer thread");
+
+        assert_eq!(detected, Some(config_path.clone()));
+        let _ = std::fs::remove_file(&config_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn wait_for_any_config_creation_blocking_times_out_when_missing() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "bridge-ui-adapter-config-watch-timeout-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp directory");
+        let missing_path = temp_dir.join("grpcServerConfig.json");
+
+        let detected =
+            wait_for_any_config_creation_blocking(vec![missing_path], Duration::from_millis(250))
+                .expect("watcher should not fail");
+
+        assert_eq!(detected, None);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

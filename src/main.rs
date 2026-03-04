@@ -3888,15 +3888,10 @@ async fn cmd_grpc(bind: &str, runtime_paths: &paths::RuntimePaths) -> anyhow::Re
 }
 
 fn generate_bridge_password() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let mut rng = rand::thread_rng();
-    (0..16)
-        .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
-            CHARSET[idx] as char
-        })
-        .collect()
+    use rand::RngCore;
+    let mut token = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut token);
+    BASE64_URL_NO_PAD.encode(token)
 }
 
 fn format_email_addresses(addrs: &[api::types::EmailAddress]) -> String {

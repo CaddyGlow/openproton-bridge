@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use aes_gcm::aead::{Aead, OsRng};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use base64::Engine;
 use rmpv::Value as MsgpackValue;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1594,11 +1594,12 @@ fn session_to_userdata_with_user_id(session: &Session, user_id_override: Option<
         .and_then(|b64| BASE64.decode(b64).ok())
         .unwrap_or_default();
 
-    // bridge_password: our Session stores as string, Go stores as raw bytes
+    // bridge_password: upstream bridge expects URL-safe raw-base64 over raw token bytes.
+    // For backward compatibility, keep raw bytes when decode fails.
     let bridge_pass = session
         .bridge_password
         .as_deref()
-        .map(|s| s.as_bytes().to_vec())
+        .map(decode_bridge_password_for_storage)
         .unwrap_or_default();
 
     // Generate a random 32-byte gluon key
@@ -1630,6 +1631,18 @@ fn session_to_userdata_with_user_id(session: &Session, user_id_override: Option<
     }
 }
 
+fn decode_bridge_password_for_storage(password: &str) -> Vec<u8> {
+    // Upstream bridge displays URL-safe raw-base64 over raw token bytes.
+    // Keep compatibility with legacy/plain passwords by only decoding long
+    // candidates, which matches generated bridge passwords (16 raw bytes => 22 chars).
+    if password.len() >= 20 {
+        if let Ok(decoded) = BASE64_URL_NO_PAD.decode(password.as_bytes()) {
+            return decoded;
+        }
+    }
+    password.as_bytes().to_vec()
+}
+
 fn userdata_to_session(ud: &UserData) -> Session {
     // key_passphrase: Go stores raw bytes, we store base64
     let key_passphrase = if ud.key_pass.is_empty() {
@@ -1638,11 +1651,11 @@ fn userdata_to_session(ud: &UserData) -> Session {
         Some(BASE64.encode(&ud.key_pass))
     };
 
-    // bridge_password: Go stores raw bytes, we store as string
+    // bridge_password: Go stores raw token bytes, UI/auth consume URL-safe raw-base64.
     let bridge_password = if ud.bridge_pass.is_empty() {
         None
     } else {
-        Some(String::from_utf8_lossy(&ud.bridge_pass).to_string())
+        Some(BASE64_URL_NO_PAD.encode(&ud.bridge_pass))
     };
 
     Session {

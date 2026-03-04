@@ -4,10 +4,11 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::Context;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD as BASE64_URL_NO_PAD};
 use base64::Engine;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 #[cfg(unix)]
@@ -738,11 +739,9 @@ fn compute_grpc_unix_socket_path() -> anyhow::Result<PathBuf> {
 }
 
 fn generate_bridge_password() -> String {
-    rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(16)
-        .map(char::from)
-        .collect()
+    let mut token = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut token);
+    BASE64_URL_NO_PAD.encode(token)
 }
 
 fn resolve_license_path() -> String {

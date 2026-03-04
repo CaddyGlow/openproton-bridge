@@ -1,5 +1,8 @@
 use std::sync::{Arc, RwLock};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
+use base64::Engine;
+
 use super::accounts::AccountRegistry;
 use super::types::AccountId;
 
@@ -25,8 +28,14 @@ impl AuthRouter {
         let registry = self.registry.read().ok()?;
         let account = registry.resolve_by_email(login_email)?;
         let stored_password = account.session.bridge_password.as_deref()?;
-
-        if !constant_time_eq(stored_password.as_bytes(), password.as_bytes()) {
+        let stored_candidates = bridge_password_candidates(stored_password);
+        let provided_candidates = bridge_password_candidates(password);
+        let matches = stored_candidates.iter().any(|stored| {
+            provided_candidates
+                .iter()
+                .any(|provided| constant_time_eq(stored, provided))
+        });
+        if !matches {
             return None;
         }
 
@@ -67,6 +76,17 @@ impl AuthRouter {
             .map(|registry| registry.account_count())
             .unwrap_or_default()
     }
+}
+
+fn bridge_password_candidates(password: &str) -> Vec<Vec<u8>> {
+    let mut variants = Vec::with_capacity(2);
+    variants.push(password.as_bytes().to_vec());
+    if let Ok(decoded) = BASE64_URL_NO_PAD.decode(password.as_bytes()) {
+        if !variants.iter().any(|existing| existing == &decoded) {
+            variants.push(decoded);
+        }
+    }
+    variants
 }
 
 impl Default for AuthRouter {
@@ -125,6 +145,15 @@ mod tests {
         let router = AuthRouter::new(registry);
 
         assert!(router.resolve_login("alice@proton.me", "wrong").is_none());
+    }
+
+    #[test]
+    fn resolves_with_base64url_bridge_password() {
+        let encoded = BASE64_URL_NO_PAD.encode(b"secret-token");
+        let registry =
+            AccountRegistry::from_single_session(session("uid-1", "alice@proton.me", &encoded));
+        let router = AuthRouter::new(registry);
+        assert!(router.resolve_login("alice@proton.me", &encoded).is_some());
     }
 
     #[test]

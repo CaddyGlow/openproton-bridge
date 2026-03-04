@@ -841,15 +841,20 @@ async fn bounded_resync_account(
     session: &mut Session,
     client: &mut ProtonClient,
 ) -> Result<(), EventWorkerError> {
+    let sync_start = unix_now();
+
     info!(
+        user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
         "Sync triggered"
     );
     info!(
+        user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
-        start_unix = unix_now(),
+        start = sync_start,
+        start_unix = sync_start,
         "Beginning user sync"
     );
     let mut progress_guard = SyncProgressRunGuard::new(
@@ -945,10 +950,13 @@ async fn bounded_resync_account(
         resync_started_at.elapsed(),
     );
     progress_guard.finish();
+    let duration = resync_started_at.elapsed();
     info!(
+        user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
-        duration_ms = resync_started_at.elapsed().as_millis() as u64,
+        duration = ?duration,
+        duration_ms = duration.as_millis() as u64,
         "Finished user sync"
     );
 

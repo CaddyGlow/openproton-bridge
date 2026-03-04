@@ -165,7 +165,7 @@ async fn next_app_event(stream: &mut tonic::Streaming<pb::StreamEvent>) -> pb::a
 }
 
 #[tokio::test]
-async fn parity_runtime_events_check_update_emits_is_latest_then_finished() {
+async fn runtime_events_check_update_emits_is_latest_then_finished() {
     let runtime = start_runtime().await;
 
     let mut event_client = runtime.connect().await;
@@ -197,7 +197,7 @@ async fn parity_runtime_events_check_update_emits_is_latest_then_finished() {
 }
 
 #[tokio::test]
-async fn parity_runtime_events_mail_settings_changed_then_finished_in_order() {
+async fn runtime_events_mail_settings_changed_then_finished_in_order() {
     let runtime = start_runtime().await;
 
     let mut event_client = runtime.connect().await;
@@ -248,7 +248,7 @@ async fn parity_runtime_events_mail_settings_changed_then_finished_in_order() {
 }
 
 #[tokio::test]
-async fn parity_runtime_events_gui_ready_emits_all_users_loaded_then_main_window() {
+async fn runtime_events_gui_ready_emits_all_users_loaded_then_main_window() {
     let runtime = start_runtime().await;
 
     let mut event_client = runtime.connect().await;

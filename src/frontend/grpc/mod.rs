@@ -2503,6 +2503,48 @@ mod tests {
             })) => {}
             other => panic!("unexpected second disk cache event: {other:?}"),
         }
+
+        // Ensure the moved disk cache path is persisted and reloaded on service restart.
+        let restarted_service = build_test_service_with_paths(runtime_paths.clone());
+        let loaded_settings = load_app_settings(
+            &runtime_paths.settings_dir().join(APP_SETTINGS_FILE),
+            &runtime_paths.disk_cache_dir(),
+        )
+        .await
+        .unwrap();
+        {
+            let mut settings = restarted_service.state.app_settings.lock().await;
+            *settings = loaded_settings.clone();
+        }
+        *restarted_service.state.active_disk_cache_path.lock().await =
+            effective_disk_cache_path(&loaded_settings, &runtime_paths);
+
+        let effective_after_restart =
+            <BridgeService as pb::bridge_server::Bridge>::disk_cache_path(
+                &restarted_service,
+                Request::new(()),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(effective_after_restart, new_path.display().to_string());
+        assert_eq!(
+            tokio::fs::read(
+                new_path
+                    .join("backend")
+                    .join("store")
+                    .join("uid-1")
+                    .join("00000001.msg")
+            )
+            .await
+            .unwrap(),
+            b"cache-payload"
+        );
+        assert!(new_path
+            .join("backend")
+            .join("db")
+            .join("uid-1.db")
+            .exists());
     }
 
     #[tokio::test]
@@ -2831,7 +2873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parity_integration_proton_fixture_reuse_survives_service_restart() {
+    async fn integration_proton_fixture_reuse_survives_service_restart() {
         let dir = tempfile::tempdir().unwrap();
         write_proton_golden_fixture(dir.path());
         let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
@@ -2858,7 +2900,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parity_integration_login_then_logout_updates_user_list_and_emits_disconnect() {
+    async fn integration_login_then_logout_updates_user_list_and_emits_disconnect() {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
         let server = MockServer::start().await;
@@ -2969,80 +3011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parity_integration_disk_cache_move_persists_across_service_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let runtime_paths = RuntimePaths::resolve(Some(dir.path())).unwrap();
-        let source_cache_root = runtime_paths.disk_cache_dir();
-        let source_blob = source_cache_root
-            .join("backend")
-            .join("store")
-            .join("uid-1")
-            .join("00000001.msg");
-        tokio::fs::create_dir_all(source_blob.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&source_blob, b"hello").await.unwrap();
-        let source_db = source_cache_root
-            .join("backend")
-            .join("db")
-            .join("uid-1.db");
-        tokio::fs::create_dir_all(source_db.parent().unwrap())
-            .await
-            .unwrap();
-        tokio::fs::write(&source_db, b"sqlite-cache").await.unwrap();
-
-        let service = build_test_service_with_paths(runtime_paths.clone());
-        let target_cache_root = dir.path().join("cache-moved");
-        <BridgeService as pb::bridge_server::Bridge>::set_disk_cache_path(
-            &service,
-            Request::new(target_cache_root.display().to_string()),
-        )
-        .await
-        .unwrap();
-
-        let restarted_service = build_test_service_with_paths(runtime_paths.clone());
-        let loaded_settings = load_app_settings(
-            &runtime_paths.settings_dir().join(APP_SETTINGS_FILE),
-            &runtime_paths.disk_cache_dir(),
-        )
-        .await
-        .unwrap();
-        {
-            let mut settings = restarted_service.state.app_settings.lock().await;
-            *settings = loaded_settings.clone();
-        }
-        *restarted_service.state.active_disk_cache_path.lock().await =
-            effective_disk_cache_path(&loaded_settings, &runtime_paths);
-
-        let effective = <BridgeService as pb::bridge_server::Bridge>::disk_cache_path(
-            &restarted_service,
-            Request::new(()),
-        )
-        .await
-        .unwrap()
-        .into_inner();
-        assert_eq!(effective, target_cache_root.display().to_string());
-        assert_eq!(
-            tokio::fs::read(
-                target_cache_root
-                    .join("backend")
-                    .join("store")
-                    .join("uid-1")
-                    .join("00000001.msg")
-            )
-            .await
-            .unwrap(),
-            b"hello"
-        );
-        assert!(target_cache_root
-            .join("backend")
-            .join("db")
-            .join("uid-1.db")
-            .exists());
-    }
-
-    #[tokio::test]
-    async fn parity_integration_restart_and_quit_signal_shutdown() {
+    async fn integration_restart_and_quit_signal_shutdown() {
         let dir = tempfile::tempdir().unwrap();
         let restart_service = build_test_service(dir.path().to_path_buf());
         let mut restart_shutdown = restart_service.state.shutdown_tx.subscribe();

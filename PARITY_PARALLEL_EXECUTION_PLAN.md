@@ -35,15 +35,15 @@
 - IMAP/SMTP TLS handshake scripts.
 - Files:
 - `tests/parity/fixtures/*`
-- `tests/parity_matrix.rs` (new)
+- `tests/fixture_matrix.rs` (new)
 
 ### W0.2 Define CI parity gates (soft fail initially)
 - Add dedicated commands:
-- `cargo test parity_store_interop`
-- `cargo test parity_api_event`
-- `cargo test parity_grpc_wire`
-- `cargo test parity_imap_smtp_tls`
-- `cargo test parity_observability`
+- `cargo test --test store_interop`
+- `cargo test --test api_event_compatibility`
+- `cargo test --test grpc_wire_contract`
+- `cargo test --test imap_smtp_tls_integration`
+- `cargo test --test observability_runtime`
 
 ### Exit criteria
 - Failing tests exist for all current P0/P1 blockers.
@@ -57,7 +57,7 @@
 Owner files:
 - `src/vault.rs`
 - `src/paths.rs` (only if needed for vault path parity)
-- `tests/parity_store_interop.rs` (new)
+- `tests/store_interop.rs` (new)
 
 Tasks:
 1. Implement vault version migration pipeline compatible with Proton versions.
@@ -78,7 +78,7 @@ Owner files:
 - `src/imap/session.rs`
 - `src/smtp/server.rs`
 - `src/smtp/session.rs`
-- `tests/parity_imap_smtp_tls.rs` (new)
+- `tests/imap_smtp_tls_integration.rs` (new)
 
 Tasks:
 1. Implement real IMAP STARTTLS upgrade flow (socket -> TLS stream swap).
@@ -96,7 +96,7 @@ Owner files:
 - `proto/bridge.proto`
 - `src/frontend/grpc/rpc.rs`
 - `src/frontend/grpc/service.rs`
-- `tests/parity_grpc_wire.rs` (new)
+- `tests/grpc_wire_contract.rs` (new)
 
 Tasks:
 1. Align password encoding behavior (base64 decode path parity).
@@ -125,7 +125,7 @@ Owner files:
 - `src/api/messages.rs`
 - `src/api/mod.rs`
 - `src/crypto/keys.rs`
-- `tests/parity_api_event.rs` (extend)
+- `tests/api_event_compatibility.rs` (extend)
 
 Tasks:
 1. Support both event payload shapes (`Event` and `Events[]`) safely.
@@ -143,7 +143,7 @@ Owner files:
 - `src/frontend/grpc/service.rs`
 - `src/main.rs`
 - `src/bridge/events.rs`
-- `tests/parity_runtime_events.rs` (new)
+- `tests/runtime_events_e2e.rs` (new)
 
 Tasks:
 1. Ensure `SetMailServerSettings` applies live runtime restart behavior.
@@ -169,7 +169,7 @@ Owner files:
 - `src/imap/session.rs`
 - `src/smtp/session.rs`
 - `src/api/client.rs`
-- `tests/parity_observability.rs` (new)
+- `tests/observability_runtime.rs` (new)
 
 Tasks:
 1. Implement sessionized log files with rotation/pruning parity.
@@ -182,7 +182,7 @@ Owner files:
 - `src/main.rs`
 - `src/frontend/grpc/rpc.rs`
 - `src/frontend/grpc/service.rs`
-- `tests/parity_observability.rs` (extend)
+- `tests/observability_runtime.rs` (extend)
 
 Tasks:
 1. Add crash capture pipeline parity (panic hooks, artifacts, report path).

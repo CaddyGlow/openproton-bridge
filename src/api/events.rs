@@ -74,7 +74,7 @@ mod tests {
                 "EventID": "event-2",
                 "More": 0,
                 "Refresh": 0,
-                "Events": [{"ID": "evt-a"}]
+                "Events": [{"ID": "evt-a"}, {"ID": "evt-b"}]
             })))
             .mount(&server)
             .await;
@@ -83,7 +83,9 @@ mod tests {
         assert_eq!(resp.event_id, "event-2");
         assert_eq!(resp.more, 0);
         assert_eq!(resp.refresh, 0);
-        assert_eq!(resp.events.len(), 1);
+        assert_eq!(resp.events.len(), 2);
+        assert_eq!(resp.events[0]["ID"], "evt-a");
+        assert_eq!(resp.events[1]["ID"], "evt-b");
     }
 
     #[tokio::test]

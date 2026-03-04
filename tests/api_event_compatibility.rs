@@ -5,7 +5,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
-async fn parity_api_event_accepts_single_event_shape() {
+async fn api_event_accepts_single_event_shape() {
     let server = MockServer::start().await;
     let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
 
@@ -30,33 +30,7 @@ async fn parity_api_event_accepts_single_event_shape() {
 }
 
 #[tokio::test]
-async fn parity_api_event_keeps_events_array_shape() {
-    let server = MockServer::start().await;
-    let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
-
-    Mock::given(method("GET"))
-        .and(path("/core/v4/events/event-1"))
-        .and(header("x-pm-uid", "uid-1"))
-        .and(header("Authorization", "Bearer token-1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "Code": 1000,
-            "EventID": "event-2",
-            "More": 0,
-            "Refresh": 0,
-            "Events": [{"ID": "evt-array-a"}, {"ID": "evt-array-b"}]
-        })))
-        .mount(&server)
-        .await;
-
-    let response = events::get_events(&client, "event-1").await.unwrap();
-    assert_eq!(response.event_id, "event-2");
-    assert_eq!(response.events.len(), 2);
-    assert_eq!(response.events[0]["ID"], "evt-array-a");
-    assert_eq!(response.events[1]["ID"], "evt-array-b");
-}
-
-#[tokio::test]
-async fn parity_api_event_attachment_error_returns_api_error_payload() {
+async fn api_event_attachment_error_returns_api_error_payload() {
     let server = MockServer::start().await;
     let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
 

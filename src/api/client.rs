@@ -265,6 +265,11 @@ mod tests {
             redact_sensitive_for_log("super-secret-access-token"),
             "su…en"
         );
+        assert_eq!(
+            redact_sensitive_for_log("Bearer super-secret-token"),
+            "Be…en"
+        );
+        assert_eq!(redact_sensitive_for_log(" access-token-value "), "ac…ue");
     }
 
     #[test]

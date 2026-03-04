@@ -17,7 +17,7 @@ fn read_fixture_json(path: &Path) -> Value {
 }
 
 #[test]
-fn parity_golden_fixture_defines_required_scenarios() {
+fn golden_fixture_defines_required_scenarios() {
     let root = repo_root();
     let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
     assert!(
@@ -92,7 +92,7 @@ fn parity_golden_fixture_defines_required_scenarios() {
 }
 
 #[test]
-fn parity_log_validator_help_mentions_required_flags() {
+fn log_validator_help_mentions_required_flags() {
     let root = repo_root();
     let tool_path = root.join("scripts/validate_parity_logs.py");
     assert!(
@@ -125,7 +125,7 @@ fn parity_log_validator_help_mentions_required_flags() {
 }
 
 #[test]
-fn parity_log_validator_passes_when_milestones_are_in_order() {
+fn log_validator_passes_when_milestones_are_in_order() {
     let root = repo_root();
     let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
     let tool_path = root.join("scripts/validate_parity_logs.py");
@@ -185,7 +185,7 @@ fn parity_log_validator_passes_when_milestones_are_in_order() {
 }
 
 #[test]
-fn parity_log_validator_reports_missing_and_out_of_order_milestones() {
+fn log_validator_reports_missing_and_out_of_order_milestones() {
     let root = repo_root();
     let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
     let tool_path = root.join("scripts/validate_parity_logs.py");

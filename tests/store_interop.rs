@@ -68,7 +68,7 @@ fn fixture_session_template() -> Session {
 }
 
 #[test]
-fn parity_store_interop_loads_proton_profile_fixture() {
+fn store_interop_loads_proton_profile_fixture() {
     let fixture_root = repo_root().join("tests/fixtures/proton_profile_golden");
     let temp = tempfile::tempdir().expect("tempdir");
     copy_dir_recursive(&fixture_root, temp.path());
@@ -93,7 +93,7 @@ fn parity_store_interop_loads_proton_profile_fixture() {
 }
 
 #[test]
-fn parity_store_interop_roundtrip_preserves_metadata_fields() {
+fn store_interop_roundtrip_preserves_metadata_fields() {
     let fixture_root = repo_root().join("tests/fixtures/proton_profile_golden");
     let temp = tempfile::tempdir().expect("tempdir");
     copy_dir_recursive(&fixture_root, temp.path());

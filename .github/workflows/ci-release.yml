@@ -46,12 +46,12 @@ jobs:
       - name: Run tests
         run: cargo test --locked
 
-      - name: Run backend parity integration gate
-        run: cargo test --locked parity_integration_ --lib
+      - name: Run backend integration gate
+        run: cargo test --locked integration_ --lib
 
-      - name: Run gluon parity and recovery gate
+      - name: Run gluon integration and recovery gate
         run: |
-          cargo test --locked --test gluon_parity_integration
+          cargo test --locked --test gluon_integration
           cargo test --locked --test gluon_recovery_integration
 
   build-release-artifacts:

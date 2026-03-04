@@ -96,7 +96,7 @@ fn load_index_payload_from_db(root: &Path, storage_user_id: &str) -> Value {
 }
 
 #[tokio::test]
-async fn be031_startup_parity_recovers_fixture_layout_without_mutating_sync_sidecars() {
+async fn be031_startup_recovers_fixture_layout_without_mutating_sync_sidecars() {
     let fixture_root = repo_root().join("tests/fixtures/proton_profile_gluon_sanitized");
     let fixture_blob = fixture_root.join("backend/store/user-redacted/00000001.msg");
     let fixture_sync = fixture_root.join("sync-user-redacted");
@@ -140,7 +140,7 @@ async fn be031_startup_parity_recovers_fixture_layout_without_mutating_sync_side
 }
 
 #[tokio::test]
-async fn be031_sync_restart_parity_preserves_uid_and_modseq_continuity() {
+async fn be031_sync_restart_preserves_uid_and_modseq_continuity() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mailbox = "account-1::INBOX";
 
@@ -244,7 +244,7 @@ async fn be031_sync_restart_parity_preserves_uid_and_modseq_continuity() {
 }
 
 #[tokio::test]
-async fn be031_delete_parity_removes_blob_and_keeps_restart_state_consistent() {
+async fn be031_delete_removes_blob_and_keeps_restart_state_consistent() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mailbox = "account-2::INBOX";
 
@@ -323,7 +323,7 @@ async fn be031_delete_parity_removes_blob_and_keeps_restart_state_consistent() {
 }
 
 #[tokio::test]
-async fn be031_cache_move_parity_keeps_store_readable_after_root_relocation() {
+async fn be031_cache_move_keeps_store_readable_after_root_relocation() {
     let temp = tempfile::tempdir().expect("tempdir");
     let source_root = temp.path().join("cache-source");
     let target_root = temp.path().join("cache-target");
@@ -386,7 +386,7 @@ async fn be031_cache_move_parity_keeps_store_readable_after_root_relocation() {
 }
 
 #[test]
-fn be031_event_parity_persists_checkpoints_across_restart_and_session_delete() {
+fn be031_event_persists_checkpoints_across_restart_and_session_delete() {
     let temp = tempfile::tempdir().expect("tempdir");
     write_file_credential_store_config(temp.path());
 

@@ -1308,7 +1308,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 }
 
 #[cfg(test)]
-mod parity_grpc_wire_tests {
+mod grpc_wire_tests {
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{header, method, path};
@@ -1340,7 +1340,7 @@ mod parity_grpc_wire_tests {
     }
 
     #[test]
-    fn parity_grpc_wire_password_decode_accepts_utf8_and_base64_payload() {
+    fn grpc_wire_password_decode_accepts_utf8_and_base64_payload() {
         let plain = decode_login_password_bytes(b"plain-password".to_vec()).expect("plain decode");
         assert_eq!(plain.value, "plain-password");
         assert!(!plain.used_base64_compat);
@@ -1352,7 +1352,7 @@ mod parity_grpc_wire_tests {
     }
 
     #[tokio::test]
-    async fn parity_grpc_wire_login2_passwords_requires_pending_login() {
+    async fn grpc_wire_login2_passwords_requires_pending_login() {
         let dir = tempfile::tempdir().expect("tempdir");
         let service = build_test_service(dir.path().to_path_buf());
 
@@ -1388,7 +1388,7 @@ mod parity_grpc_wire_tests {
     }
 
     #[tokio::test]
-    async fn parity_grpc_wire_two_password_stage_emits_event_and_completes_login() {
+    async fn grpc_wire_two_password_stage_emits_event_and_completes_login() {
         let dir = tempfile::tempdir().expect("tempdir");
         let service = build_test_service(dir.path().to_path_buf());
         let mut events = service.state.event_tx.subscribe();
@@ -1506,7 +1506,7 @@ mod parity_grpc_wire_tests {
     }
 
     #[tokio::test]
-    async fn parity_grpc_wire_lagged_stream_emits_generic_error_event() {
+    async fn grpc_wire_lagged_stream_emits_generic_error_event() {
         let dir = tempfile::tempdir().expect("tempdir");
         let service = build_test_service(dir.path().to_path_buf());
         let mut events = service.state.event_tx.subscribe();

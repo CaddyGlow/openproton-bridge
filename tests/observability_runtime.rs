@@ -1,11 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use openproton_bridge::api::client::redact_sensitive_for_log;
 use openproton_bridge::observability::{create_session_log, generate_support_log_bundle};
 use openproton_bridge::paths::RuntimePaths;
 
 #[test]
-fn parity_observability_runtime_paths_include_session_and_crash_dirs() {
+fn observability_runtime_paths_include_session_and_crash_dirs() {
     let runtime = RuntimePaths::from_bases(
         PathBuf::from("/cfg"),
         PathBuf::from("/data"),
@@ -31,18 +30,7 @@ fn parity_observability_runtime_paths_include_session_and_crash_dirs() {
 }
 
 #[test]
-fn parity_observability_sensitive_values_are_redacted_by_default() {
-    assert_eq!(redact_sensitive_for_log(""), "<redacted>");
-    assert_eq!(redact_sensitive_for_log("abc"), "<redacted>");
-    assert_eq!(
-        redact_sensitive_for_log("Bearer super-secret-token"),
-        "Be…en"
-    );
-    assert_eq!(redact_sensitive_for_log(" access-token-value "), "ac…ue");
-}
-
-#[test]
-fn parity_observability_session_logs_are_created_and_pruned() {
+fn observability_session_logs_are_created_and_pruned() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = RuntimePaths::resolve(Some(tmp.path())).unwrap();
 
@@ -62,7 +50,7 @@ fn parity_observability_session_logs_are_created_and_pruned() {
 }
 
 #[test]
-fn parity_observability_support_bundle_collects_diagnostics() {
+fn observability_support_bundle_collects_diagnostics() {
     let tmp = tempfile::tempdir().unwrap();
     let runtime = RuntimePaths::resolve(Some(tmp.path())).unwrap();
     let _ = create_session_log(&runtime).unwrap();

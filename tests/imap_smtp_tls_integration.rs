@@ -100,7 +100,7 @@ fn tls_connector_from_cert(cert_pem: &[u8]) -> TlsConnector {
 }
 
 #[tokio::test]
-async fn parity_imap_starttls_upgrade_and_capability_reflects_tls_state() {
+async fn imap_starttls_upgrade_and_capability_reflects_tls_state() {
     let tmp = tempfile::tempdir().unwrap();
     let cert_dir = tmp.path().join("imap-tls");
     let server = ImapServer::new().with_tls(&cert_dir).unwrap();
@@ -165,7 +165,7 @@ async fn parity_imap_starttls_upgrade_and_capability_reflects_tls_state() {
 }
 
 #[tokio::test]
-async fn parity_smtp_starttls_upgrade_and_auth_login_parity() {
+async fn smtp_starttls_upgrade_and_auth_login_behavior() {
     let tmp = tempfile::tempdir().unwrap();
     let cert_dir = tmp.path().join("smtp-tls");
     let server = SmtpServer::new().with_tls(&cert_dir).unwrap();
@@ -309,7 +309,7 @@ async fn parity_smtp_starttls_upgrade_and_auth_login_parity() {
 }
 
 #[tokio::test]
-async fn parity_capabilities_without_tls_do_not_advertise_starttls() {
+async fn capabilities_without_tls_do_not_advertise_starttls() {
     let imap_port = find_available_port().await;
     let smtp_port = find_available_port().await;
 

@@ -14,7 +14,7 @@ fn read_json(relative: &str) -> Value {
 }
 
 #[test]
-fn parity_matrix_manifest_references_existing_fixtures() {
+fn fixture_matrix_manifest_references_existing_fixtures() {
     let manifest = read_json("tests/parity/fixtures/manifest.json");
     let object = manifest
         .as_object()
@@ -49,7 +49,7 @@ fn parity_matrix_manifest_references_existing_fixtures() {
 }
 
 #[test]
-fn parity_matrix_event_fixtures_cover_single_and_array_shapes() {
+fn fixture_matrix_event_fixtures_cover_single_and_array_shapes() {
     let single = read_json("tests/parity/fixtures/events_single_object.json");
     assert!(
         single.get("Event").and_then(Value::as_object).is_some(),
@@ -77,7 +77,7 @@ fn parity_matrix_event_fixtures_cover_single_and_array_shapes() {
 }
 
 #[test]
-fn parity_matrix_grpc_login_fixtures_cover_base64_and_two_password_flow() {
+fn fixture_matrix_grpc_login_fixtures_cover_base64_and_two_password_flow() {
     let base64_login = read_json("tests/parity/fixtures/grpc_login_base64.json");
     let encoded = base64_login
         .get("password")
@@ -115,7 +115,7 @@ fn parity_matrix_grpc_login_fixtures_cover_base64_and_two_password_flow() {
 }
 
 #[test]
-fn parity_matrix_tls_transcripts_include_starttls_markers() {
+fn fixture_matrix_tls_transcripts_include_starttls_markers() {
     let imap = fs::read_to_string(repo_path(
         "tests/parity/fixtures/imap_starttls_transcript.txt",
     ))

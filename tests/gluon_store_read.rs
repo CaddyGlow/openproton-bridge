@@ -54,7 +54,9 @@ async fn be024_reads_fixture_message_blob_without_index() {
 async fn be024_reads_uid_maps_metadata_flags_and_snapshot_from_index() {
     let temp = tempfile::tempdir().expect("tempdir");
     let account_store = temp.path().join("backend/store/user-42");
+    let account_db = temp.path().join("backend/db/user-42.db");
     fs::create_dir_all(&account_store).expect("create account store dir");
+    fs::create_dir_all(account_db.parent().expect("db parent")).expect("create db dir");
 
     let message = b"From: alice@example.invalid\r\nSubject: indexed\r\n\r\nbody".to_vec();
     fs::write(account_store.join("00000009.msg"), &message).expect("write message blob");
@@ -94,11 +96,24 @@ async fn be024_reads_uid_maps_metadata_flags_and_snapshot_from_index() {
             }
         }
     });
-    fs::write(
-        account_store.join(".openproton-mailbox-index.json"),
-        serde_json::to_vec_pretty(&index_payload).expect("serialize index"),
+    let conn = rusqlite::Connection::open(&account_db).expect("open sqlite db");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            payload BLOB NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );",
     )
-    .expect("write index");
+    .expect("create sqlite index table");
+    conn.execute(
+        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
+         VALUES (1, ?1, ?2)",
+        rusqlite::params![
+            serde_json::to_vec_pretty(&index_payload).expect("serialize index"),
+            1_700_000_000_000_i64
+        ],
+    )
+    .expect("insert sqlite index row");
 
     let store = GluonStore::new(
         temp.path().to_path_buf(),

@@ -7,6 +7,7 @@ use openproton_bridge::bridge::events::VaultCheckpointStore;
 use openproton_bridge::bridge::types::{AccountId, EventCheckpoint, EventCheckpointStore};
 use openproton_bridge::imap::store::{GluonStore, MessageStore};
 use openproton_bridge::vault;
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 fn repo_root() -> PathBuf {
@@ -69,6 +70,25 @@ path = "vault.key"
     .expect("write credential_store.toml");
 }
 
+fn load_index_payload_from_db(root: &Path, storage_user_id: &str) -> Value {
+    let db_path = root
+        .join("backend")
+        .join("db")
+        .join(format!("{storage_user_id}.db"));
+    let conn = rusqlite::Connection::open(&db_path)
+        .unwrap_or_else(|err| panic!("open sqlite db {} failed: {err}", db_path.display()));
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM openproton_mailbox_index WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .expect("query sqlite index row")
+        .expect("sqlite index row should exist");
+    serde_json::from_slice(&payload).expect("parse sqlite index payload")
+}
+
 #[tokio::test]
 async fn be031_startup_parity_recovers_fixture_layout_without_mutating_sync_sidecars() {
     let fixture_root = repo_root().join("tests/fixtures/proton_profile_gluon_sanitized");
@@ -97,11 +117,14 @@ async fn be031_startup_parity_recovers_fixture_layout_without_mutating_sync_side
         Some(expected_blob)
     );
 
+    let synthesized_index = load_index_payload_from_db(temp.path(), "user-redacted");
     assert!(
-        temp.path()
-            .join("backend/store/user-redacted/.openproton-mailbox-index.json")
-            .exists(),
-        "startup should synthesize index from discovered blobs"
+        synthesized_index
+            .get("mailboxes")
+            .and_then(Value::as_object)
+            .and_then(|mailboxes| mailboxes.get("INBOX"))
+            .is_some(),
+        "startup should synthesize sqlite index from discovered blobs"
     );
     assert_eq!(
         fs::read(temp.path().join("sync-user-redacted")).expect("read copied sync sidecar"),
@@ -279,9 +302,7 @@ async fn be031_delete_parity_removes_blob_and_keeps_restart_state_consistent() {
     assert_eq!(status.exists, 1);
     assert_eq!(status.next_uid, 3);
 
-    let index_payload = fs::read(account_store.join(".openproton-mailbox-index.json"))
-        .expect("read index after delete");
-    let index: Value = serde_json::from_slice(&index_payload).expect("parse index");
+    let index = load_index_payload_from_db(temp.path(), "user-2");
     let inbox = index
         .get("mailboxes")
         .and_then(Value::as_object)
@@ -353,10 +374,8 @@ async fn be031_cache_move_parity_keeps_store_readable_after_root_relocation() {
         .expect("insert msg-2 after move");
     assert_eq!(uid2, 2);
     assert!(
-        target_root
-            .join("backend/store/user-9/.openproton-mailbox-index.json")
-            .exists(),
-        "moved root should remain writable"
+        target_root.join("backend/db/user-9.db").exists(),
+        "moved root should keep sqlite cache writable"
     );
 }
 

@@ -43,16 +43,24 @@ async fn be026_runtime_store_writes_gluon_layout_without_json_mailbox_files() {
         .expect("store rfc822");
 
     let account_store_dir = temp.path().join("backend").join("store").join("user-1");
+    let account_db_path = temp.path().join("backend").join("db").join("user-1.db");
     assert!(
-        account_store_dir
-            .join(".openproton-mailbox-index.json")
-            .exists(),
-        "runtime store must write a gluon account index"
+        account_db_path.exists(),
+        "runtime store must write sqlite mailbox index data"
     );
     assert!(
         account_store_dir.join("00000001.msg").exists(),
         "runtime store must write gluon message blobs"
     );
+    let conn = rusqlite::Connection::open(&account_db_path).expect("open sqlite db");
+    let row_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM openproton_mailbox_index WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("query sqlite index row count");
+    assert_eq!(row_count, 1);
 
     let root_json_files = fs::read_dir(temp.path())
         .expect("read runtime store root")

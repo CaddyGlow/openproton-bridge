@@ -19,9 +19,7 @@ fn be029_fails_startup_on_unrecoverable_pending_gluon_txn_artifact() {
         .join("txn-corrupt");
     fs::create_dir_all(&txndir).expect("create txn dir");
 
-    let missing_target = temp
-        .path()
-        .join("backend/store/user-1/.openproton-mailbox-index.json");
+    let missing_target = temp.path().join("backend/db/user-1.db");
     let missing_staged = txndir.join("stage-0000.tmp");
 
     let journal = json!({
@@ -69,7 +67,9 @@ fn be029_fails_startup_on_unrecoverable_pending_gluon_txn_artifact() {
 async fn be029_repairs_missing_blob_references_deterministically() {
     let temp = tempfile::tempdir().expect("tempdir");
     let account_store = temp.path().join("backend/store/user-1");
+    let account_db = temp.path().join("backend/db/user-1.db");
     fs::create_dir_all(&account_store).expect("create account store");
+    fs::create_dir_all(account_db.parent().expect("db parent")).expect("create db dir");
 
     fs::write(
         account_store.join("00000001.msg"),
@@ -141,11 +141,24 @@ async fn be029_repairs_missing_blob_references_deterministically() {
             }
         }
     });
-    fs::write(
-        account_store.join(".openproton-mailbox-index.json"),
-        serde_json::to_vec_pretty(&index_payload).expect("serialize index"),
+    let conn = rusqlite::Connection::open(&account_db).expect("open sqlite db");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            payload BLOB NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );",
     )
-    .expect("write index");
+    .expect("create sqlite index table");
+    conn.execute(
+        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
+         VALUES (1, ?1, ?2)",
+        rusqlite::params![
+            serde_json::to_vec_pretty(&index_payload).expect("serialize index"),
+            1_700_000_000_000_i64
+        ],
+    )
+    .expect("insert sqlite index row");
 
     let store = GluonStore::new(
         temp.path().to_path_buf(),

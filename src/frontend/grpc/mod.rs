@@ -2440,14 +2440,11 @@ mod tests {
         tokio::fs::write(&old_payload, b"cache-payload")
             .await
             .unwrap();
-        let old_index = old_path
-            .join("backend")
-            .join("store")
-            .join("uid-1")
-            .join(".openproton-mailbox-index.json");
-        tokio::fs::write(&old_index, b"{\"version\":1}")
+        let old_db = old_path.join("backend").join("db").join("uid-1.db");
+        tokio::fs::create_dir_all(old_db.parent().unwrap())
             .await
             .unwrap();
+        tokio::fs::write(&old_db, b"cache-sqlite").await.unwrap();
 
         let new_path = root.path().join("moved-cache");
         <BridgeService as pb::bridge_server::Bridge>::set_disk_cache_path(
@@ -2468,9 +2465,8 @@ mod tests {
         );
         assert!(new_path
             .join("backend")
-            .join("store")
-            .join("uid-1")
-            .join(".openproton-mailbox-index.json")
+            .join("db")
+            .join("uid-1.db")
             .exists());
         assert!(!old_path.exists());
 
@@ -2977,16 +2973,14 @@ mod tests {
             .await
             .unwrap();
         tokio::fs::write(&source_blob, b"hello").await.unwrap();
-        tokio::fs::write(
-            source_cache_root
-                .join("backend")
-                .join("store")
-                .join("uid-1")
-                .join(".openproton-mailbox-index.json"),
-            b"{\"version\":1}",
-        )
-        .await
-        .unwrap();
+        let source_db = source_cache_root
+            .join("backend")
+            .join("db")
+            .join("uid-1.db");
+        tokio::fs::create_dir_all(source_db.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&source_db, b"sqlite-cache").await.unwrap();
 
         let service = build_test_service_with_paths(runtime_paths.clone());
         let target_cache_root = dir.path().join("cache-moved");
@@ -3033,9 +3027,8 @@ mod tests {
         );
         assert!(target_cache_root
             .join("backend")
-            .join("store")
-            .join("uid-1")
-            .join(".openproton-mailbox-index.json")
+            .join("db")
+            .join("uid-1.db")
             .exists());
     }
 

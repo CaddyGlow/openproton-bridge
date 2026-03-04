@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 use openproton_bridge::imap::gluon_txn::{GluonTxnError, GluonTxnManager};
 use openproton_bridge::imap::store::{GluonStore, MessageStore};
@@ -10,8 +11,46 @@ fn make_account_map(account_id: &str, storage_user_id: &str) -> HashMap<String, 
     HashMap::from([(account_id.to_string(), storage_user_id.to_string())])
 }
 
+fn read_sqlite_index_payload(db_path: &Path) -> serde_json::Value {
+    let conn = rusqlite::Connection::open(db_path)
+        .unwrap_or_else(|err| panic!("open sqlite db {} failed: {err}", db_path.display()));
+    let payload: Vec<u8> = conn
+        .query_row(
+            "SELECT payload FROM openproton_mailbox_index WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read sqlite index payload");
+    serde_json::from_slice(&payload).expect("parse sqlite index payload")
+}
+
+fn build_sqlite_index_db_bytes(index_payload: &serde_json::Value) -> Vec<u8> {
+    let temp = tempfile::tempdir().expect("temp sqlite dir");
+    let db_path = temp.path().join("index.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open temp sqlite db");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            payload BLOB NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        );",
+    )
+    .expect("create sqlite index table");
+    conn.execute(
+        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
+         VALUES (1, ?1, ?2)",
+        rusqlite::params![
+            serde_json::to_vec(index_payload).expect("serialize index payload"),
+            1_700_000_000_000_i64
+        ],
+    )
+    .expect("write sqlite index row");
+    drop(conn);
+    fs::read(db_path).expect("read sqlite db bytes")
+}
+
 #[tokio::test]
-async fn be031_recovery_startup_replays_pending_txn_for_index_and_blob() {
+async fn be031_recovery_startup_replays_pending_txn_for_sqlite_index_and_blob() {
     let temp = tempfile::tempdir().expect("tempdir");
 
     let manager = GluonTxnManager::new(temp.path()).expect("txn manager");
@@ -36,10 +75,10 @@ async fn be031_recovery_startup_replays_pending_txn_for_index_and_blob() {
     });
 
     txn.stage_write(
-        "backend/store/user-1/.openproton-mailbox-index.json",
-        serde_json::to_vec(&index_payload).expect("serialize index"),
+        "backend/db/user-1.db",
+        build_sqlite_index_db_bytes(&index_payload),
     )
-    .expect("stage index");
+    .expect("stage sqlite index db");
     txn.stage_write(
         "backend/store/user-1/00000001.msg",
         b"From: recover\\r\\n\\r\\nbody",
@@ -89,9 +128,7 @@ fn be031_recovery_startup_fails_on_unrecoverable_pending_journal() {
         .join("txn-corrupt");
     fs::create_dir_all(&txndir).expect("create txn dir");
 
-    let missing_target = temp
-        .path()
-        .join("backend/store/user-1/.openproton-mailbox-index.json");
+    let missing_target = temp.path().join("backend/db/user-1.db");
     let missing_staged = txndir.join("stage-0000.tmp");
 
     let journal = json!({
@@ -171,10 +208,8 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
         .await
         .expect("store blob 1");
 
-    let index_path = source_root.join("backend/store/user-9/.openproton-mailbox-index.json");
-    let mut index: serde_json::Value =
-        serde_json::from_slice(&fs::read(&index_path).expect("read source index"))
-            .expect("parse source index");
+    let source_db_path = source_root.join("backend/db/user-9.db");
+    let mut index = read_sqlite_index_payload(&source_db_path);
     let inbox = index
         .get_mut("mailboxes")
         .and_then(serde_json::Value::as_object_mut)
@@ -208,11 +243,8 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
 
     let manager = GluonTxnManager::new(&source_root).expect("txn manager");
     let mut txn = manager.begin("user-9").expect("begin txn");
-    txn.stage_write(
-        "backend/store/user-9/.openproton-mailbox-index.json",
-        serde_json::to_vec(&index).expect("serialize updated index"),
-    )
-    .expect("stage updated index");
+    txn.stage_write("backend/db/user-9.db", build_sqlite_index_db_bytes(&index))
+        .expect("stage updated sqlite index db");
     txn.stage_write(
         "backend/store/user-9/00000002.msg",
         b"From: moved\\r\\n\\r\\nbody-2",

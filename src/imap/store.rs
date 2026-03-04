@@ -496,33 +496,23 @@ impl GluonStore {
                 return Ok(None);
             }
         };
-        conn.execute_batch(&format!(
+
+        if let Err(err) = conn.execute_batch(&format!(
             "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_INDEX_TABLE} (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 payload BLOB NOT NULL,
                 updated_at_ms INTEGER NOT NULL
             );"
-        ))
-        .map_err(|err| {
+        )) {
             warn!(
                 path = %db_path.display(),
                 error = %err,
                 "failed to initialize sqlite schema for gluon index, falling back to empty index"
             );
-            super::ImapError::Protocol("sqlite index schema init failed".to_string())
-        })
-        .ok();
-
-        if conn
-            .prepare(&format!(
-                "SELECT payload, updated_at_ms FROM {GLUON_SQLITE_INDEX_TABLE} WHERE id = 1"
-            ))
-            .is_err()
-        {
             return Ok(None);
         }
 
-        let row = conn
+        let row = match conn
             .query_row(
                 &format!(
                     "SELECT payload, updated_at_ms FROM {GLUON_SQLITE_INDEX_TABLE} WHERE id = 1"
@@ -531,16 +521,17 @@ impl GluonStore {
                 |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
-            .map_err(|err| {
+        {
+            Ok(row) => row,
+            Err(err) => {
                 warn!(
                     path = %db_path.display(),
                     error = %err,
                     "failed to read sqlite index row, falling back to empty index"
                 );
-                super::ImapError::Protocol("sqlite index row read failed".to_string())
-            })
-            .ok()
-            .flatten();
+                return Ok(None);
+            }
+        };
 
         let Some((payload, updated_at_ms)) = row else {
             return Ok(None);
@@ -563,6 +554,30 @@ impl GluonStore {
         Ok(Some(parsed))
     }
 
+    fn persist_index_to_sqlite_once(
+        db_path: &Path,
+        payload: &[u8],
+        updated_at_ms: i64,
+    ) -> rusqlite::Result<()> {
+        let conn = rusqlite::Connection::open(db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_INDEX_TABLE} (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                payload BLOB NOT NULL,
+                updated_at_ms INTEGER NOT NULL
+            );"
+        ))?;
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {GLUON_SQLITE_INDEX_TABLE} (id, payload, updated_at_ms)
+                 VALUES (1, ?1, ?2)"
+            ),
+            rusqlite::params![payload, updated_at_ms],
+        )?;
+        Ok(())
+    }
+
     fn persist_index_to_sqlite(
         &self,
         storage_user_id: &str,
@@ -573,52 +588,39 @@ impl GluonStore {
             std::fs::create_dir_all(parent)?;
         }
 
-        let conn = rusqlite::Connection::open(&db_path).map_err(|err| {
-            super::ImapError::Protocol(format!(
-                "failed to open sqlite db {}: {err}",
-                db_path.display()
-            ))
-        })?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|err| {
-                super::ImapError::Protocol(format!(
-                    "failed to enable sqlite wal mode {}: {err}",
-                    db_path.display()
-                ))
-            })?;
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_INDEX_TABLE} (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                payload BLOB NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );"
-        ))
-        .map_err(|err| {
-            super::ImapError::Protocol(format!(
-                "failed to initialize sqlite schema {}: {err}",
-                db_path.display()
-            ))
-        })?;
-
         let payload = serde_json::to_vec(index).map_err(|err| {
             super::ImapError::Protocol(format!(
                 "failed to serialize sqlite index payload for account {storage_user_id}: {err}"
             ))
         })?;
-        conn.execute(
-            &format!(
-                "INSERT OR REPLACE INTO {GLUON_SQLITE_INDEX_TABLE} (id, payload, updated_at_ms)
-                 VALUES (1, ?1, ?2)"
-            ),
-            rusqlite::params![payload, index.updated_at_ms as i64],
-        )
-        .map_err(|err| {
-            super::ImapError::Protocol(format!(
-                "failed to persist sqlite index payload {}: {err}",
-                db_path.display()
-            ))
-        })?;
-        Ok(())
+
+        let mut retried_with_recreate = false;
+        loop {
+            match Self::persist_index_to_sqlite_once(&db_path, &payload, index.updated_at_ms as i64)
+            {
+                Ok(()) => return Ok(()),
+                Err(err) if !retried_with_recreate && db_path.exists() => {
+                    warn!(
+                        path = %db_path.display(),
+                        error = %err,
+                        "failed to persist sqlite index; recreating db and retrying once"
+                    );
+                    std::fs::remove_file(&db_path).map_err(|remove_err| {
+                        super::ImapError::Protocol(format!(
+                            "failed to remove corrupted sqlite db {} after persist error {err}: {remove_err}",
+                            db_path.display()
+                        ))
+                    })?;
+                    retried_with_recreate = true;
+                }
+                Err(err) => {
+                    return Err(super::ImapError::Protocol(format!(
+                        "failed to persist sqlite index payload {}: {err}",
+                        db_path.display()
+                    )))
+                }
+            }
+        }
     }
 
     fn persist_account(

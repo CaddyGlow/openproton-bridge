@@ -121,14 +121,41 @@ pub async fn run_server(addr: &str, config: Arc<SessionConfig>) -> Result<()> {
     run_server_with_tls_config(addr, config, runtime_tls_config()).await
 }
 
+pub async fn run_server_with_listener(
+    listener: TcpListener,
+    config: Arc<SessionConfig>,
+) -> Result<()> {
+    run_server_with_listener_and_tls_config(listener, config, runtime_tls_config()).await
+}
+
+pub async fn run_server_with_listener_and_tls_config(
+    listener: TcpListener,
+    config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    run_server_from_listener(listener, config, tls_config).await
+}
+
 pub async fn run_server_with_tls_config(
     addr: &str,
     config: Arc<SessionConfig>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    run_server_from_listener(listener, config, tls_config).await
+}
+
+async fn run_server_from_listener(
+    listener: TcpListener,
+    config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
-    info!(addr = %addr, "IMAP server listening");
+    let listener_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    info!(addr = %listener_addr, "IMAP server listening");
 
     loop {
         let (stream, peer) = listener.accept().await?;

@@ -28,6 +28,280 @@ impl BridgeService {
         self.state.runtime_paths.grpc_app_settings_path()
     }
 
+    fn mail_runtime_config_from_settings(
+        &self,
+        settings: &StoredMailSettings,
+        transition: &'static str,
+    ) -> anyhow::Result<bridge::mail_runtime::MailRuntimeConfig> {
+        let imap_port = u16::try_from(settings.imap_port)
+            .with_context(|| format!("invalid IMAP port in grpc settings: {}", settings.imap_port))?;
+        let smtp_port = u16::try_from(settings.smtp_port)
+            .with_context(|| format!("invalid SMTP port in grpc settings: {}", settings.smtp_port))?;
+        Ok(bridge::mail_runtime::MailRuntimeConfig {
+            bind: self.state.bind_host.clone(),
+            imap_port,
+            smtp_port,
+            no_tls: false,
+            use_ssl_for_imap: settings.use_ssl_for_imap,
+            use_ssl_for_smtp: settings.use_ssl_for_smtp,
+            event_poll_interval: std::time::Duration::from_secs(30),
+            transition,
+        })
+    }
+
+    async fn start_mail_runtime_with_settings(
+        &self,
+        settings: &StoredMailSettings,
+        transition: &'static str,
+    ) -> Result<bridge::mail_runtime::MailRuntimeHandle, bridge::mail_runtime::MailRuntimeStartError>
+    {
+        let config = self
+            .mail_runtime_config_from_settings(settings, transition)
+            .map_err(bridge::mail_runtime::MailRuntimeStartError::Other)?;
+        bridge::mail_runtime::start(
+            self.settings_dir(),
+            &self.state.runtime_paths,
+            config,
+            None,
+        )
+        .await
+    }
+
+    fn log_startup_mail_runtime_error(
+        &self,
+        settings: &StoredMailSettings,
+        err: &bridge::mail_runtime::MailRuntimeStartError,
+    ) {
+        match err.protocol() {
+            Some(bridge::mail_runtime::MailRuntimeProtocol::Imap) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "startup",
+                    port = settings.imap_port,
+                    ssl = settings.use_ssl_for_imap,
+                    error = %err,
+                    "Failed to start IMAP server on bridge start"
+                );
+                self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortStartupError);
+            }
+            Some(bridge::mail_runtime::MailRuntimeProtocol::Smtp) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "startup",
+                    port = settings.smtp_port,
+                    ssl = settings.use_ssl_for_smtp,
+                    error = %err,
+                    "Failed to start SMTP server on bridge start"
+                );
+                self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortStartupError);
+            }
+            None => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "startup",
+                    error = %err,
+                    "failed to start grpc mail runtime"
+                );
+            }
+        }
+    }
+
+    fn emit_mail_runtime_change_error(
+        &self,
+        settings: &StoredMailSettings,
+        err: &bridge::mail_runtime::MailRuntimeStartError,
+    ) {
+        match err.protocol() {
+            Some(bridge::mail_runtime::MailRuntimeProtocol::Imap) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "settings_change",
+                    port = settings.imap_port,
+                    ssl = settings.use_ssl_for_imap,
+                    error = %err,
+                    "failed to restart IMAP server after settings change"
+                );
+                self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortChangeError);
+            }
+            Some(bridge::mail_runtime::MailRuntimeProtocol::Smtp) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "settings_change",
+                    port = settings.smtp_port,
+                    ssl = settings.use_ssl_for_smtp,
+                    error = %err,
+                    "failed to restart SMTP server after settings change"
+                );
+                self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
+            }
+            None => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "settings_change",
+                    error = %err,
+                    "failed to restart grpc mail runtime after settings change"
+                );
+            }
+        }
+    }
+
+    async fn stop_mail_runtime_locked(&self, transition: &'static str) {
+        let existing = self.state.mail_runtime.lock().await.take();
+        if let Some(runtime) = existing {
+            info!(
+                pkg = "grpc/bridge",
+                transition,
+                "stopping grpc mail runtime"
+            );
+            if let Err(err) = runtime.stop().await {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition,
+                    error = %err,
+                    "failed to stop grpc mail runtime cleanly"
+                );
+            }
+        }
+    }
+
+    async fn stop_mail_runtime_for_transition(&self, transition: &'static str) {
+        let _guard = self.state.mail_runtime_transition_lock.lock().await;
+        self.stop_mail_runtime_locked(transition).await;
+    }
+
+    async fn start_mail_runtime_on_startup(&self) {
+        let _guard = self.state.mail_runtime_transition_lock.lock().await;
+        let settings = self.state.mail_settings.lock().await.clone();
+
+        let imap_port = u16::try_from(settings.imap_port).ok();
+        let smtp_port = u16::try_from(settings.smtp_port).ok();
+        let mut startup_conflict = false;
+
+        if let Some(imap_port) = imap_port {
+            if !is_bind_port_free(&self.state.bind_host, imap_port).await {
+                startup_conflict = true;
+                self.log_startup_mail_runtime_error(
+                    &settings,
+                    &bridge::mail_runtime::MailRuntimeStartError::ImapBind {
+                        addr: format!("{}:{imap_port}", self.state.bind_host),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "IMAP port already in use",
+                        ),
+                    },
+                );
+            }
+        }
+        if let Some(smtp_port) = smtp_port {
+            if !is_bind_port_free(&self.state.bind_host, smtp_port).await {
+                startup_conflict = true;
+                self.log_startup_mail_runtime_error(
+                    &settings,
+                    &bridge::mail_runtime::MailRuntimeStartError::SmtpBind {
+                        addr: format!("{}:{smtp_port}", self.state.bind_host),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "SMTP port already in use",
+                        ),
+                    },
+                );
+            }
+        }
+        if startup_conflict {
+            return;
+        }
+
+        match self.start_mail_runtime_with_settings(&settings, "startup").await {
+            Ok(runtime) => {
+                *self.state.mail_runtime.lock().await = Some(runtime);
+            }
+            Err(err) => self.log_startup_mail_runtime_error(&settings, &err),
+        }
+    }
+
+    async fn apply_mail_runtime_settings_change(
+        &self,
+        previous: StoredMailSettings,
+        next: StoredMailSettings,
+    ) -> Result<(), Status> {
+        let _guard = self.state.mail_runtime_transition_lock.lock().await;
+
+        let next_imap_port = u16::try_from(next.imap_port)
+            .map_err(|_| Status::invalid_argument("IMAP port must be between 1 and 65535"))?;
+        let next_smtp_port = u16::try_from(next.smtp_port)
+            .map_err(|_| Status::invalid_argument("SMTP port must be between 1 and 65535"))?;
+        if next.imap_port != previous.imap_port
+            && !is_bind_port_free(&self.state.bind_host, next_imap_port).await
+        {
+            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortChangeError);
+            return Err(Status::failed_precondition("IMAP port is not available"));
+        }
+        if next.smtp_port != previous.smtp_port
+            && !is_bind_port_free(&self.state.bind_host, next_smtp_port).await
+        {
+            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
+            return Err(Status::failed_precondition("SMTP port is not available"));
+        }
+
+        if previous == next {
+            return Ok(());
+        }
+
+        let existing = self.state.mail_runtime.lock().await.take();
+        if let Some(runtime) = existing {
+            if let Err(err) = runtime.stop().await {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "settings_change",
+                    error = %err,
+                    "failed to stop previous grpc mail runtime before restart"
+                );
+            }
+        }
+
+        match self
+            .start_mail_runtime_with_settings(&next, "settings_change")
+            .await
+        {
+            Ok(runtime) => {
+                *self.state.mail_runtime.lock().await = Some(runtime);
+                Ok(())
+            }
+            Err(err) => {
+                self.emit_mail_runtime_change_error(&next, &err);
+
+                match self
+                    .start_mail_runtime_with_settings(&previous, "settings_change_rollback")
+                    .await
+                {
+                    Ok(previous_runtime) => {
+                        *self.state.mail_runtime.lock().await = Some(previous_runtime);
+                    }
+                    Err(restore_err) => {
+                        warn!(
+                            pkg = "grpc/bridge",
+                            transition = "settings_change_rollback",
+                            error = %restore_err,
+                            "failed to restore previous grpc mail runtime after settings change failure"
+                        );
+                    }
+                }
+
+                match err.protocol() {
+                    Some(bridge::mail_runtime::MailRuntimeProtocol::Imap) => {
+                        Err(Status::failed_precondition("IMAP port is not available"))
+                    }
+                    Some(bridge::mail_runtime::MailRuntimeProtocol::Smtp) => {
+                        Err(Status::failed_precondition("SMTP port is not available"))
+                    }
+                    None => Err(Status::internal(format!(
+                        "failed to apply mail runtime settings: {err}"
+                    ))),
+                }
+            }
+        }
+    }
+
     fn sync_state_key(&self) -> usize {
         Arc::as_ptr(&self.state) as usize
     }

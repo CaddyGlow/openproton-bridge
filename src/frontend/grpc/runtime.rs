@@ -85,6 +85,8 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         session_access_tokens: Mutex::new(HashMap::new()),
         shutdown_tx: shutdown_tx.clone(),
         mail_settings: Mutex::new(settings),
+        mail_runtime: Mutex::new(None),
+        mail_runtime_transition_lock: Mutex::new(()),
         app_settings: Mutex::new(app_settings),
         sync_workers_enabled: true,
         sync_event_workers: Mutex::new(None),
@@ -95,6 +97,7 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         .refresh_sync_workers()
         .await
         .context("failed to start grpc sync workers")?;
+    service.start_mail_runtime_on_startup().await;
     #[cfg(unix)]
     info!(pkg = "grpc", useFileSocket = true, "Starting gRPC server");
     #[cfg(not(unix))]
@@ -226,6 +229,9 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         }
     };
 
+    service_for_shutdown
+        .stop_mail_runtime_for_transition("shutdown")
+        .await;
     service_for_shutdown.shutdown_sync_workers().await;
 
     server_result

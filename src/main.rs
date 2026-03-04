@@ -480,8 +480,7 @@ struct ServeCommandOverrides {
 }
 
 struct InteractiveServeRuntime {
-    stop_tx: Option<tokio::sync::oneshot::Sender<()>>,
-    join_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+    handle: bridge::mail_runtime::MailRuntimeHandle,
     config: InteractiveServeConfig,
 }
 
@@ -3608,230 +3607,34 @@ async fn cmd_serve(
     bind: &str,
     no_tls: bool,
     event_poll_secs: u64,
-    dir: &std::path::Path,
+    _dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
-    let context = prepare_serve_runtime(
+    let runtime_config = bridge::mail_runtime::MailRuntimeConfig {
+        bind_host: bind.to_string(),
         imap_port,
         smtp_port,
-        bind,
-        no_tls,
-        event_poll_secs,
-        dir,
-        runtime_paths,
+        disable_tls: no_tls,
+        use_ssl_for_imap: !no_tls,
+        use_ssl_for_smtp: !no_tls,
+        event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
+    };
+    let handle = bridge::mail_runtime::start(
+        runtime_paths.clone(),
+        runtime_config,
+        bridge::mail_runtime::MailRuntimeTransition::Startup,
+        None,
     )
     .await?;
-
-    run_serve_runtime(context, None, None).await
-}
-
-struct ServeRuntimeContext {
-    imap_addr: String,
-    smtp_addr: String,
-    imap_config: Arc<imap::session::SessionConfig>,
-    smtp_config: Arc<smtp::session::SmtpSessionConfig>,
-    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
-    runtime_snapshot: Vec<bridge::accounts::RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: bridge::auth_router::AuthRouter,
-    event_store: Arc<dyn imap::store::MessageStore>,
-    checkpoint_store: bridge::events::SharedCheckpointStore,
-    poll_interval: std::time::Duration,
-}
-
-async fn prepare_serve_runtime(
-    imap_port: u16,
-    smtp_port: u16,
-    bind: &str,
-    no_tls: bool,
-    event_poll_secs: u64,
-    dir: &std::path::Path,
-    runtime_paths: &paths::RuntimePaths,
-) -> anyhow::Result<ServeRuntimeContext> {
-    if no_tls {
-        let addr: std::net::IpAddr = bind.parse().context("invalid bind address")?;
-        if !addr.is_loopback() {
-            anyhow::bail!(
-                "refusing to run without TLS on non-loopback address {}. \
-                 Use 127.0.0.1 with --no-tls, or remove --no-tls for STARTTLS.",
-                bind
-            );
-        }
-    }
-
-    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
-    if sessions.is_empty() {
-        anyhow::bail!("not logged in -- run `openproton-bridge login` first");
-    }
-
-    let mut active_sessions = Vec::new();
-    for mut session in sessions {
-        if session.access_token.is_empty() {
-            let email = session.email.clone();
-            match refresh_session(session, dir).await {
-                Ok(refreshed) => session = refreshed,
-                Err(e) => {
-                    tracing::warn!(
-                        email = %email,
-                        error = %e,
-                        "skipping account: failed to refresh token"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        if session.bridge_password.is_none() {
-            let bridge_password = generate_bridge_password();
-            session.bridge_password = Some(bridge_password);
-            vault::save_session(&session, dir)?;
-        }
-
-        active_sessions.push(session);
-    }
-
-    if active_sessions.is_empty() {
-        anyhow::bail!("no usable accounts available after token refresh");
-    }
-
-    let mut account_registry =
-        bridge::accounts::AccountRegistry::from_sessions(active_sessions.clone());
-    for session in &active_sessions {
-        let account_id = bridge::types::AccountId(session.uid.clone());
-        let split_mode = match vault::load_split_mode_by_account_id(dir, &session.uid) {
-            Ok(Some(enabled)) => enabled,
-            Ok(None) => false,
-            Err(e) => {
-                tracing::warn!(
-                    email = %session.email,
-                    error = %e,
-                    "failed to load split mode setting, defaulting to combined"
-                );
-                false
-            }
-        };
-        let _ = account_registry.set_split_mode(&account_id, split_mode);
-
-        let client = match api::client::ProtonClient::authenticated_with_mode(
-            session.api_mode.base_url(),
-            session.api_mode,
-            &session.uid,
-            &session.access_token,
-        ) {
-            Ok(client) => client,
-            Err(e) => {
-                tracing::warn!(
-                    email = %session.email,
-                    error = %e,
-                    "skipping address index refresh for account"
-                );
-                continue;
-            }
-        };
-
-        match api::users::get_addresses(&client).await {
-            Ok(addresses) => {
-                for address in addresses.addresses {
-                    if address.status == 1 {
-                        account_registry.add_address_email(&account_id, &address.email);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    email = %session.email,
-                    error = %e,
-                    "failed to refresh address index for account"
-                );
-            }
-        }
-    }
-    let auth_router = bridge::auth_router::AuthRouter::new(account_registry);
-    let runtime_accounts = Arc::new(bridge::accounts::RuntimeAccountRegistry::new(
-        active_sessions.clone(),
-        dir.to_path_buf(),
-    ));
-    let runtime_snapshot = runtime_accounts.snapshot().await;
-    let api_base_url = "https://mail-api.proton.me".to_string();
-
-    let bootstrap_account_ids = active_sessions
-        .iter()
-        .map(|session| session.uid.clone())
-        .collect::<Vec<_>>();
-    let gluon_bootstrap = vault::load_gluon_store_bootstrap(dir, &bootstrap_account_ids)
-        .context("failed to resolve gluon vault bindings for store bootstrap")?;
-    let gluon_paths = runtime_paths.gluon_paths(Some(gluon_bootstrap.gluon_dir.as_str()));
-    tracing::debug!(
-        gluon_dir = %gluon_paths.root().display(),
-        accounts = gluon_bootstrap.accounts.len(),
-        "resolved gluon store bootstrap context"
-    );
-    for account in &gluon_bootstrap.accounts {
-        tracing::debug!(
-            account_id = %account.account_id,
-            storage_user_id = %account.storage_user_id,
-            store_path = %gluon_paths.account_store_dir(&account.storage_user_id).display(),
-            db_path = %gluon_paths.account_db_path(&account.storage_user_id).display(),
-            "resolved account-scoped gluon layout"
-        );
-    }
-
-    let account_storage_ids = gluon_bootstrap
-        .accounts
-        .iter()
-        .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
-        .collect();
-    let store: Arc<dyn imap::store::MessageStore> = imap::store::new_runtime_message_store(
-        gluon_paths.root().to_path_buf(),
-        account_storage_ids,
-    )
-    .context("failed to initialize runtime IMAP store")?;
-    let event_store = store.clone();
-
-    let imap_config = Arc::new(imap::session::SessionConfig {
-        api_base_url: api_base_url.clone(),
-        auth_router: auth_router.clone(),
-        runtime_accounts: runtime_accounts.clone(),
-        store,
-    });
-
-    let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {
-        api_base_url: api_base_url.clone(),
-        auth_router: auth_router.clone(),
-        runtime_accounts: runtime_accounts.clone(),
-    });
-
-    if !no_tls {
-        let cert_dir = dir.join("tls");
-        let _imap_server = imap::server::ImapServer::new().with_tls(&cert_dir)?;
-        let _smtp_server = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
-    } else {
-        imap::server::clear_runtime_tls_config();
-        smtp::server::clear_runtime_tls_config();
-    }
-
     print_serve_configuration(
         bind,
         imap_port,
         smtp_port,
         no_tls,
-        &active_sessions,
-        &runtime_snapshot,
+        handle.active_sessions(),
+        handle.runtime_snapshot(),
     );
-
-    Ok(ServeRuntimeContext {
-        imap_addr: format!("{}:{}", bind, imap_port),
-        smtp_addr: format!("{}:{}", bind, smtp_port),
-        imap_config,
-        smtp_config,
-        runtime_accounts,
-        runtime_snapshot,
-        api_base_url,
-        auth_router,
-        event_store,
-        checkpoint_store: Arc::new(bridge::events::VaultCheckpointStore::new(dir.to_path_buf())),
-        poll_interval: std::time::Duration::from_secs(event_poll_secs),
-    })
+    handle.wait().await
 }
 
 fn print_serve_configuration(
@@ -3884,176 +3687,45 @@ fn print_serve_configuration(
     println!();
 }
 
-async fn run_serve_runtime(
-    context: ServeRuntimeContext,
-    shutdown_rx: Option<tokio::sync::oneshot::Receiver<()>>,
-    notify_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-) -> anyhow::Result<()> {
-    let ServeRuntimeContext {
-        imap_addr,
-        smtp_addr,
-        imap_config,
-        smtp_config,
-        runtime_accounts,
-        runtime_snapshot,
-        api_base_url,
-        auth_router,
-        event_store,
-        checkpoint_store,
-        poll_interval,
-    } = context;
-
-    let account_lookup: std::collections::HashMap<String, String> = runtime_snapshot
-        .iter()
-        .map(|info| (info.account_id.0.clone(), info.email.clone()))
-        .collect();
-    let notify_for_callback = notify_tx.clone();
-    let sync_progress_callback: bridge::events::SyncProgressCallback =
-        Arc::new(move |event| match event {
-            bridge::events::SyncProgressUpdate::Started { user_id } => {
-                let label = account_lookup
-                    .get(&user_id)
-                    .cloned()
-                    .unwrap_or_else(|| user_id.clone());
-                tracing::info!(user_id = %user_id, "account sync started");
-                if let Some(tx) = notify_for_callback.as_ref() {
-                    let _ = tx.send(format!("[event] sync started: {label}"));
-                }
-            }
-            bridge::events::SyncProgressUpdate::Progress {
-                user_id,
-                progress,
-                elapsed_ms: _,
-                remaining_ms: _,
-            } => {
-                tracing::debug!(user_id = %user_id, progress, "account sync progress");
-                if let Some(tx) = notify_for_callback.as_ref() {
-                    let label = account_lookup
-                        .get(&user_id)
-                        .cloned()
-                        .unwrap_or_else(|| user_id.clone());
-                    let _ = tx.send(format!(
-                        "[event] sync progress: {label} ({:.1}%)",
-                        progress * 100.0
-                    ));
-                }
-            }
-            bridge::events::SyncProgressUpdate::Finished { user_id } => {
-                let label = account_lookup
-                    .get(&user_id)
-                    .cloned()
-                    .unwrap_or_else(|| user_id.clone());
-                tracing::info!(user_id = %user_id, "account sync finished");
-                if let Some(tx) = notify_for_callback.as_ref() {
-                    let _ = tx.send(format!("[event] sync finished: {label}"));
-                }
-            }
-        });
-
-    let event_workers = bridge::events::start_event_worker_group_with_sync_progress(
-        runtime_accounts.clone(),
-        runtime_snapshot.clone(),
-        api_base_url,
-        auth_router,
-        event_store,
-        checkpoint_store,
-        Some(sync_progress_callback),
-        poll_interval,
-    );
-
-    let health_task = tokio::spawn(report_runtime_health_periodically(
-        runtime_accounts,
-        notify_tx.clone(),
-    ));
-    let mut imap_task =
-        tokio::spawn(async move { imap::server::run_server(&imap_addr, imap_config).await });
-    let mut smtp_task =
-        tokio::spawn(async move { smtp::server::run_server(&smtp_addr, smtp_config).await });
-
-    let shutdown_wait = async move {
-        if let Some(rx) = shutdown_rx {
-            let _ = rx.await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
-    tokio::pin!(shutdown_wait);
-
-    let serve_result: anyhow::Result<()> = tokio::select! {
-        _ = &mut shutdown_wait => {
-            Ok(())
-        }
-        result = &mut imap_task => {
-            match result {
-                Ok(inner) => inner.map_err(anyhow::Error::from),
-                Err(err) => Err(anyhow::Error::new(err).context("IMAP server task failed")),
-            }
-        }
-        result = &mut smtp_task => {
-            match result {
-                Ok(inner) => inner.map_err(anyhow::Error::from),
-                Err(err) => Err(anyhow::Error::new(err).context("SMTP server task failed")),
-            }
-        }
-    };
-
-    if !imap_task.is_finished() {
-        imap_task.abort();
-    }
-    if !smtp_task.is_finished() {
-        smtp_task.abort();
-    }
-    let _ = imap_task.await;
-    let _ = smtp_task.await;
-
-    health_task.abort();
-    let _ = health_task.await;
-    event_workers.shutdown().await;
-
-    if let Some(tx) = notify_tx.as_ref() {
-        if serve_result.is_ok() {
-            let _ = tx.send("[event] serve runtime stopped".to_string());
-        }
-    }
-
-    serve_result
-}
-
 async fn start_interactive_runtime(
     config: InteractiveServeConfig,
-    dir: &std::path::Path,
+    _dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
     notify_tx: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> anyhow::Result<InteractiveServeRuntime> {
-    let context = prepare_serve_runtime(
-        config.imap_port,
-        config.smtp_port,
-        &config.bind,
-        config.no_tls,
-        config.event_poll_secs,
-        dir,
-        runtime_paths,
+    let runtime_config = bridge::mail_runtime::MailRuntimeConfig {
+        bind_host: config.bind.clone(),
+        imap_port: config.imap_port,
+        smtp_port: config.smtp_port,
+        disable_tls: config.no_tls,
+        use_ssl_for_imap: !config.no_tls,
+        use_ssl_for_smtp: !config.no_tls,
+        event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
+    };
+    let handle = bridge::mail_runtime::start(
+        runtime_paths.clone(),
+        runtime_config,
+        bridge::mail_runtime::MailRuntimeTransition::Startup,
+        Some(notify_tx),
     )
     .await?;
+    print_serve_configuration(
+        &config.bind,
+        config.imap_port,
+        config.smtp_port,
+        config.no_tls,
+        handle.active_sessions(),
+        handle.runtime_snapshot(),
+    );
 
-    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-    let join_handle = tokio::spawn(run_serve_runtime(context, Some(stop_rx), Some(notify_tx)));
     Ok(InteractiveServeRuntime {
-        stop_tx: Some(stop_tx),
-        join_handle,
+        handle,
         config,
     })
 }
 
-async fn stop_interactive_runtime(mut state: InteractiveServeRuntime) -> anyhow::Result<()> {
-    if let Some(stop_tx) = state.stop_tx.take() {
-        let _ = stop_tx.send(());
-    }
-
-    match state.join_handle.await {
-        Ok(result) => result,
-        Err(err) => Err(anyhow::Error::new(err).context("serve runtime join failed")),
-    }
+async fn stop_interactive_runtime(state: InteractiveServeRuntime) -> anyhow::Result<()> {
+    state.handle.stop().await
 }
 
 async fn maybe_collect_runtime_completion(
@@ -4061,16 +3733,15 @@ async fn maybe_collect_runtime_completion(
 ) -> Option<String> {
     let is_finished = runtime_state
         .as_ref()
-        .is_some_and(|state| state.join_handle.is_finished());
+        .is_some_and(|state| state.handle.is_finished());
     if !is_finished {
         return None;
     }
 
     let state = runtime_state.take()?;
-    Some(match state.join_handle.await {
-        Ok(Ok(())) => "Serve runtime exited.".to_string(),
-        Ok(Err(err)) => format!("Serve runtime exited with error: {err:#}"),
-        Err(err) => format!("Serve runtime task join error: {err}"),
+    Some(match state.handle.wait().await {
+        Ok(()) => "Serve runtime exited.".to_string(),
+        Err(err) => format!("Serve runtime exited with error: {err:#}"),
     })
 }
 
@@ -4262,7 +3933,10 @@ async fn refresh_session(
             }
         }
         Err(err) => {
-            tracing::warn!(error = %err, "failed to refresh canonical user context after token refresh");
+            tracing::warn!(
+                error = %err,
+                "failed to refresh canonical user context after token refresh"
+            );
         }
     }
 
@@ -4311,79 +3985,6 @@ fn effective_disk_cache_path(runtime_paths: &paths::RuntimePaths) -> std::path::
 
 fn session_dir(override_dir: Option<&std::path::Path>) -> anyhow::Result<std::path::PathBuf> {
     Ok(runtime_paths(override_dir)?.settings_dir().to_path_buf())
-}
-
-async fn report_runtime_health_periodically(
-    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
-    notify_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
-) {
-    use tokio::time::{interval, Duration, MissedTickBehavior};
-
-    let mut ticker = interval(Duration::from_secs(60));
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker.tick().await;
-    let mut previous_health = std::collections::HashMap::new();
-
-    loop {
-        ticker.tick().await;
-        let snapshot = runtime_accounts.snapshot().await;
-        let mut healthy = 0usize;
-        let mut degraded = 0usize;
-        let mut unavailable = 0usize;
-
-        for info in &snapshot {
-            match info.health {
-                bridge::accounts::AccountHealth::Healthy => healthy += 1,
-                bridge::accounts::AccountHealth::Degraded => degraded += 1,
-                bridge::accounts::AccountHealth::Unavailable => unavailable += 1,
-            }
-        }
-
-        tracing::info!(
-            total_accounts = snapshot.len(),
-            healthy,
-            degraded,
-            unavailable,
-            "runtime account health snapshot"
-        );
-
-        let mut seen_account_ids = std::collections::HashSet::new();
-
-        for info in &snapshot {
-            seen_account_ids.insert(info.account_id.0.clone());
-            let previous = previous_health.insert(info.account_id.0.clone(), info.health);
-            if let Some(tx) = notify_tx.as_ref() {
-                if previous != Some(info.health) {
-                    let is_baseline_healthy = previous.is_none()
-                        && matches!(info.health, bridge::accounts::AccountHealth::Healthy);
-                    if !is_baseline_healthy {
-                        let _ = tx.send(format!(
-                            "[event] account health: {} ({}) -> {:?}",
-                            info.email, info.account_id.0, info.health
-                        ));
-                    }
-                }
-            }
-
-            if matches!(info.health, bridge::accounts::AccountHealth::Unavailable) {
-                tracing::warn!(
-                    account_id = %info.account_id.0,
-                    email = %info.email,
-                    health = ?info.health,
-                    "account unavailable while server is running"
-                );
-            } else {
-                tracing::debug!(
-                    account_id = %info.account_id.0,
-                    email = %info.email,
-                    health = ?info.health,
-                    "account runtime health detail"
-                );
-            }
-        }
-
-        previous_health.retain(|account_id, _| seen_account_ids.contains(account_id));
-    }
 }
 
 #[cfg(test)]

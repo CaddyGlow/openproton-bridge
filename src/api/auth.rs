@@ -152,8 +152,14 @@ pub async fn refresh_auth(
     );
     let body = build_refresh_body(uid, refresh_token, access_token);
 
-    let resp =
-        send_logged_with_pkg(client.post("/auth/v4/refresh").json(&body), "gpa/manager").await?;
+    let resp = send_logged_with_pkg(
+        client
+            .post("/auth/v4/refresh")
+            .header("x-pm-uid", uid)
+            .json(&body),
+        "gpa/manager",
+    )
+    .await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
 

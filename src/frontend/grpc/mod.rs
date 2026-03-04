@@ -81,7 +81,7 @@ struct GrpcClientConfig {
     token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredMailSettings {
     imap_port: i32,
     smtp_port: i32,
@@ -169,6 +169,8 @@ struct GrpcState {
     session_access_tokens: Mutex<HashMap<String, String>>,
     shutdown_tx: watch::Sender<bool>,
     mail_settings: Mutex<StoredMailSettings>,
+    mail_runtime: Mutex<Option<bridge::mail_runtime::MailRuntimeHandle>>,
+    mail_runtime_transition_lock: Mutex<()>,
     app_settings: Mutex<StoredAppSettings>,
     sync_workers_enabled: bool,
     sync_event_workers: Mutex<Option<bridge::events::EventWorkerGroup>>,
@@ -689,6 +691,10 @@ async fn is_port_free(port: u16) -> bool {
     TcpListener::bind(("127.0.0.1", port)).await.is_ok()
 }
 
+async fn is_bind_port_free(bind_host: &str, port: u16) -> bool {
+    TcpListener::bind((bind_host, port)).await.is_ok()
+}
+
 fn generate_server_token() -> String {
     rand::thread_rng()
         .sample_iter(&Alphanumeric)
@@ -1075,6 +1081,8 @@ mod tests {
             session_access_tokens: Mutex::new(HashMap::new()),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
+            mail_runtime: Mutex::new(None),
+            mail_runtime_transition_lock: Mutex::new(()),
             sync_workers_enabled: false,
             sync_event_workers: Mutex::new(None),
         });

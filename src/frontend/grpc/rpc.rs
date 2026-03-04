@@ -143,6 +143,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn restart(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        self.stop_mail_runtime_for_transition("restart").await;
         self.emit_show_main_window();
         let _ = self.state.shutdown_tx.send(true);
         Ok(Response::new(()))
@@ -156,6 +157,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         );
         let service = self.clone();
         tokio::spawn(async move {
+            let _runtime_transition_guard = service.state.mail_runtime_transition_lock.lock().await;
             match vault::list_sessions(service.settings_dir()) {
                 Ok(sessions) => {
                     for session in sessions {
@@ -202,6 +204,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             transition = "trigger_reset",
             "reset requested"
         );
+        self.stop_mail_runtime_for_transition("trigger_reset").await;
         vault::remove_session(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
@@ -1191,27 +1194,33 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(status);
         }
 
-        if !is_port_free(incoming.imap_port as u16).await {
-            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortChangeError);
-            return Err(Status::failed_precondition("IMAP port is not available"));
-        }
-        if !is_port_free(incoming.smtp_port as u16).await {
-            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
-            return Err(Status::failed_precondition("SMTP port is not available"));
-        }
-
         let mut settings = self.state.mail_settings.lock().await;
-        settings.imap_port = incoming.imap_port;
-        settings.smtp_port = incoming.smtp_port;
-        settings.use_ssl_for_imap = incoming.use_ssl_for_imap;
-        settings.use_ssl_for_smtp = incoming.use_ssl_for_smtp;
-        save_mail_settings(&self.grpc_mail_settings_path(), &settings)
+        let previous = settings.clone();
+        let next = StoredMailSettings {
+            imap_port: incoming.imap_port,
+            smtp_port: incoming.smtp_port,
+            use_ssl_for_imap: incoming.use_ssl_for_imap,
+            use_ssl_for_smtp: incoming.use_ssl_for_smtp,
+        };
+        *settings = next.clone();
+        save_mail_settings(&self.grpc_mail_settings_path(), &next)
             .await
             .map_err(|e| Status::internal(format!("failed to save mail settings: {e}")))?;
-
-        let snapshot = settings.clone();
         drop(settings);
-        self.emit_mail_settings_changed(&snapshot);
+
+        if let Err(err) = self
+            .apply_mail_runtime_settings_change(previous.clone(), next.clone())
+            .await
+        {
+            let mut rollback_settings = self.state.mail_settings.lock().await;
+            *rollback_settings = previous.clone();
+            save_mail_settings(&self.grpc_mail_settings_path(), &previous)
+                .await
+                .map_err(|e| Status::internal(format!("failed to rollback mail settings: {e}")))?;
+            return Err(err);
+        }
+
+        self.emit_mail_settings_changed(&next);
         self.emit_mail_settings_finished();
 
         Ok(Response::new(()))
@@ -1374,6 +1383,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn quit(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        self.stop_mail_runtime_for_transition("quit").await;
         let _ = self.state.shutdown_tx.send(true);
         Ok(Response::new(()))
     }
@@ -1404,6 +1414,8 @@ mod grpc_wire_tests {
             session_access_tokens: Mutex::new(HashMap::new()),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
+            mail_runtime: Mutex::new(None),
+            mail_runtime_transition_lock: Mutex::new(()),
             app_settings: Mutex::new(app_settings),
             sync_workers_enabled: false,
             sync_event_workers: Mutex::new(None),

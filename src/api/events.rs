@@ -34,9 +34,7 @@ pub async fn get_events(client: &ProtonClient, last_event_id: &str) -> Result<Ev
             continue;
         }
 
-        if let Err(err) = check_api_response(&json) {
-            return Err(err);
-        }
+        check_api_response(&json)?;
         if status.is_success() {
             let events: EventsResponse = serde_json::from_value(json)?;
             return Ok(events);

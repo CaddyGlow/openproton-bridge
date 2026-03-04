@@ -200,27 +200,34 @@ static PANIC_HOOK_INSTALLED: Once = Once::new();
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
     let credential_store_overrides = resolve_credential_store_overrides(&cli)?;
     vault::set_process_credential_store_overrides(credential_store_overrides);
     let resolved_vault_dir = resolve_vault_dir(&cli);
     let runtime_paths = runtime_paths(resolved_vault_dir.as_deref())?;
+    let _tracing_file_guard = match observability::install_tracing(&runtime_paths) {
+        Ok((session_log, guard)) => {
+            let _ = observability::append_session_log_line(
+                &session_log,
+                &format!("startup_command={}", command_name(&cli.command)),
+            );
+            Some(guard)
+        }
+        Err(err) => {
+            eprintln!("failed to initialize file-backed tracing: {err:#}");
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+            if let Err(dirs_err) = observability::initialize_observability_dirs(&runtime_paths) {
+                eprintln!("failed to initialize observability directories: {dirs_err:#}");
+            }
+            None
+        }
+    };
     install_crash_capture_hook(runtime_paths.clone());
-    if let Ok(session_log) = observability::create_session_log(&runtime_paths) {
-        let _ = observability::append_session_log_line(
-            &session_log,
-            &format!("startup_command={}", command_name(&cli.command)),
-        );
-    } else if let Err(err) = observability::initialize_observability_dirs(&runtime_paths) {
-        eprintln!("failed to initialize observability directories: {err:#}");
-    }
     let dir = runtime_paths.settings_dir().to_path_buf();
     let _instance_lock = match &cli.command {
         Command::Serve { .. } | Command::Grpc { .. } | Command::Cli => {

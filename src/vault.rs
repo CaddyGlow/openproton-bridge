@@ -852,7 +852,7 @@ struct PasswordArchive {
     extra_fields: ExtraFields,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase", default)]
 struct VaultCerts {
     #[serde(deserialize_with = "deserialize_nullable_default")]
@@ -861,17 +861,6 @@ struct VaultCerts {
     custom_key_path: String,
     #[serde(flatten)]
     extra_fields: ExtraFields,
-}
-
-impl Default for VaultCerts {
-    fn default() -> Self {
-        Self {
-            bridge: VaultCert::default(),
-            custom_cert_path: String::new(),
-            custom_key_path: String::new(),
-            extra_fields: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -920,7 +909,7 @@ impl VaultCert {
     }
 }
 
-fn serialize_bytes<S>(value: &Vec<u8>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+fn serialize_bytes<S>(value: &[u8], serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
     S: Serializer,
 {

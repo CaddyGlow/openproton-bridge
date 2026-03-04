@@ -70,9 +70,7 @@ pub async fn get_message_metadata(
             continue;
         }
 
-        if let Err(err) = check_api_response(&json) {
-            return Err(err);
-        }
+        check_api_response(&json)?;
 
         if status.is_success() {
             let meta_resp: MessagesMetadataResponse = serde_json::from_value(json)?;

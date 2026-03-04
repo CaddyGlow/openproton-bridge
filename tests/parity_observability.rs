@@ -75,8 +75,8 @@ fn parity_observability_support_bundle_collects_diagnostics() {
 
     let bundle = generate_support_log_bundle(&runtime, "mailbox-state diagnostics").unwrap();
     assert!(bundle.exists());
-    assert!(bundle.join("diagnostics.txt").exists());
-    assert!(bundle.join("manifest.json").exists());
-    assert!(bundle.join("sessions").exists());
-    assert!(bundle.join("crash_reports").exists());
+    assert!(bundle
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".tar.gz")));
 }

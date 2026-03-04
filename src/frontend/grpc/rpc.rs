@@ -3,8 +3,23 @@ struct DecodedLoginPassword {
     used_base64_compat: bool,
 }
 
+#[derive(Debug)]
+enum LoginPasswordDecodeError {
+    InvalidUtf8,
+    Missing,
+}
+
+impl LoginPasswordDecodeError {
+    fn into_status(self) -> Status {
+        match self {
+            Self::InvalidUtf8 => Status::invalid_argument("password must be valid utf-8"),
+            Self::Missing => Status::invalid_argument("password is required"),
+        }
+    }
+}
+
 fn looks_like_padded_base64(input: &str) -> bool {
-    if input.len() < 8 || input.len() % 4 != 0 {
+    if input.len() < 8 || !input.len().is_multiple_of(4) {
         return false;
     }
     if !input.ends_with('=') {
@@ -16,11 +31,10 @@ fn looks_like_padded_base64(input: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
-fn decode_login_password_bytes(raw: Vec<u8>) -> Result<DecodedLoginPassword, Status> {
-    let utf8 = String::from_utf8(raw)
-        .map_err(|_| Status::invalid_argument("password must be valid utf-8"))?;
+fn decode_login_password_bytes(raw: Vec<u8>) -> Result<DecodedLoginPassword, LoginPasswordDecodeError> {
+    let utf8 = String::from_utf8(raw).map_err(|_| LoginPasswordDecodeError::InvalidUtf8)?;
     if utf8.is_empty() {
-        return Err(Status::invalid_argument("password is required"));
+        return Err(LoginPasswordDecodeError::Missing);
     }
 
     if looks_like_padded_base64(&utf8) {
@@ -454,7 +468,8 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("username is required"));
         }
 
-        let decoded_password = decode_login_password_bytes(req.password)?;
+        let decoded_password = decode_login_password_bytes(req.password)
+            .map_err(LoginPasswordDecodeError::into_status)?;
         let password = decoded_password.value;
         if decoded_password.used_base64_compat {
             info!(
@@ -639,12 +654,14 @@ impl pb::bridge_server::Bridge for BridgeService {
         let session = self
             .complete_login(
                 client,
-                effective_api_mode,
-                auth.uid,
-                auth.access_token,
-                auth.refresh_token,
-                username,
-                password,
+                CompleteLoginArgs {
+                    api_mode: effective_api_mode,
+                    uid: auth.uid,
+                    access_token: auth.access_token,
+                    refresh_token: auth.refresh_token,
+                    username,
+                    password,
+                },
             )
             .await?;
         debug!(email = %session.email, "login completed through grpc");
@@ -683,12 +700,14 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         self.complete_login(
             pending.client,
-            pending.api_mode,
-            pending.uid,
-            pending.access_token,
-            pending.refresh_token,
-            pending.username,
-            pending.password,
+            CompleteLoginArgs {
+                api_mode: pending.api_mode,
+                uid: pending.uid,
+                access_token: pending.access_token,
+                refresh_token: pending.refresh_token,
+                username: pending.username,
+                password: pending.password,
+            },
         )
         .await?;
         info!(username = %username, "grpc 2FA login flow completed");
@@ -701,7 +720,8 @@ impl pb::bridge_server::Bridge for BridgeService {
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
         let username = req.username.trim().to_string();
-        let decoded_password = decode_login_password_bytes(req.password)?;
+        let decoded_password = decode_login_password_bytes(req.password)
+            .map_err(LoginPasswordDecodeError::into_status)?;
         let password = decoded_password.value;
         if decoded_password.used_base64_compat {
             info!(
@@ -727,12 +747,14 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         self.complete_login(
             pending.client,
-            pending.api_mode,
-            pending.uid,
-            pending.access_token,
-            pending.refresh_token,
-            pending.username,
-            password,
+            CompleteLoginArgs {
+                api_mode: pending.api_mode,
+                uid: pending.uid,
+                access_token: pending.access_token,
+                refresh_token: pending.refresh_token,
+                username: pending.username,
+                password,
+            },
         )
         .await?;
 
@@ -780,12 +802,14 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         self.complete_login(
             pending.client,
-            pending.api_mode,
-            pending.uid,
-            pending.access_token,
-            pending.refresh_token,
-            pending.username,
-            pending.password,
+            CompleteLoginArgs {
+                api_mode: pending.api_mode,
+                uid: pending.uid,
+                access_token: pending.access_token,
+                refresh_token: pending.refresh_token,
+                username: pending.username,
+                password: pending.password,
+            },
         )
         .await?;
 

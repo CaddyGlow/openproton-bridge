@@ -68,6 +68,7 @@ impl GluonLockManager {
             .create(true)
             .read(true)
             .write(true)
+            .truncate(false)
             .open(&lock_path)?;
 
         match file.try_lock_exclusive() {

@@ -1,3 +1,12 @@
+struct CompleteLoginArgs {
+    api_mode: crate::api::types::ApiMode,
+    uid: String,
+    access_token: String,
+    refresh_token: String,
+    username: String,
+    password: String,
+}
+
 impl BridgeService {
     fn new(state: Arc<GrpcState>) -> Self {
         Self { state }
@@ -616,9 +625,7 @@ impl BridgeService {
         if access_token.is_none() {
             access_token = self.refresh_session_access_token(session).await;
         }
-        let Some(mut access_token) = access_token else {
-            return None;
-        };
+        let mut access_token = access_token?;
 
         let first_attempt = {
             let mut client = match ProtonClient::with_api_mode(session.api_mode) {
@@ -695,13 +702,16 @@ impl BridgeService {
     async fn complete_login(
         &self,
         mut client: ProtonClient,
-        api_mode: crate::api::types::ApiMode,
-        uid: String,
-        access_token: String,
-        refresh_token: String,
-        username: String,
-        password: String,
+        args: CompleteLoginArgs,
     ) -> Result<Session, Status> {
+        let CompleteLoginArgs {
+            api_mode,
+            uid,
+            access_token,
+            refresh_token,
+            username,
+            password,
+        } = args;
         let user_resp = api::users::get_user(&client)
             .await
             .map_err(status_from_api_error)?;

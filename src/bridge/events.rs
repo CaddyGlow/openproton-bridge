@@ -795,7 +795,6 @@ async fn bounded_resync_account(
                 label_id: Some(mb.label_id.to_string()),
                 end_id: end_id.clone(),
                 desc: 1,
-                ..Default::default()
             };
             let messages = fetch_message_metadata_page_with_retry(
                 config,

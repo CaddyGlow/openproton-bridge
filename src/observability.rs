@@ -3,11 +3,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::paths::RuntimePaths;
 
 pub const DEFAULT_MAX_SESSION_LOG_FILES: usize = 20;
 pub const DEFAULT_MAX_CRASH_REPORT_FILES: usize = 20;
+pub const DEFAULT_MAX_SUPPORT_BUNDLE_FILES: usize = 20;
 pub const DEFAULT_BUNDLE_FILE_LIMIT: usize = 25;
 
 fn unix_millis() -> u128 {
@@ -18,7 +21,7 @@ fn unix_millis() -> u128 {
 }
 
 fn list_files_by_mtime(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
+    let mut files: Vec<(SystemTime, PathBuf)> = Vec::new();
     if !dir.exists() {
         return Ok(Vec::new());
     }
@@ -113,6 +116,37 @@ pub fn create_session_log(runtime_paths: &RuntimePaths) -> anyhow::Result<PathBu
     Ok(path)
 }
 
+pub fn install_tracing(
+    runtime_paths: &RuntimePaths,
+) -> anyhow::Result<(PathBuf, tracing_appender::non_blocking::WorkerGuard)> {
+    let session_log = create_session_log(runtime_paths)?;
+    let session_log_dir = session_log
+        .parent()
+        .context("session log path has no parent directory")?;
+    let session_log_name = session_log
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("session log path has invalid file name")?
+        .to_string();
+
+    let file_appender = tracing_appender::rolling::never(session_log_dir, session_log_name);
+    let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(file_writer),
+        )
+        .init();
+
+    Ok((session_log, guard))
+}
+
 pub fn append_session_log_line(session_log: &Path, message: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -167,6 +201,31 @@ fn copy_recent_files(source: &Path, target: &Path, max_files: usize) -> anyhow::
     Ok(copied)
 }
 
+fn write_tar_gz_archive(source_dir: &Path, archive_path: &Path) -> anyhow::Result<()> {
+    let archive_file = std::fs::File::create(archive_path)
+        .with_context(|| format!("failed to create archive {}", archive_path.display()))?;
+    let encoder = flate2::write::GzEncoder::new(archive_file, flate2::Compression::default());
+    let mut tar = tar::Builder::new(encoder);
+
+    let root_name = source_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("support bundle directory has invalid name")?;
+
+    tar.append_dir_all(root_name, source_dir).with_context(|| {
+        format!(
+            "failed to write bundle archive from {}",
+            source_dir.display()
+        )
+    })?;
+    let encoder = tar
+        .into_inner()
+        .context("failed to finalize tar archive stream")?;
+    encoder.finish().context("failed to finish gzip stream")?;
+
+    Ok(())
+}
+
 pub fn generate_support_log_bundle(
     runtime_paths: &RuntimePaths,
     diagnostics: &str,
@@ -195,8 +254,9 @@ pub fn generate_support_log_bundle(
         DEFAULT_BUNDLE_FILE_LIMIT,
     )?;
 
+    let archive_path = bundle_root.with_extension("tar.gz");
     let manifest = serde_json::json!({
-        "bundle_path": bundle_root.display().to_string(),
+        "bundle_archive": archive_path.display().to_string(),
         "sessions_copied": sessions_copied,
         "crash_reports_copied": crashes_copied,
     });
@@ -206,12 +266,40 @@ pub fn generate_support_log_bundle(
     )
     .with_context(|| format!("failed to write manifest in {}", bundle_root.display()))?;
 
-    Ok(bundle_root)
+    write_tar_gz_archive(&bundle_root, &archive_path)?;
+    std::fs::remove_dir_all(&bundle_root).with_context(|| {
+        format!(
+            "failed to remove temporary bundle directory {}",
+            bundle_root.display()
+        )
+    })?;
+
+    prune_old_files(
+        &runtime_paths.support_bundles_dir(),
+        DEFAULT_MAX_SUPPORT_BUNDLE_FILES,
+    )?;
+
+    Ok(archive_path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tar_gz_entries(path: &Path) -> Vec<String> {
+        let file = std::fs::File::open(path).expect("open archive");
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .entries()
+            .expect("read entries")
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let path = entry.path().ok()?;
+                Some(path.to_string_lossy().to_string())
+            })
+            .collect()
+    }
 
     #[test]
     fn prune_old_files_keeps_newest_entries() {
@@ -235,7 +323,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_support_log_bundle_copies_recent_logs_and_reports() {
+    fn generate_support_log_bundle_archives_recent_logs_and_reports() {
         let tmp = tempfile::tempdir().unwrap();
         let runtime_paths = RuntimePaths::resolve(Some(tmp.path())).unwrap();
 
@@ -249,10 +337,19 @@ mod tests {
         std::fs::write(session_b, "session-b").unwrap();
         std::fs::write(crash, "panic-report").unwrap();
 
-        let bundle = generate_support_log_bundle(&runtime_paths, "diag=ok").unwrap();
-        assert!(bundle.join("diagnostics.txt").exists());
-        assert!(bundle.join("manifest.json").exists());
-        assert!(bundle.join("crash_reports").join("panic-1.log").exists());
-        assert!(bundle.join("sessions").join("session-b.log").exists());
+        let archive = generate_support_log_bundle(&runtime_paths, "diag=ok").unwrap();
+        assert!(archive.exists());
+
+        let entries = tar_gz_entries(&archive);
+        assert!(entries
+            .iter()
+            .any(|entry| entry.ends_with("diagnostics.txt")));
+        assert!(entries.iter().any(|entry| entry.ends_with("manifest.json")));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.ends_with("crash_reports/panic-1.log")));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.ends_with("sessions/session-b.log")));
     }
 }

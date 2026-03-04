@@ -106,7 +106,7 @@ fn be020_loads_valid_gluon_bootstrap_bindings_for_accounts() {
     }
     assert_eq!(bootstrap.accounts.len(), 1);
     assert_eq!(bootstrap.accounts[0].account_id, session.uid);
-    assert_eq!(bootstrap.accounts[0].storage_user_id, session.uid);
+    assert_eq!(bootstrap.accounts[0].storage_user_id, "gluon-alpha");
     assert_eq!(bootstrap.accounts[0].gluon_key, [9u8; 32]);
     assert_eq!(
         bootstrap.accounts[0]

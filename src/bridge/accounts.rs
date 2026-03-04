@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -222,6 +222,81 @@ fn is_session_runtime_usable(session: &Session) -> bool {
     !session.uid.trim().is_empty() && !session.refresh_token.trim().is_empty()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RefreshAttemptContext {
+    uid: String,
+    refresh_token: String,
+    access_token: Option<String>,
+}
+
+impl RefreshAttemptContext {
+    fn from_session(session: &Session, include_access_token: bool) -> Self {
+        let access_token = if include_access_token && !session.access_token.trim().is_empty() {
+            Some(session.access_token.clone())
+        } else {
+            None
+        };
+        Self {
+            uid: session.uid.clone(),
+            refresh_token: session.refresh_token.clone(),
+            access_token,
+        }
+    }
+}
+
+fn register_refresh_attempt(
+    attempts: &mut HashSet<RefreshAttemptContext>,
+    session: &Session,
+    include_access_token: bool,
+) -> bool {
+    attempts.insert(RefreshAttemptContext::from_session(
+        session,
+        include_access_token,
+    ))
+}
+
+fn has_refresh_context_changed(previous: &Session, candidate: &Session) -> bool {
+    previous.uid != candidate.uid
+        || previous.refresh_token != candidate.refresh_token
+        || previous.access_token != candidate.access_token
+}
+
+fn select_reconciled_vault_session(
+    account_id: &AccountId,
+    existing: &Session,
+    sessions: Vec<Session>,
+) -> Option<Session> {
+    let account_id_key = account_id.0.trim();
+    if !account_id_key.is_empty() {
+        let mut uid_matches = sessions
+            .iter()
+            .filter(|session| session.uid.trim() == account_id_key);
+        if let Some(uid_match) = uid_matches.next() {
+            if uid_matches.next().is_some() {
+                return None;
+            }
+            if is_session_runtime_usable(uid_match) {
+                return Some(uid_match.clone());
+            }
+            return None;
+        }
+    }
+
+    let target_email = normalize_email(&existing.email);
+    if target_email.is_empty() {
+        return None;
+    }
+
+    let mut email_matches = sessions.into_iter().filter(|session| {
+        is_session_runtime_usable(session) && normalize_email(&session.email) == target_email
+    });
+    let first = email_matches.next()?;
+    if email_matches.next().is_some() {
+        return None;
+    }
+    Some(first)
+}
+
 impl RuntimeAccountRegistry {
     pub fn new(sessions: Vec<Session>, vault_dir: PathBuf) -> Self {
         Self::with_optional_vault_dir(sessions, Some(vault_dir))
@@ -285,17 +360,15 @@ impl RuntimeAccountRegistry {
             }
         };
 
-        let mut by_email = None;
-        for session in sessions {
-            if session.uid == account_id.0 {
-                return Some(session);
-            }
-            if normalize_email(&session.email) == normalize_email(&existing.email) {
-                by_email = Some(session);
-            }
+        let selected = select_reconciled_vault_session(account_id, existing, sessions);
+        if selected.is_none() {
+            debug!(
+                account_id = %account_id.0,
+                email = %existing.email,
+                "no deterministic vault session candidate found after refresh-token failure"
+            );
         }
-
-        by_email
+        selected
     }
 
     pub async fn get_session(&self, account_id: &AccountId) -> Option<Session> {
@@ -409,20 +482,23 @@ impl RuntimeAccountRegistry {
         }
 
         let mut session_for_refresh = existing;
+        let mut refresh_attempts = HashSet::new();
 
         let mut refresh_result =
             refresh_with_optional_access_token(&session_for_refresh, true).await;
+        let _ = register_refresh_attempt(&mut refresh_attempts, &session_for_refresh, true);
 
         if let Err(err) = &refresh_result {
             if is_invalid_refresh_token_error(err) {
                 if let Some(reloaded) =
                     self.load_latest_session_from_vault(account_id, &session_for_refresh)
                 {
-                    let changed_refresh_context = reloaded.uid != session_for_refresh.uid
-                        || reloaded.refresh_token != session_for_refresh.refresh_token
-                        || reloaded.access_token != session_for_refresh.access_token;
+                    let changed_refresh_context =
+                        has_refresh_context_changed(&session_for_refresh, &reloaded);
 
-                    if changed_refresh_context {
+                    if changed_refresh_context
+                        && register_refresh_attempt(&mut refresh_attempts, &reloaded, true)
+                    {
                         debug!(
                             account_id = %account_id.0,
                             old_uid = %session_for_refresh.uid,
@@ -438,7 +514,10 @@ impl RuntimeAccountRegistry {
         }
 
         if let Err(err) = &refresh_result {
-            if is_invalid_refresh_token_error(err) && !session_for_refresh.access_token.is_empty() {
+            if is_invalid_refresh_token_error(err)
+                && !session_for_refresh.access_token.is_empty()
+                && register_refresh_attempt(&mut refresh_attempts, &session_for_refresh, false)
+            {
                 debug!(
                     account_id = %account_id.0,
                     "retrying refresh without access token after invalid refresh token"
@@ -549,6 +628,7 @@ async fn fetch_canonical_user_context(session: &Session) -> Option<(String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn session(uid: &str, email: &str) -> Session {
         Session {
@@ -721,5 +801,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.email, "bob@proton.me");
+    }
+
+    #[test]
+    fn reconciled_vault_session_prefers_account_id_match() {
+        let account_id = AccountId("uid-target".to_string());
+        let existing = session("uid-target", "alice@proton.me");
+
+        let mut uid_match = session("uid-target", "old-alias@proton.me");
+        uid_match.refresh_token = "refresh-updated".to_string();
+        let email_only_match = session("uid-other", "alice@proton.me");
+
+        let selected = select_reconciled_vault_session(
+            &account_id,
+            &existing,
+            vec![email_only_match, uid_match.clone()],
+        )
+        .expect("should select canonical uid match");
+
+        assert_eq!(selected.uid, uid_match.uid);
+        assert_eq!(selected.refresh_token, "refresh-updated");
+    }
+
+    #[test]
+    fn reconciled_vault_session_rejects_ambiguous_email_fallback() {
+        let account_id = AccountId("uid-missing".to_string());
+        let existing = session("uid-current", "shared@proton.me");
+
+        let candidate_a = session("uid-a", "shared@proton.me");
+        let candidate_b = session("uid-b", "shared@proton.me");
+
+        let selected =
+            select_reconciled_vault_session(&account_id, &existing, vec![candidate_a, candidate_b]);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn refresh_attempt_registration_deduplicates_same_context() {
+        let mut attempts = HashSet::new();
+        let mut sess = session("uid-1", "alice@proton.me");
+        sess.access_token = "access".to_string();
+
+        assert!(register_refresh_attempt(&mut attempts, &sess, true));
+        assert!(
+            !register_refresh_attempt(&mut attempts, &sess, true),
+            "same refresh context should only be attempted once"
+        );
+        assert!(
+            register_refresh_attempt(&mut attempts, &sess, false),
+            "fallback attempt without access token should still be allowed once"
+        );
+        assert!(
+            !register_refresh_attempt(&mut attempts, &sess, false),
+            "duplicate fallback context should be suppressed"
+        );
     }
 }

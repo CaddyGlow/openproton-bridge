@@ -19,15 +19,62 @@ impl BridgeService {
         self.state.runtime_paths.grpc_app_settings_path()
     }
 
+    fn sync_state_key(&self) -> usize {
+        Arc::as_ptr(&self.state) as usize
+    }
+
+    fn current_sync_worker_generation(&self) -> u64 {
+        let registry = sync_lifecycle_registry()
+            .lock()
+            .expect("sync lifecycle registry poisoned");
+        registry
+            .get(&self.sync_state_key())
+            .map(|state| state.generation)
+            .unwrap_or(0)
+    }
+
+    fn next_sync_worker_generation(&self) -> u64 {
+        let mut registry = sync_lifecycle_registry()
+            .lock()
+            .expect("sync lifecycle registry poisoned");
+        let state = registry.entry(self.sync_state_key()).or_default();
+        state.generation = state.generation.saturating_add(1);
+        state.generation
+    }
+
+    fn clear_active_syncing_users(&self) {
+        let mut users_to_finish = {
+            let mut registry = sync_lifecycle_registry()
+                .lock()
+                .expect("sync lifecycle registry poisoned");
+            let state = registry.entry(self.sync_state_key()).or_default();
+            let users: Vec<String> = state.active_users.keys().cloned().collect();
+            state.active_users.clear();
+            users
+        };
+        users_to_finish.sort();
+        users_to_finish.dedup();
+        for user_id in users_to_finish {
+            self.emit_sync_finished(&user_id);
+        }
+    }
+
     async fn refresh_sync_workers(&self) -> anyhow::Result<()> {
         if !self.state.sync_workers_enabled {
             return Ok(());
         }
 
+        let worker_generation = self.next_sync_worker_generation();
+        self.clear_active_syncing_users();
+
         let active_disk_cache_path = self.state.active_disk_cache_path.lock().await.clone();
-        let next_group =
-            maybe_start_grpc_sync_workers(&self.state.runtime_paths, self, &active_disk_cache_path)
-                .await?;
+        let next_group = maybe_start_grpc_sync_workers(
+            &self.state.runtime_paths,
+            self,
+            worker_generation,
+            &active_disk_cache_path,
+        )
+        .await?;
 
         let previous_group = {
             let mut guard = self.state.sync_event_workers.lock().await;
@@ -42,6 +89,9 @@ impl BridgeService {
     }
 
     async fn shutdown_sync_workers(&self) {
+        let _ = self.next_sync_worker_generation();
+        self.clear_active_syncing_users();
+
         let previous_group = {
             let mut guard = self.state.sync_event_workers.lock().await;
             guard.take()
@@ -175,6 +225,35 @@ impl BridgeService {
         }));
     }
 
+    fn emit_sync_started_for_generation(&self, user_id: &str, worker_generation: u64) {
+        if self.current_sync_worker_generation() != worker_generation {
+            return;
+        }
+
+        let should_emit = {
+            let mut registry = sync_lifecycle_registry()
+                .lock()
+                .expect("sync lifecycle registry poisoned");
+            let state = registry.entry(self.sync_state_key()).or_default();
+            if state.generation != worker_generation {
+                return;
+            }
+            match state.active_users.get(user_id).copied() {
+                Some(existing_generation) if existing_generation == worker_generation => false,
+                _ => {
+                    state
+                        .active_users
+                        .insert(user_id.to_string(), worker_generation);
+                    true
+                }
+            }
+        };
+
+        if should_emit {
+            self.emit_sync_started(user_id);
+        }
+    }
+
     fn emit_sync_progress(&self, user_id: &str, progress: f64, elapsed_ms: i64, remaining_ms: i64) {
         self.emit_event(pb::stream_event::Event::User(pb::UserEvent {
             event: Some(pb::user_event::Event::SyncProgressEvent(
@@ -188,6 +267,33 @@ impl BridgeService {
         }));
     }
 
+    fn emit_sync_progress_for_generation(
+        &self,
+        user_id: &str,
+        progress: f64,
+        elapsed_ms: i64,
+        remaining_ms: i64,
+        worker_generation: u64,
+    ) {
+        if self.current_sync_worker_generation() != worker_generation {
+            return;
+        }
+
+        let should_emit = {
+            let registry = sync_lifecycle_registry()
+                .lock()
+                .expect("sync lifecycle registry poisoned");
+            let Some(state) = registry.get(&self.sync_state_key()) else {
+                return;
+            };
+            state.active_users.get(user_id).copied() == Some(worker_generation)
+        };
+
+        if should_emit {
+            self.emit_sync_progress(user_id, progress, elapsed_ms, remaining_ms);
+        }
+    }
+
     fn emit_sync_finished(&self, user_id: &str) {
         self.emit_event(pb::stream_event::Event::User(pb::UserEvent {
             event: Some(pb::user_event::Event::SyncFinishedEvent(
@@ -196,6 +302,25 @@ impl BridgeService {
                 },
             )),
         }));
+    }
+
+    fn emit_sync_finished_for_generation(&self, user_id: &str, worker_generation: u64) {
+        let should_emit = {
+            let mut registry = sync_lifecycle_registry()
+                .lock()
+                .expect("sync lifecycle registry poisoned");
+            let Some(state) = registry.get_mut(&self.sync_state_key()) else {
+                return;
+            };
+            if state.generation != worker_generation {
+                return;
+            }
+            state.active_users.remove(user_id).is_some()
+        };
+
+        if should_emit {
+            self.emit_sync_finished(user_id);
+        }
     }
 
     fn emit_user_disconnected(&self, username: &str) {
@@ -371,7 +496,11 @@ impl BridgeService {
     }
 
     async fn remove_session_access_token(&self, user_id: &str) {
-        self.state.session_access_tokens.lock().await.remove(user_id);
+        self.state
+            .session_access_tokens
+            .lock()
+            .await
+            .remove(user_id);
     }
 
     async fn clear_session_access_tokens(&self) {
@@ -396,24 +525,20 @@ impl BridgeService {
         }
 
         let mut client = ProtonClient::with_api_mode(session.api_mode).ok()?;
-        let refreshed = match api::auth::refresh_auth(
-            &mut client,
-            &session.uid,
-            &session.refresh_token,
-            None,
-        )
-        .await
-        {
-            Ok(refreshed) => refreshed,
-            Err(err) => {
-                warn!(
-                    user_id = %session.uid,
-                    error = %err,
-                    "failed to refresh access token for grpc user metadata"
-                );
-                return None;
-            }
-        };
+        let refreshed =
+            match api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None)
+                .await
+            {
+                Ok(refreshed) => refreshed,
+                Err(err) => {
+                    warn!(
+                        user_id = %session.uid,
+                        error = %err,
+                        "failed to refresh access token for grpc user metadata"
+                    );
+                    return None;
+                }
+            };
 
         if refreshed.access_token.trim().is_empty() {
             return None;
@@ -434,9 +559,11 @@ impl BridgeService {
             }
         };
 
-        if let Err(err) =
-            vault::save_session_with_user_id(&updated, canonical_user_id.as_deref(), self.settings_dir())
-        {
+        if let Err(err) = vault::save_session_with_user_id(
+            &updated,
+            canonical_user_id.as_deref(),
+            self.settings_dir(),
+        ) {
             warn!(
                 user_id = %session.uid,
                 error = %err,
@@ -474,7 +601,9 @@ impl BridgeService {
                 }
             };
             client.set_auth(&session.uid, &access_token);
-            api::users::get_user(&client).await.map(|resp| resp.user.into())
+            api::users::get_user(&client)
+                .await
+                .map(|resp| resp.user.into())
         };
 
         match first_attempt {
@@ -515,7 +644,10 @@ impl BridgeService {
         };
         client.set_auth(&session.uid, &access_token);
 
-        match api::users::get_user(&client).await.map(|resp| resp.user.into()) {
+        match api::users::get_user(&client)
+            .await
+            .map(|resp| resp.user.into())
+        {
             Ok(api_data) => Some(api_data),
             Err(err) => {
                 warn!(

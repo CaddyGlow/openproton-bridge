@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use anyhow::Context;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -178,6 +178,31 @@ struct BridgeService {
     state: Arc<GrpcState>,
 }
 
+#[derive(Debug, Default)]
+struct SyncLifecycleState {
+    generation: u64,
+    active_users: HashMap<String, u64>,
+}
+
+static SYNC_LIFECYCLE_BY_SERVICE: OnceLock<StdMutex<HashMap<usize, SyncLifecycleState>>> =
+    OnceLock::new();
+
+fn sync_lifecycle_registry() -> &'static StdMutex<HashMap<usize, SyncLifecycleState>> {
+    SYNC_LIFECYCLE_BY_SERVICE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+impl Drop for BridgeService {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.state) != 1 {
+            return;
+        }
+        let key = Arc::as_ptr(&self.state) as usize;
+        if let Ok(mut registry) = sync_lifecycle_registry().lock() {
+            registry.remove(&key);
+        }
+    }
+}
+
 fn os_keyring_helpers() -> &'static [&'static str] {
     match std::env::consts::OS {
         "macos" => &[KEYCHAIN_HELPER_MACOS],
@@ -269,6 +294,7 @@ include!("runtime.rs");
 async fn maybe_start_grpc_sync_workers(
     runtime_paths: &RuntimePaths,
     service: &BridgeService,
+    worker_generation: u64,
     _active_disk_cache_path: &Path,
 ) -> anyhow::Result<Option<bridge::events::EventWorkerGroup>> {
     let available_backends = vault::discover_available_keychains();
@@ -363,7 +389,7 @@ async fn maybe_start_grpc_sync_workers(
     let sync_progress_callback: bridge::events::SyncProgressCallback =
         Arc::new(move |event| match event {
             bridge::events::SyncProgressUpdate::Started { user_id } => {
-                callback_service.emit_sync_started(&user_id);
+                callback_service.emit_sync_started_for_generation(&user_id, worker_generation);
             }
             bridge::events::SyncProgressUpdate::Progress {
                 user_id,
@@ -371,10 +397,16 @@ async fn maybe_start_grpc_sync_workers(
                 elapsed_ms,
                 remaining_ms,
             } => {
-                callback_service.emit_sync_progress(&user_id, progress, elapsed_ms, remaining_ms);
+                callback_service.emit_sync_progress_for_generation(
+                    &user_id,
+                    progress,
+                    elapsed_ms,
+                    remaining_ms,
+                    worker_generation,
+                );
             }
             bridge::events::SyncProgressUpdate::Finished { user_id } => {
-                callback_service.emit_sync_finished(&user_id);
+                callback_service.emit_sync_finished_for_generation(&user_id, worker_generation);
             }
         });
 
@@ -1386,6 +1418,153 @@ mod tests {
                 assert_eq!(event.user_id, "uid-1");
             }
             other => panic!("unexpected third sync event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_generation_filters_stale_worker_callbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let generation_1 = service.next_sync_worker_generation();
+        service.emit_sync_started_for_generation("uid-1", generation_1);
+        service.emit_sync_progress_for_generation("uid-1", 0.25, 25, 75, generation_1);
+
+        let started = events.recv().await.unwrap();
+        match started.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected started event: {other:?}"),
+        }
+
+        let progress = events.recv().await.unwrap();
+        match progress.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+                assert!((event.progress - 0.25).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected progress event: {other:?}"),
+        }
+
+        let generation_2 = service.next_sync_worker_generation();
+        service.emit_sync_progress_for_generation("uid-1", 0.75, 75, 25, generation_1);
+        service.emit_sync_finished_for_generation("uid-1", generation_1);
+
+        let stale = tokio::time::timeout(Duration::from_millis(150), events.recv()).await;
+        assert!(
+            stale.is_err(),
+            "stale generation callbacks should be dropped"
+        );
+
+        service.emit_sync_started_for_generation("uid-1", generation_2);
+        service.emit_sync_progress_for_generation("uid-1", 0.8, 80, 20, generation_2);
+        service.emit_sync_finished_for_generation("uid-1", generation_2);
+
+        let started_current = events.recv().await.unwrap();
+        match started_current.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncStartedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected current started event: {other:?}"),
+        }
+
+        let progress_current = events.recv().await.unwrap();
+        match progress_current.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncProgressEvent(event)),
+            })) => {
+                assert_eq!(event.user_id, "uid-1");
+                assert!((event.progress - 0.8).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected current progress event: {other:?}"),
+        }
+
+        let finished_current = events.recv().await.unwrap();
+        match finished_current.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected current finished event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_active_syncing_users_emits_finished_once_per_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let generation = service.next_sync_worker_generation();
+        service.emit_sync_started_for_generation("uid-b", generation);
+        service.emit_sync_started_for_generation("uid-a", generation);
+        service.emit_sync_started_for_generation("uid-a", generation);
+        service.clear_active_syncing_users();
+
+        let mut started_users = Vec::new();
+        let mut finished_users = Vec::new();
+        for _ in 0..4 {
+            let event = events.recv().await.unwrap();
+            match event.event {
+                Some(pb::stream_event::Event::User(pb::UserEvent {
+                    event: Some(pb::user_event::Event::SyncStartedEvent(started)),
+                })) => started_users.push(started.user_id),
+                Some(pb::stream_event::Event::User(pb::UserEvent {
+                    event: Some(pb::user_event::Event::SyncFinishedEvent(finished)),
+                })) => finished_users.push(finished.user_id),
+                other => panic!("unexpected sync lifecycle event: {other:?}"),
+            }
+        }
+
+        started_users.sort();
+        finished_users.sort();
+        assert_eq!(
+            started_users,
+            vec!["uid-a".to_string(), "uid-b".to_string()]
+        );
+        assert_eq!(
+            finished_users,
+            vec!["uid-a".to_string(), "uid-b".to_string()]
+        );
+
+        let extra = tokio::time::timeout(Duration::from_millis(150), events.recv()).await;
+        assert!(
+            extra.is_err(),
+            "clear should not emit duplicate finish events"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_active_syncing_users_emits_sorted_finish_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+
+        let generation = service.next_sync_worker_generation();
+        service.emit_sync_started_for_generation("uid-b", generation);
+        service.emit_sync_started_for_generation("uid-a", generation);
+        let _ = events.recv().await.unwrap();
+        let _ = events.recv().await.unwrap();
+
+        service.clear_active_syncing_users();
+
+        let first_finish = events.recv().await.unwrap();
+        let second_finish = events.recv().await.unwrap();
+
+        match first_finish.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-a"),
+            other => panic!("unexpected first sorted finish event: {other:?}"),
+        }
+        match second_finish.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::SyncFinishedEvent(event)),
+            })) => assert_eq!(event.user_id, "uid-b"),
+            other => panic!("unexpected second sorted finish event: {other:?}"),
         }
     }
 

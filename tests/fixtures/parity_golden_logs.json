@@ -1,0 +1,122 @@
+{
+  "version": 1,
+  "description": "Golden milestone patterns for Proton Bridge parity log validation.",
+  "scenarios": [
+    {
+      "id": "first_login",
+      "description": "Fresh login bootstrap with initial sync lifecycle.",
+      "required_milestones": [
+        {
+          "name": "sync_started",
+          "any_of": [
+            "account sync started",
+            "\\[event\\] sync started:"
+          ]
+        },
+        {
+          "name": "startup_resync_started",
+          "any_of": [
+            "running startup bounded resync"
+          ]
+        },
+        {
+          "name": "resync_completed",
+          "any_of": [
+            "completed refresh resync"
+          ]
+        },
+        {
+          "name": "sync_finished",
+          "any_of": [
+            "account sync finished",
+            "\\[event\\] sync finished:"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "existing_account_startup",
+      "description": "Existing account startup with event polling and checkpoint updates.",
+      "required_milestones": [
+        {
+          "name": "startup_resync_started",
+          "any_of": [
+            "running startup bounded resync"
+          ]
+        },
+        {
+          "name": "event_poll",
+          "any_of": [
+            "polled account events"
+          ]
+        },
+        {
+          "name": "sync_finished",
+          "any_of": [
+            "account sync finished",
+            "\\[event\\] sync finished:"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "repair_flow",
+      "description": "Repair-triggered resync after checkpoint reset.",
+      "required_milestones": [
+        {
+          "name": "repair_started",
+          "any_of": [
+            "repairStarted",
+            "trigger_repair"
+          ]
+        },
+        {
+          "name": "startup_resync_started",
+          "any_of": [
+            "running startup bounded resync"
+          ]
+        },
+        {
+          "name": "resync_completed",
+          "any_of": [
+            "completed refresh resync"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "interrupted_sync",
+      "description": "Interrupted sync with failure and bounded recovery signal.",
+      "required_milestones": [
+        {
+          "name": "sync_started",
+          "any_of": [
+            "account sync started",
+            "\\[event\\] sync started:"
+          ]
+        },
+        {
+          "name": "poll_failed",
+          "any_of": [
+            "event worker poll failed",
+            "event worker startup resync failed"
+          ]
+        },
+        {
+          "name": "recovered",
+          "any_of": [
+            "event worker recovered",
+            "event worker startup resync recovered"
+          ]
+        },
+        {
+          "name": "sync_finished",
+          "any_of": [
+            "account sync finished",
+            "\\[event\\] sync finished:"
+          ]
+        }
+      ]
+    }
+  ]
+}

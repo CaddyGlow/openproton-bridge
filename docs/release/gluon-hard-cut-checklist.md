@@ -29,7 +29,11 @@ Every deployment is an all-or-nothing binary cutover plus runtime artifact backu
    - gRPC user list and disk-cache path checks (if gRPC mode is enabled)
    - account sync/read smoke via IMAP client.
 5. Monitor startup logs for Gluon recovery errors and account worker health.
-
+6. Validate runtime milestones against golden parity scenarios:
+   - `python3 scripts/validate_parity_logs.py --scenario first_login --log <runtime.log>`
+   - `python3 scripts/validate_parity_logs.py --scenario existing_account_startup --log <runtime.log>`
+   - `python3 scripts/validate_parity_logs.py --scenario repair_flow --log <runtime.log>`
+   - `python3 scripts/validate_parity_logs.py --scenario interrupted_sync --log <runtime.log>`
 ## Abort criteria
 
 Rollback immediately if any of the following appear:

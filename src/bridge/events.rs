@@ -725,16 +725,54 @@ async fn apply_metadata_to_store(
     Ok(())
 }
 
+struct SyncProgressRunGuard<'a> {
+    callback: Option<&'a SyncProgressCallback>,
+    user_id: String,
+    finished_emitted: bool,
+}
+
+impl<'a> SyncProgressRunGuard<'a> {
+    fn new(callback: Option<&'a SyncProgressCallback>, user_id: String) -> Self {
+        if let Some(callback) = callback {
+            callback(SyncProgressUpdate::Started {
+                user_id: user_id.clone(),
+            });
+        }
+        Self {
+            callback,
+            user_id,
+            finished_emitted: false,
+        }
+    }
+
+    fn finish(&mut self) {
+        if self.finished_emitted {
+            return;
+        }
+        if let Some(callback) = self.callback {
+            callback(SyncProgressUpdate::Finished {
+                user_id: self.user_id.clone(),
+            });
+        }
+        self.finished_emitted = true;
+    }
+}
+
+impl Drop for SyncProgressRunGuard<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 async fn bounded_resync_account(
     config: &EventWorkerConfig,
     session: &mut Session,
     client: &mut ProtonClient,
 ) -> Result<(), EventWorkerError> {
-    if let Some(callback) = config.sync_progress_callback.as_ref() {
-        callback(SyncProgressUpdate::Started {
-            user_id: config.account_id.0.clone(),
-        });
-    }
+    let mut progress_guard = SyncProgressRunGuard::new(
+        config.sync_progress_callback.as_ref(),
+        config.account_id.0.clone(),
+    );
 
     let resync_started_at = Instant::now();
     let mut total_steps = mailbox::system_mailboxes()
@@ -823,11 +861,7 @@ async fn bounded_resync_account(
         total_steps,
         resync_started_at.elapsed(),
     );
-    if let Some(callback) = config.sync_progress_callback.as_ref() {
-        callback(SyncProgressUpdate::Finished {
-            user_id: config.account_id.0.clone(),
-        });
-    }
+    progress_guard.finish();
 
     Ok(())
 }
@@ -2940,6 +2974,67 @@ mod tests {
         }
 
         group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_resync_failure_still_emits_finished_callback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "Code": 5000,
+                "Error": "boom"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        )]));
+        let auth_router = AuthRouter::new(AccountRegistry::from_sessions(vec![sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        )]));
+        let store = InMemoryStore::new();
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+
+        let observed = Arc::new(StdMutex::new(Vec::new()));
+        let observed_sink = observed.clone();
+        let callback: SyncProgressCallback = Arc::new(move |event| {
+            observed_sink.lock().unwrap().push(event);
+        });
+        let config = event_worker_config(&server.uri(), runtime, auth_router, store, checkpoints)
+            .with_sync_progress_callback(callback);
+
+        let mut session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let mut client = ProtonClient::authenticated_with_mode(
+            &server.uri(),
+            session.api_mode,
+            &session.uid,
+            &session.access_token,
+        )
+        .unwrap();
+
+        let err = bounded_resync_account(&config, &mut session, &mut client)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EventWorkerError::Api(_)));
+
+        let snapshot = observed.lock().unwrap().clone();
+        assert_eq!(snapshot.len(), 2, "expected started+finished only");
+        assert!(matches!(
+            &snapshot[0],
+            SyncProgressUpdate::Started { user_id } if user_id == "uid-1"
+        ));
+        assert!(matches!(
+            &snapshot[1],
+            SyncProgressUpdate::Finished { user_id } if user_id == "uid-1"
+        ));
     }
 
     #[tokio::test]

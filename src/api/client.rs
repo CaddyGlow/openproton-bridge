@@ -1,5 +1,8 @@
-use reqwest::header::{HeaderMap, HeaderValue};
+use std::time::Duration;
+
+use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::Client;
+use reqwest::StatusCode;
 
 use super::error::{ApiError, Result};
 use super::types::ApiMode;
@@ -8,6 +11,7 @@ const DEFAULT_BRIDGE_APP_VERSION: &str = "3.22.0+git";
 const DEFAULT_WEBMAIL_APP_VERSION: &str = "web-mail@5.0.103.3";
 const DEFAULT_WEBMAIL_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+const DEFAULT_TRANSIENT_RETRY_DELAY_MS: u64 = 200;
 
 fn bridge_app_version() -> String {
     let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
@@ -219,6 +223,34 @@ pub fn check_api_response(json: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn is_transient_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::REQUEST_TIMEOUT
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+pub(crate) fn retry_delay_from_headers(headers: &HeaderMap) -> Duration {
+    let Some(value) = headers.get(RETRY_AFTER) else {
+        return Duration::from_millis(DEFAULT_TRANSIENT_RETRY_DELAY_MS);
+    };
+
+    let Ok(raw) = value.to_str() else {
+        return Duration::from_millis(DEFAULT_TRANSIENT_RETRY_DELAY_MS);
+    };
+
+    if let Ok(seconds) = raw.trim().parse::<u64>() {
+        // Keep retry bounded even if upstream sends a very large window.
+        return Duration::from_secs(seconds.min(5));
+    }
+
+    Duration::from_millis(DEFAULT_TRANSIENT_RETRY_DELAY_MS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,6 +353,30 @@ mod tests {
         client.set_auth("test-uid", "test-token");
         assert_eq!(client.uid.as_deref(), Some("test-uid"));
         assert_eq!(client.access_token.as_deref(), Some("test-token"));
+    }
+
+    #[test]
+    fn test_is_transient_http_status() {
+        assert!(is_transient_http_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_transient_http_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(!is_transient_http_status(StatusCode::UNAUTHORIZED));
+        assert!(!is_transient_http_status(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn test_retry_delay_from_headers_defaults_when_missing() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            retry_delay_from_headers(&headers),
+            Duration::from_millis(DEFAULT_TRANSIENT_RETRY_DELAY_MS)
+        );
+    }
+
+    #[test]
+    fn test_retry_delay_from_headers_uses_retry_after_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("2"));
+        assert_eq!(retry_delay_from_headers(&headers), Duration::from_secs(2));
     }
 
     #[test]

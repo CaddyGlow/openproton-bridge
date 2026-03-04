@@ -619,7 +619,9 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Ok(Response::new(()));
         }
 
-        if self.requires_second_password(&client, &password).await? {
+        if auth.requires_two_passwords()
+            || self.requires_second_password(&client, &password).await?
+        {
             let pending = PendingLogin {
                 username: username.clone(),
                 password,

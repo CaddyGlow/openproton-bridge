@@ -74,9 +74,17 @@ pub struct AuthResponse {
     pub refresh_token: String,
     pub token_type: String,
     pub server_proof: String,
+    #[serde(default)]
+    pub password_mode: i32,
     #[serde(rename = "2FA")]
     pub two_factor: TwoFactorInfo,
     pub scopes: Vec<String>,
+}
+
+impl AuthResponse {
+    pub fn requires_two_passwords(&self) -> bool {
+        self.password_mode == 2
+    }
 }
 
 /// Human verification metadata returned by Proton in error `Code: 9001`.
@@ -532,6 +540,31 @@ mod tests {
         assert_eq!(auth.refresh_token, "refresh-123");
         assert_eq!(auth.scopes, vec!["mail", "calendar"]);
         assert!(!auth.two_factor.totp_required());
+        assert_eq!(auth.password_mode, 0);
+        assert!(!auth.requires_two_passwords());
+    }
+
+    #[test]
+    fn test_auth_response_two_password_mode() {
+        let json = serde_json::json!({
+            "Code": 1000,
+            "UID": "uid-abc",
+            "AccessToken": "token-xyz",
+            "RefreshToken": "refresh-123",
+            "TokenType": "Bearer",
+            "ServerProof": "proof-b64",
+            "PasswordMode": 2,
+            "2FA": {
+                "Enabled": 0,
+                "TOTP": 0,
+                "FIDO2": null
+            },
+            "Scopes": ["mail", "calendar"]
+        });
+
+        let auth: AuthResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(auth.password_mode, 2);
+        assert!(auth.requires_two_passwords());
     }
 
     #[test]

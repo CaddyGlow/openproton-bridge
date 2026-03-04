@@ -1,8 +1,9 @@
 use tracing::info;
 
-use super::client::{check_api_response, ProtonClient};
-use super::error::ApiError;
-use super::error::Result;
+use super::client::{
+    check_api_response, is_transient_http_status, retry_delay_from_headers, ProtonClient,
+};
+use super::error::{ApiError, Result};
 use super::types::{
     AttachmentResponse, CreateDraftReq, MessageFilter, MessageResponse, MessagesMetadataResponse,
     SendDraftReq, SendDraftResponse,
@@ -32,6 +33,8 @@ pub async fn get_message_metadata(
     page: i32,
     page_size: i32,
 ) -> Result<MessagesMetadataResponse> {
+    const MAX_TRANSIENT_ATTEMPTS: usize = 2;
+
     info!(
         page = page,
         page_size = page_size,
@@ -47,17 +50,43 @@ pub async fn get_message_metadata(
         "Sort": "ID",
     });
 
-    let resp = client
-        .post("/mail/v4/messages")
-        .header("X-HTTP-Method-Override", "GET")
-        .json(&body)
-        .send()
-        .await?;
+    for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+        let resp = client
+            .post("/mail/v4/messages")
+            .header("X-HTTP-Method-Override", "GET")
+            .json(&body)
+            .send()
+            .await?;
 
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-    let meta_resp: MessagesMetadataResponse = serde_json::from_value(json)?;
-    Ok(meta_resp)
+        let status = resp.status();
+        let retry_delay = retry_delay_from_headers(resp.headers());
+        let json: serde_json::Value = resp.json().await?;
+
+        if !status.is_success()
+            && is_transient_http_status(status)
+            && attempt + 1 < MAX_TRANSIENT_ATTEMPTS
+        {
+            tokio::time::sleep(retry_delay).await;
+            continue;
+        }
+
+        if let Err(err) = check_api_response(&json) {
+            return Err(err);
+        }
+
+        if status.is_success() {
+            let meta_resp: MessagesMetadataResponse = serde_json::from_value(json)?;
+            return Ok(meta_resp);
+        }
+
+        return Err(ApiError::Api {
+            code: i64::from(status.as_u16()),
+            message: format!("HTTP status {}", status.as_u16()),
+            details: Some(json),
+        });
+    }
+
+    Err(ApiError::Auth("exhausted transient retries".to_string()))
 }
 
 /// Fetch raw encrypted attachment data.

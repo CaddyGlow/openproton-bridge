@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 use crate::api::auth;
 use crate::api::client::ProtonClient;
 use crate::api::error::{is_auth_error, is_invalid_refresh_token_error, ApiError};
-use crate::api::types::Session;
+use crate::api::types::{Address, Session, UserKey};
 
 use super::types::{AccountId, AccountResolver};
 
@@ -51,10 +51,17 @@ pub enum AccountRuntimeError {
 pub struct RuntimeAccountRegistry {
     sessions: RwLock<HashMap<AccountId, Session>>,
     health: RwLock<HashMap<AccountId, AccountHealth>>,
+    auth_material: RwLock<HashMap<AccountId, Arc<RuntimeAuthMaterial>>>,
     runtime_generations: RwLock<HashMap<AccountId, u64>>,
     generation_watchers: Mutex<HashMap<AccountId, watch::Sender<u64>>>,
     refresh_locks: Mutex<HashMap<AccountId, Arc<AsyncMutex<()>>>>,
     vault_dir: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct RuntimeAuthMaterial {
+    pub user_keys: Vec<UserKey>,
+    pub addresses: Vec<Address>,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +265,7 @@ impl RuntimeAccountRegistry {
         Self {
             sessions: RwLock::new(map),
             health: RwLock::new(health),
+            auth_material: RwLock::new(HashMap::new()),
             runtime_generations: RwLock::new(runtime_generations),
             generation_watchers: Mutex::new(generation_watchers),
             refresh_locks: Mutex::new(HashMap::new()),
@@ -284,6 +292,27 @@ impl RuntimeAccountRegistry {
     pub async fn get_session(&self, account_id: &AccountId) -> Option<Session> {
         let sessions = self.sessions.read().await;
         sessions.get(account_id).cloned()
+    }
+
+    pub async fn get_auth_material(
+        &self,
+        account_id: &AccountId,
+    ) -> Option<Arc<RuntimeAuthMaterial>> {
+        let auth_material = self.auth_material.read().await;
+        auth_material.get(account_id).cloned()
+    }
+
+    pub async fn set_auth_material(
+        &self,
+        account_id: &AccountId,
+        material: Arc<RuntimeAuthMaterial>,
+    ) -> Result<(), AccountRuntimeError> {
+        if self.get_session(account_id).await.is_none() {
+            return Err(AccountRuntimeError::AccountNotFound(account_id.0.clone()));
+        }
+        let mut auth_material = self.auth_material.write().await;
+        auth_material.insert(account_id.clone(), material);
+        Ok(())
     }
 
     pub async fn get_health(&self, account_id: &AccountId) -> Option<AccountHealth> {
@@ -322,6 +351,10 @@ impl RuntimeAccountRegistry {
             };
             if let Some(generation_tx) = self.generation_sender_for(account_id) {
                 let _ = generation_tx.send(next_generation);
+            }
+            {
+                let mut auth_material = self.auth_material.write().await;
+                auth_material.remove(account_id);
             }
             warn!(
                 account_id = %account_id.0,
@@ -541,7 +574,7 @@ impl RuntimeAccountRegistry {
         let Some(vault_dir) = &self.vault_dir else {
             return;
         };
-        match crate::vault::remove_session_by_email(vault_dir, &session.email) {
+        match crate::vault::remove_session_by_account_id(vault_dir, &session.uid) {
             Ok(()) => {
                 warn!(
                     account_id = %session.uid,
@@ -549,13 +582,25 @@ impl RuntimeAccountRegistry {
                     "removed persisted account session after invalid refresh token"
                 );
             }
-            Err(err) => {
-                warn!(
-                    account_id = %session.uid,
-                    email = %session.email,
-                    error = %err,
-                    "failed to remove persisted account session after invalid refresh token"
-                );
+            Err(account_id_err) => {
+                match crate::vault::remove_session_by_email(vault_dir, &session.email) {
+                    Ok(()) => {
+                        warn!(
+                            account_id = %session.uid,
+                            email = %session.email,
+                            "removed persisted account session by email fallback after invalid refresh token"
+                        );
+                    }
+                    Err(email_err) => {
+                        warn!(
+                            account_id = %session.uid,
+                            email = %session.email,
+                            account_id_error = %account_id_err,
+                            email_error = %email_err,
+                            "failed to remove persisted account session after invalid refresh token"
+                        );
+                    }
+                }
             }
         }
     }
@@ -934,5 +979,29 @@ mod tests {
             .err()
             .is_some();
         assert!(removed);
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_failure_uses_account_id_removal_when_email_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stored = session("uid-1", "stored@proton.me");
+        crate::vault::save_session(&stored, tmp.path()).unwrap();
+
+        let runtime = RuntimeAccountRegistry::new(vec![stored.clone()], tmp.path().to_path_buf());
+        let account_id = AccountId("uid-1".to_string());
+        let mut stale_runtime_session = stored.clone();
+        stale_runtime_session.email = "stale-runtime@proton.me".to_string();
+
+        let invalid_refresh = ApiError::Api {
+            code: 10013,
+            message: "Invalid refresh token".to_string(),
+            details: None,
+        };
+
+        runtime
+            .handle_refresh_failure(&account_id, &stale_runtime_session, &invalid_refresh)
+            .await;
+
+        assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_err());
     }
 }

@@ -235,6 +235,7 @@ async fn prepare_runtime_context(
 
     let mut account_registry =
         super::accounts::AccountRegistry::from_sessions(active_sessions.clone());
+    let mut prefetched_auth_material = Vec::new();
     for session in &active_sessions {
         let account_id = super::types::AccountId(session.uid.clone());
         let split_mode = match vault::load_split_mode_by_account_id(settings_dir, &session.uid) {
@@ -268,12 +269,33 @@ async fn prepare_runtime_context(
             }
         };
 
+        let user_keys = match api::users::get_user(&client).await {
+            Ok(user_resp) => Some(user_resp.user.keys),
+            Err(err) => {
+                tracing::warn!(
+                    email = %session.email,
+                    error = %err,
+                    "failed to prefetch user keys for IMAP login cache"
+                );
+                None
+            }
+        };
+
         match api::users::get_addresses(&client).await {
-            Ok(addresses) => {
-                for address in addresses.addresses {
+            Ok(addresses_resp) => {
+                for address in &addresses_resp.addresses {
                     if address.status == 1 {
                         account_registry.add_address_email(&account_id, &address.email);
                     }
+                }
+                if let Some(user_keys) = user_keys {
+                    prefetched_auth_material.push((
+                        account_id.clone(),
+                        Arc::new(super::accounts::RuntimeAuthMaterial {
+                            user_keys,
+                            addresses: addresses_resp.addresses,
+                        }),
+                    ));
                 }
             }
             Err(err) => {
@@ -291,6 +313,11 @@ async fn prepare_runtime_context(
         active_sessions.clone(),
         settings_dir.to_path_buf(),
     ));
+    for (account_id, material) in prefetched_auth_material {
+        let _ = runtime_accounts
+            .set_auth_material(&account_id, material)
+            .await;
+    }
     let runtime_snapshot = runtime_accounts.snapshot().await;
     let api_base_url = "https://mail-api.proton.me".to_string();
 
@@ -675,7 +702,7 @@ fn handle_startup_refresh_failure(
         return;
     }
 
-    match vault::remove_session_by_email(settings_dir, &session.email) {
+    match vault::remove_session_by_account_id(settings_dir, &session.uid) {
         Ok(()) => {
             tracing::warn!(
                 pkg = "bridge/token",
@@ -684,15 +711,26 @@ fn handle_startup_refresh_failure(
                 "stored refresh token is invalid; removed account session from vault"
             );
         }
-        Err(remove_err) => {
-            tracing::warn!(
-                pkg = "bridge/token",
-                user_id = %session.uid,
-                email = %session.email,
-                error = %remove_err,
-                "stored refresh token is invalid; failed to remove account session from vault"
-            );
-        }
+        Err(account_id_err) => match vault::remove_session_by_email(settings_dir, &session.email) {
+            Ok(()) => {
+                tracing::warn!(
+                    pkg = "bridge/token",
+                    user_id = %session.uid,
+                    email = %session.email,
+                    "stored refresh token is invalid; removed account session from vault by email fallback"
+                );
+            }
+            Err(email_err) => {
+                tracing::warn!(
+                    pkg = "bridge/token",
+                    user_id = %session.uid,
+                    email = %session.email,
+                    account_id_error = %account_id_err,
+                    email_error = %email_err,
+                    "stored refresh token is invalid; failed to remove account session from vault"
+                );
+            }
+        },
     }
 }
 
@@ -824,5 +862,23 @@ mod tests {
 
         let persisted = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me").is_ok();
         assert!(persisted);
+    }
+
+    #[test]
+    fn startup_invalid_refresh_failure_removes_by_account_id_when_email_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stored = session("uid-1", "stored@proton.me");
+        crate::vault::save_session(&stored, tmp.path()).unwrap();
+
+        let mut stale_runtime = stored.clone();
+        stale_runtime.email = "stale@proton.me".to_string();
+        let err = ApiError::Api {
+            code: 10013,
+            message: "Invalid refresh token".to_string(),
+            details: None,
+        };
+        handle_startup_refresh_failure(&stale_runtime, tmp.path(), &err);
+
+        assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_err());
     }
 }

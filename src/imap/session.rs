@@ -13,7 +13,7 @@ use crate::api::client::ProtonClient;
 use crate::api::error::is_auth_error;
 use crate::api::messages;
 use crate::api::types::{self, MessageFilter};
-use crate::bridge::accounts::{AccountRuntimeError, RuntimeAccountRegistry};
+use crate::bridge::accounts::{AccountRuntimeError, RuntimeAccountRegistry, RuntimeAuthMaterial};
 use crate::bridge::auth_router::AuthRouter;
 use crate::crypto::keys::{self, Keyring};
 
@@ -296,74 +296,158 @@ where
             }
         };
 
-        // Fetch user keys and unlock
-        let user_resp = match crate::api::users::get_user(&client).await {
-            Ok(r) => r,
-            Err(e) if is_auth_error(&e) => {
-                let refreshed = match self
-                    .config
-                    .runtime_accounts
-                    .refresh_session_if_stale(
-                        &auth_route.account_id,
-                        Some(&account_session.access_token),
-                    )
-                    .await
-                {
-                    Ok(session) => session,
-                    Err(refresh_err) => {
-                        passphrase.zeroize();
-                        warn!(
-                            account_id = %auth_route.account_id.0,
-                            error = %refresh_err,
-                            "token refresh failed during IMAP login"
-                        );
-                        return self
-                            .writer
-                            .tagged_no(tag, "failed to refresh account token")
-                            .await;
-                    }
-                };
-                account_session = refreshed;
-                client = match ProtonClient::authenticated_with_mode(
-                    account_session.api_mode.base_url(),
-                    account_session.api_mode,
-                    &account_session.uid,
-                    &account_session.access_token,
-                ) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        passphrase.zeroize();
-                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
-                        return self
-                            .writer
-                            .tagged_no(tag, "internal error creating client")
-                            .await;
-                    }
-                };
+        let auth_material = if let Some(material) = self
+            .config
+            .runtime_accounts
+            .get_auth_material(&auth_route.account_id)
+            .await
+        {
+            material
+        } else {
+            let user_resp = match crate::api::users::get_user(&client).await {
+                Ok(r) => r,
+                Err(e) if is_auth_error(&e) => {
+                    let refreshed = match self
+                        .config
+                        .runtime_accounts
+                        .refresh_session_if_stale(
+                            &auth_route.account_id,
+                            Some(&account_session.access_token),
+                        )
+                        .await
+                    {
+                        Ok(session) => session,
+                        Err(refresh_err) => {
+                            passphrase.zeroize();
+                            warn!(
+                                account_id = %auth_route.account_id.0,
+                                error = %refresh_err,
+                                "token refresh failed during IMAP login"
+                            );
+                            return self
+                                .writer
+                                .tagged_no(tag, "failed to refresh account token")
+                                .await;
+                        }
+                    };
+                    account_session = refreshed;
+                    client = match ProtonClient::authenticated_with_mode(
+                        account_session.api_mode.base_url(),
+                        account_session.api_mode,
+                        &account_session.uid,
+                        &account_session.access_token,
+                    ) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            passphrase.zeroize();
+                            warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                            return self
+                                .writer
+                                .tagged_no(tag, "internal error creating client")
+                                .await;
+                        }
+                    };
 
-                match crate::api::users::get_user(&client).await {
-                    Ok(r) => r,
-                    Err(err) => {
-                        passphrase.zeroize();
-                        warn!(error = %err, "failed to fetch user info after refresh");
-                        return self
-                            .writer
-                            .tagged_no(tag, "failed to fetch user info")
-                            .await;
+                    match crate::api::users::get_user(&client).await {
+                        Ok(r) => r,
+                        Err(err) => {
+                            passphrase.zeroize();
+                            warn!(error = %err, "failed to fetch user info after refresh");
+                            return self
+                                .writer
+                                .tagged_no(tag, "failed to fetch user info")
+                                .await;
+                        }
                     }
                 }
-            }
-            Err(e) => {
-                passphrase.zeroize();
-                warn!(error = %e, "failed to fetch user info");
-                return self
-                    .writer
-                    .tagged_no(tag, "failed to fetch user info")
-                    .await;
-            }
+                Err(e) => {
+                    passphrase.zeroize();
+                    warn!(error = %e, "failed to fetch user info");
+                    return self
+                        .writer
+                        .tagged_no(tag, "failed to fetch user info")
+                        .await;
+                }
+            };
+
+            let addr_resp = match crate::api::users::get_addresses(&client).await {
+                Ok(r) => r,
+                Err(e) if is_auth_error(&e) => {
+                    let refreshed = match self
+                        .config
+                        .runtime_accounts
+                        .refresh_session_if_stale(
+                            &auth_route.account_id,
+                            Some(&account_session.access_token),
+                        )
+                        .await
+                    {
+                        Ok(session) => session,
+                        Err(refresh_err) => {
+                            passphrase.zeroize();
+                            warn!(
+                                account_id = %auth_route.account_id.0,
+                                error = %refresh_err,
+                                "token refresh failed while fetching addresses"
+                            );
+                            return self
+                                .writer
+                                .tagged_no(tag, "failed to refresh account token")
+                                .await;
+                        }
+                    };
+                    account_session = refreshed;
+                    client = match ProtonClient::authenticated_with_mode(
+                        account_session.api_mode.base_url(),
+                        account_session.api_mode,
+                        &account_session.uid,
+                        &account_session.access_token,
+                    ) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            passphrase.zeroize();
+                            warn!(error = %err, "failed to recreate ProtonClient after refresh");
+                            return self
+                                .writer
+                                .tagged_no(tag, "internal error creating client")
+                                .await;
+                        }
+                    };
+                    match crate::api::users::get_addresses(&client).await {
+                        Ok(r) => r,
+                        Err(err) => {
+                            passphrase.zeroize();
+                            warn!(error = %err, "failed to fetch addresses after refresh");
+                            return self
+                                .writer
+                                .tagged_no(tag, "failed to fetch addresses")
+                                .await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    passphrase.zeroize();
+                    warn!(error = %e, "failed to fetch addresses");
+                    return self
+                        .writer
+                        .tagged_no(tag, "failed to fetch addresses")
+                        .await;
+                }
+            };
+
+            let material = Arc::new(RuntimeAuthMaterial {
+                user_keys: user_resp.user.keys,
+                addresses: addr_resp.addresses,
+            });
+            let _ = self
+                .config
+                .runtime_accounts
+                .set_auth_material(&auth_route.account_id, material.clone())
+                .await;
+            material
         };
 
-        let user_keyring = match keys::unlock_user_keys(&user_resp.user.keys, &passphrase) {
+        let user_keyring = match keys::unlock_user_keys(&auth_material.user_keys, &passphrase) {
             Ok(kr) => kr,
             Err(e) => {
                 passphrase.zeroize();
@@ -375,73 +459,8 @@ where
             }
         };
 
-        let addr_resp = match crate::api::users::get_addresses(&client).await {
-            Ok(r) => r,
-            Err(e) if is_auth_error(&e) => {
-                let refreshed = match self
-                    .config
-                    .runtime_accounts
-                    .refresh_session_if_stale(
-                        &auth_route.account_id,
-                        Some(&account_session.access_token),
-                    )
-                    .await
-                {
-                    Ok(session) => session,
-                    Err(refresh_err) => {
-                        passphrase.zeroize();
-                        warn!(
-                            account_id = %auth_route.account_id.0,
-                            error = %refresh_err,
-                            "token refresh failed while fetching addresses"
-                        );
-                        return self
-                            .writer
-                            .tagged_no(tag, "failed to refresh account token")
-                            .await;
-                    }
-                };
-                account_session = refreshed;
-                client = match ProtonClient::authenticated_with_mode(
-                    account_session.api_mode.base_url(),
-                    account_session.api_mode,
-                    &account_session.uid,
-                    &account_session.access_token,
-                ) {
-                    Ok(c) => c,
-                    Err(err) => {
-                        passphrase.zeroize();
-                        warn!(error = %err, "failed to recreate ProtonClient after refresh");
-                        return self
-                            .writer
-                            .tagged_no(tag, "internal error creating client")
-                            .await;
-                    }
-                };
-                match crate::api::users::get_addresses(&client).await {
-                    Ok(r) => r,
-                    Err(err) => {
-                        passphrase.zeroize();
-                        warn!(error = %err, "failed to fetch addresses after refresh");
-                        return self
-                            .writer
-                            .tagged_no(tag, "failed to fetch addresses")
-                            .await;
-                    }
-                }
-            }
-            Err(e) => {
-                passphrase.zeroize();
-                warn!(error = %e, "failed to fetch addresses");
-                return self
-                    .writer
-                    .tagged_no(tag, "failed to fetch addresses")
-                    .await;
-            }
-        };
-
         let mut addr_keyrings = HashMap::new();
-        for addr in &addr_resp.addresses {
+        for addr in &auth_material.addresses {
             if addr.status != 1 || addr.keys.is_empty() {
                 continue;
             }
@@ -627,7 +646,7 @@ where
                 .await;
         }
 
-        let store = &self.config.store;
+        let store = self.config.store.clone();
         let scoped_mailbox = self.scoped_mailbox_name(mb.name);
         let cached_uids = store.list_uids(&scoped_mailbox).await?;
 
@@ -728,9 +747,9 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
-        let mailbox = self.selected_mailbox.as_ref().unwrap();
-        let scoped_mailbox = self.scoped_mailbox_name(mailbox);
-        let store = &self.config.store;
+        let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
+        let store = self.config.store.clone();
         let all_uids = store.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
@@ -771,8 +790,8 @@ where
         let seen_flag = "\\Seen".to_string();
         let user_id = self
             .authenticated_account_id
-            .as_deref()
-            .unwrap_or("unknown");
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         let header_only_body_fetch = needs_body_sections && !needs_full_rfc822;
         let target_fetch_count = target_messages.len() as u32;
         let mut cache_hits = 0u32;
@@ -953,7 +972,7 @@ where
             if header_only_body_fetch {
                 // Match bridge behavior: header index fetch should avoid RFC822 disk/blob reads.
                 info!(
-                    user_id = user_id,
+                    user_id = %user_id,
                     mailbox = %mailbox,
                     count = target_fetch_count,
                     "rfc822_cache_miss"
@@ -961,7 +980,7 @@ where
             } else {
                 if cache_hits > 0 {
                     info!(
-                        user_id = user_id,
+                        user_id = %user_id,
                         mailbox = %mailbox,
                         count = cache_hits,
                         "rfc822_cache_hit"
@@ -969,7 +988,7 @@ where
                 }
                 if cache_misses > 0 {
                     info!(
-                        user_id = user_id,
+                        user_id = %user_id,
                         mailbox = %mailbox,
                         count = cache_misses,
                         "rfc822_cache_miss"
@@ -983,42 +1002,93 @@ where
     }
 
     async fn fetch_and_cache_rfc822(
-        &self,
+        &mut self,
         mailbox: &str,
         uid: u32,
         proton_id: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let client = match &self.client {
-            Some(c) => c,
+        let mut client = match &self.client {
+            Some(c) => c.clone(),
             None => return Ok(None),
         };
 
-        let msg_resp = match messages::get_message(client, proton_id).await {
+        let msg_resp = match messages::get_message(&client, proton_id).await {
             Ok(r) => r,
+            Err(e) if is_auth_error(&e) => {
+                let Some(account_id) = self
+                    .authenticated_account_id
+                    .as_ref()
+                    .map(|id| crate::bridge::types::AccountId(id.clone()))
+                else {
+                    warn!(proton_id = %proton_id, error = %e, "auth error without authenticated account");
+                    return Ok(None);
+                };
+                let refreshed = match self
+                    .config
+                    .runtime_accounts
+                    .refresh_session(&account_id)
+                    .await
+                {
+                    Ok(session) => session,
+                    Err(refresh_err) => {
+                        warn!(
+                            account_id = %account_id.0,
+                            proton_id = %proton_id,
+                            error = %refresh_err,
+                            "failed to refresh account token while fetching message"
+                        );
+                        return Ok(None);
+                    }
+                };
+                client = match ProtonClient::authenticated_with_mode(
+                    refreshed.api_mode.base_url(),
+                    refreshed.api_mode,
+                    &refreshed.uid,
+                    &refreshed.access_token,
+                ) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        warn!(proton_id = %proton_id, error = %err, "failed to recreate ProtonClient after refresh");
+                        return Ok(None);
+                    }
+                };
+                self.client = Some(client.clone());
+                match messages::get_message(&client, proton_id).await {
+                    Ok(r) => r,
+                    Err(err) => {
+                        warn!(
+                            proton_id = %proton_id,
+                            error = %err,
+                            "failed to fetch message after token refresh"
+                        );
+                        return Ok(None);
+                    }
+                }
+            }
             Err(e) => {
                 warn!(proton_id = %proton_id, error = %e, "failed to fetch message");
                 return Ok(None);
             }
         };
-
         let msg = &msg_resp.message;
 
         // Find the right keyring for this message's address
         let keyring = match &self.addr_keyrings {
-            Some(keyrings) => match keyrings.get(&msg.metadata.address_id) {
-                Some(kr) => kr,
-                None => {
-                    warn!(
-                        address_id = %msg.metadata.address_id,
-                        "no keyring for address"
-                    );
-                    return Ok(None);
-                }
-            },
+            Some(c) => c,
             None => return Ok(None),
         };
+        let keyring = match keyring.get(&msg.metadata.address_id) {
+            Some(kr) => kr,
+            None => {
+                warn!(
+                    address_id = %msg.metadata.address_id,
+                    "no keyring for address"
+                );
+                return Ok(None);
+            }
+        };
 
-        let data = match rfc822::build_rfc822(client, keyring, msg).await {
+        let data = match rfc822::build_rfc822(&client, keyring, msg).await {
             Ok(d) => d,
             Err(e) => {
                 warn!(proton_id = %proton_id, error = %e, "failed to build RFC822");

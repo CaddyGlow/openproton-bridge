@@ -1994,6 +1994,40 @@ pub fn remove_session_by_email(dir: &Path, email: &str) -> Result<()> {
     Ok(())
 }
 
+/// Remove a specific account session by account id (`AuthUID` in the vault).
+pub fn remove_session_by_account_id(dir: &Path, account_id: &str) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let account_id = account_id.trim();
+    if account_id.is_empty() {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    }
+
+    let original_len = data.users.len();
+    data.users.retain(|u| u.auth_uid != account_id);
+
+    if data.users.len() == original_len {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    }
+
+    if data.users.is_empty() {
+        return remove_session(dir);
+    }
+
+    save_vault_data(dir, &mut data)?;
+
+    let default_email = get_default_email(dir)?;
+    let still_valid_default = default_email.is_some_and(|default_email| {
+        data.users
+            .iter()
+            .any(|u| normalize_email(&u.primary_email) == normalize_email(&default_email))
+    });
+    if !still_valid_default {
+        write_default_email(dir, &data.users[0].primary_email)?;
+    }
+
+    Ok(())
+}
+
 pub fn remove_session(dir: &Path) -> Result<()> {
     let store_config = resolve_credential_store_config(dir);
     let vault = dir.join(VAULT_FILE);
@@ -3129,6 +3163,40 @@ path = "custom-vault.key"
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].email, "bob@proton.me");
         assert!(load_session_by_email(tmp.path(), "alice@proton.me").is_err());
+        assert!(session_exists(tmp.path()));
+    }
+
+    #[test]
+    fn test_remove_session_by_account_id_keeps_other_accounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_a = Session {
+            uid: "uid-a".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-a".to_string(),
+            email: "alice@proton.me".to_string(),
+            display_name: "Alice".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-a".to_string()),
+        };
+        let session_b = Session {
+            uid: "uid-b".to_string(),
+            access_token: String::new(),
+            refresh_token: "refresh-b".to_string(),
+            email: "bob@proton.me".to_string(),
+            display_name: "Bob".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-b".to_string()),
+        };
+        save_session(&session_a, tmp.path()).unwrap();
+        save_session(&session_b, tmp.path()).unwrap();
+
+        remove_session_by_account_id(tmp.path(), "uid-a").unwrap();
+        let sessions = list_sessions(tmp.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].uid, "uid-b");
+        assert!(load_session_by_account_id(tmp.path(), "uid-a").is_err());
         assert!(session_exists(tmp.path()));
     }
 

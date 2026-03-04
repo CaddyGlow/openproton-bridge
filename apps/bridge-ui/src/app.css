@@ -76,6 +76,36 @@ body {
   padding: 12px;
 }
 
+.startup-loading {
+  min-height: calc(100vh - 24px);
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  text-align: center;
+}
+
+.startup-spinner {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  border: 2px solid color-mix(in oklab, var(--brand) 24%, var(--panel-border));
+  border-top-color: var(--brand);
+  animation: startup-spin 900ms linear infinite;
+}
+
+.startup-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+@keyframes startup-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .workspace {
   display: grid;
   grid-template-columns: minmax(250px, 288px) minmax(0, 1fr);
@@ -112,20 +142,37 @@ body {
 }
 
 .status-inline {
+  --status-color: #1cb38d;
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  color: #1cb38d;
+  color: var(--status-color);
   font-weight: 600;
   font-size: 1.08rem;
+}
+
+.status-inline.is-online {
+  --status-color: #1cb38d;
+}
+
+.status-inline.is-busy {
+  --status-color: #f0c86d;
+}
+
+.status-inline.is-offline {
+  --status-color: var(--text-muted);
+}
+
+.status-inline.is-error {
+  --status-color: var(--danger);
 }
 
 .status-dot {
   width: 8px;
   height: 8px;
   border-radius: 999px;
-  background: #1cb38d;
-  box-shadow: 0 0 0 3px rgba(28, 179, 141, 0.14);
+  background: var(--status-color);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--status-color) 24%, transparent);
 }
 
 .shell-status-bar {
@@ -137,9 +184,29 @@ body {
   border-bottom: 1px solid var(--table-sep);
 }
 
+.shell-status-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .shell-icon-actions {
   display: flex;
   gap: 6px;
+}
+
+.connection-action-btn {
+  min-height: 28px;
+  padding: 6px 9px;
+  font-size: 0.74rem;
+}
+
+.connection-error {
+  margin: 0;
+  color: color-mix(in oklab, var(--danger) 80%, var(--text));
+  font-size: 0.78rem;
+  line-height: 1.4;
 }
 
 .icon-btn {
@@ -947,5 +1014,9 @@ li {
 @media (prefers-reduced-motion: reduce) {
   button {
     transition: none;
+  }
+
+  .startup-spinner {
+    animation: none;
   }
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { fade, fly } from 'svelte/transition'
-  import { connect } from './lib/stores/bridge'
+  import { connect, disconnect } from './lib/stores/bridge'
   import {
     bridge_refresh_tray_users,
     onCaptchaToken,
@@ -74,6 +74,8 @@
   type ThemeMode = 'system' | 'light' | 'dark'
   type SettingsSectionId = 'general' | 'advanced' | 'maintenance'
   type CacheMoveUiState = 'idle' | 'in_flight' | 'success' | 'failure'
+  type GrpcLifecycleState = 'booting' | 'connecting' | 'ready' | 'disconnected' | 'retrying' | 'error'
+  type GrpcConnectReason = 'startup' | 'retry' | 'login' | 'captcha'
   type UserParityHook = {
     syncProgress?: number | null
     disconnected?: boolean
@@ -100,7 +102,10 @@
   let users = $state<UserSummary[]>([])
   let usersLoading = $state(false)
   let initialUsersLoadDone = $state(false)
-  let onboardingOnlyMode = $state(false)
+  let startupLoading = $state(true)
+  let grpcLifecycleState = $state<GrpcLifecycleState>('booting')
+  let grpcActionInFlight = $state(false)
+  let grpcErrorMessage = $state('')
   let appSettings = $state<AppSettings>({ ...defaultAppSettings })
   let settingsStatus = $state('')
   let diskCachePathInput = $state('')
@@ -140,6 +145,42 @@
   let clientConfigUserId = $state('')
   let selectedAccountKey = $state('')
 
+  function canShowAccountWizard(): boolean {
+    return grpcLifecycleState === 'ready' && initialUsersLoadDone && users.length === 0
+  }
+
+  function grpcLifecycleStatusLabel(state: GrpcLifecycleState): string {
+    if (state === 'booting') {
+      return 'Starting'
+    }
+    if (state === 'connecting') {
+      return 'Connecting'
+    }
+    if (state === 'retrying') {
+      return 'Retrying'
+    }
+    if (state === 'ready') {
+      return 'Connected'
+    }
+    if (state === 'error') {
+      return 'Connection failed'
+    }
+    return 'Disconnected'
+  }
+
+  function grpcLifecycleStatusClass(state: GrpcLifecycleState): string {
+    if (state === 'ready') {
+      return 'is-online'
+    }
+    if (state === 'booting' || state === 'connecting' || state === 'retrying') {
+      return 'is-busy'
+    }
+    if (state === 'error') {
+      return 'is-error'
+    }
+    return 'is-offline'
+  }
+
   function normalizeThemeMode(value: string | undefined): ThemeMode {
     if (value === 'light' || value === 'dark') {
       return value
@@ -153,7 +194,7 @@
     }
     lastLoginStepSeen = step
 
-    if (step !== 'credentials') {
+    if (step !== 'credentials' && canShowAccountWizard()) {
       activeSection = 'accounts'
       loginWizardOpen = true
     }
@@ -263,6 +304,10 @@
   }
 
   function openLoginWizard() {
+    if (!canShowAccountWizard()) {
+      settingsStatus = 'Account wizard is available only when no account exists.'
+      return
+    }
     activeSection = 'accounts'
     loginWizardOpen = true
   }
@@ -312,7 +357,15 @@
   let userParityById = $derived(buildUserParityById(users, parityState, userRuntimeParityById, disconnectedUsernames))
   let activeAccountSummary = $derived(activeSidebarEntry?.user ?? null)
   let activeAccountIndex = $derived(activeSidebarEntry?.index ?? -1)
-  let showOnboardingOnlyWizard = $derived(onboardingOnlyMode && initialUsersLoadDone && users.length === 0)
+  let showOnboardingOnlyWizard = $derived(canShowAccountWizard())
+  let grpcStatusLabel = $derived(grpcLifecycleStatusLabel(grpcLifecycleState))
+  let grpcStatusClass = $derived(grpcLifecycleStatusClass(grpcLifecycleState))
+  let canRetryGrpc = $derived(
+    !startupLoading && !grpcActionInFlight && (grpcLifecycleState === 'disconnected' || grpcLifecycleState === 'error'),
+  )
+  let canDisconnectGrpc = $derived(
+    !startupLoading && !grpcActionInFlight && grpcLifecycleState === 'ready' && parityState.snapshot.connected,
+  )
 
   $effect(() => {
     syncLoginStatusWithStep(parityState.snapshot.login_step)
@@ -337,15 +390,36 @@
   })
 
   $effect(() => {
-    if (!onboardingOnlyMode) {
-      return
-    }
-    if (users.length === 0) {
+    if (showOnboardingOnlyWizard) {
       loginWizardOpen = true
       activeSection = 'accounts'
       return
     }
-    onboardingOnlyMode = false
+    if (!canShowAccountWizard() && loginWizardOpen) {
+      loginWizardOpen = false
+    }
+  })
+
+  $effect(() => {
+    if (startupLoading || grpcActionInFlight) {
+      return
+    }
+    if (parityState.snapshot.connected) {
+      if (grpcLifecycleState !== 'ready') {
+        grpcLifecycleState = 'ready'
+        grpcErrorMessage = ''
+      }
+      return
+    }
+    const snapshotError = parityState.snapshot.last_error?.trim() ?? ''
+    if (snapshotError.length > 0) {
+      grpcErrorMessage = snapshotError
+      grpcLifecycleState = 'error'
+      return
+    }
+    if (grpcLifecycleState === 'ready' || grpcLifecycleState === 'connecting' || grpcLifecycleState === 'retrying') {
+      grpcLifecycleState = 'disconnected'
+    }
   })
 
   $effect(() => {
@@ -711,7 +785,7 @@
     tlsInstalled = await isTlsCertificateInstalled()
   }
 
-  async function refreshBridgeData() {
+  async function refreshBridgeData(options: { throwOnError?: boolean } = {}) {
     logger.debug('app', 'refresh bridge data started')
     usersLoading = true
     saveStatus = ''
@@ -727,21 +801,86 @@
     } catch (error) {
       logger.error('app', 'refresh bridge data failed', { error: String(error) })
       saveStatus = `refresh failed: ${String(error)}`
+      if (options.throwOnError) {
+        throw error
+      }
     } finally {
       usersLoading = false
       logger.debug('app', 'refresh bridge data completed')
     }
   }
 
-  async function connectAndLoad() {
-    logger.info('app', 'connect and load requested')
+  async function establishGrpcConnection(
+    reason: GrpcConnectReason,
+    options: { refreshData?: boolean } = {},
+  ): Promise<boolean> {
+    if (grpcActionInFlight) {
+      return parityState.snapshot.connected || parityState.snapshot.stream_running
+    }
+
+    logger.info('app', 'grpc connect requested', { reason, refresh_data: options.refreshData === true })
+    grpcActionInFlight = true
+    grpcErrorMessage = ''
+
+    if (reason === 'retry') {
+      grpcLifecycleState = 'retrying'
+    } else {
+      grpcLifecycleState = 'connecting'
+    }
+
     try {
       await connect()
-      await refreshBridgeData()
-      logger.info('app', 'connect and load completed')
+      if (options.refreshData) {
+        await refreshBridgeData({ throwOnError: true })
+        initialUsersLoadDone = true
+      }
+      grpcLifecycleState = 'ready'
+      logger.info('app', 'grpc connect completed', { reason })
+      return true
     } catch (error) {
-      logger.error('app', 'connect and load failed', { error: String(error) })
-      throw error
+      const message = String(error)
+      grpcErrorMessage = message
+      grpcLifecycleState = 'error'
+      logger.error('app', 'grpc connect failed', { reason, error: message })
+      return false
+    } finally {
+      grpcActionInFlight = false
+    }
+  }
+
+  async function ensureGrpcStreamForAuth(reason: Extract<GrpcConnectReason, 'login' | 'captcha'>): Promise<boolean> {
+    if (parityState.snapshot.stream_running) {
+      return true
+    }
+    logger.info('app', 'bridge stream not running, reconnecting before auth operation', { reason })
+    return establishGrpcConnection(reason)
+  }
+
+  async function retryGrpcConnection() {
+    const connected = await establishGrpcConnection('retry', { refreshData: true })
+    if (!connected && grpcErrorMessage.length === 0) {
+      grpcErrorMessage = 'Retry failed.'
+    }
+  }
+
+  async function disconnectGrpcConnection() {
+    if (grpcActionInFlight) {
+      return
+    }
+    logger.info('app', 'grpc disconnect requested')
+    grpcActionInFlight = true
+    try {
+      await disconnect()
+      grpcLifecycleState = 'disconnected'
+      grpcErrorMessage = ''
+      loginWizardOpen = false
+      logger.info('app', 'grpc disconnect completed')
+    } catch (error) {
+      grpcLifecycleState = 'error'
+      grpcErrorMessage = String(error)
+      logger.error('app', 'grpc disconnect failed', { error: String(error) })
+    } finally {
+      grpcActionInFlight = false
     }
   }
 
@@ -788,9 +927,10 @@
     hvCaptchaToken = ''
     await closeCaptchaVerificationWindow()
     try {
-      if (!parityState.snapshot.stream_running) {
-        logger.info('app', 'bridge stream not running, connecting before login')
-        await connect()
+      const streamReady = await ensureGrpcStreamForAuth('login')
+      if (!streamReady) {
+        loginStatus = `Could not connect to Bridge: ${grpcErrorMessage || 'unknown connection error'}`
+        return
       }
       await login(loginUsername, loginPassword)
       loginStatus = 'Sign-in submitted.'
@@ -826,9 +966,10 @@
     loginStatus = 'Continuing sign-in...'
     lastLoginStepSeen = ''
     try {
-      if (!parityState.snapshot.stream_running) {
-        logger.info('app', 'bridge stream not running, reconnecting before captcha retry')
-        await connect()
+      const streamReady = await ensureGrpcStreamForAuth('captcha')
+      if (!streamReady) {
+        loginStatus = `Could not reconnect to Bridge: ${grpcErrorMessage || 'unknown connection error'}`
+        return
       }
       await login(loginUsername, loginPassword, true, captchaToken.length > 0 ? captchaToken : undefined)
       const step = parityStore.getState().snapshot.login_step
@@ -1074,38 +1215,44 @@
     }
     void (async () => {
       logger.info('app', 'mount start')
-      stopParitySubscription = parityStore.subscribe((nextState) => {
-        parityState = nextState
-      })
-      stopParityListeners = await parityStore.init()
-      stopCaptchaToken = await onCaptchaToken((token) => {
-        hvCaptchaToken = token
-        loginStatus = 'Verification complete. Continuing sign-in...'
-        logger.info('app', 'captured pm_captcha token from verification window', {
-          pm_captcha_token: token,
-          token_len: token.length,
+      try {
+        startupLoading = true
+        grpcLifecycleState = 'booting'
+
+        stopParitySubscription = parityStore.subscribe((nextState) => {
+          parityState = nextState
         })
-        void retryCaptchaLogin('token')
-      })
-      stopCaptchaWindowClosed = await onCaptchaWindowClosed(() => {
-        if (captchaWindowOpenInFlight || !hvVerificationUrl) {
-          return
-        }
-        logger.info('app', 'captcha window closed; retrying login continuation')
-        void retryCaptchaLogin('window_closed')
-      })
-      stopTrayActions = await onTrayAction((action) => {
-        handleTrayAction(action)
-      })
-      configPathInput = parityStore.getState().snapshot.config_path ?? ''
-      await refreshBridgeData()
-      initialUsersLoadDone = true
-      if (users.length === 0) {
-        onboardingOnlyMode = true
-        loginWizardOpen = true
-        activeSection = 'accounts'
+        stopParityListeners = await parityStore.init()
+        stopCaptchaToken = await onCaptchaToken((token) => {
+          hvCaptchaToken = token
+          loginStatus = 'Verification complete. Continuing sign-in...'
+          logger.info('app', 'captured pm_captcha token from verification window', {
+            pm_captcha_token: token,
+            token_len: token.length,
+          })
+          void retryCaptchaLogin('token')
+        })
+        stopCaptchaWindowClosed = await onCaptchaWindowClosed(() => {
+          if (captchaWindowOpenInFlight || !hvVerificationUrl) {
+            return
+          }
+          logger.info('app', 'captcha window closed; retrying login continuation')
+          void retryCaptchaLogin('window_closed')
+        })
+        stopTrayActions = await onTrayAction((action) => {
+          handleTrayAction(action)
+        })
+        configPathInput = parityStore.getState().snapshot.config_path ?? ''
+
+        await establishGrpcConnection('startup', { refreshData: true })
+      } catch (error) {
+        grpcLifecycleState = 'error'
+        grpcErrorMessage = String(error)
+        logger.error('app', 'mount failed', { error: String(error) })
+      } finally {
+        startupLoading = false
+        logger.info('app', 'mount completed')
       }
-      logger.info('app', 'mount completed')
     })()
 
     return () => {
@@ -1128,196 +1275,221 @@
 </script>
 
 <main class="app-shell">
-  {#if !showOnboardingOnlyWizard}
-    <section class="workspace">
-    <aside class="left-rail">
-      <article class="card account-summary-pane">
-        <div class="shell-status-bar">
-          <span class="status-inline">
-            <span class="status-dot" aria-hidden="true"></span>
-            {parityState.snapshot.connected ? 'Connected' : 'Offline'}
-          </span>
-          <div class="shell-icon-actions">
-            <button class="icon-btn" aria-label="Help" title="Help" onclick={openSupportPage}>?</button>
-            <button
-              class={`icon-btn ${activeSection === 'settings' ? 'active' : ''}`}
-              aria-label="Settings"
-              title="Settings"
-              onclick={() => {
-                activeSection = 'settings'
-              }}
-            >
-              ⚙
-            </button>
-            <button
-              class="icon-btn"
-              aria-label="Open runtime settings menu"
-              aria-expanded={settingsOverflowOpen}
-              title="Runtime menu"
-              onclick={toggleSettingsOverflowMenu}
-            >
-              ⋮
-            </button>
-          </div>
-        </div>
-
-        <h2 class="accounts-heading">Accounts</h2>
-        <div class="account-chip-list accounts-list">
-          {#if users.length > 0}
-            {#each users as user, index}
+  {#if startupLoading}
+    <section class="startup-loading card" data-testid="startup-loading" role="status" aria-live="polite">
+      <span class="startup-spinner" aria-hidden="true"></span>
+      <p class="startup-title">Connecting to Bridge gRPC...</p>
+      <p class="muted">Waiting for runtime initialization before loading accounts and settings.</p>
+    </section>
+  {:else}
+    {#if !showOnboardingOnlyWizard}
+      <section class="workspace">
+      <aside class="left-rail">
+        <article class="card account-summary-pane">
+          <div class="shell-status-bar">
+            <div class="shell-status-left">
+              <span class={`status-inline ${grpcStatusClass}`} data-testid="grpc-connection-status">
+                <span class="status-dot" aria-hidden="true"></span>
+                {grpcStatusLabel}
+              </span>
+              {#if canRetryGrpc}
+                <button class="secondary connection-action-btn" onclick={() => void retryGrpcConnection()}>
+                  Retry
+                </button>
+              {:else if canDisconnectGrpc}
+                <button class="secondary connection-action-btn" onclick={() => void disconnectGrpcConnection()}>
+                  Disconnect
+                </button>
+              {/if}
+            </div>
+            <div class="shell-icon-actions">
+              <button class="icon-btn" aria-label="Help" title="Help" onclick={openSupportPage}>?</button>
               <button
-                class={`account-pane-chip ${selectedAccountKey === `${user.id}:${index}` ? 'active' : ''}`}
+                class={`icon-btn ${activeSection === 'settings' ? 'active' : ''}`}
+                aria-label="Settings"
+                title="Settings"
                 onclick={() => {
-                  activeSection = 'accounts'
-                  selectedAccountKey = `${user.id}:${index}`
+                  activeSection = 'settings'
                 }}
               >
-                <span class="avatar">{avatarInitial(user.username)}</span>
-                <span class="account-chip-content">
-                  <span class="account-chip-name">{user.username}</span>
-                  <span class="account-chip-meta">{accountSummaryStatus(user)}</span>
-                </span>
+                ⚙
               </button>
-            {/each}
-          {:else}
-            <div class="account-pane-chip empty">
-              <span class="avatar">?</span>
-              <span class="account-chip-content">
-                <span class="account-chip-name">No account loaded</span>
-                <span class="account-chip-meta">Open sign-in to add an account</span>
-              </span>
+              <button
+                class="icon-btn"
+                aria-label="Open runtime settings menu"
+                aria-expanded={settingsOverflowOpen}
+                title="Runtime menu"
+                onclick={toggleSettingsOverflowMenu}
+              >
+                ⋮
+              </button>
+            </div>
+          </div>
+
+          {#if grpcErrorMessage.length > 0}
+            <p class="connection-error">{grpcErrorMessage}</p>
+          {/if}
+
+          <h2 class="accounts-heading">Accounts</h2>
+          <div class="account-chip-list accounts-list">
+            {#if users.length > 0}
+              {#each users as user, index}
+                <button
+                  class={`account-pane-chip ${selectedAccountKey === `${user.id}:${index}` ? 'active' : ''}`}
+                  onclick={() => {
+                    activeSection = 'accounts'
+                    selectedAccountKey = `${user.id}:${index}`
+                  }}
+                >
+                  <span class="avatar">{avatarInitial(user.username)}</span>
+                  <span class="account-chip-content">
+                    <span class="account-chip-name">{user.username}</span>
+                    <span class="account-chip-meta">{accountSummaryStatus(user)}</span>
+                  </span>
+                </button>
+              {/each}
+            {:else}
+              <div class="account-pane-chip empty">
+                <span class="avatar">?</span>
+                <span class="account-chip-content">
+                  <span class="account-chip-name">No account loaded</span>
+                  <span class="account-chip-meta">Connect to Bridge to create your first account</span>
+                </span>
+              </div>
+            {/if}
+          </div>
+
+          {#if users.length === 0 && grpcLifecycleState === 'ready'}
+            <div class="account-summary-footer">
+              <button
+                class="secondary add-account-btn"
+                aria-label="Open Sign-In Wizard"
+                title="Open Sign-In Wizard"
+                onclick={openLoginWizard}
+              >
+                +
+              </button>
             </div>
           {/if}
-        </div>
 
-        <div class="account-summary-footer">
-          <button
-            class="secondary add-account-btn"
-            aria-label="Open Sign-In Wizard"
-            title="Open Sign-In Wizard"
-            onclick={openLoginWizard}
-          >
-            +
-          </button>
-        </div>
-
-        {#if settingsOverflowOpen}
-          <div class="settings-overflow-menu sidebar-overflow-menu" role="menu" data-testid="runtime-settings-overflow-menu">
-            <button class="menu-item" role="menuitem" onclick={() => void closeRuntimeWindow()}>
-              Close window
-            </button>
-            <button class="menu-item" role="menuitem" onclick={quitBridge}>Quit Bridge</button>
-          </div>
-        {/if}
-      </article>
-    </aside>
-
-    <section class="main-pane">
-      {#key activeSection}
-        <div
-          class="section-stage"
-          in:fly={{ y: 8, duration: sectionTransitionDuration, opacity: 0.65 }}
-          out:fade={{ duration: Math.max(sectionTransitionDuration - 40, 0) }}
-        >
-          {#if activeSection === 'accounts'}
-            <UsersCard
-              hostname={hostname}
-              usersLoading={usersLoading}
-              users={users}
-              activeUserId={clientConfigUserId}
-              activeUserIndex={activeAccountIndex}
-              userParityById={userParityById}
-              syncPhase={parityState.sync.phase}
-              syncProgressPercent={parityState.sync.progress_percent}
-              imapPort={imapPort}
-              smtpPort={smtpPort}
-              useSslImap={useSslImap}
-              useSslSmtp={useSslSmtp}
-              onConfigureClient={(userId) => openClientConfigWizard(userId)}
-              onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
-              onLogout={(userId) => logout(userId)}
-              onRemove={(userId) => remove(userId)}
-            />
-          {:else if activeSection === 'mail'}
-            <MailSettingsCard
-              bind:imapPort
-              bind:smtpPort
-              bind:useSslImap
-              bind:useSslSmtp
-              saveStatus={saveStatus}
-              bind:portToCheck
-              portCheckResult={portCheckResult}
-              onSaveMailSettings={saveMailServerSettings}
-              onCheckPort={checkPort}
-            />
-          {:else if activeSection === 'settings'}
-            <article class="card settings-heading-card">
-              <div class="settings-title-row">
-                <h1>Settings</h1>
-                <h2>Runtime</h2>
-              </div>
-            </article>
-
-            <GeneralSettingsCard
-              bind:appSettings
-              bind:diskCachePathInput
-              bind:colorSchemeNameInput
-              bind:currentKeychainInput
-              settingsStatus={settingsStatus}
-              expandedSections={settingsExpandedSections}
-              onToggleSection={toggleSettingsSection}
-              cacheMoveState={cacheMoveState}
-              cacheMoveStatus={cacheMoveStatus}
-              onApplySettings={applyGeneralSettings}
-            />
-
-            <TlsSettingsCard
-              tlsInstalled={tlsInstalled}
-              bind:tlsExportDir
-              tlsStatus={tlsStatus}
-              onInstallTls={installTls}
-              onExportTls={exportTls}
-            />
-          {:else}
-            <StreamEventsCard events={parityState.stream_log} />
+          {#if settingsOverflowOpen}
+            <div class="settings-overflow-menu sidebar-overflow-menu" role="menu" data-testid="runtime-settings-overflow-menu">
+              <button class="menu-item" role="menuitem" onclick={() => void closeRuntimeWindow()}>
+                Close window
+              </button>
+              <button class="menu-item" role="menuitem" onclick={quitBridge}>Quit Bridge</button>
+            </div>
           {/if}
-        </div>
-      {/key}
-    </section>
-    </section>
-  {/if}
+        </article>
+      </aside>
 
-  <LoginWizard
-    open={loginWizardOpen}
-    canClose={!showOnboardingOnlyWizard}
-    loginStep={parityState.snapshot.login_step}
-    bind:loginUsername
-    bind:loginPassword
-    bind:twoFactorCode
-    bind:mailboxPassword
-    bind:fidoAssertionPayload
-    hvVerificationUrl={hvVerificationUrl}
-    bind:hvCaptchaToken
-    loginStatus={loginStatus}
-    onSubmitCredentials={submitCredentials}
-    onSubmitTwoFactor={submitTwoFactor}
-    onSubmitMailboxPassword={submitMailboxPassword}
-    onSubmitFidoAssertion={submitFidoAssertion}
-    onAbortFidoFlow={abortFidoFlow}
-    onAbortLoginFlow={abortLoginFlow}
-    onClose={closeLoginWizard}
-  />
+      <section class="main-pane">
+        {#key activeSection}
+          <div
+            class="section-stage"
+            in:fly={{ y: 8, duration: sectionTransitionDuration, opacity: 0.65 }}
+            out:fade={{ duration: Math.max(sectionTransitionDuration - 40, 0) }}
+          >
+            {#if activeSection === 'accounts'}
+              <UsersCard
+                hostname={hostname}
+                usersLoading={usersLoading}
+                users={users}
+                activeUserId={clientConfigUserId}
+                activeUserIndex={activeAccountIndex}
+                userParityById={userParityById}
+                syncPhase={parityState.sync.phase}
+                syncProgressPercent={parityState.sync.progress_percent}
+                imapPort={imapPort}
+                smtpPort={smtpPort}
+                useSslImap={useSslImap}
+                useSslSmtp={useSslSmtp}
+                onConfigureClient={(userId) => openClientConfigWizard(userId)}
+                onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
+                onLogout={(userId) => logout(userId)}
+                onRemove={(userId) => remove(userId)}
+              />
+            {:else if activeSection === 'mail'}
+              <MailSettingsCard
+                bind:imapPort
+                bind:smtpPort
+                bind:useSslImap
+                bind:useSslSmtp
+                saveStatus={saveStatus}
+                bind:portToCheck
+                portCheckResult={portCheckResult}
+                onSaveMailSettings={saveMailServerSettings}
+                onCheckPort={checkPort}
+              />
+            {:else if activeSection === 'settings'}
+              <article class="card settings-heading-card">
+                <div class="settings-title-row">
+                  <h1>Settings</h1>
+                  <h2>Runtime</h2>
+                </div>
+              </article>
 
-  {#if !showOnboardingOnlyWizard}
-    <ClientConfigWizard
-      open={clientConfigWizardOpen}
-      username={selectedClientConfigUser?.username ?? ''}
-      addresses={selectedClientConfigUser?.addresses ?? []}
-      hostname={hostname || '127.0.0.1'}
-      imapPort={imapPort}
-      smtpPort={smtpPort}
-      password={resolveUserPassword(selectedClientConfigUser)}
-      onClose={closeClientConfigWizard}
+              <GeneralSettingsCard
+                bind:appSettings
+                bind:diskCachePathInput
+                bind:colorSchemeNameInput
+                bind:currentKeychainInput
+                settingsStatus={settingsStatus}
+                expandedSections={settingsExpandedSections}
+                onToggleSection={toggleSettingsSection}
+                cacheMoveState={cacheMoveState}
+                cacheMoveStatus={cacheMoveStatus}
+                onApplySettings={applyGeneralSettings}
+              />
+
+              <TlsSettingsCard
+                tlsInstalled={tlsInstalled}
+                bind:tlsExportDir
+                tlsStatus={tlsStatus}
+                onInstallTls={installTls}
+                onExportTls={exportTls}
+              />
+            {:else}
+              <StreamEventsCard events={parityState.stream_log} />
+            {/if}
+          </div>
+        {/key}
+      </section>
+      </section>
+    {/if}
+
+    <LoginWizard
+      open={loginWizardOpen}
+      canClose={!showOnboardingOnlyWizard}
+      loginStep={parityState.snapshot.login_step}
+      bind:loginUsername
+      bind:loginPassword
+      bind:twoFactorCode
+      bind:mailboxPassword
+      bind:fidoAssertionPayload
+      hvVerificationUrl={hvVerificationUrl}
+      bind:hvCaptchaToken
+      loginStatus={loginStatus}
+      onSubmitCredentials={submitCredentials}
+      onSubmitTwoFactor={submitTwoFactor}
+      onSubmitMailboxPassword={submitMailboxPassword}
+      onSubmitFidoAssertion={submitFidoAssertion}
+      onAbortFidoFlow={abortFidoFlow}
+      onAbortLoginFlow={abortLoginFlow}
+      onClose={closeLoginWizard}
     />
+
+    {#if !showOnboardingOnlyWizard}
+      <ClientConfigWizard
+        open={clientConfigWizardOpen}
+        username={selectedClientConfigUser?.username ?? ''}
+        addresses={selectedClientConfigUser?.addresses ?? []}
+        hostname={hostname || '127.0.0.1'}
+        imapPort={imapPort}
+        smtpPort={smtpPort}
+        password={resolveUserPassword(selectedClientConfigUser)}
+        onClose={closeClientConfigWizard}
+      />
+    {/if}
   {/if}
 </main>

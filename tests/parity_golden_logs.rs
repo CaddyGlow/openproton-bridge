@@ -111,7 +111,10 @@ fn parity_log_validator_help_mentions_required_flags() {
         String::from_utf8_lossy(&help.stdout),
         String::from_utf8_lossy(&help.stderr)
     );
-    assert!(help.status.success(), "validator --help failed:\n{help_text}");
+    assert!(
+        help.status.success(),
+        "validator --help failed:\n{help_text}"
+    );
 
     for flag in ["--fixture", "--scenario", "--log", "--report-json"] {
         assert!(

@@ -49,6 +49,7 @@ rmp-serde = "1"
 rmpv = { version = "1", features = ["with-serde"] }
 serde_bytes = "0.11"
 keyring = { version = "3", features = ["apple-native", "linux-native", "windows-native"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 # Password input
 rpassword = "7"

@@ -1,18 +1,42 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Instant;
 
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
-use super::session::{ImapSession, SessionConfig};
+use super::session::{ImapSession, SessionAction, SessionConfig};
 use super::Result;
 
 const MAX_CONNECTIONS_PER_IP: usize = 10;
 const RATE_WINDOW_SECS: u64 = 60;
+static RUNTIME_TLS_CONFIG: OnceLock<RwLock<Option<Arc<rustls::ServerConfig>>>> = OnceLock::new();
+
+fn runtime_tls_config_store() -> &'static RwLock<Option<Arc<rustls::ServerConfig>>> {
+    RUNTIME_TLS_CONFIG.get_or_init(|| RwLock::new(None))
+}
+
+fn install_runtime_tls_config(config: Option<Arc<rustls::ServerConfig>>) {
+    let mut guard = runtime_tls_config_store()
+        .write()
+        .expect("runtime tls config lock poisoned");
+    *guard = config;
+}
+
+pub fn clear_runtime_tls_config() {
+    install_runtime_tls_config(None);
+}
+
+fn runtime_tls_config() -> Option<Arc<rustls::ServerConfig>> {
+    runtime_tls_config_store()
+        .read()
+        .expect("runtime tls config lock poisoned")
+        .clone()
+}
 
 pub struct ImapServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -57,7 +81,12 @@ impl ImapServer {
             .map_err(|e| super::ImapError::Tls(e.to_string()))?;
 
         self.tls_config = Some(Arc::new(tls_config));
+        install_runtime_tls_config(self.tls_config.clone());
         Ok(self)
+    }
+
+    pub fn tls_config(&self) -> Option<Arc<rustls::ServerConfig>> {
+        self.tls_config.clone()
     }
 }
 
@@ -89,6 +118,14 @@ impl RateLimiter {
 }
 
 pub async fn run_server(addr: &str, config: Arc<SessionConfig>) -> Result<()> {
+    run_server_with_tls_config(addr, config, runtime_tls_config()).await
+}
+
+pub async fn run_server_with_tls_config(
+    addr: &str,
+    config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
     info!(addr = %addr, "IMAP server listening");
@@ -109,16 +146,48 @@ pub async fn run_server(addr: &str, config: Arc<SessionConfig>) -> Result<()> {
         info!(peer = %peer, "new IMAP connection");
 
         let config = config.clone();
+        let tls_config = tls_config.clone();
 
         tokio::spawn(async move {
-            let (read, write) = tokio::io::split(stream);
-            let mut session = ImapSession::new(read, write, config);
-            if let Err(e) = session.run().await {
+            if let Err(e) = handle_connection(stream, config, tls_config).await {
                 error!(peer = %peer, error = %e, "connection error");
             }
             info!(peer = %peer, "connection closed");
         });
     }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let (read, write) = stream.into_split();
+    let mut session = ImapSession::with_starttls(read, write, config.clone(), tls_config.is_some());
+    let action = session.run().await?;
+    let (read, write) = session.into_parts();
+    let stream = write.reunite(read).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "failed to reunite IMAP stream halves",
+        )
+    })?;
+
+    if matches!(action, SessionAction::StartTls) {
+        let Some(tls_config) = tls_config else {
+            return Ok(());
+        };
+        let acceptor = TlsAcceptor::from(tls_config);
+        let tls_stream = acceptor
+            .accept(stream)
+            .await
+            .map_err(|err| super::ImapError::Tls(err.to_string()))?;
+        let (read, write) = tokio::io::split(tls_stream);
+        let mut tls_session = ImapSession::with_starttls(read, write, config, false);
+        let _ = tls_session.run().await?;
+    }
+
+    Ok(())
 }
 
 fn generate_self_signed_cert(dir: &Path) -> Result<()> {

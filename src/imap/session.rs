@@ -41,6 +41,7 @@ pub struct SessionConfig {
 }
 
 /// Sentinel returned to the caller to signal STARTTLS upgrade is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionAction {
     Continue,
     StartTls,
@@ -58,6 +59,7 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     selected_mailbox: Option<String>,
     selected_mailbox_mod_seq: Option<u64>,
     authenticated_account_id: Option<String>,
+    starttls_available: bool,
 }
 
 impl<R, W> ImapSession<R, W>
@@ -66,6 +68,15 @@ where
     W: AsyncWriteExt + Unpin + Send,
 {
     pub fn new(reader: R, writer: W, config: Arc<SessionConfig>) -> Self {
+        Self::with_starttls(reader, writer, config, true)
+    }
+
+    pub fn with_starttls(
+        reader: R,
+        writer: W,
+        config: Arc<SessionConfig>,
+        starttls_available: bool,
+    ) -> Self {
         Self {
             reader: BufReader::new(reader),
             writer: ResponseWriter::new(writer),
@@ -77,6 +88,7 @@ where
             selected_mailbox: None,
             selected_mailbox_mod_seq: None,
             authenticated_account_id: None,
+            starttls_available,
         }
     }
 
@@ -86,7 +98,7 @@ where
             .await
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<SessionAction> {
         self.greet().await?;
 
         loop {
@@ -94,7 +106,7 @@ where
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
                 debug!("client disconnected");
-                break;
+                return Ok(SessionAction::Close);
             }
 
             let line = line.trim_end().to_string();
@@ -106,12 +118,10 @@ where
 
             match self.handle_line(&line).await? {
                 SessionAction::Continue => {}
-                SessionAction::StartTls => return Ok(()),
-                SessionAction::Close => break,
+                SessionAction::StartTls => return Ok(SessionAction::StartTls),
+                SessionAction::Close => return Ok(SessionAction::Close),
             }
         }
-
-        Ok(())
     }
 
     pub async fn handle_line(&mut self, line: &str) -> Result<SessionAction> {
@@ -186,7 +196,11 @@ where
 
     async fn cmd_capability(&mut self, tag: &str) -> Result<()> {
         let caps = if self.state == State::NotAuthenticated {
-            "CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE"
+            if self.starttls_available {
+                "CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE"
+            } else {
+                "CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE"
+            }
         } else {
             "CAPABILITY IMAP4rev1 IDLE"
         };
@@ -511,6 +525,9 @@ where
                 .writer
                 .tagged_bad(tag, "STARTTLS only in not-authenticated state")
                 .await;
+        }
+        if !self.starttls_available {
+            return self.writer.tagged_bad(tag, "STARTTLS unavailable").await;
         }
         self.writer
             .tagged_ok(tag, None, "begin TLS negotiation")
@@ -1212,9 +1229,9 @@ where
         self.writer.tagged_ok(tag, None, "COPY completed").await
     }
 
-    /// Get the inner writer (for TLS upgrade).
-    pub fn into_parts(self) -> (BufReader<R>, ResponseWriter<W>, Arc<SessionConfig>) {
-        (self.reader, self.writer, self.config)
+    /// Get stream halves for TLS upgrade.
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader.into_inner(), self.writer.into_inner())
     }
 }
 

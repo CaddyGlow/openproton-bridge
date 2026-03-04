@@ -3493,6 +3493,9 @@ async fn prepare_serve_runtime(
         let cert_dir = dir.join("tls");
         let _imap_server = imap::server::ImapServer::new().with_tls(&cert_dir)?;
         let _smtp_server = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
+    } else {
+        imap::server::clear_runtime_tls_config();
+        smtp::server::clear_runtime_tls_config();
     }
 
     print_serve_configuration(

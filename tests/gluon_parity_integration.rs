@@ -169,7 +169,10 @@ async fn be031_sync_restart_parity_preserves_uid_and_modseq_continuity() {
     )
     .expect("reload store");
 
-    assert_eq!(reloaded.list_uids(mailbox).await.expect("list uids"), vec![1, 2]);
+    assert_eq!(
+        reloaded.list_uids(mailbox).await.expect("list uids"),
+        vec![1, 2]
+    );
     assert_eq!(
         reloaded.get_uid(mailbox, "msg-1").await.expect("uid msg-1"),
         Some(1)
@@ -203,7 +206,10 @@ async fn be031_sync_restart_parity_preserves_uid_and_modseq_continuity() {
     )
     .expect("reload store again");
     assert_eq!(
-        reloaded_again.list_uids(mailbox).await.expect("list final uids"),
+        reloaded_again
+            .list_uids(mailbox)
+            .await
+            .expect("list final uids"),
         vec![1, 2, 3]
     );
 }
@@ -258,15 +264,16 @@ async fn be031_delete_parity_removes_blob_and_keeps_restart_state_consistent() {
     )
     .expect("reload store");
 
-    assert_eq!(reloaded.list_uids(mailbox).await.expect("list uids"), vec![2]);
-    assert_eq!(reloaded.get_rfc822(mailbox, 1).await.expect("blob 1"), None);
-    assert!(
-        reloaded
-            .get_rfc822(mailbox, 2)
-            .await
-            .expect("blob 2")
-            .is_some()
+    assert_eq!(
+        reloaded.list_uids(mailbox).await.expect("list uids"),
+        vec![2]
     );
+    assert_eq!(reloaded.get_rfc822(mailbox, 1).await.expect("blob 1"), None);
+    assert!(reloaded
+        .get_rfc822(mailbox, 2)
+        .await
+        .expect("blob 2")
+        .is_some());
 
     let status = reloaded.mailbox_status(mailbox).await.expect("status");
     assert_eq!(status.exists, 1);
@@ -297,11 +304,9 @@ async fn be031_cache_move_parity_keeps_store_readable_after_root_relocation() {
 
     fs::create_dir_all(&source_root).expect("create source root");
 
-    let source_store = GluonStore::new(
-        source_root.clone(),
-        make_account_map("account-9", "user-9"),
-    )
-    .expect("create source store");
+    let source_store =
+        GluonStore::new(source_root.clone(), make_account_map("account-9", "user-9"))
+            .expect("create source store");
 
     let uid = source_store
         .store_metadata(mailbox, "msg-1", make_meta("msg-1", "before-move", 1))
@@ -315,11 +320,9 @@ async fn be031_cache_move_parity_keeps_store_readable_after_root_relocation() {
     fs::rename(&source_root, &target_root).expect("move cache root");
     assert!(!source_root.exists(), "source root should be moved away");
 
-    let target_store = GluonStore::new(
-        target_root.clone(),
-        make_account_map("account-9", "user-9"),
-    )
-    .expect("create target store");
+    let target_store =
+        GluonStore::new(target_root.clone(), make_account_map("account-9", "user-9"))
+            .expect("create target store");
 
     assert_eq!(
         target_store
@@ -329,7 +332,10 @@ async fn be031_cache_move_parity_keeps_store_readable_after_root_relocation() {
         vec![1]
     );
     assert_eq!(
-        target_store.get_uid(mailbox, "msg-1").await.expect("uid after move"),
+        target_store
+            .get_uid(mailbox, "msg-1")
+            .await
+            .expect("uid after move"),
         Some(1)
     );
     assert_eq!(
@@ -407,8 +413,7 @@ fn be031_event_parity_persists_checkpoints_across_restart_and_session_delete() {
         Some(checkpoint_2)
     );
 
-    vault::save_split_mode_by_account_id(temp.path(), &session.uid, true)
-        .expect("save split mode");
+    vault::save_split_mode_by_account_id(temp.path(), &session.uid, true).expect("save split mode");
     assert_eq!(
         vault::load_split_mode_by_account_id(temp.path(), &session.uid).expect("load split mode"),
         Some(true)

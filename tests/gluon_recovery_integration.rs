@@ -40,8 +40,11 @@ async fn be031_recovery_startup_replays_pending_txn_for_index_and_blob() {
         serde_json::to_vec(&index_payload).expect("serialize index"),
     )
     .expect("stage index");
-    txn.stage_write("backend/store/user-1/00000001.msg", b"From: recover\\r\\n\\r\\nbody")
-        .expect("stage blob");
+    txn.stage_write(
+        "backend/store/user-1/00000001.msg",
+        b"From: recover\\r\\n\\r\\nbody",
+    )
+    .expect("stage blob");
 
     let err = txn.commit_with_injected_failure(1).unwrap_err();
     assert!(matches!(err, GluonTxnError::InjectedFailure { applied } if applied == 1));
@@ -135,11 +138,9 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
     let target_root = temp.path().join("cache-target");
     let mailbox = "account-9::INBOX";
 
-    let source_store = GluonStore::new(
-        source_root.clone(),
-        make_account_map("account-9", "user-9"),
-    )
-    .expect("create source store");
+    let source_store =
+        GluonStore::new(source_root.clone(), make_account_map("account-9", "user-9"))
+            .expect("create source store");
     let uid1 = source_store
         .store_metadata(
             mailbox,
@@ -212,20 +213,21 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
         serde_json::to_vec(&index).expect("serialize updated index"),
     )
     .expect("stage updated index");
-    txn.stage_write("backend/store/user-9/00000002.msg", b"From: moved\\r\\n\\r\\nbody-2")
-        .expect("stage blob 2");
+    txn.stage_write(
+        "backend/store/user-9/00000002.msg",
+        b"From: moved\\r\\n\\r\\nbody-2",
+    )
+    .expect("stage blob 2");
     let err = txn.commit_with_injected_failure(1).unwrap_err();
     assert!(matches!(err, GluonTxnError::InjectedFailure { applied } if applied == 1));
 
     fs::rename(&source_root, &target_root).expect("move cache root with pending txn");
 
-    let moved_startup_err = match GluonStore::new(
-        target_root.clone(),
-        make_account_map("account-9", "user-9"),
-    ) {
-        Ok(_) => panic!("startup should fail when moved cache contains unresolved txn paths"),
-        Err(err) => err,
-    };
+    let moved_startup_err =
+        match GluonStore::new(target_root.clone(), make_account_map("account-9", "user-9")) {
+            Ok(_) => panic!("startup should fail when moved cache contains unresolved txn paths"),
+            Err(err) => err,
+        };
     match moved_startup_err {
         ImapError::GluonCorruption { reason, .. } => {
             assert!(
@@ -238,11 +240,9 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
 
     fs::rename(&target_root, &source_root).expect("rollback cache move to original root");
 
-    let recovered_store = GluonStore::new(
-        source_root.clone(),
-        make_account_map("account-9", "user-9"),
-    )
-    .expect("startup should recover once original paths are restored");
+    let recovered_store =
+        GluonStore::new(source_root.clone(), make_account_map("account-9", "user-9"))
+            .expect("startup should recover once original paths are restored");
     assert_eq!(
         recovered_store
             .list_uids(mailbox)
@@ -260,11 +260,9 @@ async fn be031_recovery_flags_pending_txn_after_cache_move_and_recovers_after_ro
     );
 
     fs::rename(&source_root, &target_root).expect("move clean cache root");
-    let moved_clean_store = GluonStore::new(
-        target_root.clone(),
-        make_account_map("account-9", "user-9"),
-    )
-    .expect("clean cache root should load after rollback recovery");
+    let moved_clean_store =
+        GluonStore::new(target_root.clone(), make_account_map("account-9", "user-9"))
+            .expect("clean cache root should load after rollback recovery");
     assert_eq!(
         moved_clean_store
             .list_uids(mailbox)

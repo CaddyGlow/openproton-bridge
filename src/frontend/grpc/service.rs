@@ -198,6 +198,16 @@ impl BridgeService {
         }));
     }
 
+    fn emit_login_two_password_requested(&self, username: &str) {
+        self.emit_event(pb::stream_event::Event::Login(pb::LoginEvent {
+            event: Some(pb::login_event::Event::TwoPasswordRequested(
+                pb::LoginTwoPasswordsRequestedEvent {
+                    username: username.to_string(),
+                },
+            )),
+        }));
+    }
+
     fn emit_login_finished(&self, user_id: &str) {
         self.emit_event(pb::stream_event::Event::Login(pb::LoginEvent {
             event: Some(pb::login_event::Event::Finished(pb::LoginFinishedEvent {
@@ -736,5 +746,28 @@ impl BridgeService {
         self.refresh_sync_workers_for_transition("login").await;
 
         Ok(session)
+    }
+
+    async fn requires_second_password(
+        &self,
+        client: &ProtonClient,
+        password: &str,
+    ) -> Result<bool, Status> {
+        let user_resp = api::users::get_user(client)
+            .await
+            .map_err(status_from_api_error)?;
+        let salts_resp = api::users::get_salts(client)
+            .await
+            .map_err(status_from_api_error)?;
+
+        let mut has_active_keys = false;
+        for key in user_resp.user.keys.iter().filter(|key| key.active == 1) {
+            has_active_keys = true;
+            if api::srp::salt_for_key(password.as_bytes(), &key.id, &salts_resp.key_salts).is_ok() {
+                return Ok(false);
+            }
+        }
+
+        Ok(has_active_keys)
     }
 }

@@ -16,6 +16,13 @@ use crate::crypto::keys::{self, Keyring};
 
 use super::Result;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionAction {
+    Continue,
+    StartTls,
+    Close,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum State {
     Connected,
@@ -44,6 +51,8 @@ pub struct SmtpSession<R, W> {
     mail_from: Option<String>,
     rcpt_to: Vec<String>,
     hostname: String,
+    starttls_available: bool,
+    tls_active: bool,
 }
 
 impl<R, W> SmtpSession<R, W>
@@ -52,6 +61,16 @@ where
     W: AsyncWriteExt + Unpin + Send,
 {
     pub fn new(reader: R, writer: W, config: Arc<SmtpSessionConfig>) -> Self {
+        Self::with_starttls(reader, writer, config, false, false)
+    }
+
+    pub fn with_starttls(
+        reader: R,
+        writer: W,
+        config: Arc<SmtpSessionConfig>,
+        starttls_available: bool,
+        tls_active: bool,
+    ) -> Self {
         Self {
             reader: BufReader::new(reader),
             writer,
@@ -64,7 +83,13 @@ where
             mail_from: None,
             rcpt_to: Vec::new(),
             hostname: "openproton-bridge".to_string(),
+            starttls_available,
+            tls_active,
         }
+    }
+
+    pub fn into_parts(self) -> (R, W) {
+        (self.reader.into_inner(), self.writer)
     }
 
     async fn write_line(&mut self, code: u16, msg: &str) -> Result<()> {
@@ -90,7 +115,7 @@ where
         Ok(())
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<SessionAction> {
         // Send greeting
         self.write_line(
             220,
@@ -110,7 +135,7 @@ where
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
                 debug!("SMTP client disconnected");
-                break;
+                return Ok(SessionAction::Close);
             }
 
             let line = line.trim_end().to_string();
@@ -120,22 +145,23 @@ where
 
             debug!(line = %line, "SMTP received");
 
-            if self.handle_command(&line).await? {
-                break;
+            match self.handle_command(&line).await? {
+                SessionAction::Continue => {}
+                SessionAction::StartTls => return Ok(SessionAction::StartTls),
+                SessionAction::Close => return Ok(SessionAction::Close),
             }
         }
-
-        Ok(())
     }
 
-    /// Handle a single SMTP command. Returns true if the session should end.
-    async fn handle_command(&mut self, line: &str) -> Result<bool> {
+    /// Handle a single SMTP command.
+    async fn handle_command(&mut self, line: &str) -> Result<SessionAction> {
         let (verb, args) = split_command(line);
         let verb_upper = verb.to_uppercase();
 
         match verb_upper.as_str() {
             "EHLO" | "HELO" => self.cmd_ehlo(args).await?,
             "AUTH" => self.cmd_auth(args).await?,
+            "STARTTLS" => return self.cmd_starttls().await,
             "MAIL" => self.cmd_mail_from(args).await?,
             "RCPT" => self.cmd_rcpt_to(args).await?,
             "DATA" => self.cmd_data().await?,
@@ -143,14 +169,14 @@ where
             "NOOP" => self.write_line(250, "OK").await?,
             "QUIT" => {
                 self.write_line(221, "Bye").await?;
-                return Ok(true);
+                return Ok(SessionAction::Close);
             }
             _ => {
                 self.write_line(502, "Command not implemented").await?;
             }
         }
 
-        Ok(false)
+        Ok(SessionAction::Continue)
     }
 
     async fn cmd_ehlo(&mut self, args: &str) -> Result<()> {
@@ -159,17 +185,30 @@ where
         }
 
         self.state = State::Greeted;
-        self.write_multiline(
-            250,
-            &[
-                &self.hostname.clone(),
-                "AUTH PLAIN",
-                "SIZE 26214400",
-                "8BITMIME",
-                "PIPELINING",
-            ],
-        )
-        .await
+        let mut lines = vec![self.hostname.clone()];
+        if self.starttls_available && !self.tls_active {
+            lines.push("STARTTLS".to_string());
+        }
+        lines.push("AUTH PLAIN LOGIN".to_string());
+        lines.push("SIZE 26214400".to_string());
+        lines.push("8BITMIME".to_string());
+        lines.push("PIPELINING".to_string());
+        let refs = lines.iter().map(String::as_str).collect::<Vec<_>>();
+        self.write_multiline(250, &refs).await
+    }
+
+    async fn cmd_starttls(&mut self) -> Result<SessionAction> {
+        if self.state != State::Greeted {
+            self.write_line(503, "Bad sequence of commands").await?;
+            return Ok(SessionAction::Continue);
+        }
+        if !self.starttls_available || self.tls_active {
+            self.write_line(454, "TLS not available").await?;
+            return Ok(SessionAction::Continue);
+        }
+
+        self.write_line(220, "Ready to start TLS").await?;
+        Ok(SessionAction::StartTls)
     }
 
     async fn cmd_auth(&mut self, args: &str) -> Result<()> {
@@ -177,42 +216,72 @@ where
             return self.write_line(503, "Bad sequence of commands").await;
         }
 
-        // Parse "PLAIN <base64>" or "PLAIN"
-        let parts: Vec<&str> = args.splitn(2, ' ').collect();
-        if parts.is_empty() || !parts[0].eq_ignore_ascii_case("PLAIN") {
-            return self.write_line(504, "Only AUTH PLAIN is supported").await;
-        }
-
-        let b64_data = if parts.len() > 1 {
-            parts[1].to_string()
-        } else {
-            // Send continuation prompt and read the base64 data
-            self.write_line(334, "").await?;
-            let mut data_line = String::new();
-            self.reader.read_line(&mut data_line).await?;
-            data_line.trim().to_string()
+        let mut auth_parts = args.split_whitespace();
+        let Some(mechanism) = auth_parts.next() else {
+            return self.write_line(501, "Syntax error in AUTH command").await;
         };
 
-        let decoded = match BASE64.decode(&b64_data) {
-            Ok(d) => d,
-            Err(_) => {
+        let (username, password) = if mechanism.eq_ignore_ascii_case("PLAIN") {
+            let b64_data = if let Some(initial) = auth_parts.next() {
+                initial.to_string()
+            } else {
+                // Send continuation prompt and read the base64 data
+                self.write_line(334, "").await?;
+                let mut data_line = String::new();
+                self.reader.read_line(&mut data_line).await?;
+                data_line.trim().to_string()
+            };
+
+            let decoded = match BASE64.decode(b64_data.trim()) {
+                Ok(d) => d,
+                Err(_) => {
+                    return self.write_line(535, "Authentication failed").await;
+                }
+            };
+
+            // AUTH PLAIN format: \0username\0password
+            let parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
+            if parts.len() != 3 {
                 return self.write_line(535, "Authentication failed").await;
             }
+
+            (
+                String::from_utf8_lossy(parts[1]).to_string(),
+                String::from_utf8_lossy(parts[2]).to_string(),
+            )
+        } else if mechanism.eq_ignore_ascii_case("LOGIN") {
+            let username_b64 = if let Some(initial) = auth_parts.next() {
+                initial.to_string()
+            } else {
+                self.write_line(334, "VXNlcm5hbWU6").await?;
+                let mut line = String::new();
+                self.reader.read_line(&mut line).await?;
+                line.trim().to_string()
+            };
+            let username = match BASE64.decode(username_b64.trim()) {
+                Ok(decoded) => String::from_utf8_lossy(&decoded).to_string(),
+                Err(_) => return self.write_line(535, "Authentication failed").await,
+            };
+
+            self.write_line(334, "UGFzc3dvcmQ6").await?;
+            let mut password_line = String::new();
+            self.reader.read_line(&mut password_line).await?;
+            let password = match BASE64.decode(password_line.trim()) {
+                Ok(decoded) => String::from_utf8_lossy(&decoded).to_string(),
+                Err(_) => return self.write_line(535, "Authentication failed").await,
+            };
+
+            (username, password)
+        } else {
+            return self
+                .write_line(504, "Only AUTH PLAIN and AUTH LOGIN are supported")
+                .await;
         };
-
-        // AUTH PLAIN format: \0username\0password
-        let parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
-        if parts.len() != 3 {
-            return self.write_line(535, "Authentication failed").await;
-        }
-
-        let username = String::from_utf8_lossy(parts[1]);
-        let password = String::from_utf8_lossy(parts[2]);
 
         let auth_route = match self
             .config
             .auth_router
-            .resolve_login(username.as_ref(), password.as_ref())
+            .resolve_login(username.as_str(), password.as_str())
         {
             Some(route) => route,
             None => return self.write_line(535, "Authentication failed").await,
@@ -988,8 +1057,8 @@ mod tests {
         let config = test_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
-        let should_close = session.handle_command("QUIT").await.unwrap();
-        assert!(should_close);
+        let action = session.handle_command("QUIT").await.unwrap();
+        assert!(matches!(action, SessionAction::Close));
 
         let response = read_response(&mut client_read).await;
         assert!(response.contains("221"));

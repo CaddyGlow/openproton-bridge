@@ -1,3 +1,55 @@
+struct DecodedLoginPassword {
+    value: String,
+    used_base64_compat: bool,
+}
+
+fn looks_like_padded_base64(input: &str) -> bool {
+    if input.len() < 8 || input.len() % 4 != 0 {
+        return false;
+    }
+    if !input.ends_with('=') {
+        return false;
+    }
+
+    input
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+}
+
+fn decode_login_password_bytes(raw: Vec<u8>) -> Result<DecodedLoginPassword, Status> {
+    let utf8 = String::from_utf8(raw)
+        .map_err(|_| Status::invalid_argument("password must be valid utf-8"))?;
+    if utf8.is_empty() {
+        return Err(Status::invalid_argument("password is required"));
+    }
+
+    if looks_like_padded_base64(&utf8) {
+        if let Ok(decoded) = BASE64.decode(utf8.as_bytes()) {
+            if !decoded.is_empty() {
+                if let Ok(decoded_utf8) = String::from_utf8(decoded) {
+                    return Ok(DecodedLoginPassword {
+                        value: decoded_utf8,
+                        used_base64_compat: true,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(DecodedLoginPassword {
+        value: utf8,
+        used_base64_compat: false,
+    })
+}
+
+impl BridgeService {
+    async fn stage_two_password_login(&self, pending: PendingLogin) {
+        let username = pending.username.clone();
+        *self.state.pending_login.lock().await = Some(pending);
+        self.emit_login_two_password_requested(&username);
+    }
+}
+
 #[tonic::async_trait]
 impl pb::bridge_server::Bridge for BridgeService {
     async fn check_tokens(&self, request: Request<String>) -> Result<Response<String>, Status> {
@@ -386,10 +438,13 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("username is required"));
         }
 
-        let password = String::from_utf8(req.password)
-            .map_err(|_| Status::invalid_argument("password must be valid utf-8"))?;
-        if password.is_empty() {
-            return Err(Status::invalid_argument("password is required"));
+        let decoded_password = decode_login_password_bytes(req.password)?;
+        let password = decoded_password.value;
+        if decoded_password.used_base64_compat {
+            info!(
+                username = %username,
+                "decoded login password through base64 compatibility path"
+            );
         }
         let requested_api_mode = match req
             .api_mode
@@ -480,47 +535,47 @@ impl pb::bridge_server::Bridge for BridgeService {
                         continue;
                     }
 
-                if let Some(hv) = human_verification_details(&err) {
-                    let hv_url = hv.challenge_url();
-                    info!(
-                        username = %username,
-                        methods = ?hv.human_verification_methods,
-                        "received human verification challenge from Proton"
-                    );
-                    let mut pending_hv = self.state.pending_hv.lock().await;
-                    *pending_hv = Some(PendingHumanVerification {
-                        username: username.clone(),
-                        details: hv,
-                    });
-                    self.emit_login_error(format!(
-                        "human verification required; open {hv_url}, complete CAPTCHA, then retry login"
-                    ));
-                } else {
-                    if matches!(&err, ApiError::Api { code: 12087, .. }) {
-                        if let Some(hv) = any_human_verification_details(&err) {
-                            let hv_url = hv.challenge_url();
-                            let mut pending_hv = self.state.pending_hv.lock().await;
-                            *pending_hv = Some(PendingHumanVerification {
-                                username: username.clone(),
-                                details: hv,
-                            });
-                            self.emit_login_error(format!(
-                                "captcha validation failed; open {hv_url}, complete CAPTCHA again, then retry login. \
-                                 If your client can provide the `pm_captcha` token, send it as `humanVerificationToken`."
-                            ));
-                        } else {
-                            *self.state.pending_hv.lock().await = None;
-                            self.emit_login_error(
-                                "captcha validation failed; start login again to get a fresh challenge",
-                            );
-                        }
+                    if let Some(hv) = human_verification_details(&err) {
+                        let hv_url = hv.challenge_url();
+                        info!(
+                            username = %username,
+                            methods = ?hv.human_verification_methods,
+                            "received human verification challenge from Proton"
+                        );
+                        let mut pending_hv = self.state.pending_hv.lock().await;
+                        *pending_hv = Some(PendingHumanVerification {
+                            username: username.clone(),
+                            details: hv,
+                        });
+                        self.emit_login_error(format!(
+                            "human verification required; open {hv_url}, complete CAPTCHA, then retry login"
+                        ));
                     } else {
-                        self.emit_login_error(err.to_string());
+                        if matches!(&err, ApiError::Api { code: 12087, .. }) {
+                            if let Some(hv) = any_human_verification_details(&err) {
+                                let hv_url = hv.challenge_url();
+                                let mut pending_hv = self.state.pending_hv.lock().await;
+                                *pending_hv = Some(PendingHumanVerification {
+                                    username: username.clone(),
+                                    details: hv,
+                                });
+                                self.emit_login_error(format!(
+                                    "captcha validation failed; open {hv_url}, complete CAPTCHA again, then retry login. \
+                                     If your client can provide the `pm_captcha` token, send it as `humanVerificationToken`."
+                                ));
+                            } else {
+                                *self.state.pending_hv.lock().await = None;
+                                self.emit_login_error(
+                                    "captcha validation failed; start login again to get a fresh challenge",
+                                );
+                            }
+                        } else {
+                            self.emit_login_error(err.to_string());
+                        }
+                        warn!(username = %username, error = %err, "grpc login failed");
                     }
-                    warn!(username = %username, error = %err, "grpc login failed");
+                    return Err(status_from_api_error(err));
                 }
-                return Err(status_from_api_error(err));
-            }
             }
         };
         info!(username = %username, "grpc login auth phase completed");
@@ -545,6 +600,21 @@ impl pb::bridge_server::Bridge for BridgeService {
             } else {
                 self.emit_login_error("second-factor authentication required");
             }
+            return Ok(Response::new(()));
+        }
+
+        if self.requires_second_password(&client, &password).await? {
+            let pending = PendingLogin {
+                username: username.clone(),
+                password,
+                api_mode: effective_api_mode,
+                uid: auth.uid,
+                access_token: auth.access_token,
+                refresh_token: auth.refresh_token,
+                client,
+                fido_authentication_options: None,
+            };
+            self.stage_two_password_login(pending).await;
             return Ok(Response::new(()));
         }
 
@@ -611,7 +681,44 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         request: Request<pb::LoginRequest>,
     ) -> Result<Response<()>, Status> {
-        self.login(request).await
+        let req = request.into_inner();
+        let username = req.username.trim().to_string();
+        let decoded_password = decode_login_password_bytes(req.password)?;
+        let password = decoded_password.value;
+        if decoded_password.used_base64_compat {
+            info!(
+                username = %username,
+                "decoded second-stage login password through base64 compatibility path"
+            );
+        }
+
+        let mut pending_guard = self.state.pending_login.lock().await;
+        let Some(pending) = pending_guard.take() else {
+            return Err(Status::failed_precondition(
+                "no pending login for second password",
+            ));
+        };
+
+        if !username.is_empty() && !username.eq_ignore_ascii_case(&pending.username) {
+            *pending_guard = Some(pending);
+            return Err(Status::invalid_argument(
+                "username does not match pending login",
+            ));
+        }
+        drop(pending_guard);
+
+        self.complete_login(
+            pending.client,
+            pending.api_mode,
+            pending.uid,
+            pending.access_token,
+            pending.refresh_token,
+            pending.username,
+            password,
+        )
+        .await?;
+
+        Ok(Response::new(()))
     }
 
     async fn login_fido(&self, request: Request<pb::LoginRequest>) -> Result<Response<()>, Status> {
@@ -725,10 +832,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let mut users = Vec::with_capacity(sessions.len());
         for session in &sessions {
-            let split_mode = vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
-                .ok()
-                .flatten()
-                .unwrap_or(false);
+            let split_mode =
+                vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
             let api_data = self.fetch_user_api_data(session).await;
             users.push(session_to_user(session, split_mode, api_data.as_ref()));
         }
@@ -1145,5 +1253,204 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn quit(&self, _request: Request<()>) -> Result<Response<()>, Status> {
         let _ = self.state.shutdown_tx.send(true);
         Ok(Response::new(()))
+    }
+}
+
+#[cfg(test)]
+mod parity_grpc_wire_tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn build_test_service(vault_dir: PathBuf) -> BridgeService {
+        let runtime_paths = RuntimePaths::resolve(Some(&vault_dir)).expect("runtime paths");
+        let app_settings = StoredAppSettings::with_defaults_for(&runtime_paths.disk_cache_dir());
+        let active_disk_cache_path = effective_disk_cache_path(&app_settings, &runtime_paths);
+        let (event_tx, _) = broadcast::channel(16);
+        let (shutdown_tx, _) = watch::channel(false);
+        let state = Arc::new(GrpcState {
+            runtime_paths,
+            bind_host: "127.0.0.1".to_string(),
+            active_disk_cache_path: Mutex::new(active_disk_cache_path),
+            event_tx,
+            event_backlog: std::sync::Mutex::new(VecDeque::new()),
+            active_stream_stop: Mutex::new(None),
+            pending_login: Mutex::new(None),
+            pending_hv: Mutex::new(None),
+            session_access_tokens: Mutex::new(HashMap::new()),
+            shutdown_tx,
+            mail_settings: Mutex::new(StoredMailSettings::default()),
+            app_settings: Mutex::new(app_settings),
+            sync_workers_enabled: false,
+            sync_event_workers: Mutex::new(None),
+        });
+        BridgeService::new(state)
+    }
+
+    #[test]
+    fn parity_grpc_wire_password_decode_accepts_utf8_and_base64_payload() {
+        let plain = decode_login_password_bytes(b"plain-password".to_vec()).expect("plain decode");
+        assert_eq!(plain.value, "plain-password");
+        assert!(!plain.used_base64_compat);
+
+        let compat =
+            decode_login_password_bytes(b"c2Vjb25kLXBhc3M=".to_vec()).expect("base64 decode");
+        assert_eq!(compat.value, "second-pass");
+        assert!(compat.used_base64_compat);
+    }
+
+    #[tokio::test]
+    async fn parity_grpc_wire_login2_passwords_requires_pending_login() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let utf8_status = <BridgeService as pb::bridge_server::Bridge>::login2_passwords(
+            &service,
+            Request::new(pb::LoginRequest {
+                username: "alice@example.com".to_string(),
+                password: b"mailbox-secret".to_vec(),
+                use_hv_details: None,
+                human_verification_token: None,
+                api_mode: None,
+            }),
+        )
+        .await
+        .expect_err("missing pending login should fail");
+        assert_eq!(utf8_status.code(), tonic::Code::FailedPrecondition);
+        assert!(utf8_status.message().contains("no pending login"));
+
+        let b64_status = <BridgeService as pb::bridge_server::Bridge>::login2_passwords(
+            &service,
+            Request::new(pb::LoginRequest {
+                username: "alice@example.com".to_string(),
+                password: b"bWFpbGJveC1zZWNyZXQ=".to_vec(),
+                use_hv_details: None,
+                human_verification_token: None,
+                api_mode: None,
+            }),
+        )
+        .await
+        .expect_err("missing pending login should fail");
+        assert_eq!(b64_status.code(), tonic::Code::FailedPrecondition);
+        assert!(b64_status.message().contains("no pending login"));
+    }
+
+    #[tokio::test]
+    async fn parity_grpc_wire_two_password_stage_emits_event_and_completes_login() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = build_test_service(dir.path().to_path_buf());
+        let mut events = service.state.event_tx.subscribe();
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/users"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "User": {
+                    "ID": "user-1",
+                    "Name": "alice",
+                    "DisplayName": "Alice",
+                    "Email": "alice@example.com",
+                    "Keys": [{
+                        "ID": "key-1",
+                        "PrivateKey": "unused",
+                        "Active": 1
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let key_salt = BASE64.encode([7u8; 16]);
+        Mock::given(method("GET"))
+            .and(path("/core/v4/keys/salts"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "Code": 1000,
+                "KeySalts": [{
+                    "ID": "key-1",
+                    "KeySalt": key_salt,
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let pending_client = ProtonClient::authenticated_with_mode(
+            &server.uri(),
+            crate::api::types::ApiMode::Bridge,
+            "uid-1",
+            "access-1",
+        )
+        .expect("pending client");
+
+        service
+            .stage_two_password_login(PendingLogin {
+                username: "alice@example.com".to_string(),
+                password: "account-secret".to_string(),
+                api_mode: crate::api::types::ApiMode::Bridge,
+                uid: "uid-1".to_string(),
+                access_token: "access-1".to_string(),
+                refresh_token: "refresh-1".to_string(),
+                client: pending_client,
+                fido_authentication_options: None,
+            })
+            .await;
+
+        <BridgeService as pb::bridge_server::Bridge>::login2_passwords(
+            &service,
+            Request::new(pb::LoginRequest {
+                username: "alice@example.com".to_string(),
+                password: b"bWFpbGJveC1zZWNyZXQ=".to_vec(),
+                use_hv_details: None,
+                human_verification_token: None,
+                api_mode: None,
+            }),
+        )
+        .await
+        .expect("second-stage login should succeed");
+
+        let first = events.recv().await.expect("first event");
+        match first.event {
+            Some(pb::stream_event::Event::Login(pb::LoginEvent {
+                event: Some(pb::login_event::Event::TwoPasswordRequested(event)),
+            })) => assert_eq!(event.username, "alice@example.com"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+
+        let second = events.recv().await.expect("second event");
+        match second.event {
+            Some(pb::stream_event::Event::Login(pb::LoginEvent {
+                event: Some(pb::login_event::Event::Finished(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected second event: {other:?}"),
+        }
+
+        let third = events.recv().await.expect("third event");
+        match third.event {
+            Some(pb::stream_event::Event::User(pb::UserEvent {
+                event: Some(pb::user_event::Event::UserChanged(event)),
+            })) => assert_eq!(event.user_id, "uid-1"),
+            other => panic!("unexpected third event: {other:?}"),
+        }
+
+        let session = vault::load_session_by_account_id(service.settings_dir(), "uid-1")
+            .expect("saved session");
+        let expected_passphrase = api::srp::salt_for_key(
+            b"mailbox-secret",
+            "key-1",
+            &[crate::api::types::KeySalt {
+                id: "key-1".to_string(),
+                key_salt: Some(BASE64.encode([7u8; 16])),
+            }],
+        )
+        .expect("derive expected passphrase");
+        assert_eq!(
+            session.key_passphrase,
+            Some(BASE64.encode(expected_passphrase))
+        );
     }
 }

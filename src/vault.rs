@@ -2486,6 +2486,25 @@ path = "custom-vault.key"
     }
 
     #[test]
+    fn test_resolve_key_material_prefers_key_file_over_keychain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_from_file = [0x11; KEY_LEN];
+        std::fs::write(tmp.path().join(KEY_FILE), key_from_file).unwrap();
+
+        let keychain_called = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let keychain_called_clone = keychain_called.clone();
+
+        let resolved = resolve_key_material_with_keychain_ops(tmp.path(), move || {
+            *keychain_called_clone.lock().unwrap() = true;
+            Ok(Some([0x22; KEY_LEN]))
+        })
+        .unwrap();
+
+        assert_eq!(resolved, key_from_file);
+        assert!(!*keychain_called.lock().unwrap());
+    }
+
+    #[test]
     fn test_sync_vault_key_to_keyring_backend_writes_keychain() {
         let tmp = tempfile::tempdir().unwrap();
         let key = [0xAB; KEY_LEN];

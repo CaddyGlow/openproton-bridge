@@ -795,10 +795,21 @@ impl GluonStore {
         Ok(())
     }
 
+    async fn ensure_account_loaded(&self, storage_user_id: &str) -> Result<()> {
+        let already_loaded = {
+            let accounts = self.accounts.read().await;
+            accounts.contains_key(storage_user_id)
+        };
+        if already_loaded {
+            return Ok(());
+        }
+        self.sync_account_from_disk(storage_user_id).await
+    }
+
     async fn resolve_scope(&self, mailbox: &str) -> Result<(String, String)> {
         let (account_id, mailbox_name) = Self::split_scoped_mailbox(mailbox);
         let storage_user_id = self.storage_user_id_for_account(&account_id);
-        self.sync_account_from_disk(&storage_user_id).await?;
+        self.ensure_account_loaded(&storage_user_id).await?;
         Ok((storage_user_id, mailbox_name))
     }
 }

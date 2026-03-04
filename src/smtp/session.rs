@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -53,7 +54,10 @@ pub struct SmtpSession<R, W> {
     hostname: String,
     starttls_available: bool,
     tls_active: bool,
+    connection_id: u64,
 }
+
+static NEXT_SMTP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 impl<R, W> SmtpSession<R, W>
 where
@@ -85,6 +89,7 @@ where
             hostname: "openproton-bridge".to_string(),
             starttls_available,
             tls_active,
+            connection_id: NEXT_SMTP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -134,7 +139,10 @@ where
             let mut line = String::new();
             let n = self.reader.read_line(&mut line).await?;
             if n == 0 {
-                debug!("SMTP client disconnected");
+                debug!(
+                    connection_id = self.connection_id,
+                    "SMTP client disconnected"
+                );
                 return Ok(SessionAction::Close);
             }
 
@@ -143,7 +151,7 @@ where
                 continue;
             }
 
-            debug!(line = %line, "SMTP received");
+            debug!(connection_id = self.connection_id, line = %line, "SMTP received");
 
             match self.handle_command(&line).await? {
                 SessionAction::Continue => {}
@@ -239,16 +247,10 @@ where
                 }
             };
 
-            // AUTH PLAIN format: \0username\0password
-            let parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
-            if parts.len() != 3 {
+            let Some((username, password)) = parse_auth_plain_credentials(&decoded) else {
                 return self.write_line(535, "Authentication failed").await;
-            }
-
-            (
-                String::from_utf8_lossy(parts[1]).to_string(),
-                String::from_utf8_lossy(parts[2]).to_string(),
-            )
+            };
+            (username, password)
         } else if mechanism.eq_ignore_ascii_case("LOGIN") {
             let username_b64 = if let Some(initial) = auth_parts.next() {
                 initial.to_string()
@@ -510,7 +512,11 @@ where
         self.addresses = Some(addr_resp.addresses);
         self.state = State::Authenticated;
 
-        info!(email = %auth_route.primary_email, "SMTP authentication successful");
+        info!(
+            connection_id = self.connection_id,
+            email = %auth_route.primary_email,
+            "SMTP authentication successful"
+        );
         self.write_line(235, "Authentication successful").await
     }
 
@@ -684,6 +690,23 @@ fn extract_angle_addr(args: &str) -> String {
     }
 
     s.to_string()
+}
+
+fn parse_auth_plain_credentials(decoded: &[u8]) -> Option<(String, String)> {
+    // RFC 4616 form: [authzid] NUL authcid NUL passwd.
+    // Some clients send `authcid NUL passwd` (no authzid segment), so support both.
+    let parts: Vec<&[u8]> = decoded.splitn(3, |&b| b == 0).collect();
+    match parts.as_slice() {
+        [_, username, password] => Some((
+            String::from_utf8_lossy(username).to_string(),
+            String::from_utf8_lossy(password).to_string(),
+        )),
+        [username, password] => Some((
+            String::from_utf8_lossy(username).to_string(),
+            String::from_utf8_lossy(password).to_string(),
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1099,5 +1122,26 @@ mod tests {
             split_command("AUTH PLAIN dGVzdA=="),
             ("AUTH", "PLAIN dGVzdA==")
         );
+    }
+
+    #[test]
+    fn test_parse_auth_plain_credentials_with_empty_authzid() {
+        let decoded = b"\0test@proton.me\0bridge-pass-1234";
+        let parsed = parse_auth_plain_credentials(decoded).expect("parse auth plain payload");
+        assert_eq!(parsed.0, "test@proton.me");
+        assert_eq!(parsed.1, "bridge-pass-1234");
+    }
+
+    #[test]
+    fn test_parse_auth_plain_credentials_without_authzid_segment() {
+        let decoded = b"test@proton.me\0bridge-pass-1234";
+        let parsed = parse_auth_plain_credentials(decoded).expect("parse auth plain payload");
+        assert_eq!(parsed.0, "test@proton.me");
+        assert_eq!(parsed.1, "bridge-pass-1234");
+    }
+
+    #[test]
+    fn test_parse_auth_plain_credentials_rejects_missing_separator() {
+        assert!(parse_auth_plain_credentials(b"only-one-field").is_none());
     }
 }

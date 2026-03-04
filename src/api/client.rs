@@ -3,6 +3,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use reqwest::Client;
 use reqwest::StatusCode;
+use tracing::{error, info, warn};
 
 use super::error::{ApiError, Result};
 use super::types::ApiMode;
@@ -200,6 +201,62 @@ impl ProtonClient {
         }
         req
     }
+}
+
+fn request_preview(req: &reqwest::RequestBuilder) -> Option<(String, String)> {
+    req.try_clone().and_then(|builder| {
+        builder.build().ok().map(|request| {
+            (
+                request.method().to_string(),
+                request.url().as_str().to_string(),
+            )
+        })
+    })
+}
+
+pub async fn send_logged_with_pkg(
+    req: reqwest::RequestBuilder,
+    pkg_name: &'static str,
+) -> Result<reqwest::Response> {
+    let preview = request_preview(&req);
+    let response = req.send().await.map_err(|err| {
+        if let Some((method, url)) = &preview {
+            error!(
+                pkg = pkg_name,
+                error = %err,
+                "{} {} failed",
+                method,
+                url
+            );
+        } else {
+            error!(pkg = pkg_name, error = %err, "request failed");
+        }
+        ApiError::Http(err)
+    })?;
+
+    let status = response.status();
+    if let Some((method, url)) = &preview {
+        let status_line = format!(
+            "{} {}: {} {}",
+            status.as_u16(),
+            status.canonical_reason().unwrap_or(""),
+            method,
+            url
+        );
+        if status.is_success() {
+            info!(pkg = pkg_name, "{}", status_line);
+        } else if is_transient_http_status(status) {
+            warn!(pkg = pkg_name, "{}", status_line);
+        } else {
+            error!(pkg = pkg_name, "{}", status_line);
+        }
+    }
+
+    Ok(response)
+}
+
+pub async fn send_logged(req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+    send_logged_with_pkg(req, "gpa/client").await
 }
 
 /// Check API response JSON for error codes.

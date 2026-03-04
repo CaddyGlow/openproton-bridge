@@ -1,6 +1,6 @@
 use tracing::info;
 
-use super::client::{check_api_response, ProtonClient};
+use super::client::{check_api_response, send_logged, ProtonClient};
 use super::error::Result;
 use super::types::PublicKeysResponse;
 
@@ -10,7 +10,7 @@ use super::types::PublicKeysResponse;
 pub async fn get_public_keys(client: &ProtonClient, email: &str) -> Result<PublicKeysResponse> {
     info!(email = %email, "fetching public keys");
     let path = format!("/core/v4/keys?Email={}", email);
-    let resp = client.get(&path).send().await?;
+    let resp = send_logged(client.get(&path)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let keys_resp: PublicKeysResponse = serde_json::from_value(json)?;

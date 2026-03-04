@@ -7,7 +7,7 @@ use rand::Rng as _;
 use serde_json::{json, Value};
 use tracing::{debug, info};
 
-use super::client::{check_api_response, ProtonClient};
+use super::client::{check_api_response, send_logged, send_logged_with_pkg, ProtonClient};
 use super::error::Result;
 use super::srp;
 use super::types::{
@@ -45,7 +45,7 @@ pub async fn login(
     info!(username = ?username, "fetching auth info");
     let info_body = json!({ "Username": username });
 
-    let info_resp = client.post("/auth/v4/info").json(&info_body).send().await?;
+    let info_resp = send_logged(client.post("/auth/v4/info").json(&info_body)).await?;
     let info_json: serde_json::Value = info_resp.json().await?;
     check_api_response(&info_json)?;
 
@@ -75,10 +75,8 @@ pub async fn login(
         "SRPSession": auth_info.srp_session,
     });
 
-    let auth_resp = with_hv_headers(client.post("/auth/v4"), hv_details)
-        .json(&auth_body)
-        .send()
-        .await?;
+    let auth_resp =
+        send_logged(with_hv_headers(client.post("/auth/v4"), hv_details).json(&auth_body)).await?;
     let auth_json: serde_json::Value = auth_resp.json().await?;
     check_api_response(&auth_json)?;
 
@@ -153,7 +151,8 @@ pub async fn refresh_auth(
     );
     let body = build_refresh_body(uid, refresh_token, access_token);
 
-    let resp = client.post("/auth/v4/refresh").json(&body).send().await?;
+    let resp =
+        send_logged_with_pkg(client.post("/auth/v4/refresh").json(&body), "gpa/manager").await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
 
@@ -174,7 +173,7 @@ pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorRe
     info!("submitting 2FA code");
     let body = json!({ "TwoFactorCode": code });
 
-    let resp = client.post("/auth/v4/2fa").json(&body).send().await?;
+    let resp = send_logged(client.post("/auth/v4/2fa").json(&body)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
 
@@ -248,7 +247,7 @@ pub async fn submit_fido_2fa(
         }
     });
 
-    let resp = client.post("/auth/v4/2fa").json(&body).send().await?;
+    let resp = send_logged(client.post("/auth/v4/2fa").json(&body)).await?;
     let json: Value = resp.json().await?;
     check_api_response(&json)?;
 

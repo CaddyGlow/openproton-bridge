@@ -183,6 +183,9 @@ impl BridgeService {
 
     fn emit_event(&self, event: pb::stream_event::Event) {
         let stream_event = pb::StreamEvent { event: Some(event) };
+        if let Some(event) = stream_event.event.as_ref() {
+            debug!(pkg = "grpc", event = ?event, "Sending event");
+        }
         if let Ok(mut backlog) = self.state.event_backlog.lock() {
             backlog.push_back(stream_event.clone());
             while backlog.len() > MAX_BUFFERED_STREAM_EVENTS {

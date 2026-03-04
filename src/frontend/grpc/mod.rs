@@ -801,7 +801,10 @@ async fn write_server_config(path: &Path, cfg: &GrpcServerConfig) -> anyhow::Res
     tokio::fs::rename(&tmp_path, path)
         .await
         .with_context(|| format!("failed to rename server config to {}", path.display()))?;
-    info!(path = %path.display(), "saved grpc server config");
+    info!(
+        path = %path.display(),
+        "Successfully saved gRPC service config file"
+    );
     Ok(())
 }
 

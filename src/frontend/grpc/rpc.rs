@@ -89,6 +89,7 @@ impl BridgeService {
 #[tonic::async_trait]
 impl pb::bridge_server::Bridge for BridgeService {
     async fn check_tokens(&self, request: Request<String>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "CheckTokens");
         let path = request.into_inner();
         if path.trim().is_empty() {
             return Err(Status::invalid_argument("client config path is empty"));
@@ -132,6 +133,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::GuiReadyResponse>, Status> {
+        debug!(pkg = "grpc", "GuiReady");
         let settings = self.state.app_settings.lock().await;
         self.emit_all_users_loaded();
         self.emit_show_main_window();
@@ -219,6 +221,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn show_on_startup(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "ShowOnStartup");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.show_on_startup))
     }
@@ -234,6 +237,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn is_autostart_on(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "IsAutostartOn");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.is_autostart_on))
     }
@@ -248,6 +252,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn is_beta_enabled(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "IsBetaEnabled");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.is_beta_enabled))
     }
@@ -265,6 +270,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn is_all_mail_visible(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "IsAllMailVisible");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.is_all_mail_visible))
     }
@@ -282,11 +288,13 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn is_telemetry_disabled(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "IsTelemetryDisabled");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.is_telemetry_disabled))
     }
 
     async fn disk_cache_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "DiskCachePath");
         let path = self.state.active_disk_cache_path.lock().await.clone();
         Ok(Response::new(path.display().to_string()))
     }
@@ -349,6 +357,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn is_do_h_enabled(&self, _request: Request<()>) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "IsDohEnabled");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.is_doh_enabled))
     }
@@ -370,6 +379,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn color_scheme_name(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "ColorSchemeName");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.color_scheme_name.clone()))
     }
@@ -378,6 +388,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "CurrentEmailClient");
         Ok(Response::new(format!(
             "{DEFAULT_EMAIL_CLIENT} ({})",
             std::env::consts::OS
@@ -385,6 +396,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn logs_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "LogsPath");
         let path = self.logs_dir();
         tokio::fs::create_dir_all(&path)
             .await
@@ -393,7 +405,10 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn license_path(&self, _request: Request<()>) -> Result<Response<String>, Status> {
-        Ok(Response::new(resolve_license_path()))
+        debug!(pkg = "grpc", "LicensePath");
+        let path = resolve_license_path();
+        info!(path = %path, "License file path");
+        Ok(Response::new(path))
     }
 
     async fn release_notes_page_link(
@@ -455,6 +470,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn set_main_executable(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let executable = request.into_inner();
+        debug!(pkg = "grpc", executable = %executable, "SetMainExecutable");
         let mut settings = self.state.app_settings.lock().await;
         settings.main_executable = executable;
         save_app_settings(&self.grpc_app_settings_path(), &settings)
@@ -905,6 +921,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::UserListResponse>, Status> {
+        debug!(pkg = "grpc", "GetUserList");
         let sessions = vault::list_sessions(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let mut users = Vec::with_capacity(sessions.len());
@@ -922,6 +939,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn get_user(&self, request: Request<String>) -> Result<Response<pb::User>, Status> {
         let lookup = request.into_inner();
+        debug!(pkg = "grpc", userID = %lookup, "GetUser");
         let sessions = vault::list_sessions(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let session = sessions
@@ -1114,6 +1132,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<bool>, Status> {
+        debug!(pkg = "grpc", "IsAutomaticUpdateOn");
         let settings = self.state.app_settings.lock().await;
         Ok(Response::new(settings.is_automatic_update_on))
     }
@@ -1122,6 +1141,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::AvailableKeychainsResponse>, Status> {
+        debug!(pkg = "grpc", "AvailableKeychains");
         let keychains = available_keychain_helpers();
         Ok(Response::new(pb::AvailableKeychainsResponse { keychains }))
     }
@@ -1135,6 +1155,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn current_keychain(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "CurrentKeychain");
         if let Some(helper) = vault::get_keychain_helper(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?
         {
@@ -1148,6 +1169,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<pb::ImapSmtpSettings>, Status> {
+        debug!(pkg = "grpc", "ConnectionMode");
         let settings = self.state.mail_settings.lock().await.clone();
         Ok(Response::new(pb::ImapSmtpSettings {
             imap_port: settings.imap_port,
@@ -1196,6 +1218,7 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn hostname(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "Hostname");
         Ok(Response::new(self.state.bind_host.clone()))
     }
 
@@ -1264,6 +1287,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<pb::EventStreamRequest>,
     ) -> Result<Response<Self::RunEventStreamStream>, Status> {
+        debug!(pkg = "grpc", "Starting Event stream");
         let mut active = self.state.active_stream_stop.lock().await;
         if active.is_some() {
             return Err(Status::already_exists("the service is already streaming"));
@@ -1340,10 +1364,12 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn version(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "Version");
         Ok(Response::new(env!("CARGO_PKG_VERSION").to_string()))
     }
 
     async fn go_os(&self, _request: Request<()>) -> Result<Response<String>, Status> {
+        debug!(pkg = "grpc", "GoOs");
         Ok(Response::new(std::env::consts::OS.to_string()))
     }
 

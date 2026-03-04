@@ -1,7 +1,8 @@
 use tracing::info;
 
 use super::client::{
-    check_api_response, is_transient_http_status, retry_delay_from_headers, ProtonClient,
+    check_api_response, is_transient_http_status, retry_delay_from_headers, send_logged,
+    ProtonClient,
 };
 use super::error::{ApiError, Result};
 use super::types::{EventsResponse, TypedEventPayload};
@@ -21,7 +22,7 @@ pub async fn get_events(client: &ProtonClient, last_event_id: &str) -> Result<Ev
     };
 
     for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-        let resp = client.get(&path).send().await?;
+        let resp = send_logged(client.get(&path)).await?;
         let status = resp.status();
         let retry_delay = retry_delay_from_headers(resp.headers());
         let json: serde_json::Value = resp.json().await?;

@@ -95,6 +95,10 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         .refresh_sync_workers()
         .await
         .context("failed to start grpc sync workers")?;
+    #[cfg(unix)]
+    info!(pkg = "grpc", useFileSocket = true, "Starting gRPC server");
+    #[cfg(not(unix))]
+    info!(pkg = "grpc", useFileSocket = false, "Starting gRPC server");
     let service_for_shutdown = service.clone();
     let expected_token = token;
     let expected_token_tcp = expected_token.clone();
@@ -150,6 +154,12 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         port,
         file_socket_path = %unix_socket_path.display(),
         "grpc frontend service listening"
+    );
+    #[cfg(unix)]
+    info!(
+        pkg = "grpc",
+        "gRPC server listening on {}",
+        unix_socket_path.display()
     );
     #[cfg(not(unix))]
     info!(port, "grpc frontend service listening");

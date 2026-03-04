@@ -1,7 +1,8 @@
 use tracing::info;
 
 use super::client::{
-    check_api_response, is_transient_http_status, retry_delay_from_headers, ProtonClient,
+    check_api_response, is_transient_http_status, retry_delay_from_headers, send_logged,
+    ProtonClient,
 };
 use super::error::{ApiError, Result};
 use super::types::{
@@ -36,7 +37,7 @@ fn build_message_metadata_body(
 pub async fn get_message(client: &ProtonClient, message_id: &str) -> Result<MessageResponse> {
     info!(message_id = %message_id, "fetching message");
     let path = format!("/mail/v4/messages/{}", message_id);
-    let resp = client.get(&path).send().await?;
+    let resp = send_logged(client.get(&path)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let msg_resp: MessageResponse = serde_json::from_value(json)?;
@@ -65,12 +66,13 @@ pub async fn get_message_metadata(
     let body = build_message_metadata_body(filter, page, page_size)?;
 
     for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-        let resp = client
-            .post("/mail/v4/messages")
-            .header("X-HTTP-Method-Override", "GET")
-            .json(&body)
-            .send()
-            .await?;
+        let resp = send_logged(
+            client
+                .post("/mail/v4/messages")
+                .header("X-HTTP-Method-Override", "GET")
+                .json(&body),
+        )
+        .await?;
 
         let status = resp.status();
         let retry_delay = retry_delay_from_headers(resp.headers());
@@ -107,7 +109,7 @@ pub async fn get_message_metadata(
 pub async fn get_attachment(client: &ProtonClient, attachment_id: &str) -> Result<Vec<u8>> {
     info!(attachment_id = %attachment_id, "fetching attachment");
     let path = format!("/mail/v4/attachments/{}", attachment_id);
-    let resp = client.get(&path).send().await?;
+    let resp = send_logged(client.get(&path)).await?;
     let status = resp.status();
     let content_type = resp
         .headers()
@@ -137,11 +139,7 @@ pub async fn get_attachment(client: &ProtonClient, attachment_id: &str) -> Resul
 pub async fn mark_messages_read(client: &ProtonClient, ids: &[&str]) -> Result<()> {
     info!(count = ids.len(), "marking messages read");
     let body = serde_json::json!({ "IDs": ids });
-    let resp = client
-        .put("/mail/v4/messages/read")
-        .json(&body)
-        .send()
-        .await?;
+    let resp = send_logged(client.put("/mail/v4/messages/read").json(&body)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     Ok(())
@@ -153,11 +151,7 @@ pub async fn mark_messages_read(client: &ProtonClient, ids: &[&str]) -> Result<(
 pub async fn mark_messages_unread(client: &ProtonClient, ids: &[&str]) -> Result<()> {
     info!(count = ids.len(), "marking messages unread");
     let body = serde_json::json!({ "IDs": ids });
-    let resp = client
-        .put("/mail/v4/messages/unread")
-        .json(&body)
-        .send()
-        .await?;
+    let resp = send_logged(client.put("/mail/v4/messages/unread").json(&body)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     Ok(())
@@ -169,11 +163,7 @@ pub async fn mark_messages_unread(client: &ProtonClient, ids: &[&str]) -> Result
 pub async fn label_messages(client: &ProtonClient, ids: &[&str], label_id: &str) -> Result<()> {
     info!(count = ids.len(), label_id = %label_id, "labeling messages");
     let body = serde_json::json!({ "LabelID": label_id, "IDs": ids });
-    let resp = client
-        .put("/mail/v4/messages/label")
-        .json(&body)
-        .send()
-        .await?;
+    let resp = send_logged(client.put("/mail/v4/messages/label").json(&body)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     Ok(())
@@ -185,11 +175,7 @@ pub async fn label_messages(client: &ProtonClient, ids: &[&str], label_id: &str)
 pub async fn unlabel_messages(client: &ProtonClient, ids: &[&str], label_id: &str) -> Result<()> {
     info!(count = ids.len(), label_id = %label_id, "unlabeling messages");
     let body = serde_json::json!({ "LabelID": label_id, "IDs": ids });
-    let resp = client
-        .put("/mail/v4/messages/unlabel")
-        .json(&body)
-        .send()
-        .await?;
+    let resp = send_logged(client.put("/mail/v4/messages/unlabel").json(&body)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     Ok(())
@@ -200,7 +186,7 @@ pub async fn unlabel_messages(client: &ProtonClient, ids: &[&str], label_id: &st
 /// Reference: go-proton-api/message_send.go CreateDraft
 pub async fn create_draft(client: &ProtonClient, req: &CreateDraftReq) -> Result<MessageResponse> {
     info!("creating draft");
-    let resp = client.post("/mail/v4/messages").json(req).send().await?;
+    let resp = send_logged(client.post("/mail/v4/messages").json(req)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let msg_resp: MessageResponse = serde_json::from_value(json)?;
@@ -256,11 +242,7 @@ pub async fn upload_attachment(
                 .unwrap(),
         );
 
-    let resp = client
-        .post("/mail/v4/attachments")
-        .multipart(form)
-        .send()
-        .await?;
+    let resp = send_logged(client.post("/mail/v4/attachments").multipart(form)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let att_resp: AttachmentResponse = serde_json::from_value(json)?;
@@ -277,7 +259,7 @@ pub async fn send_draft(
 ) -> Result<SendDraftResponse> {
     info!(draft_id = %draft_id, "sending draft");
     let path = format!("/mail/v4/messages/{}", draft_id);
-    let resp = client.post(&path).json(req).send().await?;
+    let resp = send_logged(client.post(&path).json(req)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let send_resp: SendDraftResponse = serde_json::from_value(json)?;

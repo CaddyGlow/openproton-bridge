@@ -1,13 +1,13 @@
 use tracing::info;
 
-use super::client::{check_api_response, ProtonClient};
+use super::client::{check_api_response, send_logged, ProtonClient};
 use super::error::Result;
 use super::types::{AddressesResponse, SaltsResponse, UserResponse};
 
 /// Fetch the authenticated user's info.
 pub async fn get_user(client: &ProtonClient) -> Result<UserResponse> {
     info!("fetching user info");
-    let resp = client.get("/core/v4/users").send().await?;
+    let resp = send_logged(client.get("/core/v4/users")).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let user_resp: UserResponse = serde_json::from_value(json)?;
@@ -17,7 +17,7 @@ pub async fn get_user(client: &ProtonClient) -> Result<UserResponse> {
 /// Fetch the authenticated user's addresses.
 pub async fn get_addresses(client: &ProtonClient) -> Result<AddressesResponse> {
     info!("fetching addresses");
-    let resp = client.get("/core/v4/addresses").send().await?;
+    let resp = send_logged(client.get("/core/v4/addresses")).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let addr_resp: AddressesResponse = serde_json::from_value(json)?;
@@ -27,7 +27,7 @@ pub async fn get_addresses(client: &ProtonClient) -> Result<AddressesResponse> {
 /// Fetch key salts for the authenticated user.
 pub async fn get_salts(client: &ProtonClient) -> Result<SaltsResponse> {
     info!("fetching key salts");
-    let resp = client.get("/core/v4/keys/salts").send().await?;
+    let resp = send_logged(client.get("/core/v4/keys/salts")).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let salts_resp: SaltsResponse = serde_json::from_value(json)?;

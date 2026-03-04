@@ -18,7 +18,8 @@ use crate::bridge::auth_router::AuthRouter;
 use crate::crypto::keys::{self, Keyring};
 
 use super::command::{
-    parse_command, Command, FetchItem, ImapFlag, SearchKey, SequenceSet, StoreAction,
+    parse_command, Command, FetchItem, ImapFlag, SearchKey, SequenceSet, StatusDataItem,
+    StoreAction,
 };
 use super::mailbox;
 use super::response::ResponseWriter;
@@ -168,6 +169,11 @@ where
                 ref tag,
                 ref mailbox,
             } => self.cmd_select(tag, mailbox).await?,
+            Command::Status {
+                ref tag,
+                ref mailbox,
+                ref items,
+            } => self.cmd_status(tag, mailbox, items).await?,
             Command::Close { ref tag } => self.cmd_close(tag).await?,
             Command::Fetch {
                 ref tag,
@@ -720,6 +726,48 @@ where
         self.writer
             .tagged_ok(tag, Some("READ-WRITE"), "SELECT completed")
             .await
+    }
+
+    async fn cmd_status(
+        &mut self,
+        tag: &str,
+        mailbox_name: &str,
+        items: &[StatusDataItem],
+    ) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        let mb = match mailbox::find_mailbox(mailbox_name) {
+            Some(m) => m,
+            None => {
+                return self
+                    .writer
+                    .tagged_no(tag, &format!("mailbox not found: {}", mailbox_name))
+                    .await;
+            }
+        };
+
+        let scoped_mailbox = self.scoped_mailbox_name(mb.name);
+        let status = self.config.store.mailbox_status(&scoped_mailbox).await?;
+
+        let mut attrs = Vec::new();
+        for item in items {
+            match item {
+                StatusDataItem::Messages => attrs.push(format!("MESSAGES {}", status.exists)),
+                StatusDataItem::Recent => attrs.push("RECENT 0".to_string()),
+                StatusDataItem::UidNext => attrs.push(format!("UIDNEXT {}", status.next_uid)),
+                StatusDataItem::UidValidity => {
+                    attrs.push(format!("UIDVALIDITY {}", status.uid_validity))
+                }
+                StatusDataItem::Unseen => attrs.push(format!("UNSEEN {}", status.unseen)),
+            }
+        }
+
+        self.writer
+            .untagged(&format!("STATUS \"{}\" ({})", mb.name, attrs.join(" ")))
+            .await?;
+        self.writer.tagged_ok(tag, None, "STATUS completed").await
     }
 
     async fn cmd_close(&mut self, tag: &str) -> Result<()> {
@@ -1992,6 +2040,40 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("a001 NO"));
+    }
+
+    #[tokio::test]
+    async fn test_status_authenticated() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::Drafts", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 STATUS \"Drafts\" (UIDNEXT UIDVALIDITY UNSEEN RECENT MESSAGES)")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* STATUS \"Drafts\" ("));
+        assert!(response.contains("UIDNEXT"));
+        assert!(response.contains("UIDVALIDITY"));
+        assert!(response.contains("UNSEEN"));
+        assert!(response.contains("RECENT 0"));
+        assert!(response.contains("MESSAGES 1"));
+        assert!(response.contains("a001 OK STATUS completed"));
     }
 
     #[tokio::test]

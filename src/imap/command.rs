@@ -31,6 +31,11 @@ pub enum Command {
         tag: String,
         mailbox: String,
     },
+    Status {
+        tag: String,
+        mailbox: String,
+        items: Vec<StatusDataItem>,
+    },
     Close {
         tag: String,
     },
@@ -159,6 +164,15 @@ pub enum SearchKey {
     Or(Box<SearchKey>, Box<SearchKey>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusDataItem {
+    Messages,
+    Recent,
+    UidNext,
+    UidValidity,
+    Unseen,
+}
+
 impl SequenceSet {
     pub fn contains(&self, num: u32, max: u32) -> bool {
         self.ranges.iter().any(|r| {
@@ -206,6 +220,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "STARTTLS" => Ok(Command::StartTls { tag }),
         "LIST" => parse_list(&tag, args),
         "SELECT" => parse_select(&tag, args),
+        "STATUS" => parse_status(&tag, args),
         "CLOSE" => Ok(Command::Close { tag }),
         "FETCH" => parse_fetch(&tag, args, false),
         "STORE" => parse_store(&tag, args, false),
@@ -318,6 +333,54 @@ fn parse_select(tag: &str, args: &str) -> Result<Command> {
         tag: tag.to_string(),
         mailbox,
     })
+}
+
+fn parse_status(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, rest) = parse_astring(args.trim_start())?;
+    let items = parse_status_items(rest.trim_start())?;
+    Ok(Command::Status {
+        tag: tag.to_string(),
+        mailbox,
+        items,
+    })
+}
+
+fn parse_status_items(s: &str) -> Result<Vec<StatusDataItem>> {
+    let content = s.trim();
+    if content.is_empty() {
+        return Err(ImapError::Protocol("missing STATUS data items".to_string()));
+    }
+
+    let content = if content.starts_with('(') && content.ends_with(')') {
+        &content[1..content.len() - 1]
+    } else {
+        content
+    };
+
+    let mut items = Vec::new();
+    for token in content.split_whitespace() {
+        let item = match token.to_ascii_uppercase().as_str() {
+            "MESSAGES" => StatusDataItem::Messages,
+            "RECENT" => StatusDataItem::Recent,
+            "UIDNEXT" => StatusDataItem::UidNext,
+            "UIDVALIDITY" => StatusDataItem::UidValidity,
+            "UNSEEN" => StatusDataItem::Unseen,
+            _ => {
+                return Err(ImapError::Protocol(format!(
+                    "unknown STATUS data item: {}",
+                    token
+                )))
+            }
+        };
+        if !items.contains(&item) {
+            items.push(item);
+        }
+    }
+
+    if items.is_empty() {
+        return Err(ImapError::Protocol("missing STATUS data items".to_string()));
+    }
+    Ok(items)
 }
 
 fn parse_sequence_set(s: &str) -> Result<SequenceSet> {
@@ -715,6 +778,27 @@ mod tests {
             Command::Select {
                 tag: "a006".to_string(),
                 mailbox: "All Mail".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_status() {
+        let cmd =
+            parse_command("a006 STATUS \"Drafts\" (UIDNEXT UIDVALIDITY UNSEEN RECENT MESSAGES)")
+                .unwrap();
+        assert_eq!(
+            cmd,
+            Command::Status {
+                tag: "a006".to_string(),
+                mailbox: "Drafts".to_string(),
+                items: vec![
+                    StatusDataItem::UidNext,
+                    StatusDataItem::UidValidity,
+                    StatusDataItem::Unseen,
+                    StatusDataItem::Recent,
+                    StatusDataItem::Messages,
+                ],
             }
         );
     }

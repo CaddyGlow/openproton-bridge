@@ -480,7 +480,7 @@ struct ServeCommandOverrides {
 }
 
 struct InteractiveServeRuntime {
-    handle: bridge::mail_runtime::MailRuntimeHandle,
+    supervisor: std::sync::Arc<bridge::runtime_supervisor::RuntimeSupervisor>,
     config: InteractiveServeConfig,
 }
 
@@ -3718,41 +3718,42 @@ async fn start_interactive_runtime(
         use_ssl_for_smtp: !config.no_tls,
         event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
     };
-    let handle = bridge::mail_runtime::start(
+    let supervisor = std::sync::Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
         runtime_paths.clone(),
-        runtime_config,
-        bridge::mail_runtime::MailRuntimeTransition::Startup,
-        Some(notify_tx),
-    )
-    .await?;
+    ));
+    let snapshot = supervisor
+        .start_with_snapshot(
+            runtime_config,
+            bridge::mail_runtime::MailRuntimeTransition::Startup,
+            Some(notify_tx),
+        )
+        .await?;
     print_serve_configuration(
         &config.bind,
         config.imap_port,
         config.smtp_port,
         config.no_tls,
-        handle.active_sessions(),
-        handle.runtime_snapshot(),
+        &snapshot.active_sessions,
+        &snapshot.runtime_snapshot,
     );
 
-    Ok(InteractiveServeRuntime { handle, config })
+    Ok(InteractiveServeRuntime { supervisor, config })
 }
 
 async fn stop_interactive_runtime(state: InteractiveServeRuntime) -> anyhow::Result<()> {
-    state.handle.stop().await
+    state.supervisor.stop("interactive_stop").await
 }
 
 async fn maybe_collect_runtime_completion(
     runtime_state: &mut Option<InteractiveServeRuntime>,
 ) -> Option<String> {
-    let is_finished = runtime_state
-        .as_ref()
-        .is_some_and(|state| state.handle.is_finished());
-    if !is_finished {
+    let state = runtime_state.as_ref()?;
+    if state.supervisor.is_running().await {
         return None;
     }
 
     let state = runtime_state.take()?;
-    Some(match state.handle.wait().await {
+    Some(match state.supervisor.wait_for_termination().await {
         Ok(()) => "Serve runtime exited.".to_string(),
         Err(err) => format!("Serve runtime exited with error: {err:#}"),
     })

@@ -1404,6 +1404,9 @@ mod grpc_wire_tests {
         let (event_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = watch::channel(false);
         let state = Arc::new(GrpcState {
+            runtime_supervisor: bridge::runtime_supervisor::RuntimeSupervisor::new(
+                runtime_paths.clone(),
+            ),
             runtime_paths,
             bind_host: "127.0.0.1".to_string(),
             active_disk_cache_path: Mutex::new(active_disk_cache_path),
@@ -1415,7 +1418,6 @@ mod grpc_wire_tests {
             session_access_tokens: Mutex::new(HashMap::new()),
             shutdown_tx,
             mail_settings: Mutex::new(StoredMailSettings::default()),
-            mail_runtime: Mutex::new(None),
             mail_runtime_transition_lock: Mutex::new(()),
             app_settings: Mutex::new(app_settings),
             sync_workers_enabled: false,

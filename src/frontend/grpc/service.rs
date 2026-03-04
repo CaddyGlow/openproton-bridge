@@ -51,18 +51,14 @@ impl BridgeService {
         &self,
         settings: &StoredMailSettings,
         transition: bridge::mail_runtime::MailRuntimeTransition,
-    ) -> Result<bridge::mail_runtime::MailRuntimeHandle, bridge::mail_runtime::MailRuntimeStartError>
-    {
+    ) -> Result<(), bridge::mail_runtime::MailRuntimeStartError> {
         let config = self
             .mail_runtime_config_from_settings(settings)
             .map_err(bridge::mail_runtime::MailRuntimeStartError::Prepare)?;
-        bridge::mail_runtime::start(
-            self.state.runtime_paths.clone(),
-            config,
-            transition,
-            None,
-        )
-        .await
+        self.state
+            .runtime_supervisor
+            .start(config, transition, None)
+            .await
     }
 
     fn log_startup_mail_runtime_error(
@@ -144,14 +140,13 @@ impl BridgeService {
     }
 
     async fn stop_mail_runtime_locked(&self, transition: &'static str) {
-        let existing = self.state.mail_runtime.lock().await.take();
-        if let Some(runtime) = existing {
+        if self.state.runtime_supervisor.is_running().await {
             info!(
                 pkg = "grpc/bridge",
                 transition,
                 "stopping grpc mail runtime"
             );
-            if let Err(err) = runtime.stop().await {
+            if let Err(err) = self.state.runtime_supervisor.stop(transition).await {
                 warn!(
                     pkg = "grpc/bridge",
                     transition,
@@ -237,9 +232,7 @@ impl BridgeService {
             )
             .await
         {
-            Ok(runtime) => {
-                *self.state.mail_runtime.lock().await = Some(runtime);
-            }
+            Ok(()) => {}
             Err(err) => self.log_startup_mail_runtime_error(&settings, &err),
         }
     }
@@ -284,16 +277,13 @@ impl BridgeService {
             return Ok(());
         }
 
-        let existing = self.state.mail_runtime.lock().await.take();
-        if let Some(runtime) = existing {
-            if let Err(err) = runtime.stop().await {
-                warn!(
-                    pkg = "grpc/bridge",
-                    transition = "settings_change",
-                    error = %err,
-                    "failed to stop previous grpc mail runtime before restart"
-                );
-            }
+        if let Err(err) = self.state.runtime_supervisor.stop("settings_change").await {
+            warn!(
+                pkg = "grpc/bridge",
+                transition = "settings_change",
+                error = %err,
+                "failed to stop previous grpc mail runtime before restart"
+            );
         }
 
         match self
@@ -303,10 +293,7 @@ impl BridgeService {
             )
             .await
         {
-            Ok(runtime) => {
-                *self.state.mail_runtime.lock().await = Some(runtime);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(err) => {
                 self.emit_mail_runtime_change_error(&next, &err);
 
@@ -317,9 +304,7 @@ impl BridgeService {
                     )
                     .await
                 {
-                    Ok(previous_runtime) => {
-                        *self.state.mail_runtime.lock().await = Some(previous_runtime);
-                    }
+                    Ok(()) => {}
                     Err(restore_err) => {
                         warn!(
                             pkg = "grpc/bridge",
@@ -423,15 +408,14 @@ impl BridgeService {
             }
         };
 
-        let existing = self.state.mail_runtime.lock().await.take();
-        let had_runtime = existing.is_some();
-        if let Some(runtime) = existing {
+        let had_runtime = self.state.runtime_supervisor.is_running().await;
+        if had_runtime {
             info!(
                 pkg = "grpc/sync",
                 owner = "mail_runtime",
                 "stopping grpc mail runtime before sync-owner refresh"
             );
-            if let Err(err) = runtime.stop().await {
+            if let Err(err) = self.state.runtime_supervisor.stop("sync_refresh").await {
                 warn!(
                     pkg = "grpc/sync",
                     owner = "mail_runtime",
@@ -459,8 +443,7 @@ impl BridgeService {
             .start_mail_runtime_with_settings(&settings, runtime_transition)
             .await
         {
-            Ok(runtime) => {
-                *self.state.mail_runtime.lock().await = Some(runtime);
+            Ok(()) => {
                 info!(
                     pkg = "grpc/sync",
                     owner = "mail_runtime",

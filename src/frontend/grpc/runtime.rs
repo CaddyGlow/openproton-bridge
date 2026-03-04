@@ -75,6 +75,7 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
     let (event_tx, _) = broadcast::channel(128);
     let state = Arc::new(GrpcState {
         runtime_paths: runtime_paths.clone(),
+        runtime_supervisor: bridge::runtime_supervisor::RuntimeSupervisor::new(runtime_paths.clone()),
         bind_host,
         active_disk_cache_path: Mutex::new(active_disk_cache_path),
         event_tx,
@@ -85,7 +86,6 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         session_access_tokens: Mutex::new(HashMap::new()),
         shutdown_tx: shutdown_tx.clone(),
         mail_settings: Mutex::new(settings),
-        mail_runtime: Mutex::new(None),
         mail_runtime_transition_lock: Mutex::new(()),
         app_settings: Mutex::new(app_settings),
         sync_workers_enabled: true,

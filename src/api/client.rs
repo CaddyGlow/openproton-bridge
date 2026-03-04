@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, CONTENT_LENGTH, RETRY_AFTER};
 use reqwest::Client;
 use reqwest::StatusCode;
 use tracing::{error, info, warn};
@@ -203,13 +203,33 @@ impl ProtonClient {
     }
 }
 
-fn request_preview(req: &reqwest::RequestBuilder) -> Option<(String, String)> {
+struct RequestPreview {
+    method: String,
+    url: String,
+    request_length: Option<u64>,
+}
+
+fn parse_content_length(value: Option<&HeaderValue>) -> Option<u64> {
+    value
+        .and_then(|raw| raw.to_str().ok())
+        .and_then(|raw| raw.parse::<u64>().ok())
+}
+
+fn request_preview(req: &reqwest::RequestBuilder) -> Option<RequestPreview> {
     req.try_clone().and_then(|builder| {
         builder.build().ok().map(|request| {
-            (
-                request.method().to_string(),
-                request.url().as_str().to_string(),
-            )
+            let request_length = parse_content_length(request.headers().get(CONTENT_LENGTH))
+                .or_else(|| {
+                    request
+                        .body()
+                        .and_then(|body| body.as_bytes())
+                        .map(|bytes| bytes.len() as u64)
+                });
+            RequestPreview {
+                method: request.method().to_string(),
+                url: request.url().as_str().to_string(),
+                request_length,
+            }
         })
     })
 }
@@ -218,37 +238,67 @@ pub async fn send_logged_with_pkg(
     req: reqwest::RequestBuilder,
     pkg_name: &'static str,
 ) -> Result<reqwest::Response> {
+    let started = Instant::now();
     let preview = request_preview(&req);
     let response = req.send().await.map_err(|err| {
-        if let Some((method, url)) = &preview {
+        let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if let Some(preview) = &preview {
             error!(
                 pkg = pkg_name,
                 error = %err,
-                "{} {} failed",
-                method,
-                url
+                method = %preview.method,
+                url = %preview.url,
+                duration_ms,
+                request_length = preview.request_length,
+                "http request failed"
             );
         } else {
-            error!(pkg = pkg_name, error = %err, "request failed");
+            error!(pkg = pkg_name, error = %err, duration_ms, "http request failed");
         }
         ApiError::Http(err)
     })?;
 
     let status = response.status();
-    if let Some((method, url)) = &preview {
-        let status_line = format!(
-            "{} {}: {} {}",
-            status.as_u16(),
-            status.canonical_reason().unwrap_or(""),
-            method,
-            url
-        );
+    let duration_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    let response_length = parse_content_length(response.headers().get(CONTENT_LENGTH));
+    if let Some(preview) = &preview {
+        let status_text = status.canonical_reason().unwrap_or("unknown");
         if status.is_success() {
-            info!(pkg = pkg_name, "{}", status_line);
+            info!(
+                pkg = pkg_name,
+                status = status.as_u16(),
+                status_text,
+                method = %preview.method,
+                url = %preview.url,
+                duration_ms,
+                request_length = preview.request_length,
+                response_length,
+                "http request completed"
+            );
         } else if is_transient_http_status(status) {
-            warn!(pkg = pkg_name, "{}", status_line);
+            warn!(
+                pkg = pkg_name,
+                status = status.as_u16(),
+                status_text,
+                method = %preview.method,
+                url = %preview.url,
+                duration_ms,
+                request_length = preview.request_length,
+                response_length,
+                "http request transient failure"
+            );
         } else {
-            error!(pkg = pkg_name, "{}", status_line);
+            error!(
+                pkg = pkg_name,
+                status = status.as_u16(),
+                status_text,
+                method = %preview.method,
+                url = %preview.url,
+                duration_ms,
+                request_length = preview.request_length,
+                response_length,
+                "http request failed"
+            );
         }
     }
 

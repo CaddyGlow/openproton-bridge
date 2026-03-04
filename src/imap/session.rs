@@ -769,6 +769,14 @@ where
                 .collect()
         };
         let seen_flag = "\\Seen".to_string();
+        let user_id = self
+            .authenticated_account_id
+            .as_deref()
+            .unwrap_or("unknown");
+        let header_only_body_fetch = needs_body_sections && !needs_full_rfc822;
+        let target_fetch_count = target_messages.len() as u32;
+        let mut cache_hits = 0u32;
+        let mut cache_misses = 0u32;
 
         for (uid, seq) in target_messages {
             let meta = store.get_metadata(&scoped_mailbox, uid).await?;
@@ -779,8 +787,13 @@ where
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
 
             let mut rfc822_data = None;
-            if needs_body_sections {
+            if needs_body_sections && !header_only_body_fetch {
                 rfc822_data = store.get_rfc822(&scoped_mailbox, uid).await?;
+                if rfc822_data.is_some() {
+                    cache_hits = cache_hits.saturating_add(1);
+                } else {
+                    cache_misses = cache_misses.saturating_add(1);
+                }
                 if rfc822_data.is_none() && needs_full_rfc822 {
                     // Fetch + decrypt on demand for full/body/text paths.
                     if let Some(ref meta) = meta {
@@ -932,6 +945,35 @@ where
                     }
                     out.extend_from_slice(b")\r\n");
                     self.writer.raw(&out).await?;
+                }
+            }
+        }
+
+        if needs_body_sections {
+            if header_only_body_fetch {
+                // Match bridge behavior: header index fetch should avoid RFC822 disk/blob reads.
+                info!(
+                    user_id = user_id,
+                    mailbox = %mailbox,
+                    count = target_fetch_count,
+                    "rfc822_cache_miss"
+                );
+            } else {
+                if cache_hits > 0 {
+                    info!(
+                        user_id = user_id,
+                        mailbox = %mailbox,
+                        count = cache_hits,
+                        "rfc822_cache_hit"
+                    );
+                }
+                if cache_misses > 0 {
+                    info!(
+                        user_id = user_id,
+                        mailbox = %mailbox,
+                        count = cache_misses,
+                        "rfc822_cache_miss"
+                    );
                 }
             }
         }

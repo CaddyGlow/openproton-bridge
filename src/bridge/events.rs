@@ -1184,6 +1184,35 @@ async fn run_startup_resync_for_generation(
         .await
 }
 
+async fn cached_message_count_for_generation(
+    config: &EventWorkerConfig,
+    expected_generation: u64,
+) -> Result<u64, EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "cached_message_count").await?;
+    let mut total = 0u64;
+
+    for mb in mailbox::system_mailboxes() {
+        if !mb.selectable {
+            continue;
+        }
+
+        let scoped = scoped_mailbox_name(&config.account_id, mb.name);
+        let count = config
+            .store
+            .list_uids(&scoped)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
+            .len() as u64;
+        total = total.saturating_add(count);
+
+        if total > 0 {
+            break;
+        }
+    }
+
+    Ok(total)
+}
+
 pub async fn poll_account_once(
     config: &EventWorkerConfig,
     last_event_id: &str,
@@ -1439,6 +1468,32 @@ async fn run_event_worker_with_shutdown(
                     }
                 };
                 if startup_resync_pending {
+                    if !last_event_id.trim().is_empty() {
+                        match cached_message_count_for_generation(&config, expected_generation).await
+                        {
+                            Ok(cached_count) if cached_count > 0 => {
+                                info!(
+                                    user_id = %config.account_id.0,
+                                    account_id = %config.account_id.0,
+                                    account_email = %config.account_email,
+                                    count = cached_count,
+                                    "Messages are already synced, skipping"
+                                );
+                                startup_resync_pending = false;
+                                next_delay = Duration::ZERO;
+                                continue;
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                warn!(
+                                    account_id = %config.account_id.0,
+                                    account_email = %config.account_email,
+                                    error = %err,
+                                    "failed to inspect cached message state before startup resync"
+                                );
+                            }
+                        }
+                    }
                     let startup_result = match run_startup_resync_for_generation(
                         &config,
                         expected_generation,

@@ -202,9 +202,9 @@ where
     async fn cmd_capability(&mut self, tag: &str) -> Result<()> {
         let caps = if self.state == State::NotAuthenticated {
             if self.starttls_available {
-                "CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN IDLE"
+                "CAPABILITY IMAP4rev1 STARTTLS IDLE"
             } else {
-                "CAPABILITY IMAP4rev1 AUTH=PLAIN IDLE"
+                "CAPABILITY IMAP4rev1 IDLE"
             }
         } else {
             "CAPABILITY IMAP4rev1 IDLE"
@@ -1536,6 +1536,8 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("IMAP4rev1"));
+        assert!(response.contains("STARTTLS"));
+        assert!(!response.contains("AUTH=PLAIN"));
         assert!(response.contains("a001 OK"));
     }
 

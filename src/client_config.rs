@@ -44,6 +44,8 @@ pub fn render_mutt_config(template: &MuttConfigTemplate, include_password: bool)
         "set imap_user = \"{}\"",
         escape_mutt_string(&template.account_address)
     );
+    // Bridge IMAP currently authenticates via LOGIN command (not SASL AUTHENTICATE).
+    out.push_str("set imap_authenticators = \"login\"\n");
     let _ = writeln!(
         out,
         "set folder = \"{imap_scheme}://{}:{}/\"",
@@ -133,6 +135,7 @@ mod tests {
     #[test]
     fn render_mutt_config_without_password_placeholders() {
         let rendered = render_mutt_config(&sample_template(), false);
+        assert!(rendered.contains("set imap_authenticators = \"login\""));
         assert!(rendered.contains("set folder = \"imap://127.0.0.1:1143/\""));
         assert!(
             rendered.contains("set smtp_url = \"smtp://alice%2Bqa%40proton.me@127.0.0.1:1025/\"")

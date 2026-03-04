@@ -17,12 +17,20 @@
           "name": "startup_resync_started",
           "any_of": [
             "running startup bounded resync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\baccount_email="
           ]
         },
         {
           "name": "resync_completed",
           "any_of": [
             "completed refresh resync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\baccount_email="
           ]
         },
         {
@@ -42,12 +50,21 @@
           "name": "startup_resync_started",
           "any_of": [
             "running startup bounded resync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\baccount_email="
           ]
         },
         {
           "name": "event_poll",
           "any_of": [
             "polled account events"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bevent_id="
           ]
         },
         {
@@ -74,12 +91,20 @@
           "name": "startup_resync_started",
           "any_of": [
             "running startup bounded resync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\baccount_email="
           ]
         },
         {
           "name": "resync_completed",
           "any_of": [
             "completed refresh resync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\baccount_email="
           ]
         }
       ]
@@ -100,6 +125,10 @@
           "any_of": [
             "event worker poll failed",
             "event worker startup resync failed"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\bretry_delay_ms="
           ]
         },
         {
@@ -107,6 +136,10 @@
           "any_of": [
             "event worker recovered",
             "event worker startup resync recovered"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\brecovered_after_failures="
           ]
         },
         {
@@ -114,6 +147,221 @@
           "any_of": [
             "account sync finished",
             "\\[event\\] sync finished:"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "auth_lifecycle",
+      "description": "Authentication lifecycle from login request through token refresh.",
+      "required_milestones": [
+        {
+          "name": "login_requested",
+          "any_of": [
+            "login requested",
+            "Authorizing user for login"
+          ],
+          "required_fields": [
+            "\\b(username=|username:|username\\\")"
+          ]
+        },
+        {
+          "name": "login_succeeded",
+          "any_of": [
+            "login succeeded",
+            "Logging in authorized user"
+          ],
+          "required_fields": [
+            "\\b(user_id=|userID=)"
+          ]
+        },
+        {
+          "name": "refresh_requested",
+          "any_of": [
+            "refresh token exchange requested"
+          ],
+          "required_fields": [
+            "\\buser_id="
+          ]
+        },
+        {
+          "name": "refresh_succeeded",
+          "any_of": [
+            "refresh token exchange succeeded",
+            "stored refresh token exchange completed"
+          ],
+          "required_fields": [
+            "\\buser_id="
+          ]
+        }
+      ]
+    },
+    {
+      "id": "grpc_transition_lifecycle",
+      "description": "Repair/reset transitions and sync worker refresh lifecycle from gRPC.",
+      "required_milestones": [
+        {
+          "name": "repair_requested",
+          "any_of": [
+            "repair requested",
+            "trigger_repair"
+          ]
+        },
+        {
+          "name": "sync_refresh_for_repair",
+          "any_of": [
+            "refreshing grpc sync workers for transition"
+          ],
+          "required_fields": [
+            "transition=\\\"?trigger_repair\\\"?"
+          ]
+        },
+        {
+          "name": "repair_completed",
+          "any_of": [
+            "repair transition completed",
+            "repairStarted"
+          ]
+        },
+        {
+          "name": "reset_requested",
+          "any_of": [
+            "reset requested",
+            "trigger_reset"
+          ]
+        },
+        {
+          "name": "sync_refresh_for_reset",
+          "any_of": [
+            "refreshing grpc sync workers for transition"
+          ],
+          "required_fields": [
+            "transition=\\\"?trigger_reset\\\"?"
+          ]
+        },
+        {
+          "name": "reset_completed",
+          "any_of": [
+            "reset transition completed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "feedback_logout_lifecycle",
+      "description": "Bad-event feedback handling followed by logout lifecycle.",
+      "required_milestones": [
+        {
+          "name": "bad_event_feedback",
+          "any_of": [
+            "user bad event feedback received",
+            "Passing bad event feedback to user"
+          ],
+          "required_fields": [
+            "\\b(user_id=|userID=)",
+            "\\b(do_resync=|doResync=)"
+          ]
+        },
+        {
+          "name": "logout_requested",
+          "any_of": [
+            "logout requested",
+            "Logging out user"
+          ]
+        },
+        {
+          "name": "logout_completed",
+          "any_of": [
+            "logout completed"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "event_loop_recovery",
+      "description": "Stale cursor reset and event loop recovery progression.",
+      "required_milestones": [
+        {
+          "name": "event_loop_reset",
+          "any_of": [
+            "detected stale event cursor; resetting to baseline after bounded resync",
+            "Event loop reset"
+          ]
+        },
+        {
+          "name": "resync_completed",
+          "any_of": [
+            "completed refresh resync",
+            "Received refresh event"
+          ]
+        },
+        {
+          "name": "event_poll",
+          "any_of": [
+            "polled account events",
+            "Received new API event"
+          ],
+          "required_fields": [
+            "\\b(account_id=|old=)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "second_factor_prompts",
+      "description": "Second-factor prompt lifecycle for TOTP and mailbox password paths.",
+      "required_milestones": [
+        {
+          "name": "totp_requested",
+          "any_of": [
+            "Requesting TOTP"
+          ],
+          "required_fields": [
+            "\\b(user_id=|userID=)"
+          ]
+        },
+        {
+          "name": "mailbox_password_requested",
+          "any_of": [
+            "Requesting mailbox password"
+          ],
+          "required_fields": [
+            "\\b(user_id=|userID=)"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "sync_job_lifecycle",
+      "description": "User sync lifecycle envelope around bounded sync operations.",
+      "required_milestones": [
+        {
+          "name": "sync_triggered",
+          "any_of": [
+            "Sync triggered"
+          ],
+          "required_fields": [
+            "\\baccount_id="
+          ]
+        },
+        {
+          "name": "sync_started",
+          "any_of": [
+            "Beginning user sync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\bstart_unix="
+          ]
+        },
+        {
+          "name": "sync_finished",
+          "any_of": [
+            "Finished user sync"
+          ],
+          "required_fields": [
+            "\\baccount_id=",
+            "\\bduration_ms="
           ]
         }
       ]

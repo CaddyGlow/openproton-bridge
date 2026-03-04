@@ -841,6 +841,17 @@ async fn bounded_resync_account(
     session: &mut Session,
     client: &mut ProtonClient,
 ) -> Result<(), EventWorkerError> {
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        "Sync triggered"
+    );
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        start_unix = unix_now(),
+        "Beginning user sync"
+    );
     let mut progress_guard = SyncProgressRunGuard::new(
         config.sync_progress_callback.as_ref(),
         config.account_id.0.clone(),
@@ -934,6 +945,12 @@ async fn bounded_resync_account(
         resync_started_at.elapsed(),
     );
     progress_guard.finish();
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        duration_ms = resync_started_at.elapsed().as_millis() as u64,
+        "Finished user sync"
+    );
 
     Ok(())
 }
@@ -1049,12 +1066,19 @@ pub async fn poll_account_once(
                 Err(EventWorkerError::Api(error))
                     if !cursor.trim().is_empty() && is_invalid_event_cursor_error(&error) =>
                 {
+                    let reset_event_id = cursor.clone();
                     warn!(
                         account_id = %config.account_id.0,
                         account_email = %config.account_email,
                         cursor = %cursor,
                         error = %error,
                         "detected stale event cursor; resetting to baseline after bounded resync"
+                    );
+                    info!(
+                        account_id = %config.account_id.0,
+                        account_email = %config.account_email,
+                        event_id = %reset_event_id,
+                        "Event loop reset"
                     );
                     bounded_resync_account(config, &mut session, &mut client).await?;
                     forced_sync_state = Some("cursor_reset_resync");
@@ -1068,6 +1092,12 @@ pub async fn poll_account_once(
         let mut labels_changed = false;
         let mut resync_state: Option<&str> = None;
         if response.refresh != 0 && forced_sync_state.is_none() {
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                refresh = response.refresh,
+                "Received refresh event"
+            );
             bounded_resync_account(config, &mut session, &mut client).await?;
             resync_state = Some("refresh_resync");
         }
@@ -1091,7 +1121,17 @@ pub async fn poll_account_once(
         }
 
         if labels_changed && resync_state.is_none() {
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                "Syncing labels"
+            );
             bounded_resync_account(config, &mut session, &mut client).await?;
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                "Synced labels"
+            );
             resync_state = Some("label_resync");
         }
 
@@ -1104,6 +1144,17 @@ pub async fn poll_account_once(
         } else {
             response.event_id.clone()
         };
+
+        if next_event_id != cursor || !response.events.is_empty() {
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                old_event_id = %cursor,
+                new_event_id = %next_event_id,
+                events = response.events.len(),
+                "Received new API event"
+            );
+        }
 
         if next_event_id != cursor || !response.events.is_empty() {
             let checkpoint = EventCheckpoint {

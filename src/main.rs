@@ -2416,6 +2416,13 @@ async fn cmd_login(
         anyhow::bail!("username cannot be empty");
     }
 
+    tracing::info!(
+        pkg = "bridge/login",
+        username = %username,
+        api_mode = requested_api_mode.as_str(),
+        "login requested"
+    );
+
     let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
 
     let mut client = api::client::ProtonClient::with_api_mode(effective_api_mode)?;
@@ -2431,6 +2438,13 @@ async fn cmd_login(
                     && matches!(&err, api::error::ApiError::Api { code: 10004, .. })
                 {
                     let fallback_mode = effective_api_mode.alternate();
+                    tracing::warn!(
+                        pkg = "bridge/login",
+                        username = %username,
+                        from_api_mode = effective_api_mode.as_str(),
+                        to_api_mode = fallback_mode.as_str(),
+                        "login mode fallback requested after API gating"
+                    );
                     eprintln!(
                         "Login mode {} is gated for this account; retrying with {}.",
                         effective_api_mode.as_str(),
@@ -2452,6 +2466,12 @@ async fn cmd_login(
 
                 if let Some(hv) = needs_hv {
                     let mut hv = hv;
+                    tracing::info!(
+                        pkg = "bridge/login",
+                        username = %username,
+                        methods = ?hv.human_verification_methods,
+                        "human verification required for login"
+                    );
                     if matches!(&err, api::error::ApiError::Api { code: 12087, .. }) {
                         eprintln!(
                             "CAPTCHA validation failed; please complete the challenge again."
@@ -2485,12 +2505,27 @@ async fn cmd_login(
                     continue;
                 }
 
+                tracing::warn!(
+                    pkg = "bridge/login",
+                    username = %username,
+                    error = %err,
+                    "login failed"
+                );
                 return Err(err.into());
             }
         }
     };
 
-    complete_cli_second_factor(&client, &auth).await?;
+    if let Err(err) = complete_cli_second_factor(&client, &auth).await {
+        tracing::warn!(
+            pkg = "bridge/login",
+            username = %username,
+            user_id = %auth.uid,
+            error = %err,
+            "second-factor login step failed"
+        );
+        return Err(err);
+    }
 
     // Fetch user info
     let user_resp = api::users::get_user(&client).await?;
@@ -2545,6 +2580,13 @@ async fn cmd_login(
 
     vault::save_session_with_user_id(&session, Some(user.id.as_str()), dir)?;
     vault::set_default_email(dir, &session.email)?;
+    tracing::info!(
+        pkg = "bridge/login",
+        user_id = %session.uid,
+        email = %session.email,
+        api_mode = session.api_mode.as_str(),
+        "login succeeded"
+    );
 
     println!(
         "Logged in as {} ({}) using API mode {}",
@@ -2579,6 +2621,11 @@ async fn complete_cli_second_factor(
     }
 
     if auth.two_factor.totp_required() {
+        tracing::info!(
+            pkg = "bridge/login",
+            user_id = %auth.uid,
+            "Requesting TOTP"
+        );
         let code = rpassword::prompt_password("2FA code: ").context("failed to read 2FA code")?;
         api::auth::submit_2fa(client, code.trim()).await?;
         return Ok(());
@@ -3207,18 +3254,29 @@ async fn cmd_account_info(
 
 fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::Result<()> {
     if !vault::session_exists(dir) {
+        tracing::info!(
+            pkg = "bridge/login",
+            scope = "none",
+            "logout requested without active session"
+        );
         println!("Not logged in");
         return Ok(());
     }
 
     if all {
+        tracing::info!(pkg = "bridge/login", scope = "all", "logout requested");
         vault::remove_session(dir)?;
+        tracing::info!(pkg = "bridge/login", scope = "all", "logout completed");
         println!("Logged out all accounts");
     } else if let Some(email) = email {
+        tracing::info!(pkg = "bridge/login", scope = "single", email = %email, "logout requested");
         vault::remove_session_by_email(dir, email)?;
+        tracing::info!(pkg = "bridge/login", scope = "single", email = %email, "logout completed");
         println!("Removed account: {}", email);
     } else {
+        tracing::info!(pkg = "bridge/login", scope = "all", "logout requested");
         vault::remove_session(dir)?;
+        tracing::info!(pkg = "bridge/login", scope = "all", "logout completed");
         println!("Logged out all accounts");
     }
     Ok(())
@@ -4022,10 +4080,30 @@ async fn refresh_session(
     session: api::types::Session,
     dir: &std::path::Path,
 ) -> anyhow::Result<api::types::Session> {
-    tracing::info!("access token missing, refreshing via stored refresh token");
+    tracing::info!(
+        pkg = "bridge/token",
+        user_id = %session.uid,
+        email = %session.email,
+        "access token missing, refreshing via stored refresh token"
+    );
     let mut client = api::client::ProtonClient::with_api_mode(session.api_mode)?;
-    let auth =
-        api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None).await?;
+    let auth = api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None)
+        .await
+        .map_err(|err| {
+            tracing::warn!(
+                pkg = "bridge/token",
+                user_id = %session.uid,
+                email = %session.email,
+                error = %err,
+                "stored refresh token exchange failed"
+            );
+            err
+        })?;
+    tracing::info!(
+        pkg = "bridge/token",
+        user_id = %auth.uid,
+        "stored refresh token exchange completed"
+    );
 
     let mut refreshed = api::types::Session {
         uid: auth.uid,
@@ -4051,6 +4129,12 @@ async fn refresh_session(
     }
 
     vault::save_session_with_user_id(&refreshed, canonical_user_id.as_deref(), dir)?;
+    tracing::info!(
+        pkg = "bridge/token",
+        user_id = %refreshed.uid,
+        email = %refreshed.email,
+        "session token refresh persisted"
+    );
     Ok(refreshed)
 }
 

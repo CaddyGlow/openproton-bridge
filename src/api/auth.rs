@@ -145,6 +145,12 @@ pub async fn refresh_auth(
     refresh_token: &str,
     access_token: Option<&str>,
 ) -> Result<RefreshResponse> {
+    info!(
+        pkg = "api/auth",
+        user_id = %uid,
+        has_access_token = access_token.is_some_and(|token| !token.is_empty()),
+        "refresh token exchange requested"
+    );
     let body = build_refresh_body(uid, refresh_token, access_token);
 
     let resp = client.post("/auth/v4/refresh").json(&body).send().await?;
@@ -154,6 +160,11 @@ pub async fn refresh_auth(
     let auth: RefreshResponse = serde_json::from_value(json)?;
     let auth = finalize_refresh_response(uid, refresh_token, auth);
     client.set_auth(&auth.uid, &auth.access_token);
+    info!(
+        pkg = "api/auth",
+        user_id = %auth.uid,
+        "refresh token exchange succeeded"
+    );
 
     Ok(auth)
 }

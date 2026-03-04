@@ -84,6 +84,12 @@ fn golden_fixture_defines_required_scenarios() {
         "existing_account_startup".to_string(),
         "repair_flow".to_string(),
         "interrupted_sync".to_string(),
+        "auth_lifecycle".to_string(),
+        "grpc_transition_lifecycle".to_string(),
+        "feedback_logout_lifecycle".to_string(),
+        "event_loop_recovery".to_string(),
+        "second_factor_prompts".to_string(),
+        "sync_job_lifecycle".to_string(),
     ]);
     assert_eq!(
         scenario_ids, required,
@@ -137,8 +143,8 @@ fn log_validator_passes_when_milestones_are_in_order() {
         &log_path,
         [
             "INFO account sync started",
-            "INFO running startup bounded resync",
-            "DEBUG completed refresh resync",
+            "INFO account_id=uid-1 account_email=user@proton.me running startup bounded resync",
+            "DEBUG account_id=uid-1 account_email=user@proton.me total_applied=12 completed refresh resync",
             "INFO account sync finished",
         ]
         .join("\n"),
@@ -182,6 +188,14 @@ fn log_validator_passes_when_milestones_are_in_order() {
             .len(),
         0
     );
+    assert_eq!(
+        report
+            .get("field_mismatch_milestones")
+            .and_then(Value::as_array)
+            .expect("field_mismatch_milestones array")
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -197,8 +211,8 @@ fn log_validator_reports_missing_and_out_of_order_milestones() {
         &log_path,
         [
             "INFO account sync started",
-            "DEBUG completed refresh resync",
-            "INFO running startup bounded resync",
+            "DEBUG account_id=uid-1 account_email=user@proton.me total_applied=7 completed refresh resync",
+            "INFO account_id=uid-1 account_email=user@proton.me running startup bounded resync",
         ]
         .join("\n"),
     )
@@ -242,4 +256,197 @@ fn log_validator_reports_missing_and_out_of_order_milestones() {
         .filter_map(Value::as_str)
         .collect::<Vec<_>>();
     assert_eq!(out_of_order, vec!["resync_completed"]);
+
+    let field_mismatch = report
+        .get("field_mismatch_milestones")
+        .and_then(Value::as_array)
+        .expect("field_mismatch_milestones array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(field_mismatch.is_empty());
+}
+
+#[test]
+fn log_validator_reports_field_mismatch_for_required_fields() {
+    let root = repo_root();
+    let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
+    let tool_path = root.join("scripts/validate_parity_logs.py");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("field-mismatch.log");
+    let report_path = tmp.path().join("field-mismatch-report.json");
+
+    fs::write(
+        &log_path,
+        [
+            "INFO account sync started",
+            "INFO running startup bounded resync",
+            "DEBUG completed refresh resync",
+            "INFO account sync finished",
+        ]
+        .join("\n"),
+    )
+    .expect("write field mismatch log");
+
+    let output = Command::new("python3")
+        .arg(&tool_path)
+        .arg("--fixture")
+        .arg(&fixture_path)
+        .arg("--scenario")
+        .arg("first_login")
+        .arg("--log")
+        .arg(&log_path)
+        .arg("--report-json")
+        .arg(&report_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run parity validator: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "validator should fail for field mismatch log"
+    );
+
+    let report = read_fixture_json(&report_path);
+    let field_mismatch = report
+        .get("field_mismatch_milestones")
+        .and_then(Value::as_array)
+        .expect("field_mismatch_milestones array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        field_mismatch,
+        vec!["startup_resync_started", "resync_completed"]
+    );
+}
+
+#[test]
+fn log_validator_passes_grpc_transition_lifecycle() {
+    let root = repo_root();
+    let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
+    let tool_path = root.join("scripts/validate_parity_logs.py");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("grpc-transition.log");
+    let report_path = tmp.path().join("grpc-transition-report.json");
+
+    fs::write(
+        &log_path,
+        [
+            "INFO pkg=grpc/bridge transition=trigger_repair repair requested",
+            "INFO pkg=grpc/sync transition=trigger_repair refreshing grpc sync workers for transition",
+            "INFO pkg=grpc/bridge transition=trigger_repair repair transition completed",
+            "INFO pkg=grpc/bridge transition=trigger_reset reset requested",
+            "INFO pkg=grpc/sync transition=trigger_reset refreshing grpc sync workers for transition",
+            "INFO pkg=grpc/bridge transition=trigger_reset reset transition completed",
+        ]
+        .join("\n"),
+    )
+    .expect("write grpc transition log");
+
+    let output = Command::new("python3")
+        .arg(&tool_path)
+        .arg("--fixture")
+        .arg(&fixture_path)
+        .arg("--scenario")
+        .arg("grpc_transition_lifecycle")
+        .arg("--log")
+        .arg(&log_path)
+        .arg("--report-json")
+        .arg(&report_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run parity validator: {err}"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected validator success, got stderr:\n{stderr}"
+    );
+
+    let report = read_fixture_json(&report_path);
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn log_validator_passes_second_factor_prompts() {
+    let root = repo_root();
+    let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
+    let tool_path = root.join("scripts/validate_parity_logs.py");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("second-factor.log");
+    let report_path = tmp.path().join("second-factor-report.json");
+
+    fs::write(
+        &log_path,
+        [
+            "INFO pkg=bridge/login user_id=uid-1 Requesting TOTP",
+            "INFO pkg=bridge/login user_id=uid-1 username=user@proton.me Requesting mailbox password",
+        ]
+        .join("\n"),
+    )
+    .expect("write second factor log");
+
+    let output = Command::new("python3")
+        .arg(&tool_path)
+        .arg("--fixture")
+        .arg(&fixture_path)
+        .arg("--scenario")
+        .arg("second_factor_prompts")
+        .arg("--log")
+        .arg(&log_path)
+        .arg("--report-json")
+        .arg(&report_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run parity validator: {err}"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected validator success, got stderr:\n{stderr}"
+    );
+
+    let report = read_fixture_json(&report_path);
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn log_validator_passes_sync_job_lifecycle() {
+    let root = repo_root();
+    let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
+    let tool_path = root.join("scripts/validate_parity_logs.py");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("sync-job.log");
+    let report_path = tmp.path().join("sync-job-report.json");
+
+    fs::write(
+        &log_path,
+        [
+            "INFO account_id=uid-1 account_email=user@proton.me Sync triggered",
+            "INFO account_id=uid-1 account_email=user@proton.me start_unix=1700000000 Beginning user sync",
+            "INFO account_id=uid-1 account_email=user@proton.me duration_ms=512 Finished user sync",
+        ]
+        .join("\n"),
+    )
+    .expect("write sync job log");
+
+    let output = Command::new("python3")
+        .arg(&tool_path)
+        .arg("--fixture")
+        .arg(&fixture_path)
+        .arg("--scenario")
+        .arg("sync_job_lifecycle")
+        .arg("--log")
+        .arg(&log_path)
+        .arg("--report-json")
+        .arg(&report_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run parity validator: {err}"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected validator success, got stderr:\n{stderr}"
+    );
+
+    let report = read_fixture_json(&report_path);
+    assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
 }

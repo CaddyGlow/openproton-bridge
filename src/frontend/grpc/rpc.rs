@@ -75,6 +75,12 @@ fn handle_stream_recv_error(
 impl BridgeService {
     async fn stage_two_password_login(&self, pending: PendingLogin) {
         let username = pending.username.clone();
+        info!(
+            pkg = "bridge/login",
+            user_id = %pending.uid,
+            username = %username,
+            "Requesting mailbox password"
+        );
         *self.state.pending_login.lock().await = Some(pending);
         self.emit_login_two_password_requested(&username);
     }
@@ -141,6 +147,11 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn trigger_repair(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        tracing::info!(
+            pkg = "grpc/bridge",
+            transition = "trigger_repair",
+            "repair requested"
+        );
         let service = self.clone();
         tokio::spawn(async move {
             match vault::list_sessions(service.settings_dir()) {
@@ -172,6 +183,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             service
                 .refresh_sync_workers_for_transition("trigger_repair")
                 .await;
+            tracing::info!(
+                pkg = "grpc/bridge",
+                transition = "trigger_repair",
+                "repair transition completed"
+            );
             service.emit_repair_started();
             service.emit_show_main_window();
         });
@@ -179,6 +195,11 @@ impl pb::bridge_server::Bridge for BridgeService {
     }
 
     async fn trigger_reset(&self, _request: Request<()>) -> Result<Response<()>, Status> {
+        tracing::info!(
+            pkg = "grpc/bridge",
+            transition = "trigger_reset",
+            "reset requested"
+        );
         vault::remove_session(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
@@ -188,6 +209,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         *self.state.pending_hv.lock().await = None;
         self.refresh_sync_workers_for_transition("trigger_reset")
             .await;
+        tracing::info!(
+            pkg = "grpc/bridge",
+            transition = "trigger_reset",
+            "reset transition completed"
+        );
         self.emit_reset_finished();
         Ok(Response::new(()))
     }
@@ -614,6 +640,14 @@ impl pb::bridge_server::Bridge for BridgeService {
         *self.state.pending_hv.lock().await = None;
 
         if auth.two_factor.requires_second_factor() {
+            if auth.two_factor.totp_required() {
+                info!(
+                    pkg = "bridge/login",
+                    user_id = %auth.uid,
+                    username = %username,
+                    "Requesting TOTP"
+                );
+            }
             let pending = PendingLogin {
                 username: username.clone(),
                 password,
@@ -978,10 +1012,22 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        tracing::info!(
+            pkg = "grpc/bridge",
+            user_id = %session.uid,
+            email = %session.email,
+            "logout requested"
+        );
         self.remove_session_access_token(&session.uid).await;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("logout_user")
             .await;
+        tracing::info!(
+            pkg = "grpc/bridge",
+            user_id = %session.uid,
+            email = %session.email,
+            "logout completed"
+        );
         Ok(Response::new(()))
     }
 

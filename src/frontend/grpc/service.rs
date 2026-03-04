@@ -111,13 +111,25 @@ impl BridgeService {
     }
 
     async fn refresh_sync_workers_for_transition(&self, transition: &'static str) {
+        info!(
+            pkg = "grpc/sync",
+            transition,
+            "refreshing grpc sync workers for transition"
+        );
         if let Err(err) = self.refresh_sync_workers().await {
             warn!(
+                pkg = "grpc/sync",
                 transition,
                 error = %err,
                 "failed to refresh grpc sync workers during transition"
             );
+            return;
         }
+        info!(
+            pkg = "grpc/sync",
+            transition,
+            "grpc sync workers refreshed for transition"
+        );
     }
 
     fn status_from_vault_error_with_events(&self, err: vault::VaultError) -> Status {

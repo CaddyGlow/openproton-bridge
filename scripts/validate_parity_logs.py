@@ -16,6 +16,7 @@ from typing import Iterable
 class Milestone:
     name: str
     any_of: tuple[str, ...]
+    required_fields: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,11 @@ def parse_scenarios(raw: dict) -> dict[str, Scenario]:
                 raise SystemExit(
                     f"scenarios[{idx}].required_milestones[{midx}].any_of must be non-empty"
                 )
+            required_fields_raw = milestone_raw.get("required_fields", [])
+            if not isinstance(required_fields_raw, list):
+                raise SystemExit(
+                    f"scenarios[{idx}].required_milestones[{midx}].required_fields must be an array"
+                )
             patterns: list[str] = []
             for pidx, pattern in enumerate(any_of_raw):
                 if not isinstance(pattern, str) or not pattern:
@@ -81,7 +87,27 @@ def parse_scenarios(raw: dict) -> dict[str, Scenario]:
                         f"invalid regex for {scenario_id}.{name}: {pattern!r}: {exc}"
                     )
                 patterns.append(pattern)
-            milestones.append(Milestone(name=name, any_of=tuple(patterns)))
+            required_fields: list[str] = []
+            for fidx, field_pattern in enumerate(required_fields_raw):
+                if not isinstance(field_pattern, str) or not field_pattern:
+                    raise SystemExit(
+                        f"scenarios[{idx}].required_milestones[{midx}].required_fields"
+                        f"[{fidx}] must be a non-empty string"
+                    )
+                try:
+                    re.compile(field_pattern)
+                except re.error as exc:
+                    raise SystemExit(
+                        f"invalid field regex for {scenario_id}.{name}: {field_pattern!r}: {exc}"
+                    )
+                required_fields.append(field_pattern)
+            milestones.append(
+                Milestone(
+                    name=name,
+                    any_of=tuple(patterns),
+                    required_fields=tuple(required_fields),
+                )
+            )
 
         parsed[scenario_id] = Scenario(
             scenario_id=scenario_id,
@@ -91,48 +117,56 @@ def parse_scenarios(raw: dict) -> dict[str, Scenario]:
     return parsed
 
 
-def first_match_after(patterns: Iterable[str], text: str, start_index: int) -> tuple[int, int] | None:
-    best: tuple[int, int] | None = None
-    for pattern in patterns:
-        match = re.search(pattern, text[start_index:], flags=re.MULTILINE)
-        if match is None:
-            continue
-        absolute_start = start_index + match.start()
-        absolute_end = start_index + match.end()
-        candidate = (absolute_start, absolute_end)
-        if best is None or candidate < best:
-            best = candidate
-    return best
+def matches_any(patterns: Iterable[str], text: str) -> bool:
+    return any(re.search(pattern, text) is not None for pattern in patterns)
 
 
-def has_match_anywhere(patterns: Iterable[str], text: str) -> bool:
-    for pattern in patterns:
-        if re.search(pattern, text, flags=re.MULTILINE) is not None:
-            return True
-    return False
+def line_matches_milestone(line: str, milestone: Milestone) -> bool:
+    if not matches_any(milestone.any_of, line):
+        return False
+    if not milestone.required_fields:
+        return True
+    return all(re.search(field, line) is not None for field in milestone.required_fields)
 
 
 def evaluate_scenario(
     log_text: str, scenario: Scenario
-) -> tuple[bool, list[str], list[str], list[str]]:
+) -> tuple[bool, list[str], list[str], list[str], list[str]]:
+    lines = log_text.splitlines()
     cursor = 0
     matched: list[str] = []
     missing: list[str] = []
     out_of_order: list[str] = []
+    field_mismatch: list[str] = []
 
     for milestone in scenario.required_milestones:
-        matched_span = first_match_after(milestone.any_of, log_text, cursor)
-        if matched_span is None:
-            if has_match_anywhere(milestone.any_of, log_text):
+        matched_index: int | None = None
+        for idx in range(cursor, len(lines)):
+            if line_matches_milestone(lines[idx], milestone):
+                matched_index = idx
+                break
+
+        if matched_index is None:
+            if any(line_matches_milestone(line, milestone) for line in lines):
+                out_of_order.append(milestone.name)
+            elif any(matches_any(milestone.any_of, line) for line in lines) and milestone.required_fields:
+                field_mismatch.append(milestone.name)
+            elif any(matches_any(milestone.any_of, line) for line in lines):
                 out_of_order.append(milestone.name)
             else:
                 missing.append(milestone.name)
             continue
-        _, end_idx = matched_span
-        cursor = end_idx
+
+        cursor = matched_index + 1
         matched.append(milestone.name)
 
-    return not missing and not out_of_order, matched, missing, out_of_order
+    return (
+        not missing and not out_of_order and not field_mismatch,
+        matched,
+        missing,
+        out_of_order,
+        field_mismatch,
+    )
 
 
 def main() -> int:
@@ -169,13 +203,16 @@ def main() -> int:
     except FileNotFoundError:
         raise SystemExit(f"log file not found: {log_path}")
 
-    passed, matched, missing, out_of_order = evaluate_scenario(log_text, scenario)
+    passed, matched, missing, out_of_order, field_mismatch = evaluate_scenario(
+        log_text, scenario
+    )
     report = {
         "scenario": scenario.scenario_id,
         "passed": passed,
         "matched_milestones": matched,
         "missing_milestones": missing,
         "out_of_order_milestones": out_of_order,
+        "field_mismatch_milestones": field_mismatch,
         "fixture": str(fixture_path),
         "log": str(log_path),
     }
@@ -197,6 +234,8 @@ def main() -> int:
         failure_parts.append(f"missing={', '.join(missing)}")
     if out_of_order:
         failure_parts.append(f"out_of_order={', '.join(out_of_order)}")
+    if field_mismatch:
+        failure_parts.append(f"field_mismatch={', '.join(field_mismatch)}")
     detail = "; ".join(failure_parts) if failure_parts else "unknown mismatch"
     print(f"FAIL: scenario={scenario.scenario_id} {detail}", file=sys.stderr)
     if matched:

@@ -16,9 +16,9 @@ Implementation status (2026-03-04):
 
 ## Current Gap Snapshot
 
-- Total compared rows: 142
+- Total compared rows: 139
 - Missing in Rust: 0
-- Rust-only: 3
+- Rust-only: 0
 - Compatible: 94
 - Exact: 45
 

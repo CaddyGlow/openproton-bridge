@@ -11,10 +11,8 @@ Auth,AccessToken,AccessToken,string,access_token,String,Exact,
 Auth,RefreshToken,RefreshToken,string,refresh_token,String,Exact,
 Auth,ServerProof,ServerProof,string,server_proof,String,Exact,
 Auth,Scope,Scope,string,scope,Option<String>,Compatible,Rust keeps both Scope and Scopes for compatibility
-Auth,Scopes,,,scopes,Vec<String>,Rust-only,
 Auth,2FA,TwoFA,TwoFAInfo,two_factor,TwoFactorInfo,Compatible,Same concept different shape
 Auth,PasswordMode,PasswordMode,PasswordMode,password_mode,i32,Compatible,Enum vs raw int
-Auth,TokenType,,,token_type,String,Rust-only,
 RefreshResponse,UID,UID,string,uid,String,Exact,Rust defaults/fills if missing
 RefreshResponse,AccessToken,AccessToken,string,access_token,String,Exact,
 RefreshResponse,RefreshToken,RefreshToken,string,refresh_token,String,Exact,
@@ -23,7 +21,6 @@ RefreshResponse,Scope,Scope,string,scope,Option<String>,Compatible,
 RefreshResponse,2FA,TwoFA,TwoFAInfo,two_factor,Option<TwoFactorInfo>,Compatible,
 RefreshResponse,PasswordMode,PasswordMode,PasswordMode,password_mode,Option<i32>,Compatible,Enum vs optional raw int
 TwoFAInfo,Enabled,Enabled,TwoFAStatus,enabled,i32,Compatible,Enum vs raw int
-TwoFAInfo,TOTP,,,totp,i32,Rust-only,
 TwoFAInfo,FIDO2,FIDO2,FIDO2Info,fido2,Option<Fido2Info>,Compatible,Rust optional
 FIDO2Info,AuthenticationOptions,AuthenticationOptions,any,authentication_options,Value,Compatible,
 FIDO2Info,RegisteredKeys,RegisteredKeys,[]RegisteredKey,registered_keys,Vec<RegisteredKey>,Compatible,

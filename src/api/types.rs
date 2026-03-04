@@ -77,7 +77,6 @@ pub struct AuthResponse {
     pub uid: String,
     pub access_token: String,
     pub refresh_token: String,
-    pub token_type: String,
     pub server_proof: String,
     #[serde(default)]
     pub scope: Option<String>,
@@ -85,7 +84,6 @@ pub struct AuthResponse {
     pub password_mode: i32,
     #[serde(rename = "2FA")]
     pub two_factor: TwoFactorInfo,
-    pub scopes: Vec<String>,
 }
 
 impl AuthResponse {
@@ -140,8 +138,6 @@ pub struct RefreshResponse {
 #[serde(rename_all = "PascalCase")]
 pub struct TwoFactorInfo {
     pub enabled: i32,
-    #[serde(rename = "TOTP")]
-    pub totp: i32,
     #[serde(rename = "FIDO2", default)]
     pub fido2: Option<Fido2Info>,
 }
@@ -171,11 +167,11 @@ impl TwoFactorInfo {
     }
 
     pub fn totp_required(&self) -> bool {
-        self.enabled != 0 && self.totp != 0
+        self.enabled & TWO_FACTOR_STATUS_HAS_TOTP != 0
     }
 
     pub fn fido_supported(&self) -> bool {
-        self.enabled == 2 || self.enabled == 3
+        self.enabled & TWO_FACTOR_STATUS_HAS_FIDO2 != 0
     }
 
     pub fn fido_authentication_options(&self) -> Option<Value> {
@@ -184,6 +180,9 @@ impl TwoFactorInfo {
             .map(|f| f.authentication_options.clone())
     }
 }
+
+const TWO_FACTOR_STATUS_HAS_TOTP: i32 = 1;
+const TWO_FACTOR_STATUS_HAS_FIDO2: i32 = 2;
 
 /// API response from POST /auth/v4/2fa
 #[derive(Debug, Deserialize)]
@@ -760,7 +759,6 @@ mod tests {
         assert_eq!(auth.access_token, "token-xyz");
         assert_eq!(auth.refresh_token, "refresh-123");
         assert_eq!(auth.scope.as_deref(), Some("mail self"));
-        assert_eq!(auth.scopes, vec!["mail", "calendar"]);
         assert!(!auth.two_factor.totp_required());
         assert_eq!(auth.password_mode, 0);
         assert!(!auth.requires_two_passwords());
@@ -840,7 +838,6 @@ mod tests {
     fn test_two_factor_info_totp_required() {
         let info = TwoFactorInfo {
             enabled: 1,
-            totp: 1,
             fido2: None,
         };
         assert!(info.totp_required());
@@ -849,25 +846,28 @@ mod tests {
 
         let info = TwoFactorInfo {
             enabled: 0,
-            totp: 1,
             fido2: None,
         };
         assert!(!info.totp_required());
         assert!(!info.requires_second_factor());
 
         let info = TwoFactorInfo {
-            enabled: 1,
-            totp: 0,
+            enabled: 2,
             fido2: None,
         };
         assert!(!info.totp_required());
+
+        let info = TwoFactorInfo {
+            enabled: 3,
+            fido2: None,
+        };
+        assert!(info.totp_required());
     }
 
     #[test]
     fn test_two_factor_info_fido_supported() {
         let info = TwoFactorInfo {
             enabled: 2,
-            totp: 0,
             fido2: Some(Fido2Info {
                 authentication_options: serde_json::json!({
                     "publicKey": { "challenge": [1, 2, 3] }

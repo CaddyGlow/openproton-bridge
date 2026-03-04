@@ -32,11 +32,9 @@ Status legend:
 | `AccessToken` | `AccessToken string` | `access_token String` | Exact | |
 | `RefreshToken` | `RefreshToken string` | `refresh_token String` | Exact | |
 | `ServerProof` | `ServerProof string` | `server_proof String` | Exact | |
-| `Scope` | `Scope string` | `scope Option<String>` | Compatible | Rust keeps both `Scope` and `Scopes` for compatibility. |
-| `Scopes` | _none_ | `scopes Vec<String>` | Rust-only | Go keeps a single `Scope` string. |
+| `Scope` | `Scope string` | `scope Option<String>` | Compatible | |
 | `2FA` | `TwoFA TwoFAInfo` | `two_factor TwoFactorInfo` | Compatible | Same concept, different nested shape. |
 | `PasswordMode` | `PasswordMode PasswordMode` | `password_mode i32` | Compatible | Rust uses raw integer, Go typed enum. |
-| `TokenType` | _none_ | `token_type String` | Rust-only | Parsed in Rust login response. |
 
 ## Refresh Auth Response (`Auth` vs `RefreshResponse`)
 
@@ -54,8 +52,7 @@ Status legend:
 
 | JSON key | go-proton-api | openproton-bridge | Status | Notes |
 |---|---|---|---|---|
-| `Enabled` | `Enabled TwoFAStatus` | `enabled i32` | Compatible | Rust uses raw integer. |
-| `TOTP` | _none_ | `totp i32` | Rust-only | Rust explicitly tracks TOTP flag. |
+| `Enabled` | `Enabled TwoFAStatus` | `enabled i32` | Compatible | Rust uses raw integer bit flags. |
 | `FIDO2` | `FIDO2 FIDO2Info` | `fido2 Option<Fido2Info>` | Compatible | Rust optional, Go non-optional struct. |
 
 ## FIDO2 Metadata (`FIDO2Info` vs `Fido2Info`)

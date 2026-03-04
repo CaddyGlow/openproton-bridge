@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Mutex as AsyncMutex, RwLock};
+use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
 use tracing::{debug, warn};
 
 use crate::api::auth;
@@ -51,6 +51,8 @@ pub enum AccountRuntimeError {
 pub struct RuntimeAccountRegistry {
     sessions: RwLock<HashMap<AccountId, Session>>,
     health: RwLock<HashMap<AccountId, AccountHealth>>,
+    runtime_generations: RwLock<HashMap<AccountId, u64>>,
+    generation_watchers: Mutex<HashMap<AccountId, watch::Sender<u64>>>,
     refresh_locks: Mutex<HashMap<AccountId, Arc<AsyncMutex<()>>>>,
     vault_dir: Option<PathBuf>,
 }
@@ -234,6 +236,8 @@ impl RuntimeAccountRegistry {
     fn with_optional_vault_dir(sessions: Vec<Session>, vault_dir: Option<PathBuf>) -> Self {
         let mut map = HashMap::new();
         let mut health = HashMap::new();
+        let mut runtime_generations = HashMap::new();
+        let mut generation_watchers = HashMap::new();
         for session in sessions {
             if !is_session_runtime_usable(&session) {
                 warn!(
@@ -246,11 +250,16 @@ impl RuntimeAccountRegistry {
             }
             let account_id = AccountId(session.uid.clone());
             map.insert(account_id.clone(), session);
-            health.insert(account_id, AccountHealth::Healthy);
+            health.insert(account_id.clone(), AccountHealth::Healthy);
+            runtime_generations.insert(account_id.clone(), 0);
+            let (generation_tx, _generation_rx) = watch::channel(0);
+            generation_watchers.insert(account_id, generation_tx);
         }
         Self {
             sessions: RwLock::new(map),
             health: RwLock::new(health),
+            runtime_generations: RwLock::new(runtime_generations),
+            generation_watchers: Mutex::new(generation_watchers),
             refresh_locks: Mutex::new(HashMap::new()),
             vault_dir,
         }
@@ -262,6 +271,14 @@ impl RuntimeAccountRegistry {
             .entry(account_id.clone())
             .or_insert_with(|| Arc::new(AsyncMutex::new(())))
             .clone()
+    }
+
+    fn generation_sender_for(&self, account_id: &AccountId) -> Option<watch::Sender<u64>> {
+        let watchers = self
+            .generation_watchers
+            .lock()
+            .expect("generation watcher lock poisoned");
+        watchers.get(account_id).cloned()
     }
 
     pub async fn get_session(&self, account_id: &AccountId) -> Option<Session> {
@@ -291,6 +308,87 @@ impl RuntimeAccountRegistry {
                 current = ?account_health,
                 "account health changed"
             );
+        }
+        drop(health);
+
+        if previous != AccountHealth::Unavailable && account_health == AccountHealth::Unavailable {
+            let next_generation = {
+                let mut generations = self.runtime_generations.write().await;
+                let Some(generation) = generations.get_mut(account_id) else {
+                    return Err(AccountRuntimeError::AccountNotFound(account_id.0.clone()));
+                };
+                *generation = generation.saturating_add(1);
+                *generation
+            };
+            if let Some(generation_tx) = self.generation_sender_for(account_id) {
+                let _ = generation_tx.send(next_generation);
+            }
+            warn!(
+                account_id = %account_id.0,
+                generation = next_generation,
+                "account transitioned to unavailable; canceled active runtime generation"
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn runtime_generation(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<u64, AccountRuntimeError> {
+        let generations = self.runtime_generations.read().await;
+        generations
+            .get(account_id)
+            .copied()
+            .ok_or_else(|| AccountRuntimeError::AccountNotFound(account_id.0.clone()))
+    }
+
+    pub fn subscribe_runtime_generation(
+        &self,
+        account_id: &AccountId,
+    ) -> Result<watch::Receiver<u64>, AccountRuntimeError> {
+        let watchers = self
+            .generation_watchers
+            .lock()
+            .expect("generation watcher lock poisoned");
+        let Some(generation_tx) = watchers.get(account_id) else {
+            return Err(AccountRuntimeError::AccountNotFound(account_id.0.clone()));
+        };
+        Ok(generation_tx.subscribe())
+    }
+
+    pub async fn is_runtime_generation_current(
+        &self,
+        account_id: &AccountId,
+        expected_generation: u64,
+    ) -> Result<bool, AccountRuntimeError> {
+        Ok(self.runtime_generation(account_id).await? == expected_generation)
+    }
+
+    pub async fn ensure_runtime_generation(
+        &self,
+        account_id: &AccountId,
+        expected_generation: u64,
+    ) -> Result<(), AccountRuntimeError> {
+        let current_generation = self.runtime_generation(account_id).await?;
+        if current_generation != expected_generation {
+            warn!(
+                account_id = %account_id.0,
+                expected_generation,
+                current_generation,
+                "stale runtime generation detected for account"
+            );
+            return Err(AccountRuntimeError::AccountUnavailable(
+                account_id.0.clone(),
+            ));
+        }
+        if matches!(
+            self.get_health(account_id).await,
+            Some(AccountHealth::Unavailable)
+        ) {
+            return Err(AccountRuntimeError::AccountUnavailable(
+                account_id.0.clone(),
+            ));
         }
         Ok(())
     }
@@ -657,6 +755,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.email, "bob@proton.me");
+    }
+
+    #[tokio::test]
+    async fn runtime_generation_defaults_to_zero_and_bumps_on_unavailable() {
+        let runtime = RuntimeAccountRegistry::in_memory(vec![session("uid-1", "alice@proton.me")]);
+        let account_id = AccountId("uid-1".to_string());
+        let mut generation_rx = runtime.subscribe_runtime_generation(&account_id).unwrap();
+
+        assert_eq!(runtime.runtime_generation(&account_id).await.unwrap(), 0);
+        assert_eq!(*generation_rx.borrow(), 0);
+
+        runtime
+            .set_health(&account_id, AccountHealth::Unavailable)
+            .await
+            .unwrap();
+        generation_rx.changed().await.unwrap();
+        assert_eq!(*generation_rx.borrow_and_update(), 1);
+        assert_eq!(runtime.runtime_generation(&account_id).await.unwrap(), 1);
+
+        runtime
+            .set_health(&account_id, AccountHealth::Unavailable)
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(30),
+            generation_rx.changed(),
+        )
+        .await
+        .is_err());
+        assert_eq!(runtime.runtime_generation(&account_id).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn runtime_generation_guard_rejects_stale_generation() {
+        let runtime = RuntimeAccountRegistry::in_memory(vec![session("uid-1", "alice@proton.me")]);
+        let account_id = AccountId("uid-1".to_string());
+        let initial_generation = runtime.runtime_generation(&account_id).await.unwrap();
+        assert!(runtime
+            .is_runtime_generation_current(&account_id, initial_generation)
+            .await
+            .unwrap());
+
+        runtime
+            .set_health(&account_id, AccountHealth::Unavailable)
+            .await
+            .unwrap();
+
+        let err = runtime
+            .ensure_runtime_generation(&account_id, initial_generation)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AccountRuntimeError::AccountUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_generation_unavailable_transition_is_isolated_per_account() {
+        let runtime = RuntimeAccountRegistry::in_memory(vec![
+            session("uid-1", "alice@proton.me"),
+            session("uid-2", "bob@proton.me"),
+        ]);
+        let account_a = AccountId("uid-1".to_string());
+        let account_b = AccountId("uid-2".to_string());
+        let mut generation_b = runtime.subscribe_runtime_generation(&account_b).unwrap();
+
+        runtime
+            .set_health(&account_a, AccountHealth::Unavailable)
+            .await
+            .unwrap();
+
+        assert_eq!(runtime.runtime_generation(&account_a).await.unwrap(), 1);
+        assert_eq!(runtime.runtime_generation(&account_b).await.unwrap(), 0);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), generation_b.changed(),)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

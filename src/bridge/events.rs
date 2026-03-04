@@ -638,6 +638,53 @@ fn resolve_api_base_url_for_mode(configured_base_url: &str, api_mode: ApiMode) -
     }
 }
 
+async fn ensure_account_generation(
+    config: &EventWorkerConfig,
+    expected_generation: u64,
+    stage: &'static str,
+) -> Result<(), EventWorkerError> {
+    let generation_is_current = config
+        .runtime_accounts
+        .is_runtime_generation_current(&config.account_id, expected_generation)
+        .await?;
+    match config
+        .runtime_accounts
+        .ensure_runtime_generation(&config.account_id, expected_generation)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(AccountRuntimeError::AccountUnavailable(_)) => {
+            if !generation_is_current {
+                let current_generation = config
+                    .runtime_accounts
+                    .runtime_generation(&config.account_id)
+                    .await
+                    .unwrap_or(expected_generation);
+                info!(
+                    account_id = %config.account_id.0,
+                    account_email = %config.account_email,
+                    stage,
+                    expected_generation,
+                    current_generation,
+                    "ignored stale account worker success due to runtime generation mismatch"
+                );
+            } else {
+                info!(
+                    account_id = %config.account_id.0,
+                    account_email = %config.account_email,
+                    stage,
+                    expected_generation,
+                    "account runtime became unavailable; canceling account-scoped work"
+                );
+            }
+            Err(EventWorkerError::Account(
+                AccountRuntimeError::AccountUnavailable(config.account_id.0.clone()),
+            ))
+        }
+        Err(err) => Err(EventWorkerError::Account(err)),
+    }
+}
+
 async fn build_client_with_retry(
     config: &EventWorkerConfig,
     session: &mut Session,
@@ -720,7 +767,9 @@ async fn refresh_address_index_with_retry(
     config: &EventWorkerConfig,
     session: &mut Session,
     client: &mut ProtonClient,
+    expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "refresh_address_index_fetch").await?;
     let addresses = match users::get_addresses(client).await {
         Ok(resp) => resp,
         Err(err) if is_auth_error(&err) => {
@@ -738,6 +787,7 @@ async fn refresh_address_index_with_retry(
         .map(|addr| addr.email)
         .collect();
 
+    ensure_account_generation(config, expected_generation, "refresh_address_index_commit").await?;
     let _ = config
         .auth_router
         .set_account_addresses(&config.account_id, emails);
@@ -749,20 +799,24 @@ async fn apply_message_upsert(
     session: &mut Session,
     client: &mut ProtonClient,
     message_id: &str,
+    expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
     let metadata = fetch_message_metadata_with_retry(config, session, client, message_id).await?;
 
-    apply_metadata_to_store(config, &metadata).await
+    apply_metadata_to_store(config, &metadata, expected_generation).await
 }
 
 async fn apply_metadata_to_store(
     config: &EventWorkerConfig,
     metadata: &MessageMetadata,
+    expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "apply_metadata_to_store").await?;
     for mb in mailbox::system_mailboxes() {
         if !mb.selectable {
             continue;
         }
+        ensure_account_generation(config, expected_generation, "apply_metadata_to_store").await?;
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         let in_mailbox = metadata.label_ids.iter().any(|label| label == mb.label_id);
         if in_mailbox {
@@ -841,6 +895,20 @@ async fn bounded_resync_account(
     session: &mut Session,
     client: &mut ProtonClient,
 ) -> Result<(), EventWorkerError> {
+    let expected_generation = config
+        .runtime_accounts
+        .runtime_generation(&config.account_id)
+        .await?;
+    bounded_resync_account_for_generation(config, session, client, expected_generation).await
+}
+
+async fn bounded_resync_account_for_generation(
+    config: &EventWorkerConfig,
+    session: &mut Session,
+    client: &mut ProtonClient,
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "bounded_resync_start").await?;
     let resync_started_at = Instant::now();
     let sync_start = unix_now();
 
@@ -918,9 +986,11 @@ async fn bounded_resync_account(
         if !mb.selectable {
             continue;
         }
+        ensure_account_generation(config, expected_generation, "bounded_resync_mailbox").await?;
 
         let mut end_id: Option<String> = None;
         loop {
+            ensure_account_generation(config, expected_generation, "bounded_resync_page").await?;
             let filter = MessageFilter {
                 label_id: Some(mb.label_id.to_string()),
                 end_id: end_id.clone(),
@@ -957,7 +1027,7 @@ async fn bounded_resync_account(
 
             for metadata in messages {
                 if synced_message_ids.insert(metadata.id.clone()) {
-                    apply_metadata_to_store(config, &metadata).await?;
+                    apply_metadata_to_store(config, &metadata, expected_generation).await?;
                     total_applied += 1;
                 }
             }
@@ -1065,7 +1135,9 @@ fn emit_sync_progress(
 async fn apply_message_delete(
     config: &EventWorkerConfig,
     message_id: &str,
+    expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "apply_message_delete").await?;
     for mb in mailbox::system_mailboxes() {
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         if let Some(uid) = config
@@ -1084,7 +1156,11 @@ async fn apply_message_delete(
     Ok(())
 }
 
-async fn run_startup_resync(config: &EventWorkerConfig) -> Result<(), EventWorkerError> {
+async fn run_startup_resync_for_generation(
+    config: &EventWorkerConfig,
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "startup_resync_init").await?;
     let mut session = config
         .runtime_accounts
         .with_valid_access_token(&config.account_id)
@@ -1103,13 +1179,27 @@ async fn run_startup_resync(config: &EventWorkerConfig) -> Result<(), EventWorke
         account_email = %config.account_email,
         "running startup bounded resync"
     );
-    bounded_resync_account(config, &mut session, &mut client).await
+    bounded_resync_account_for_generation(config, &mut session, &mut client, expected_generation)
+        .await
 }
 
 pub async fn poll_account_once(
     config: &EventWorkerConfig,
     last_event_id: &str,
 ) -> Result<String, EventWorkerError> {
+    let expected_generation = config
+        .runtime_accounts
+        .runtime_generation(&config.account_id)
+        .await?;
+    poll_account_once_for_generation(config, last_event_id, expected_generation).await
+}
+
+async fn poll_account_once_for_generation(
+    config: &EventWorkerConfig,
+    last_event_id: &str,
+    expected_generation: u64,
+) -> Result<String, EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "poll_init").await?;
     let mut session = config
         .runtime_accounts
         .with_valid_access_token(&config.account_id)
@@ -1127,6 +1217,7 @@ pub async fn poll_account_once(
     let mut pages = 0usize;
 
     loop {
+        ensure_account_generation(config, expected_generation, "poll_loop").await?;
         pages += 1;
         if pages > 32 {
             warn!(
@@ -1158,13 +1249,20 @@ pub async fn poll_account_once(
                         event_id = %reset_event_id,
                         "Event loop reset"
                     );
-                    bounded_resync_account(config, &mut session, &mut client).await?;
+                    bounded_resync_account_for_generation(
+                        config,
+                        &mut session,
+                        &mut client,
+                        expected_generation,
+                    )
+                    .await?;
                     forced_sync_state = Some("cursor_reset_resync");
                     cursor.clear();
                     fetch_events_with_retry(config, &mut session, &mut client, &cursor).await?
                 }
                 Err(error) => return Err(error),
             };
+        ensure_account_generation(config, expected_generation, "poll_after_fetch").await?;
 
         let mut address_changed = response.refresh != 0;
         let mut labels_changed = false;
@@ -1176,17 +1274,31 @@ pub async fn poll_account_once(
                 refresh = response.refresh,
                 "Received refresh event"
             );
-            bounded_resync_account(config, &mut session, &mut client).await?;
+            bounded_resync_account_for_generation(
+                config,
+                &mut session,
+                &mut client,
+                expected_generation,
+            )
+            .await?;
             resync_state = Some("refresh_resync");
         }
         for event in &response.events {
+            ensure_account_generation(config, expected_generation, "poll_event_delta").await?;
             for delta in parse_event_deltas(event) {
                 match delta {
                     EventDelta::MessageUpsert(id) => {
-                        apply_message_upsert(config, &mut session, &mut client, &id).await?;
+                        apply_message_upsert(
+                            config,
+                            &mut session,
+                            &mut client,
+                            &id,
+                            expected_generation,
+                        )
+                        .await?;
                     }
                     EventDelta::MessageDelete(id) => {
-                        apply_message_delete(config, &id).await?;
+                        apply_message_delete(config, &id, expected_generation).await?;
                     }
                     EventDelta::LabelsChanged => {
                         labels_changed = true;
@@ -1199,12 +1311,26 @@ pub async fn poll_account_once(
         }
 
         if labels_changed && resync_state.is_none() {
-            bounded_resync_account(config, &mut session, &mut client).await?;
+            bounded_resync_account_for_generation(
+                config,
+                &mut session,
+                &mut client,
+                expected_generation,
+            )
+            .await?;
             resync_state = Some("label_resync");
         }
 
         if address_changed {
-            refresh_address_index_with_retry(config, &mut session, &mut client).await?;
+            ensure_account_generation(config, expected_generation, "poll_refresh_address_index")
+                .await?;
+            refresh_address_index_with_retry(
+                config,
+                &mut session,
+                &mut client,
+                expected_generation,
+            )
+            .await?;
         }
 
         let next_event_id = if response.event_id.is_empty() {
@@ -1225,6 +1351,8 @@ pub async fn poll_account_once(
         }
 
         if next_event_id != cursor || !response.events.is_empty() {
+            ensure_account_generation(config, expected_generation, "poll_checkpoint_commit")
+                .await?;
             let checkpoint = EventCheckpoint {
                 last_event_id: next_event_id.clone(),
                 last_event_ts: Some(unix_now()),
@@ -1293,8 +1421,39 @@ async fn run_event_worker_with_shutdown(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(next_delay) => {
+                let expected_generation = match config
+                    .runtime_accounts
+                    .runtime_generation(&config.account_id)
+                    .await
+                {
+                    Ok(generation) => generation,
+                    Err(err) => {
+                        warn!(
+                            account_id = %config.account_id.0,
+                            account_email = %config.account_email,
+                            error = %err,
+                            "failed to read account runtime generation; stopping worker"
+                        );
+                        break;
+                    }
+                };
                 if startup_resync_pending {
-                    match run_startup_resync(&config).await {
+                    let startup_result = match run_startup_resync_for_generation(
+                        &config,
+                        expected_generation,
+                    )
+                    .await
+                    {
+                        Ok(()) => ensure_account_generation(
+                            &config,
+                            expected_generation,
+                            "startup_resync_success_commit",
+                        )
+                        .await
+                        .map(|_| ()),
+                        Err(err) => Err(err),
+                    };
+                    match startup_result {
                         Ok(()) => {
                             let now = unix_now();
                             let failures_before_recovery = consecutive_failures;
@@ -1367,7 +1526,23 @@ async fn run_event_worker_with_shutdown(
                     continue;
                 }
 
-                match poll_account_once(&config, &last_event_id).await {
+                let poll_result = match poll_account_once_for_generation(
+                    &config,
+                    &last_event_id,
+                    expected_generation,
+                )
+                .await
+                {
+                    Ok(next_event_id) => ensure_account_generation(
+                        &config,
+                        expected_generation,
+                        "poll_success_commit",
+                    )
+                    .await
+                    .map(|_| next_event_id),
+                    Err(err) => Err(err),
+                };
+                match poll_result {
                     Ok(next_event_id) => {
                         let now = unix_now();
                         let failures_before_recovery = consecutive_failures;
@@ -3043,6 +3218,71 @@ mod tests {
         );
 
         group.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_in_flight_poll_does_not_commit_after_unavailable_transition() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(250))
+                    .set_body_json(serde_json::json!({
+                        "Code": 1000,
+                        "EventID": "event-1",
+                        "More": 0,
+                        "Refresh": 0,
+                        "Events": []
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let auth_router = AuthRouter::new(AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        )));
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+        let config = event_worker_config(
+            &server.uri(),
+            runtime.clone(),
+            auth_router,
+            store,
+            checkpoints.clone(),
+        );
+        let account_id = AccountId("uid-1".to_string());
+        let expected_generation = runtime.runtime_generation(&account_id).await.unwrap();
+
+        let poll = tokio::spawn({
+            let config = config.clone();
+            async move {
+                poll_account_once_for_generation(&config, "event-0", expected_generation).await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        runtime
+            .set_health(&account_id, AccountHealth::Unavailable)
+            .await
+            .unwrap();
+
+        let err = poll.await.unwrap().unwrap_err();
+        assert!(matches!(
+            err,
+            EventWorkerError::Account(AccountRuntimeError::AccountUnavailable(_))
+        ));
+        assert_eq!(
+            runtime.get_health(&account_id).await.unwrap(),
+            AccountHealth::Unavailable
+        );
+        assert!(checkpoints.load_checkpoint(&account_id).unwrap().is_none());
     }
 
     #[tokio::test]

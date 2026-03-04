@@ -157,7 +157,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         );
         let service = self.clone();
         tokio::spawn(async move {
-            let _runtime_transition_guard = service.state.mail_runtime_transition_lock.lock().await;
+            let runtime_transition_guard = service.state.mail_runtime_transition_lock.lock().await;
             match vault::list_sessions(service.settings_dir()) {
                 Ok(sessions) => {
                     for session in sessions {
@@ -183,6 +183,7 @@ impl pb::bridge_server::Bridge for BridgeService {
                     tracing::warn!(error = %err, "failed to list sessions during repair");
                 }
             }
+            drop(runtime_transition_guard);
 
             service
                 .refresh_sync_workers_for_transition("trigger_repair")

@@ -93,10 +93,11 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
     });
 
     let service = BridgeService::new(state);
-    service
-        .refresh_sync_workers()
-        .await
-        .context("failed to start grpc sync workers")?;
+    info!(
+        pkg = "grpc/sync",
+        owner = "mail_runtime",
+        "using mail runtime as the single grpc sync worker owner"
+    );
     service.start_mail_runtime_on_startup().await;
     #[cfg(unix)]
     info!(pkg = "grpc", useFileSocket = true, "Starting gRPC server");

@@ -294,6 +294,7 @@ include!("service.rs");
 include!("rpc.rs");
 include!("runtime.rs");
 
+#[allow(dead_code)]
 async fn maybe_start_grpc_sync_workers(
     runtime_paths: &RuntimePaths,
     service: &BridgeService,
@@ -427,6 +428,7 @@ async fn maybe_start_grpc_sync_workers(
     ))
 }
 
+#[allow(dead_code)]
 async fn repair_vault_user_ids_for_compatibility(
     settings_dir: &Path,
     runtime_accounts: &Arc<bridge::accounts::RuntimeAccountRegistry>,

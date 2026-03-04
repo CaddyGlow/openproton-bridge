@@ -387,28 +387,90 @@ impl BridgeService {
 
     async fn refresh_sync_workers(&self) -> anyhow::Result<()> {
         if !self.state.sync_workers_enabled {
+            debug!(
+                pkg = "grpc/sync",
+                "sync owner refresh disabled; skipping mail runtime restart"
+            );
             return Ok(());
         }
 
-        let worker_generation = self.next_sync_worker_generation();
+        let _worker_generation = self.next_sync_worker_generation();
         self.clear_active_syncing_users();
-
-        let active_disk_cache_path = self.state.active_disk_cache_path.lock().await.clone();
-        let next_group = maybe_start_grpc_sync_workers(
-            &self.state.runtime_paths,
-            self,
-            worker_generation,
-            &active_disk_cache_path,
-        )
-        .await?;
-
-        let previous_group = {
+        let legacy_group = {
             let mut guard = self.state.sync_event_workers.lock().await;
-            std::mem::replace(&mut *guard, next_group)
+            guard.take()
+        };
+        if let Some(group) = legacy_group {
+            info!(
+                pkg = "grpc/sync",
+                owner = "mail_runtime",
+                "shutting down legacy grpc-owned sync worker group"
+            );
+            group.shutdown().await;
+        }
+
+        let _guard = self.state.mail_runtime_transition_lock.lock().await;
+        let settings = self.state.mail_settings.lock().await.clone();
+        let has_sessions = match vault::list_sessions(self.settings_dir()) {
+            Ok(sessions) => !sessions.is_empty(),
+            Err(err) => {
+                warn!(
+                    pkg = "grpc/sync",
+                    error = %err,
+                    "failed to load sessions while refreshing grpc sync owner"
+                );
+                false
+            }
         };
 
-        if let Some(group) = previous_group {
-            group.shutdown().await;
+        let existing = self.state.mail_runtime.lock().await.take();
+        let had_runtime = existing.is_some();
+        if let Some(runtime) = existing {
+            info!(
+                pkg = "grpc/sync",
+                owner = "mail_runtime",
+                "stopping grpc mail runtime before sync-owner refresh"
+            );
+            if let Err(err) = runtime.stop().await {
+                warn!(
+                    pkg = "grpc/sync",
+                    owner = "mail_runtime",
+                    error = %err,
+                    "failed to stop grpc mail runtime during sync-owner refresh"
+                );
+            }
+        }
+
+        if !has_sessions {
+            info!(
+                pkg = "grpc/sync",
+                owner = "mail_runtime",
+                "no sessions available after transition; sync owner remains stopped"
+            );
+            return Ok(());
+        }
+
+        let runtime_transition = if had_runtime {
+            bridge::mail_runtime::MailRuntimeTransition::SettingsChange
+        } else {
+            bridge::mail_runtime::MailRuntimeTransition::Startup
+        };
+        match self
+            .start_mail_runtime_with_settings(&settings, runtime_transition)
+            .await
+        {
+            Ok(runtime) => {
+                *self.state.mail_runtime.lock().await = Some(runtime);
+                info!(
+                    pkg = "grpc/sync",
+                    owner = "mail_runtime",
+                    "refreshed grpc sync owner via mail runtime restart"
+                );
+            }
+            Err(err) => {
+                self.emit_mail_runtime_change_error(&settings, &err);
+                anyhow::bail!("failed to restart grpc mail runtime sync owner: {err}");
+            }
         }
 
         Ok(())
@@ -431,21 +493,24 @@ impl BridgeService {
         info!(
             pkg = "grpc/sync",
             transition,
-            "refreshing grpc sync workers for transition"
+            owner = "mail_runtime",
+            "refreshing grpc sync owner for transition"
         );
         if let Err(err) = self.refresh_sync_workers().await {
             warn!(
                 pkg = "grpc/sync",
                 transition,
                 error = %err,
-                "failed to refresh grpc sync workers during transition"
+                owner = "mail_runtime",
+                "failed to refresh grpc sync owner during transition"
             );
             return;
         }
         info!(
             pkg = "grpc/sync",
             transition,
-            "grpc sync workers refreshed for transition"
+            owner = "mail_runtime",
+            "grpc sync owner refreshed for transition"
         );
     }
 

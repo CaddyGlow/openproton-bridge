@@ -420,9 +420,13 @@ fn log_validator_passes_sync_job_lifecycle() {
     fs::write(
         &log_path,
         [
-            "INFO account_id=uid-1 account_email=user@proton.me Sync triggered",
-            "INFO account_id=uid-1 account_email=user@proton.me start_unix=1700000000 Beginning user sync",
-            "INFO account_id=uid-1 account_email=user@proton.me duration_ms=512 Finished user sync",
+            "INFO user_id=uid-1 start=1700000000 duration=0ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=0 Sync triggered",
+            "INFO user_id=uid-1 start=1700000000 duration=1ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=1 Beginning user sync",
+            "INFO user_id=uid-1 start=1700000000 duration=2ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=2 Syncing labels",
+            "INFO user_id=uid-1 start=1700000000 duration=3ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=3 Synced labels",
+            "INFO user_id=uid-1 start=1700000000 duration=4ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=4 Syncing messages",
+            "INFO user_id=uid-1 start=1700000000 duration=5ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=5 Synced messages",
+            "INFO user_id=uid-1 start=1700000000 duration=6ms account_id=uid-1 account_email=user@proton.me start_unix=1700000000 duration_ms=6 Finished user sync",
         ]
         .join("\n"),
     )
@@ -449,4 +453,68 @@ fn log_validator_passes_sync_job_lifecycle() {
 
     let report = read_fixture_json(&report_path);
     assert_eq!(report.get("passed").and_then(Value::as_bool), Some(true));
+}
+
+#[test]
+fn log_validator_reports_sync_job_lifecycle_field_mismatch() {
+    let root = repo_root();
+    let fixture_path = root.join("tests/fixtures/parity_golden_logs.json");
+    let tool_path = root.join("scripts/validate_parity_logs.py");
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let log_path = tmp.path().join("sync-job-field-mismatch.log");
+    let report_path = tmp.path().join("sync-job-field-mismatch-report.json");
+
+    fs::write(
+        &log_path,
+        [
+            "INFO Sync triggered",
+            "INFO Beginning user sync",
+            "INFO Syncing labels",
+            "INFO Synced labels",
+            "INFO Syncing messages",
+            "INFO Messages are already synced, skipping",
+            "INFO Finished user sync",
+        ]
+        .join("\n"),
+    )
+    .expect("write sync job mismatch log");
+
+    let output = Command::new("python3")
+        .arg(&tool_path)
+        .arg("--fixture")
+        .arg(&fixture_path)
+        .arg("--scenario")
+        .arg("sync_job_lifecycle")
+        .arg("--log")
+        .arg(&log_path)
+        .arg("--report-json")
+        .arg(&report_path)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run parity validator: {err}"));
+
+    assert!(
+        !output.status.success(),
+        "validator should fail for sync job field mismatch log"
+    );
+
+    let report = read_fixture_json(&report_path);
+    let field_mismatch = report
+        .get("field_mismatch_milestones")
+        .and_then(Value::as_array)
+        .expect("field_mismatch_milestones array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        field_mismatch,
+        vec![
+            "sync_triggered",
+            "sync_beginning",
+            "syncing_labels",
+            "synced_labels",
+            "syncing_messages",
+            "message_sync_completed_or_skipped",
+            "sync_finished",
+        ]
+    );
 }

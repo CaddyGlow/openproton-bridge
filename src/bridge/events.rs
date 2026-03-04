@@ -841,20 +841,29 @@ async fn bounded_resync_account(
     session: &mut Session,
     client: &mut ProtonClient,
 ) -> Result<(), EventWorkerError> {
+    let resync_started_at = Instant::now();
     let sync_start = unix_now();
 
-    info!(
-        user_id = %config.account_id.0,
-        account_id = %config.account_id.0,
-        account_email = %config.account_email,
-        "Sync triggered"
-    );
+    let duration = resync_started_at.elapsed();
     info!(
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
         start = sync_start,
         start_unix = sync_start,
+        duration = ?duration,
+        duration_ms = duration.as_millis() as u64,
+        "Sync triggered"
+    );
+    let duration = resync_started_at.elapsed();
+    info!(
+        user_id = %config.account_id.0,
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        start = sync_start,
+        start_unix = sync_start,
+        duration = ?duration,
+        duration_ms = duration.as_millis() as u64,
         "Beginning user sync"
     );
     let mut progress_guard = SyncProgressRunGuard::new(
@@ -862,7 +871,40 @@ async fn bounded_resync_account(
         config.account_id.0.clone(),
     );
 
-    let resync_started_at = Instant::now();
+    let duration = resync_started_at.elapsed();
+    info!(
+        user_id = %config.account_id.0,
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        start = sync_start,
+        start_unix = sync_start,
+        duration = ?duration,
+        duration_ms = duration.as_millis() as u64,
+        "Syncing labels"
+    );
+    let duration = resync_started_at.elapsed();
+    info!(
+        user_id = %config.account_id.0,
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        start = sync_start,
+        start_unix = sync_start,
+        duration = ?duration,
+        duration_ms = duration.as_millis() as u64,
+        "Synced labels"
+    );
+    let duration = resync_started_at.elapsed();
+    info!(
+        user_id = %config.account_id.0,
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        start = sync_start,
+        start_unix = sync_start,
+        duration = ?duration,
+        duration_ms = duration.as_millis() as u64,
+        "Syncing messages"
+    );
+
     let mut total_steps = mailbox::system_mailboxes()
         .iter()
         .filter(|mb| mb.selectable)
@@ -950,11 +992,39 @@ async fn bounded_resync_account(
         resync_started_at.elapsed(),
     );
     progress_guard.finish();
+
+    let duration = resync_started_at.elapsed();
+    if total_applied == 0 {
+        info!(
+            user_id = %config.account_id.0,
+            account_id = %config.account_id.0,
+            account_email = %config.account_email,
+            start = sync_start,
+            start_unix = sync_start,
+            duration = ?duration,
+            duration_ms = duration.as_millis() as u64,
+            "Messages are already synced, skipping"
+        );
+    } else {
+        info!(
+            user_id = %config.account_id.0,
+            account_id = %config.account_id.0,
+            account_email = %config.account_email,
+            start = sync_start,
+            start_unix = sync_start,
+            duration = ?duration,
+            duration_ms = duration.as_millis() as u64,
+            "Synced messages"
+        );
+    }
+
     let duration = resync_started_at.elapsed();
     info!(
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
+        start = sync_start,
+        start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
         "Finished user sync"
@@ -1129,17 +1199,7 @@ pub async fn poll_account_once(
         }
 
         if labels_changed && resync_state.is_none() {
-            info!(
-                account_id = %config.account_id.0,
-                account_email = %config.account_email,
-                "Syncing labels"
-            );
             bounded_resync_account(config, &mut session, &mut client).await?;
-            info!(
-                account_id = %config.account_id.0,
-                account_email = %config.account_email,
-                "Synced labels"
-            );
             resync_state = Some("label_resync");
         }
 

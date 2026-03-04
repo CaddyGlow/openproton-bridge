@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use tracing::info;
 
 use super::client::{
@@ -36,11 +38,18 @@ fn build_message_metadata_body(
 /// Reference: go-proton-api/message.go GetMessage
 pub async fn get_message(client: &ProtonClient, message_id: &str) -> Result<MessageResponse> {
     info!(message_id = %message_id, "fetching message");
+    let fetch_started = Instant::now();
     let path = format!("/mail/v4/messages/{}", message_id);
     let resp = send_logged(client.get(&path)).await?;
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     let msg_resp: MessageResponse = serde_json::from_value(json)?;
+    info!(
+        message_id = %message_id,
+        duration_ms = fetch_started.elapsed().as_millis() as u64,
+        attachment_count = msg_resp.message.attachments.len(),
+        "full_message_fetch"
+    );
     Ok(msg_resp)
 }
 
@@ -66,6 +75,7 @@ pub async fn get_message_metadata(
     let body = build_message_metadata_body(filter, page, page_size)?;
 
     for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+        let fetch_started = Instant::now();
         let resp = send_logged(
             client
                 .post("/mail/v4/messages")
@@ -90,6 +100,15 @@ pub async fn get_message_metadata(
 
         if status.is_success() {
             let meta_resp: MessagesMetadataResponse = serde_json::from_value(json)?;
+            info!(
+                page = page,
+                page_size = page_size,
+                messages_count = meta_resp.messages.len(),
+                total = meta_resp.total,
+                attempt = attempt + 1,
+                duration_ms = fetch_started.elapsed().as_millis() as u64,
+                "metadata_fetch"
+            );
             return Ok(meta_resp);
         }
 
@@ -108,6 +127,7 @@ pub async fn get_message_metadata(
 /// Reference: go-proton-api/attachment.go GetAttachment
 pub async fn get_attachment(client: &ProtonClient, attachment_id: &str) -> Result<Vec<u8>> {
     info!(attachment_id = %attachment_id, "fetching attachment");
+    let fetch_started = Instant::now();
     let path = format!("/mail/v4/attachments/{}", attachment_id);
     let resp = send_logged(client.get(&path)).await?;
     let status = resp.status();
@@ -129,6 +149,13 @@ pub async fn get_attachment(client: &ProtonClient, attachment_id: &str) -> Resul
             )));
         }
     }
+
+    info!(
+        attachment_id = %attachment_id,
+        bytes = bytes.len(),
+        duration_ms = fetch_started.elapsed().as_millis() as u64,
+        "attachment_fetch"
+    );
 
     Ok(bytes.to_vec())
 }

@@ -341,17 +341,89 @@
             "Sync triggered"
           ],
           "required_fields": [
-            "\\baccount_id="
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
+            "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bstart_unix=",
+            "\\bduration_ms="
           ]
         },
         {
-          "name": "sync_started",
+          "name": "sync_beginning",
           "any_of": [
             "Beginning user sync"
           ],
           "required_fields": [
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
             "\\baccount_id=",
-            "\\bstart_unix="
+            "\\baccount_email=",
+            "\\bstart_unix=",
+            "\\bduration_ms="
+          ]
+        },
+        {
+          "name": "syncing_labels",
+          "any_of": [
+            "Syncing labels"
+          ],
+          "required_fields": [
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
+            "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bstart_unix=",
+            "\\bduration_ms="
+          ]
+        },
+        {
+          "name": "synced_labels",
+          "any_of": [
+            "Synced labels"
+          ],
+          "required_fields": [
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
+            "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bstart_unix=",
+            "\\bduration_ms="
+          ]
+        },
+        {
+          "name": "syncing_messages",
+          "any_of": [
+            "Syncing messages"
+          ],
+          "required_fields": [
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
+            "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bstart_unix=",
+            "\\bduration_ms="
+          ]
+        },
+        {
+          "name": "message_sync_completed_or_skipped",
+          "any_of": [
+            "Synced messages",
+            "Messages are already synced, skipping"
+          ],
+          "required_fields": [
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
+            "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bstart_unix=",
+            "\\bduration_ms="
           ]
         },
         {
@@ -360,7 +432,12 @@
             "Finished user sync"
           ],
           "required_fields": [
+            "\\buser_id=",
+            "\\bstart=",
+            "\\bduration=",
             "\\baccount_id=",
+            "\\baccount_email=",
+            "\\bstart_unix=",
             "\\bduration_ms="
           ]
         }

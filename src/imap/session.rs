@@ -627,35 +627,45 @@ where
                 .await;
         }
 
-        let client = self.client.as_ref().unwrap();
-
-        // Fetch metadata from Proton API
-        let filter = MessageFilter {
-            label_id: Some(mb.label_id.to_string()),
-            desc: 1,
-            ..Default::default()
-        };
-
-        let meta_resp = match messages::get_message_metadata(client, &filter, 0, 150).await {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(error = %e, "failed to fetch message metadata");
-                return self.writer.tagged_no(tag, "failed to fetch messages").await;
-            }
-        };
-
         let store = &self.config.store;
         let scoped_mailbox = self.scoped_mailbox_name(mb.name);
+        let cached_uids = store.list_uids(&scoped_mailbox).await?;
 
-        // Populate store with message metadata
-        for meta in &meta_resp.messages {
-            let uid = store
-                .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
-                .await?;
-            // Initialize flags from metadata
-            let flags = mailbox::message_flags(meta);
-            let flag_strings: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-            store.set_flags(&scoped_mailbox, uid, flag_strings).await?;
+        if cached_uids.is_empty() {
+            let client = self.client.as_ref().unwrap();
+
+            // Fetch metadata from Proton API
+            let filter = MessageFilter {
+                label_id: Some(mb.label_id.to_string()),
+                desc: 1,
+                ..Default::default()
+            };
+
+            let meta_resp = match messages::get_message_metadata(client, &filter, 0, 150).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "failed to fetch message metadata");
+                    return self.writer.tagged_no(tag, "failed to fetch messages").await;
+                }
+            };
+
+            // Populate store with message metadata
+            for meta in &meta_resp.messages {
+                let uid = store
+                    .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
+                    .await?;
+                // Initialize flags from metadata
+                let flags = mailbox::message_flags(meta);
+                let flag_strings: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+                store.set_flags(&scoped_mailbox, uid, flag_strings).await?;
+            }
+        } else {
+            info!(
+                user_id = self.authenticated_account_id.as_deref().unwrap_or("unknown"),
+                mailbox = %mb.name,
+                count = cached_uids.len(),
+                "Messages are already synced, skipping"
+            );
         }
 
         let status = store.mailbox_status(&scoped_mailbox).await?;
@@ -732,6 +742,15 @@ where
 
         // Expand macro items
         let expanded = expand_fetch_items(items);
+        let needs_body_sections = expanded
+            .iter()
+            .any(|i| matches!(i, FetchItem::BodySection { .. }));
+        let needs_full_rfc822 = expanded.iter().any(|i| match i {
+            FetchItem::BodySection { section, .. } => {
+                !body_section_is_header_only(section.as_deref())
+            }
+            _ => false,
+        });
 
         // Resolve which UIDs to fetch
         let target_uids: Vec<u32> = if uid_mode {
@@ -748,6 +767,11 @@ where
                 .map(|(_, &uid)| uid)
                 .collect()
         };
+        let user_id = self
+            .authenticated_account_id
+            .as_deref()
+            .unwrap_or("unknown");
+        let fetch_count = target_uids.len() as u32;
 
         for &uid in &target_uids {
             let seq = store.uid_to_seq(&scoped_mailbox, uid).await?.unwrap_or(0);
@@ -757,19 +781,36 @@ where
             let mut parts: Vec<String> = Vec::new();
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
 
-            let needs_body = expanded
-                .iter()
-                .any(|i| matches!(i, FetchItem::BodySection { .. }));
-
             let mut rfc822_data = None;
-            if needs_body {
+            if needs_body_sections {
+                let message_id = meta.as_ref().map(|m| m.id.as_str()).unwrap_or("unknown");
                 rfc822_data = store.get_rfc822(&scoped_mailbox, uid).await?;
-                if rfc822_data.is_none() {
-                    // Fetch + decrypt on demand
-                    if let Some(ref meta) = meta {
-                        rfc822_data = self
-                            .fetch_and_cache_rfc822(&scoped_mailbox, uid, &meta.id)
-                            .await?;
+                if rfc822_data.is_some() {
+                    info!(
+                        user_id = user_id,
+                        mailbox = %mailbox,
+                        message_id = message_id,
+                        uid = uid,
+                        count = fetch_count,
+                        "rfc822_cache_hit"
+                    );
+                } else {
+                    info!(
+                        user_id = user_id,
+                        mailbox = %mailbox,
+                        message_id = message_id,
+                        uid = uid,
+                        count = fetch_count,
+                        "rfc822_cache_miss"
+                    );
+
+                    if needs_full_rfc822 {
+                        // Fetch + decrypt on demand for full/body/text paths.
+                        if let Some(ref meta) = meta {
+                            rfc822_data = self
+                                .fetch_and_cache_rfc822(&scoped_mailbox, uid, &meta.id)
+                                .await?;
+                        }
                     }
                 }
             }
@@ -840,6 +881,22 @@ where
                                     }
                                 }
                                 None => data.clone(),
+                            }
+                        } else if let Some(ref meta) = meta {
+                            match section {
+                                Some(s) => {
+                                    let upper = s.to_uppercase();
+                                    if upper.starts_with("HEADER.FIELDS") {
+                                        let fields = parse_header_field_names(s);
+                                        let hdr = build_metadata_header_section(meta);
+                                        filter_headers_by_fields(&hdr, &fields).into_bytes()
+                                    } else if upper == "HEADER" {
+                                        build_metadata_header_section(meta).into_bytes()
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                                None => Vec::new(),
                             }
                         } else {
                             Vec::new()
@@ -1334,6 +1391,85 @@ fn parse_header_field_names(section: &str) -> Vec<String> {
     vec![]
 }
 
+fn body_section_is_header_only(section: Option<&str>) -> bool {
+    let Some(section) = section else {
+        return false;
+    };
+    let upper = section.trim().to_uppercase();
+    upper == "HEADER" || upper.starts_with("HEADER.FIELDS")
+}
+
+fn build_metadata_header_section(meta: &types::MessageMetadata) -> String {
+    let mut out = String::new();
+
+    out.push_str("Date: ");
+    out.push_str(rfc822::format_internal_date(meta.time).trim_matches('"'));
+    out.push_str("\r\n");
+
+    out.push_str("Subject: ");
+    out.push_str(&sanitize_header_value(&meta.subject));
+    out.push_str("\r\n");
+
+    out.push_str("From: ");
+    out.push_str(&format_header_addresses(std::slice::from_ref(&meta.sender)));
+    out.push_str("\r\n");
+
+    if !meta.reply_tos.is_empty() {
+        out.push_str("Reply-To: ");
+        out.push_str(&format_header_addresses(&meta.reply_tos));
+        out.push_str("\r\n");
+    }
+    if !meta.to_list.is_empty() {
+        out.push_str("To: ");
+        out.push_str(&format_header_addresses(&meta.to_list));
+        out.push_str("\r\n");
+    }
+    if !meta.cc_list.is_empty() {
+        out.push_str("Cc: ");
+        out.push_str(&format_header_addresses(&meta.cc_list));
+        out.push_str("\r\n");
+    }
+    if !meta.bcc_list.is_empty() {
+        out.push_str("Bcc: ");
+        out.push_str(&format_header_addresses(&meta.bcc_list));
+        out.push_str("\r\n");
+    }
+    if let Some(external_id) = meta.external_id.as_deref() {
+        if !external_id.is_empty() {
+            out.push_str("Message-ID: <");
+            out.push_str(&sanitize_header_value(external_id));
+            out.push_str(">\r\n");
+        }
+    }
+    out.push_str("\r\n");
+    out
+}
+
+fn format_header_addresses(addrs: &[types::EmailAddress]) -> String {
+    addrs
+        .iter()
+        .map(format_header_address)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_header_address(addr: &types::EmailAddress) -> String {
+    let address = sanitize_header_value(&addr.address);
+    let name = sanitize_header_value(&addr.name);
+    if name.trim().is_empty() {
+        return address;
+    }
+    let escaped_name = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\" <{}>", escaped_name, address)
+}
+
+fn sanitize_header_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect()
+}
+
 fn filter_headers_by_fields(header_section: &str, fields: &[String]) -> String {
     let mut result = String::new();
     let mut current_name = String::new();
@@ -1794,6 +1930,104 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("a001 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_header_fields_uses_metadata_when_rfc822_missing() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/mail/v4/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .named("no full message fetch for header-only body section")
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 FETCH 1 (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("BODY[HEADER.FIELDS"));
+        assert!(response.contains("Subject: Subject msg-1"));
+        assert!(response.contains("From: \"Alice\" <alice@proton.me>"));
+        assert!(response.contains("a001 OK FETCH completed"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_select_warm_cache_skips_metadata_fetch() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .named("no metadata fetch on warm select")
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 SELECT INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("1 EXISTS"));
+        assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
+
+        server.verify().await;
     }
 
     #[test]

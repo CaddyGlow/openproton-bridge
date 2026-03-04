@@ -1,13 +1,67 @@
-# Claude Code Instructions for openproton-bridge
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
 Rust implementation of a Proton Mail bridge. Exposes local IMAP/SMTP servers to let standard email clients access Proton Mail (including free accounts). Single-crate project, single developer, test-driven.
 
+## Build and Test Commands
+
+```bash
+cargo build                          # build
+cargo fmt                            # format (always run before finishing work)
+cargo clippy                         # lint (always run before finishing work)
+cargo test                           # run all tests
+cargo test <test_name>               # run a single test by name
+cargo test --test <file_stem>        # run one integration test file, e.g. cargo test --test gluon_integration
+cargo test -- --nocapture             # run tests with stdout visible
+```
+
+The project uses `build.rs` to compile `proto/bridge.proto` via `tonic-build` with vendored `protoc`. No manual protobuf toolchain setup is needed.
+
+## Architecture
+
+### Module Dependency Flow
+
+```
+frontend (gRPC/Tauri) -> bridge -> imap, smtp, api, crypto
+                                   api and crypto are standalone
+                                   imap and smtp must never cross-depend
+```
+
+### Core Modules
+
+- **`api/`** -- Proton REST API client. Submodules: `auth` (SRP login, 2FA, token refresh), `client` (ProtonClient with reqwest, retry logic, two ApiMode variants: Bridge and Webmail), `srp` (SRP-6a implementation), `events` (event polling), `messages`, `keys`, `users`, `types` (API response structs with PascalCase serde).
+- **`crypto/`** -- PGP operations via `sequoia-openpgp`. `keys` (key parsing/unlocking), `encrypt`, `decrypt`. Standalone; no IMAP/SMTP/bridge imports.
+- **`imap/`** -- Custom IMAP4rev1 server built directly on tokio TCP + tokio-rustls (no IMAP library). `server` (connection accept loop), `session` (per-connection state machine), `command` (IMAP command parsing), `response` (IMAP response formatting), `mailbox` (label-to-mailbox mapping), `store` (MessageStore trait + GluonStore SQLite impl + InMemoryStore for tests), `gluon_*` (Go-bridge-compatible on-disk message store: codec, locking, transactions).
+- **`smtp/`** -- Custom SMTP server on tokio TCP + tokio-rustls. `server`, `session` (SMTP state machine), `send` (message submission to Proton API).
+- **`bridge/`** -- Orchestration layer. `accounts` (AccountRegistry, RuntimeAccountRegistry with health tracking and token refresh), `auth_router` (maps IMAP/SMTP login credentials to Proton sessions via bridge passwords), `events` (event loop syncing Proton server events to local store), `types` (AccountId newtype, SessionProvider/AccountResolver/EventCheckpointStore traits).
+- **`vault`** -- Go-bridge-compatible encrypted vault (AES-256-GCM + MessagePack). Reads/writes `vault.enc` with keys from OS keychain (`keyring`), `pass`, or file-based credential stores. Stores per-account sessions, settings, gluon encryption keys.
+- **`frontend/grpc/`** -- gRPC control service (`proto/bridge.proto`) exposing login, account management, settings, and event streaming to GUI clients (Tauri app in `apps/bridge-ui/`).
+- **`paths`** -- RuntimePaths: resolves config/data/cache directories matching Go bridge layout (XDG on Linux, Library on macOS, AppData on Windows).
+- **`observability`** -- Tracing setup with rotating session logs, crash reports, and support bundles.
+
+### Key Trait Boundaries
+
+- `MessageStore` (`imap::store`) -- abstracts message persistence. `GluonStore` (SQLite + on-disk) for production, `InMemoryStore` for tests.
+- `SessionProvider`, `AccountResolver`, `EventCheckpointStore` (`bridge::types`) -- abstractions for session/account/event state.
+- No `ProtonApi` trait yet; `ProtonClient` is used directly (via free functions in `api::auth`, `api::messages`, etc.).
+
+### Data Flow: Email Client -> Proton
+
+1. Email client connects to local IMAP/SMTP on 127.0.0.1
+2. `AuthRouter` maps the bridge password to a Proton `Session`
+3. IMAP reads from `GluonStore` (populated by event sync worker)
+4. SMTP encrypts outgoing mail via `crypto` and submits via `api::messages`
+
+### CLI Subcommands (clap)
+
+`login`, `fido-assert`, `status`, `logout`, `accounts`, `fetch`, `serve` (IMAP+SMTP), `grpc` (frontend service), `cli` (interactive shell), `vault-dump`.
+
 ## Key Conventions
 
 ### Rust Style
-- Always run `cargo fmt` and `cargo clippy` before finishing work.
 - Use `thiserror` for error enums in library code. Use `anyhow` only in `main.rs` / CLI layer.
 - Use newtypes for identifiers: `MessageId(String)`, `LabelId(String)`, `AddressId(String)`, etc.
 - Use `async/await` for all I/O. Never block the tokio runtime with synchronous calls.
@@ -18,16 +72,9 @@ Rust implementation of a Proton Mail bridge. Exposes local IMAP/SMTP servers to 
 ### Testing
 - Write tests first when implementing new functionality.
 - Unit tests go in `#[cfg(test)]` blocks within each module.
-- Integration tests go in `tests/` directory.
+- Integration tests go in `tests/` directory. Major test suites: `gluon_*` (store behavior, concurrency, corruption recovery, codec), `smtp_integration`, `imap_smtp_tls_integration`, `grpc_wire_contract`, `runtime_events_e2e`, `observability_runtime`.
 - No network calls in unit tests. Use trait mocks instead.
 - Use `wiremock` for API integration tests, `async-imap` for IMAP integration tests, `lettre` for SMTP integration tests.
-- Test every error path, not just happy paths.
-
-### Architecture
-- External dependencies (HTTP, PGP, storage) sit behind traits (`ProtonApi`, `CryptoProvider`, `MessageStore`).
-- Module dependency flow: `bridge -> imap, smtp, api, crypto`. `api` and `crypto` are standalone.
-- Do not introduce cross-dependencies between `imap` and `smtp` modules.
-- Keep `api/` and `crypto/` free of any IMAP/SMTP concerns.
 
 ### Git
 - Use conventional commits: `feat:`, `fix:`, `test:`, `refactor:`, `docs:`, `chore:`.
@@ -41,21 +88,9 @@ Rust implementation of a Proton Mail bridge. Exposes local IMAP/SMTP servers to 
 - Do not create utility/helper modules for one-off functions.
 - Do not introduce `unsafe` without explicit discussion.
 - No emoji in code, comments, commit messages, or documentation.
+- Do not introduce cross-dependencies between `imap` and `smtp` modules.
+- Keep `api/` and `crypto/` free of any IMAP/SMTP concerns.
 
 ## Reference Code
 
-SRP authentication is adapted from `../proton-vpn-rst/tunmux/src/proton/api/srp.rs`. The Go bridge at `../proton-bridge/` is the architecture reference. See `PLAN.md` for the full implementation plan and phase breakdown.
-
-## File Layout
-
-```
-src/
-  main.rs         CLI entry point (clap)
-  lib.rs          Re-exports for integration tests
-  api/            Proton REST API client (auth, messages, labels, events)
-  crypto/         PGP key management, encrypt/decrypt (sequoia-openpgp)
-  imap/           Local IMAP4rev1 server
-  smtp/           Local SMTP server
-  bridge/         Config, vault, sync engine, user management
-tests/            Integration tests
-```
+SRP authentication is adapted from `../proton-vpn-rst/tunmux/src/proton/api/srp.rs`. The Go bridge at `../proton-bridge/` is the architecture reference.

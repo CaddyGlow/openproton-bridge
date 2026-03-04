@@ -7,7 +7,7 @@ use tracing::{debug, warn};
 
 use crate::api::auth;
 use crate::api::client::ProtonClient;
-use crate::api::error::{is_auth_error, ApiError};
+use crate::api::error::{is_auth_error, is_invalid_refresh_token_error, ApiError};
 use crate::api::types::Session;
 
 use super::types::{AccountId, AccountResolver};
@@ -475,13 +475,8 @@ impl RuntimeAccountRegistry {
         let (refreshed, refreshed_api_mode) = match refresh_with_mode_fallback(&existing).await {
             Ok((auth, api_mode)) => (auth, api_mode),
             Err(err) => {
-                let next_health = refresh_failure_health(&err);
-                debug!(
-                    account_id = %account_id.0,
-                    is_auth_error = is_auth_error(&err),
-                    "refresh failed; updating account health"
-                );
-                let _ = self.set_health(account_id, next_health).await;
+                self.handle_refresh_failure(account_id, &existing, &err)
+                    .await;
                 return Err(err.into());
             }
         };
@@ -521,6 +516,48 @@ impl RuntimeAccountRegistry {
         }
         let _ = self.set_health(account_id, AccountHealth::Healthy).await;
         Ok(updated)
+    }
+
+    async fn handle_refresh_failure(
+        &self,
+        account_id: &AccountId,
+        session: &Session,
+        err: &ApiError,
+    ) {
+        let next_health = refresh_failure_health(err);
+        debug!(
+            account_id = %account_id.0,
+            is_auth_error = is_auth_error(err),
+            is_invalid_refresh = is_invalid_refresh_token_error(err),
+            "refresh failed; updating account health"
+        );
+        let _ = self.set_health(account_id, next_health).await;
+        if next_health == AccountHealth::Unavailable {
+            self.clear_persisted_session(session);
+        }
+    }
+
+    fn clear_persisted_session(&self, session: &Session) {
+        let Some(vault_dir) = &self.vault_dir else {
+            return;
+        };
+        match crate::vault::remove_session_by_email(vault_dir, &session.email) {
+            Ok(()) => {
+                warn!(
+                    account_id = %session.uid,
+                    email = %session.email,
+                    "removed persisted account session after invalid refresh token"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    account_id = %session.uid,
+                    email = %session.email,
+                    error = %err,
+                    "failed to remove persisted account session after invalid refresh token"
+                );
+            }
+        }
     }
 }
 
@@ -573,7 +610,7 @@ async fn fetch_canonical_user_context(session: &Session) -> Option<(String, Stri
 }
 
 fn refresh_failure_health(err: &ApiError) -> AccountHealth {
-    if is_auth_error(err) {
+    if is_invalid_refresh_token_error(err) {
         AccountHealth::Unavailable
     } else {
         AccountHealth::Degraded
@@ -834,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_failure_health_marks_auth_failures_unavailable() {
+    fn refresh_failure_health_marks_only_invalid_refresh_unavailable() {
         let invalid_refresh = ApiError::Api {
             code: 10013,
             message: "Invalid refresh token".to_string(),
@@ -848,7 +885,54 @@ mod tests {
         let generic_auth = ApiError::Auth("auth failed".to_string());
         assert_eq!(
             refresh_failure_health(&generic_auth),
-            AccountHealth::Unavailable
+            AccountHealth::Degraded
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_registry_unavailable_blocks_access_with_empty_token() {
+        let runtime = RuntimeAccountRegistry::in_memory(vec![session("uid-1", "alice@proton.me")]);
+        let account_id = AccountId("uid-1".to_string());
+        runtime
+            .set_health(&account_id, AccountHealth::Unavailable)
+            .await
+            .unwrap();
+
+        let err = runtime
+            .with_valid_access_token(&account_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AccountRuntimeError::AccountUnavailable(_)));
+    }
+
+    #[tokio::test]
+    async fn invalid_refresh_failure_marks_unavailable_and_clears_persisted_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session("uid-1", "alice@proton.me");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let runtime = RuntimeAccountRegistry::new(vec![session.clone()], tmp.path().to_path_buf());
+        let account_id = AccountId("uid-1".to_string());
+        let invalid_refresh = ApiError::Api {
+            code: 10013,
+            message: "Invalid refresh token".to_string(),
+            details: None,
+        };
+
+        runtime
+            .handle_refresh_failure(&account_id, &session, &invalid_refresh)
+            .await;
+
+        let health = runtime.get_health(&account_id).await.unwrap();
+        assert_eq!(health, AccountHealth::Unavailable);
+
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].health, AccountHealth::Unavailable);
+
+        let removed = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me")
+            .err()
+            .is_some();
+        assert!(removed);
     }
 }

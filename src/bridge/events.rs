@@ -890,6 +890,7 @@ impl Drop for SyncProgressRunGuard<'_> {
     }
 }
 
+#[cfg(test)]
 async fn bounded_resync_account(
     config: &EventWorkerConfig,
     session: &mut Session,

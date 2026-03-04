@@ -728,8 +728,8 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
-        let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
-        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
+        let mailbox = self.selected_mailbox.as_ref().unwrap();
+        let scoped_mailbox = self.scoped_mailbox_name(mailbox);
         let store = &self.config.store;
         let all_uids = store.list_uids(&scoped_mailbox).await?;
 
@@ -752,65 +752,41 @@ where
             _ => false,
         });
 
-        // Resolve which UIDs to fetch
-        let target_uids: Vec<u32> = if uid_mode {
+        // Resolve which messages to fetch from current mailbox snapshot.
+        let target_messages: Vec<(u32, u32)> = if uid_mode {
             all_uids
                 .iter()
-                .filter(|&&uid| sequence.contains(uid, max_uid))
-                .copied()
+                .enumerate()
+                .filter(|(_, &uid)| sequence.contains(uid, max_uid))
+                .map(|(i, &uid)| (uid, i as u32 + 1))
                 .collect()
         } else {
             all_uids
                 .iter()
                 .enumerate()
                 .filter(|(i, _)| sequence.contains(*i as u32 + 1, max_seq))
-                .map(|(_, &uid)| uid)
+                .map(|(i, &uid)| (uid, i as u32 + 1))
                 .collect()
         };
-        let user_id = self
-            .authenticated_account_id
-            .as_deref()
-            .unwrap_or("unknown");
-        let fetch_count = target_uids.len() as u32;
+        let seen_flag = "\\Seen".to_string();
 
-        for &uid in &target_uids {
-            let seq = store.uid_to_seq(&scoped_mailbox, uid).await?.unwrap_or(0);
+        for (uid, seq) in target_messages {
             let meta = store.get_metadata(&scoped_mailbox, uid).await?;
             let flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let mut has_seen = flags.iter().any(|flag| flag == &seen_flag);
 
-            let mut parts: Vec<String> = Vec::new();
+            let mut parts: Vec<String> = Vec::with_capacity(expanded.len());
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
 
             let mut rfc822_data = None;
             if needs_body_sections {
-                let message_id = meta.as_ref().map(|m| m.id.as_str()).unwrap_or("unknown");
                 rfc822_data = store.get_rfc822(&scoped_mailbox, uid).await?;
-                if rfc822_data.is_some() {
-                    info!(
-                        user_id = user_id,
-                        mailbox = %mailbox,
-                        message_id = message_id,
-                        uid = uid,
-                        count = fetch_count,
-                        "rfc822_cache_hit"
-                    );
-                } else {
-                    info!(
-                        user_id = user_id,
-                        mailbox = %mailbox,
-                        message_id = message_id,
-                        uid = uid,
-                        count = fetch_count,
-                        "rfc822_cache_miss"
-                    );
-
-                    if needs_full_rfc822 {
-                        // Fetch + decrypt on demand for full/body/text paths.
-                        if let Some(ref meta) = meta {
-                            rfc822_data = self
-                                .fetch_and_cache_rfc822(&scoped_mailbox, uid, &meta.id)
-                                .await?;
-                        }
+                if rfc822_data.is_none() && needs_full_rfc822 {
+                    // Fetch + decrypt on demand for full/body/text paths.
+                    if let Some(ref meta) = meta {
+                        rfc822_data = self
+                            .fetch_and_cache_rfc822(&scoped_mailbox, uid, &meta.id)
+                            .await?;
                     }
                 }
             }
@@ -910,10 +886,15 @@ where
 
                         if !peek {
                             // Set \Seen flag
-                            if !flags.contains(&"\\Seen".to_string()) {
+                            if !has_seen {
                                 store
-                                    .add_flags(&scoped_mailbox, uid, &["\\Seen".to_string()])
+                                    .add_flags(
+                                        &scoped_mailbox,
+                                        uid,
+                                        std::slice::from_ref(&seen_flag),
+                                    )
                                     .await?;
+                                has_seen = true;
                                 // Mark as read on API
                                 if let Some(ref meta) = meta {
                                     if let Some(ref client) = self.client {
@@ -1980,6 +1961,75 @@ mod tests {
         assert!(response.contains("Subject: Subject msg-1"));
         assert!(response.contains("From: \"Alice\" <alice@proton.me>"));
         assert!(response.contains("a001 OK FETCH completed"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_multiple_non_peek_body_sections_marks_read_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .named("mark read should only happen once per message")
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_rfc822(
+                "test-uid::INBOX",
+                uid,
+                b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nbody".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 FETCH 1 (BODY[] BODY[TEXT])")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("BODY[]"));
+        assert!(response.contains("BODY[TEXT]"));
+        assert!(response.contains("a001 OK FETCH completed"));
+
+        let flags = config
+            .store
+            .get_flags("test-uid::INBOX", uid)
+            .await
+            .unwrap();
+        assert!(flags.iter().any(|f| f == "\\Seen"));
 
         server.verify().await;
     }

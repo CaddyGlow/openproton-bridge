@@ -660,13 +660,73 @@ impl GluonStore {
         stem.parse::<u64>().ok()
     }
 
-    fn uid_from_blob_name(name: &str) -> Option<u32> {
+    fn uid_from_legacy_blob_name(name: &str) -> Option<u32> {
         let path = Path::new(name);
         if path.extension().and_then(|ext| ext.to_str()) != Some("msg") {
             return None;
         }
         let stem = path.file_stem()?.to_string_lossy();
         stem.parse::<u32>().ok()
+    }
+
+    fn discover_blob_uid_pairs(account_dir: &Path) -> Result<Vec<(u32, String)>> {
+        let mut file_names = Vec::new();
+        for entry in std::fs::read_dir(account_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            file_names.push(name);
+        }
+
+        file_names.sort();
+        file_names.dedup();
+
+        let mut discovered = Vec::new();
+        let mut used_uids = HashSet::new();
+        let mut max_uid = 0_u32;
+
+        for name in &file_names {
+            let Some(uid) = Self::uid_from_legacy_blob_name(name) else {
+                continue;
+            };
+            if used_uids.insert(uid) {
+                max_uid = max_uid.max(uid);
+                discovered.push((uid, name.clone()));
+            }
+        }
+
+        let mut next_generated_uid = max_uid.saturating_add(1);
+        for name in file_names {
+            if Self::uid_from_legacy_blob_name(&name).is_some() {
+                continue;
+            }
+
+            while used_uids.contains(&next_generated_uid) {
+                let bumped = next_generated_uid.saturating_add(1);
+                if bumped == next_generated_uid {
+                    return Ok(discovered);
+                }
+                next_generated_uid = bumped;
+            }
+
+            used_uids.insert(next_generated_uid);
+            discovered.push((next_generated_uid, name));
+            let bumped = next_generated_uid.saturating_add(1);
+            if bumped == next_generated_uid {
+                break;
+            }
+            next_generated_uid = bumped;
+        }
+
+        discovered.sort_unstable_by_key(|(uid, _)| *uid);
+        Ok(discovered)
     }
 
     fn load_account_from_disk(&self, storage_user_id: &str) -> Result<GluonAccountState> {
@@ -689,22 +749,7 @@ impl GluonStore {
         }
 
         if index.mailboxes.is_empty() {
-            let mut discovered = Vec::new();
-            for entry in std::fs::read_dir(&account_dir)? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file() {
-                    continue;
-                }
-                let Some(name) = entry.file_name().to_str().map(|value| value.to_string()) else {
-                    continue;
-                };
-                let Some(uid) = Self::uid_from_blob_name(&name) else {
-                    continue;
-                };
-                discovered.push((uid, name));
-            }
-
-            discovered.sort_unstable_by_key(|(uid, _)| *uid);
+            let discovered = Self::discover_blob_uid_pairs(&account_dir)?;
             if !discovered.is_empty() {
                 let mut inbox = GluonMailboxData::new();
                 for (uid, name) in discovered {

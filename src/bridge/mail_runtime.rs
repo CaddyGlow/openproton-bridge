@@ -610,6 +610,7 @@ async fn refresh_session(
     )
     .await
     .map_err(|err| {
+        handle_startup_refresh_failure(&session, settings_dir, &err);
         tracing::warn!(
             pkg = "bridge/token",
             user_id = %session.uid,
@@ -663,6 +664,36 @@ async fn refresh_session(
         "session token refresh persisted"
     );
     Ok(refreshed)
+}
+
+fn handle_startup_refresh_failure(
+    session: &Session,
+    settings_dir: &std::path::Path,
+    err: &api::error::ApiError,
+) {
+    if !api::error::is_invalid_refresh_token_error(err) {
+        return;
+    }
+
+    match vault::remove_session_by_email(settings_dir, &session.email) {
+        Ok(()) => {
+            tracing::warn!(
+                pkg = "bridge/token",
+                user_id = %session.uid,
+                email = %session.email,
+                "stored refresh token is invalid; removed account session from vault"
+            );
+        }
+        Err(remove_err) => {
+            tracing::warn!(
+                pkg = "bridge/token",
+                user_id = %session.uid,
+                email = %session.email,
+                error = %remove_err,
+                "stored refresh token is invalid; failed to remove account session from vault"
+            );
+        }
+    }
 }
 
 fn generate_bridge_password() -> String {
@@ -741,5 +772,57 @@ async fn report_runtime_health_periodically(
         }
 
         previous_health.retain(|account_id, _| seen_account_ids.contains(account_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle_startup_refresh_failure, Session};
+    use crate::api::error::ApiError;
+    use crate::api::types::ApiMode;
+
+    fn session(uid: &str, email: &str) -> Session {
+        Session {
+            uid: uid.to_string(),
+            access_token: String::new(),
+            refresh_token: format!("refresh-{uid}"),
+            email: email.to_string(),
+            display_name: uid.to_string(),
+            api_mode: ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-password".to_string()),
+        }
+    }
+
+    #[test]
+    fn startup_invalid_refresh_failure_clears_persisted_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session("uid-1", "alice@proton.me");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let err = ApiError::Api {
+            code: 10013,
+            message: "Invalid refresh token".to_string(),
+            details: None,
+        };
+        handle_startup_refresh_failure(&session, tmp.path(), &err);
+
+        let removed = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me")
+            .err()
+            .is_some();
+        assert!(removed);
+    }
+
+    #[test]
+    fn startup_non_invalid_refresh_failure_keeps_persisted_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = session("uid-1", "alice@proton.me");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let err = ApiError::Auth("temporary auth failure".to_string());
+        handle_startup_refresh_failure(&session, tmp.path(), &err);
+
+        let persisted = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me").is_ok();
+        assert!(persisted);
     }
 }

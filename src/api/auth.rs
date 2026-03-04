@@ -5,10 +5,10 @@ use base64::Engine as _;
 use rand::distributions::Alphanumeric;
 use rand::Rng as _;
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use super::client::{check_api_response, send_logged, send_logged_with_pkg, ProtonClient};
-use super::error::{is_invalid_refresh_token_error, Result};
+use super::error::Result;
 use super::srp;
 use super::types::{
     ApiMode, AuthInfoResponse, AuthResponse, HumanVerificationDetails, RefreshResponse,
@@ -169,14 +169,10 @@ pub async fn refresh_auth(
     Ok(auth)
 }
 
-fn should_retry_refresh_with_alternate_mode(err: &super::error::ApiError) -> bool {
-    is_invalid_refresh_token_error(err)
-}
-
-/// Refresh auth credentials using the preferred API mode and retry once with
-/// the alternate mode if the first attempt fails with "Invalid refresh token".
+/// Refresh auth credentials using the preferred API mode.
 ///
-/// Returns refreshed credentials and the API mode that succeeded.
+/// Note: function name is preserved for compatibility with existing call sites.
+/// Strict parity mode does not retry with the alternate API mode.
 pub async fn refresh_auth_with_mode_fallback(
     preferred_mode: ApiMode,
     uid: &str,
@@ -184,33 +180,8 @@ pub async fn refresh_auth_with_mode_fallback(
     access_token: Option<&str>,
 ) -> Result<(RefreshResponse, ApiMode)> {
     let mut primary_client = ProtonClient::with_api_mode(preferred_mode)?;
-    match refresh_auth(&mut primary_client, uid, refresh_token, access_token).await {
-        Ok(auth) => Ok((auth, preferred_mode)),
-        Err(primary_err) => {
-            if !should_retry_refresh_with_alternate_mode(&primary_err) {
-                return Err(primary_err);
-            }
-
-            let fallback_mode = preferred_mode.alternate();
-            warn!(
-                pkg = "api/auth",
-                user_id = %uid,
-                from_api_mode = preferred_mode.as_str(),
-                to_api_mode = fallback_mode.as_str(),
-                "refresh token exchange failed with invalid refresh token; retrying with alternate api mode"
-            );
-
-            let mut fallback_client = ProtonClient::with_api_mode(fallback_mode)?;
-            let auth = refresh_auth(&mut fallback_client, uid, refresh_token, access_token).await?;
-            info!(
-                pkg = "api/auth",
-                user_id = %uid,
-                effective_api_mode = fallback_mode.as_str(),
-                "refresh token exchange succeeded after api mode fallback"
-            );
-            Ok((auth, fallback_mode))
-        }
-    }
+    let auth = refresh_auth(&mut primary_client, uid, refresh_token, access_token).await?;
+    Ok((auth, preferred_mode))
 }
 
 /// Submit TOTP 2FA code.
@@ -362,9 +333,8 @@ fn decode_base64_flexible(input: &str) -> std::result::Result<Vec<u8>, base64::D
 mod tests {
     use super::{
         build_refresh_body, decode_base64_flexible, extract_first_binary,
-        finalize_refresh_response, should_retry_refresh_with_alternate_mode, RefreshResponse,
+        finalize_refresh_response, RefreshResponse,
     };
-    use crate::api::error::ApiError;
     use serde_json::json;
 
     #[test]
@@ -439,18 +409,5 @@ mod tests {
         let encoded = "AQIDBA";
         let decoded = decode_base64_flexible(encoded).unwrap();
         assert_eq!(decoded, vec![1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn test_should_retry_refresh_with_alternate_mode_only_for_invalid_refresh_token() {
-        let invalid_refresh = ApiError::Api {
-            code: 10013,
-            message: "Invalid refresh token".to_string(),
-            details: None,
-        };
-        assert!(should_retry_refresh_with_alternate_mode(&invalid_refresh));
-
-        let other_auth = ApiError::Auth("auth failure".to_string());
-        assert!(!should_retry_refresh_with_alternate_mode(&other_auth));
     }
 }

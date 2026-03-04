@@ -169,7 +169,7 @@ struct GrpcState {
     session_access_tokens: Mutex<HashMap<String, String>>,
     shutdown_tx: watch::Sender<bool>,
     mail_settings: Mutex<StoredMailSettings>,
-    runtime_supervisor: bridge::runtime_supervisor::RuntimeSupervisor,
+    runtime_supervisor: Arc<bridge::runtime_supervisor::RuntimeSupervisor>,
     mail_runtime_transition_lock: Mutex<()>,
     app_settings: Mutex<StoredAppSettings>,
     sync_workers_enabled: bool,
@@ -1072,9 +1072,9 @@ mod tests {
         let (shutdown_tx, _) = watch::channel(false);
         let state = Arc::new(GrpcState {
             app_settings: Mutex::new(app_settings),
-            runtime_supervisor: bridge::runtime_supervisor::RuntimeSupervisor::new(
+            runtime_supervisor: Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
                 runtime_paths.clone(),
-            ),
+            )),
             runtime_paths,
             bind_host: "127.0.0.1".to_string(),
             active_disk_cache_path: Mutex::new(active_disk_cache_path),

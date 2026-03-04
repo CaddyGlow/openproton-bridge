@@ -1,4 +1,34 @@
+#[derive(Clone)]
+pub struct GrpcServerOptions {
+    pub runtime_supervisor: Option<Arc<bridge::runtime_supervisor::RuntimeSupervisor>>,
+    pub start_mail_runtime_on_startup: bool,
+    pub stop_mail_runtime_on_shutdown: bool,
+}
+
+impl Default for GrpcServerOptions {
+    fn default() -> Self {
+        Self {
+            runtime_supervisor: None,
+            start_mail_runtime_on_startup: true,
+            stop_mail_runtime_on_shutdown: true,
+        }
+    }
+}
+
 pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyhow::Result<()> {
+    run_server_with_options(runtime_paths, bind_host, GrpcServerOptions::default()).await
+}
+
+pub async fn run_server_with_options(
+    runtime_paths: RuntimePaths,
+    bind_host: String,
+    options: GrpcServerOptions,
+) -> anyhow::Result<()> {
+    let GrpcServerOptions {
+        runtime_supervisor,
+        start_mail_runtime_on_startup,
+        stop_mail_runtime_on_shutdown,
+    } = options;
     tokio::fs::create_dir_all(runtime_paths.settings_dir())
         .await
         .with_context(|| {
@@ -73,9 +103,14 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let (event_tx, _) = broadcast::channel(128);
+    let runtime_supervisor = runtime_supervisor.unwrap_or_else(|| {
+        Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
+            runtime_paths.clone(),
+        ))
+    });
     let state = Arc::new(GrpcState {
         runtime_paths: runtime_paths.clone(),
-        runtime_supervisor: bridge::runtime_supervisor::RuntimeSupervisor::new(runtime_paths.clone()),
+        runtime_supervisor,
         bind_host,
         active_disk_cache_path: Mutex::new(active_disk_cache_path),
         event_tx,
@@ -98,7 +133,15 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         owner = "mail_runtime",
         "using mail runtime as the single grpc sync worker owner"
     );
-    service.start_mail_runtime_on_startup().await;
+    if start_mail_runtime_on_startup {
+        service.start_mail_runtime_on_startup().await;
+    } else {
+        info!(
+            pkg = "grpc/sync",
+            owner = "mail_runtime",
+            "skipping grpc mail runtime startup; runtime is externally managed"
+        );
+    }
     #[cfg(unix)]
     info!(pkg = "grpc", useFileSocket = true, "Starting gRPC server");
     #[cfg(not(unix))]
@@ -230,9 +273,11 @@ pub async fn run_server(runtime_paths: RuntimePaths, bind_host: String) -> anyho
         }
     };
 
-    service_for_shutdown
-        .stop_mail_runtime_for_transition("shutdown")
-        .await;
+    if stop_mail_runtime_on_shutdown {
+        service_for_shutdown
+            .stop_mail_runtime_for_transition("shutdown")
+            .await;
+    }
     service_for_shutdown.shutdown_sync_workers().await;
 
     server_result

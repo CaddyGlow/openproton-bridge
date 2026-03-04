@@ -1404,9 +1404,9 @@ mod grpc_wire_tests {
         let (event_tx, _) = broadcast::channel(16);
         let (shutdown_tx, _) = watch::channel(false);
         let state = Arc::new(GrpcState {
-            runtime_supervisor: bridge::runtime_supervisor::RuntimeSupervisor::new(
+            runtime_supervisor: Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
                 runtime_paths.clone(),
-            ),
+            )),
             runtime_paths,
             bind_host: "127.0.0.1".to_string(),
             active_disk_cache_path: Mutex::new(active_disk_cache_path),

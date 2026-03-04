@@ -118,7 +118,7 @@ enum Command {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
-    /// Start the IMAP and SMTP servers
+    /// Start the IMAP/SMTP servers with the gRPC control service
     Serve {
         /// IMAP port to listen on
         #[arg(long, default_value = "1143")]
@@ -1442,14 +1442,6 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             print_cli_prompt()?;
                             continue;
                         }
-                        if runtime_state.is_some() {
-                            eprintln!(
-                                "Cannot start gRPC runtime while serve runtime is running. Use `stop` first."
-                            );
-                            print_cli_prompt()?;
-                            continue;
-                        }
-
                         let bind = match parse_grpc_bind(&tokens[1..]) {
                             Ok(bind) => bind,
                             Err(err) => {
@@ -1459,7 +1451,17 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             }
                         };
 
-                        match start_interactive_grpc(bind.clone(), runtime_paths).await {
+                        let grpc_options = if let Some(runtime) = runtime_state.as_ref() {
+                            frontend::grpc::GrpcServerOptions {
+                                runtime_supervisor: Some(runtime.supervisor.clone()),
+                                start_mail_runtime_on_startup: false,
+                                stop_mail_runtime_on_shutdown: false,
+                            }
+                        } else {
+                            frontend::grpc::GrpcServerOptions::default()
+                        };
+
+                        match start_interactive_grpc(bind.clone(), runtime_paths, grpc_options).await {
                             Ok(state) => {
                                 grpc_state = Some(state);
                                 println!("gRPC runtime started in background (bind={bind}).");
@@ -1827,7 +1829,9 @@ fn print_interactive_help() {
     println!("  grpc-status                      Show background gRPC runtime status");
     println!("  grpc [grpc flags]                Start gRPC frontend service (background)");
     println!("  grpc-stop                        Stop background gRPC runtime");
-    println!("  note                             `serve` and `grpc` are mutually exclusive");
+    println!(
+        "  note                             start `serve` first, then `grpc` to expose control API"
+    );
     println!("  stop                             Stop all background runtimes");
     println!("  mutt-config [flags]              Generate mutt/neomutt config snippet");
     println!();
@@ -3634,7 +3638,9 @@ async fn cmd_serve(
         use_ssl_for_smtp: !no_tls,
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
     };
-    let supervisor = bridge::runtime_supervisor::RuntimeSupervisor::new(runtime_paths.clone());
+    let supervisor = std::sync::Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
+        runtime_paths.clone(),
+    ));
     let snapshot = supervisor
         .start_with_snapshot(
             runtime_config,
@@ -3650,7 +3656,16 @@ async fn cmd_serve(
         &snapshot.active_sessions,
         &snapshot.runtime_snapshot,
     );
-    supervisor.wait_for_termination().await
+    frontend::grpc::run_server_with_options(
+        runtime_paths.clone(),
+        bind.to_string(),
+        frontend::grpc::GrpcServerOptions {
+            runtime_supervisor: Some(supervisor),
+            start_mail_runtime_on_startup: false,
+            stop_mail_runtime_on_shutdown: true,
+        },
+    )
+    .await
 }
 
 fn print_serve_configuration(
@@ -3762,10 +3777,13 @@ async fn maybe_collect_runtime_completion(
 async fn start_interactive_grpc(
     bind: String,
     runtime_paths: &paths::RuntimePaths,
+    options: frontend::grpc::GrpcServerOptions,
 ) -> anyhow::Result<InteractiveGrpcRuntime> {
     let runtime_paths = runtime_paths.clone();
     let bind_for_task = bind.clone();
-    let join_handle = tokio::spawn(async move { cmd_grpc(&bind_for_task, &runtime_paths).await });
+    let join_handle = tokio::spawn(async move {
+        frontend::grpc::run_server_with_options(runtime_paths, bind_for_task, options).await
+    });
     Ok(InteractiveGrpcRuntime { join_handle, bind })
 }
 

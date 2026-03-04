@@ -6,9 +6,16 @@ use super::mail_runtime::{
 };
 use crate::paths::RuntimePaths;
 
+#[derive(Debug, Clone)]
+pub struct RuntimeStartSnapshot {
+    pub active_sessions: Vec<crate::api::types::Session>,
+    pub runtime_snapshot: Vec<super::accounts::RuntimeAccountInfo>,
+}
+
 pub struct RuntimeSupervisor {
     runtime_paths: RuntimePaths,
     handle: Mutex<Option<SupervisorRuntimeHandle>>,
+    start_snapshot: Mutex<Option<RuntimeStartSnapshot>>,
     transition_lock: Mutex<()>,
 }
 
@@ -17,6 +24,7 @@ impl RuntimeSupervisor {
         Self {
             runtime_paths,
             handle: Mutex::new(None),
+            start_snapshot: Mutex::new(None),
             transition_lock: Mutex::new(()),
         }
     }
@@ -27,8 +35,29 @@ impl RuntimeSupervisor {
         transition: MailRuntimeTransition,
         notify_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<(), MailRuntimeStartError> {
+        let _ = self
+            .start_with_snapshot(config, transition, notify_tx)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn start_with_snapshot(
+        &self,
+        config: MailRuntimeConfig,
+        transition: MailRuntimeTransition,
+        notify_tx: Option<mpsc::UnboundedSender<String>>,
+    ) -> Result<RuntimeStartSnapshot, MailRuntimeStartError> {
         let _transition_guard = self.transition_lock.lock().await;
-        self.start_locked(config, transition, notify_tx).await
+        self.start_locked(config, transition, notify_tx).await?;
+        Ok(self
+            .start_snapshot
+            .lock()
+            .await
+            .clone()
+            .unwrap_or(RuntimeStartSnapshot {
+                active_sessions: Vec::new(),
+                runtime_snapshot: Vec::new(),
+            }))
     }
 
     pub async fn stop(&self, reason: &str) -> anyhow::Result<()> {
@@ -47,6 +76,16 @@ impl RuntimeSupervisor {
             .await
             .map_err(|err| MailRuntimeStartError::Prepare(err.context("failed to stop runtime")))?;
         self.start_locked(config, transition, notify_tx).await
+    }
+
+    pub async fn wait_for_termination(&self) -> anyhow::Result<()> {
+        let _transition_guard = self.transition_lock.lock().await;
+        let handle = self.handle.lock().await.take();
+        self.start_snapshot.lock().await.take();
+        let Some(runtime) = handle else {
+            anyhow::bail!("runtime is not running");
+        };
+        runtime.wait().await
     }
 
     pub async fn is_running(&self) -> bool {
@@ -78,7 +117,12 @@ impl RuntimeSupervisor {
 
         let handle =
             mail_runtime::start(self.runtime_paths.clone(), config, transition, notify_tx).await?;
+        let start_snapshot = RuntimeStartSnapshot {
+            active_sessions: handle.active_sessions().to_vec(),
+            runtime_snapshot: handle.runtime_snapshot().to_vec(),
+        };
         *self.handle.lock().await = Some(SupervisorRuntimeHandle::Live(handle));
+        *self.start_snapshot.lock().await = Some(start_snapshot);
         info!(
             transition = ?transition,
             "runtime supervisor started mail runtime"
@@ -97,6 +141,7 @@ impl RuntimeSupervisor {
         };
 
         info!(reason, "runtime supervisor stopping mail runtime");
+        self.start_snapshot.lock().await.take();
         runtime.stop().await?;
         info!(reason, "runtime supervisor stopped mail runtime");
         Ok(())
@@ -134,6 +179,14 @@ impl SupervisorRuntimeHandle {
             Self::Live(handle) => handle.stop().await,
             #[cfg(test)]
             Self::Test(handle) => handle.stop().await,
+        }
+    }
+
+    async fn wait(self) -> anyhow::Result<()> {
+        match self {
+            Self::Live(handle) => handle.wait().await,
+            #[cfg(test)]
+            Self::Test(_handle) => Ok(()),
         }
     }
 }

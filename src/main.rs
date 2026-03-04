@@ -3634,22 +3634,23 @@ async fn cmd_serve(
         use_ssl_for_smtp: !no_tls,
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
     };
-    let handle = bridge::mail_runtime::start(
-        runtime_paths.clone(),
-        runtime_config,
-        bridge::mail_runtime::MailRuntimeTransition::Startup,
-        None,
-    )
-    .await?;
+    let supervisor = bridge::runtime_supervisor::RuntimeSupervisor::new(runtime_paths.clone());
+    let snapshot = supervisor
+        .start_with_snapshot(
+            runtime_config,
+            bridge::mail_runtime::MailRuntimeTransition::Startup,
+            None,
+        )
+        .await?;
     print_serve_configuration(
         bind,
         imap_port,
         smtp_port,
         no_tls,
-        handle.active_sessions(),
-        handle.runtime_snapshot(),
+        &snapshot.active_sessions,
+        &snapshot.runtime_snapshot,
     );
-    handle.wait().await
+    supervisor.wait_for_termination().await
 }
 
 fn print_serve_configuration(

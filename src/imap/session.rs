@@ -120,7 +120,13 @@ where
                 continue;
             }
 
-            debug!(connection_id = self.connection_id, line = %line, "received command");
+            debug!(
+                pkg = "imap/session",
+                session = self.connection_id,
+                line = %line,
+                msg = %line,
+                "{line}"
+            );
 
             match self.handle_line(&line).await? {
                 SessionAction::Continue => {}
@@ -496,6 +502,8 @@ where
         self.state = State::Authenticated;
 
         info!(
+            service = "imap",
+            msg = "IMAP login successful",
             connection_id = self.connection_id,
             email = %auth_route.primary_email,
             "IMAP login successful"
@@ -686,6 +694,8 @@ where
             }
         } else {
             info!(
+                service = "imap",
+                msg = "Messages are already synced, skipping",
                 user_id = self.authenticated_account_id.as_deref().unwrap_or("unknown"),
                 mailbox = %mb.name,
                 count = cached_uids.len(),
@@ -718,6 +728,8 @@ where
         self.state = State::Selected;
 
         info!(
+            service = "imap",
+            msg = "mailbox selected",
             mailbox = %mb.name,
             messages = status.exists,
             "mailbox selected"
@@ -849,6 +861,19 @@ where
             let meta = store.get_metadata(&scoped_mailbox, uid).await?;
             let flags = store.get_flags(&scoped_mailbox, uid).await?;
             let mut has_seen = flags.iter().any(|flag| flag == &seen_flag);
+
+            if needs_body_sections {
+                if let Some(ref meta) = meta {
+                    debug!(
+                        pkg = "gluon/state/mailbox",
+                        UID = uid,
+                        mboxID = %scoped_mailbox,
+                        messageID = %meta.id,
+                        msg = "Fetch Body",
+                        "Fetch Body"
+                    );
+                }
+            }
 
             let mut parts: Vec<String> = Vec::with_capacity(expanded.len());
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
@@ -1020,6 +1045,8 @@ where
             if header_only_body_fetch {
                 // Match bridge behavior: header index fetch should avoid RFC822 disk/blob reads.
                 info!(
+                    service = "imap",
+                    msg = "rfc822_cache_miss",
                     user_id = %user_id,
                     mailbox = %mailbox,
                     count = target_fetch_count,
@@ -1028,6 +1055,8 @@ where
             } else {
                 if cache_hits > 0 {
                     info!(
+                        service = "imap",
+                        msg = "rfc822_cache_hit",
                         user_id = %user_id,
                         mailbox = %mailbox,
                         count = cache_hits,
@@ -1036,6 +1065,8 @@ where
                 }
                 if cache_misses > 0 {
                     info!(
+                        service = "imap",
+                        msg = "rfc822_cache_miss",
                         user_id = %user_id,
                         mailbox = %mailbox,
                         count = cache_misses,

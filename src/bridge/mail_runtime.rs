@@ -540,33 +540,41 @@ fn log_protocol_start(
     match (protocol, transition) {
         (MailProtocol::Imap, MailRuntimeTransition::SettingsChange) => {
             tracing::info!(
+                service = "server-manager",
                 port = config.imap_port,
                 ssl = config.use_ssl_for_imap,
                 transition = transition.as_str(),
+                msg = "Restarting IMAP server",
                 "Restarting IMAP server"
             );
         }
         (MailProtocol::Smtp, MailRuntimeTransition::SettingsChange) => {
             tracing::info!(
+                service = "server-manager",
                 port = config.smtp_port,
                 ssl = config.use_ssl_for_smtp,
                 transition = transition.as_str(),
+                msg = "Restarting SMTP server",
                 "Restarting SMTP server"
             );
         }
         (MailProtocol::Imap, _) => {
             tracing::info!(
+                service = "server-manager",
                 port = config.imap_port,
                 ssl = config.use_ssl_for_imap,
                 transition = transition.as_str(),
+                msg = "Starting IMAP server",
                 "Starting IMAP server"
             );
         }
         (MailProtocol::Smtp, _) => {
             tracing::info!(
+                service = "server-manager",
                 port = config.smtp_port,
                 ssl = config.use_ssl_for_smtp,
                 transition = transition.as_str(),
+                msg = "Starting SMTP server",
                 "Starting SMTP server"
             );
         }
@@ -581,17 +589,21 @@ fn log_protocol_stopping(
     match protocol {
         MailProtocol::Imap => {
             tracing::info!(
+                service = "server-manager",
                 port = config.imap_port,
                 ssl = config.use_ssl_for_imap,
                 transition = transition.as_str(),
+                msg = "Stopping IMAP server",
                 "Stopping IMAP server"
             );
         }
         MailProtocol::Smtp => {
             tracing::info!(
+                service = "server-manager",
                 port = config.smtp_port,
                 ssl = config.use_ssl_for_smtp,
                 transition = transition.as_str(),
+                msg = "Stopping SMTP server",
                 "Stopping SMTP server"
             );
         }

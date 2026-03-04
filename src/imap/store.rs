@@ -1161,12 +1161,14 @@ impl MessageStore for GluonStore {
                 labelPath = %mailbox_name,
                 numberOfConnectors = "1",
                 pkg = "imapservice/labelConflictResolver",
+                msg = "Label not found in DB, creating mailbox.",
                 "Label not found in DB, creating mailbox."
             );
             info!(
                 pkg = "gluon/user",
                 remoteMailboxID = %mailbox_name,
                 userID = %storage_user_id,
+                msg = "Mailbox created",
                 "Mailbox created"
             );
         }

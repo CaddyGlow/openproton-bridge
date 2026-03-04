@@ -428,6 +428,44 @@ fn scoped_mailbox_name(account_id: &AccountId, mailbox_name: &str) -> String {
     format!("{}::{}", account_id.0, mailbox_name)
 }
 
+fn redacted_subject_for_log(subject: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    subject.hash(&mut hasher);
+    format!("******** ({:08x})", (hasher.finish() & 0xffff_ffff) as u32)
+}
+
+fn format_ids_for_update(ids: &[String]) -> String {
+    ids.join(" ")
+}
+
+fn format_flags_for_update(metadata: &MessageMetadata) -> String {
+    mailbox::message_flags(metadata).join(" ")
+}
+
+async fn message_exists_in_store(
+    config: &EventWorkerConfig,
+    message_id: &str,
+    expected_generation: u64,
+) -> Result<bool, EventWorkerError> {
+    for mb in mailbox::system_mailboxes() {
+        if !mb.selectable {
+            continue;
+        }
+        ensure_account_generation(config, expected_generation, "message_exists_in_store").await?;
+        let scoped = scoped_mailbox_name(&config.account_id, mb.name);
+        let uid = config
+            .store
+            .get_uid(&scoped, message_id)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        if uid.is_some() {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 fn extract_message_id(value: &serde_json::Value, fallback_key: Option<&str>) -> Option<String> {
     if let Some(id) = value.get("ID").and_then(|v| v.as_str()) {
         return Some(id.to_string());
@@ -801,7 +839,52 @@ async fn apply_message_upsert(
     message_id: &str,
     expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
+    let already_present = message_exists_in_store(config, message_id, expected_generation).await?;
     let metadata = fetch_message_metadata_with_retry(config, session, client, message_id).await?;
+    let subject = redacted_subject_for_log(&metadata.subject);
+    let mailbox_ids = format_ids_for_update(&metadata.label_ids);
+    let flags = format_flags_for_update(&metadata);
+
+    if already_present {
+        info!(
+            service = "imap",
+            user = %config.account_id.0,
+            messageID = %metadata.id,
+            subject = %subject,
+            msg = "Handling message updated event",
+            "Handling message updated event"
+        );
+        debug!(
+            pkg = "gluon/user",
+            userID = %config.account_id.0,
+            update = format!(
+                "MessageMailboxesUpdated: MessageID = {}, MailboxIDs = [{}], Flags = [{}]",
+                metadata.id, mailbox_ids, flags
+            ),
+            msg = "Applying update",
+            "Applying update"
+        );
+    } else {
+        info!(
+            date = metadata.time,
+            service = "imap",
+            user = %config.account_id.0,
+            messageID = %metadata.id,
+            subject = %subject,
+            msg = "Handling message created event",
+            "Handling message created event"
+        );
+        debug!(
+            pkg = "gluon/user",
+            userID = %config.account_id.0,
+            update = format!(
+                "MessagesCreated: MessageCount=1 Messages=[ID:{} Mailboxes:[{}] Flags:[{}]]",
+                metadata.id, mailbox_ids, flags
+            ),
+            msg = "Applying update",
+            "Applying update"
+        );
+    }
 
     apply_metadata_to_store(config, &metadata, expected_generation).await
 }
@@ -915,6 +998,8 @@ async fn bounded_resync_account_for_generation(
 
     let duration = resync_started_at.elapsed();
     info!(
+        service = "imap",
+        user = %config.account_id.0,
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
@@ -922,10 +1007,13 @@ async fn bounded_resync_account_for_generation(
         start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
+        msg = "Sync triggered",
         "Sync triggered"
     );
     let duration = resync_started_at.elapsed();
     info!(
+        service = "imap",
+        user = %config.account_id.0,
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
@@ -933,6 +1021,7 @@ async fn bounded_resync_account_for_generation(
         start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
+        msg = "Beginning user sync",
         "Beginning user sync"
     );
     let mut progress_guard = SyncProgressRunGuard::new(
@@ -942,6 +1031,8 @@ async fn bounded_resync_account_for_generation(
 
     let duration = resync_started_at.elapsed();
     info!(
+        service = "imap",
+        user = %config.account_id.0,
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
@@ -949,10 +1040,13 @@ async fn bounded_resync_account_for_generation(
         start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
+        msg = "Syncing labels",
         "Syncing labels"
     );
     let duration = resync_started_at.elapsed();
     info!(
+        service = "imap",
+        user = %config.account_id.0,
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
@@ -960,10 +1054,13 @@ async fn bounded_resync_account_for_generation(
         start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
+        msg = "Synced labels",
         "Synced labels"
     );
     let duration = resync_started_at.elapsed();
     info!(
+        service = "imap",
+        user = %config.account_id.0,
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
@@ -971,6 +1068,7 @@ async fn bounded_resync_account_for_generation(
         start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
+        msg = "Syncing messages",
         "Syncing messages"
     );
 
@@ -1067,6 +1165,8 @@ async fn bounded_resync_account_for_generation(
     let duration = resync_started_at.elapsed();
     if total_applied == 0 {
         info!(
+            service = "imap",
+            user = %config.account_id.0,
             user_id = %config.account_id.0,
             account_id = %config.account_id.0,
             account_email = %config.account_email,
@@ -1074,10 +1174,13 @@ async fn bounded_resync_account_for_generation(
             start_unix = sync_start,
             duration = ?duration,
             duration_ms = duration.as_millis() as u64,
+            msg = "Messages are already synced, skipping",
             "Messages are already synced, skipping"
         );
     } else {
         info!(
+            service = "imap",
+            user = %config.account_id.0,
             user_id = %config.account_id.0,
             account_id = %config.account_id.0,
             account_email = %config.account_email,
@@ -1085,12 +1188,15 @@ async fn bounded_resync_account_for_generation(
             start_unix = sync_start,
             duration = ?duration,
             duration_ms = duration.as_millis() as u64,
+            msg = "Synced messages",
             "Synced messages"
         );
     }
 
     let duration = resync_started_at.elapsed();
     info!(
+        service = "imap",
+        user = %config.account_id.0,
         user_id = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
@@ -1098,6 +1204,7 @@ async fn bounded_resync_account_for_generation(
         start_unix = sync_start,
         duration = ?duration,
         duration_ms = duration.as_millis() as u64,
+        msg = "Finished user sync",
         "Finished user sync"
     );
 
@@ -1274,9 +1381,12 @@ async fn poll_account_once_for_generation(
                         "detected stale event cursor; resetting to baseline after bounded resync"
                     );
                     info!(
+                        service = "user-events",
+                        user = %config.account_id.0,
                         account_id = %config.account_id.0,
                         account_email = %config.account_email,
                         event_id = %reset_event_id,
+                        msg = "Event loop reset",
                         "Event loop reset"
                     );
                     bounded_resync_account_for_generation(
@@ -1299,9 +1409,12 @@ async fn poll_account_once_for_generation(
         let mut resync_state: Option<&str> = None;
         if response.refresh != 0 && forced_sync_state.is_none() {
             info!(
+                service = "user-events",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 account_email = %config.account_email,
                 refresh = response.refresh,
+                msg = "Received refresh event",
                 "Received refresh event"
             );
             bounded_resync_account_for_generation(
@@ -1473,10 +1586,13 @@ async fn run_event_worker_with_shutdown(
                         {
                             Ok(cached_count) if cached_count > 0 => {
                                 info!(
+                                    service = "imap",
+                                    user = %config.account_id.0,
                                     user_id = %config.account_id.0,
                                     account_id = %config.account_id.0,
                                     account_email = %config.account_email,
                                     count = cached_count,
+                                    msg = "Messages are already synced, skipping",
                                     "Messages are already synced, skipping"
                                 );
                                 startup_resync_pending = false;

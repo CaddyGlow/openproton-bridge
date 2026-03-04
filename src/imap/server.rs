@@ -155,7 +155,12 @@ async fn run_server_from_listener(
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    info!(addr = %listener_addr, "IMAP server listening");
+    info!(
+        pkg = "imap/server",
+        msg = "IMAP server listening",
+        addr = %listener_addr,
+        "IMAP server listening"
+    );
 
     loop {
         let (stream, peer) = listener.accept().await?;
@@ -170,16 +175,32 @@ async fn run_server_from_listener(
             }
         }
 
-        info!(peer = %peer, "new IMAP connection");
+        info!(
+            pkg = "imap/server",
+            msg = "new IMAP connection",
+            peer = %peer,
+            "new IMAP connection"
+        );
 
         let config = config.clone();
         let tls_config = tls_config.clone();
 
         tokio::spawn(async move {
             if let Err(e) = handle_connection(stream, config, tls_config).await {
-                error!(peer = %peer, error = %e, "connection error");
+                error!(
+                    pkg = "imap/server",
+                    msg = "connection error",
+                    peer = %peer,
+                    error = %e,
+                    "connection error"
+                );
             }
-            info!(peer = %peer, "connection closed");
+            info!(
+                pkg = "imap/server",
+                msg = "connection closed",
+                peer = %peer,
+                "connection closed"
+            );
         });
     }
 }

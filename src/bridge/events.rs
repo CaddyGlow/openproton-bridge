@@ -2037,6 +2037,8 @@ mod tests {
     use crate::bridge::accounts::AccountHealth;
     use crate::bridge::accounts::AccountRegistry;
     use crate::imap::store::InMemoryStore;
+    use crate::pim::store::PimStore;
+    use rusqlite::Connection;
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2094,6 +2096,13 @@ mod tests {
             store,
             checkpoints,
         )
+    }
+
+    fn setup_pim_store() -> Arc<PimStore> {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("account.db");
+        Box::leak(Box::new(tmp));
+        Arc::new(PimStore::new(db_path).unwrap())
     }
 
     #[test]
@@ -2463,6 +2472,153 @@ mod tests {
         assert_eq!(checkpoint.last_event_id, "event-1");
         assert!(checkpoint.last_event_ts.is_some());
         assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_with_pim_contact_delta_updates_cache_and_checkpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Contacts": [{"Action": 2, "Contact": {"ID": "contact-1"}}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/contacts/v4/contact-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Contact": {
+                    "ID": "contact-1",
+                    "Name": "Alice",
+                    "UID": "uid-contact-1",
+                    "Size": 10,
+                    "CreateTime": 1700000000,
+                    "ModifyTime": 1700000001,
+                    "ContactEmails": [{
+                        "ID": "email-1",
+                        "Email": "alice@proton.me",
+                        "Name": "Alice",
+                        "ContactID": "contact-1",
+                        "Kind": []
+                    }],
+                    "Cards": [{
+                        "Type": 0,
+                        "Data": "BEGIN:VCARD"
+                    }]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+        let pim_store = setup_pim_store();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store,
+            checkpoints.clone(),
+        )
+        .with_pim_store(pim_store.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-1");
+
+        let conn = Connection::open(pim_store.db_path()).unwrap();
+        let deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_contacts WHERE id = 'contact-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(deleted, 0);
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_pim_failure_does_not_commit_checkpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Contacts": [{"Action": 2, "Contact": {"ID": "contact-1"}}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/contacts/v4/contact-1"))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "Code": 5000,
+                "Error": "boom"
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+        let pim_store = setup_pim_store();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store,
+            checkpoints.clone(),
+        )
+        .with_pim_store(pim_store.clone());
+
+        let err = poll_account_once(&config, "event-0").await.unwrap_err();
+        assert!(
+            matches!(err, EventWorkerError::Payload(message) if message.contains("pim incremental apply failed"))
+        );
+
+        assert!(checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .is_none());
+
+        let conn = Connection::open(pim_store.db_path()).unwrap();
+        let contacts_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pim_contacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(contacts_count, 0);
     }
 
     #[tokio::test]

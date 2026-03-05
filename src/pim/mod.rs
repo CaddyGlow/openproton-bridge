@@ -1,4 +1,5 @@
 pub mod incremental;
+pub mod query;
 pub mod schema;
 pub mod store;
 pub mod sync_calendar;

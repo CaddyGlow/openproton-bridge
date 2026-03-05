@@ -334,6 +334,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
+    use crate::api::calendar;
     use crate::api::contacts::{Contact, ContactCard, ContactEmail, ContactMetadata};
 
     fn setup_store() -> PimStore {
@@ -371,6 +372,30 @@ mod tests {
                     data: "BEGIN:VCARD".to_string(),
                     signature: None,
                 }],
+            })
+            .unwrap();
+    }
+
+    fn seed_calendar_with_event(store: &PimStore, calendar_id: &str, event_id: &str) {
+        store
+            .upsert_calendar(&calendar::Calendar {
+                id: calendar_id.to_string(),
+                name: "Seed".to_string(),
+                description: "".to_string(),
+                color: "#00AAFF".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar::CalendarEvent {
+                id: event_id.to_string(),
+                uid: format!("uid-{event_id}"),
+                calendar_id: calendar_id.to_string(),
+                shared_event_id: "shared-seed".to_string(),
+                create_time: 1700000000,
+                ..calendar::CalendarEvent::default()
             })
             .unwrap();
     }
@@ -445,6 +470,150 @@ mod tests {
         let del_deleted: i64 = conn
             .query_row(
                 "SELECT deleted FROM pim_contacts WHERE id = 'contact-del'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(upsert_deleted, 0);
+        assert_eq!(del_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn apply_incremental_event_handles_calendar_refresh_and_model_events() {
+        let server = MockServer::start().await;
+        let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
+        let store = setup_store();
+
+        seed_calendar_with_event(&store, "cal-1", "event-del");
+        store
+            .set_sync_state_text("calendar.cal-1.model_event_id", "cme-old")
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Calendar": {
+                    "ID": "cal-1",
+                    "Name": "Personal",
+                    "Description": "Main",
+                    "Color": "#00AAFF",
+                    "Display": 1,
+                    "Type": 0,
+                    "Flags": 0
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/members"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Members": [{
+                    "ID": "member-1",
+                    "CalendarID": "cal-1",
+                    "Email": "alice@proton.me",
+                    "Color": "#00AAFF",
+                    "Display": 1,
+                    "Permissions": 2
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Keys": [{
+                    "ID": "key-1",
+                    "CalendarID": "cal-1",
+                    "PassphraseID": "pp-1",
+                    "PrivateKey": "private",
+                    "Flags": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "CalendarSettings": {
+                    "ID": "settings-1",
+                    "CalendarID": "cal-1",
+                    "DefaultEventDuration": 30,
+                    "DefaultPartDayNotifications": [],
+                    "DefaultFullDayNotifications": []
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/modelevents/cme-old"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "CalendarModelEventID": "cme-new",
+                "CalendarEvents": [
+                    {"Action": 2, "CalendarEvent": {"ID": "event-upsert"}},
+                    {"Action": 0, "CalendarEvent": {"ID": "event-del"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/events/event-upsert"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Event": {
+                    "ID": "event-upsert",
+                    "UID": "uid-event-upsert",
+                    "CalendarID": "cal-1",
+                    "SharedEventID": "shared-1",
+                    "CreateTime": 1700000000,
+                    "LastEditTime": 1700000001,
+                    "StartTime": 1700001000,
+                    "StartTimezone": "UTC",
+                    "EndTime": 1700004600,
+                    "EndTimezone": "UTC",
+                    "FullDay": 0,
+                    "Author": "alice@proton.me",
+                    "Permissions": 2
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let payload = serde_json::json!({
+            "Calendars": [
+                {"Action": 2, "Calendar": {"ID": "cal-1"}}
+            ]
+        });
+
+        let summary = apply_incremental_event(&client, &store, &payload)
+            .await
+            .unwrap();
+        assert_eq!(summary.calendars_refreshed, 1);
+        assert_eq!(summary.calendar_events_upserted, 1);
+        assert_eq!(summary.calendar_events_deleted, 1);
+        assert_eq!(
+            store
+                .get_sync_state_text("calendar.cal-1.model_event_id")
+                .unwrap()
+                .as_deref(),
+            Some("cme-new")
+        );
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let upsert_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-upsert'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let del_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-del'",
                 [],
                 |row| row.get(0),
             )

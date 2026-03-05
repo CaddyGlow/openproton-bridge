@@ -1,3 +1,4 @@
 /target
 .bun
 __pycache__
+.claude/

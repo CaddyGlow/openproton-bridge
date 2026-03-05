@@ -241,12 +241,14 @@ impl CliGrpcClient {
         contact: pb::PimContact,
         emails: Vec<pb::PimContactEmail>,
         cards: Vec<pb::PimContactCard>,
+        expected_updated_at_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let request = self.request_with_token(pb::PimUpsertContactRequest {
             account_id: account_id.to_string(),
             contact: Some(contact),
             emails,
             cards,
+            expected_updated_at_ms,
         })?;
         self.inner
             .pim_upsert_contact(request)
@@ -260,11 +262,13 @@ impl CliGrpcClient {
         account_id: &str,
         contact_id: &str,
         hard_delete: bool,
+        expected_updated_at_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let request = self.request_with_token(pb::PimDeleteContactRequest {
             account_id: account_id.to_string(),
             contact_id: contact_id.to_string(),
             hard_delete,
+            expected_updated_at_ms,
         })?;
         self.inner
             .pim_delete_contact(request)
@@ -277,10 +281,12 @@ impl CliGrpcClient {
         &mut self,
         account_id: &str,
         calendar: pb::PimCalendar,
+        expected_updated_at_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let request = self.request_with_token(pb::PimUpsertCalendarRequest {
             account_id: account_id.to_string(),
             calendar: Some(calendar),
+            expected_updated_at_ms,
         })?;
         self.inner
             .pim_upsert_calendar(request)
@@ -294,11 +300,13 @@ impl CliGrpcClient {
         account_id: &str,
         calendar_id: &str,
         hard_delete: bool,
+        expected_updated_at_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let request = self.request_with_token(pb::PimDeleteCalendarRequest {
             account_id: account_id.to_string(),
             calendar_id: calendar_id.to_string(),
             hard_delete,
+            expected_updated_at_ms,
         })?;
         self.inner
             .pim_delete_calendar(request)
@@ -311,10 +319,12 @@ impl CliGrpcClient {
         &mut self,
         account_id: &str,
         event: pb::PimCalendarEvent,
+        expected_updated_at_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let request = self.request_with_token(pb::PimUpsertCalendarEventRequest {
             account_id: account_id.to_string(),
             event: Some(event),
+            expected_updated_at_ms,
         })?;
         self.inner
             .pim_upsert_calendar_event(request)
@@ -328,11 +338,13 @@ impl CliGrpcClient {
         account_id: &str,
         event_id: &str,
         hard_delete: bool,
+        expected_updated_at_ms: Option<i64>,
     ) -> anyhow::Result<()> {
         let request = self.request_with_token(pb::PimDeleteCalendarEventRequest {
             account_id: account_id.to_string(),
             event_id: event_id.to_string(),
             hard_delete,
+            expected_updated_at_ms,
         })?;
         self.inner
             .pim_delete_calendar_event(request)

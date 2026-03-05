@@ -37,7 +37,7 @@ impl PimStore {
         let conn = open_read_connection(self)?;
         let (limit, offset) = normalize_page(page);
         let mut stmt = conn.prepare(
-            "SELECT id, uid, name, size, create_time, modify_time, deleted
+            "SELECT id, uid, name, size, create_time, modify_time, deleted, updated_at_ms
              FROM pim_contacts
              WHERE (?1 = 1 OR deleted = 0)
              ORDER BY modify_time DESC, id ASC
@@ -60,7 +60,7 @@ impl PimStore {
         }
         let conn = open_read_connection(self)?;
         let mut stmt = conn.prepare(
-            "SELECT id, uid, name, size, create_time, modify_time, deleted
+            "SELECT id, uid, name, size, create_time, modify_time, deleted, updated_at_ms
              FROM pim_contacts
              WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
         )?;
@@ -87,7 +87,7 @@ impl PimStore {
         };
         let (limit, offset) = normalize_page(page);
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT c.id, c.uid, c.name, c.size, c.create_time, c.modify_time, c.deleted
+            "SELECT DISTINCT c.id, c.uid, c.name, c.size, c.create_time, c.modify_time, c.deleted, c.updated_at_ms
              FROM pim_contact_emails e
              INNER JOIN pim_contacts c ON c.id = e.contact_id
              WHERE c.deleted = 0 AND e.email LIKE ?1 COLLATE NOCASE
@@ -106,7 +106,7 @@ impl PimStore {
         let conn = open_read_connection(self)?;
         let (limit, offset) = normalize_page(page);
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, color, display, calendar_type, flags, deleted
+            "SELECT id, name, description, color, display, calendar_type, flags, deleted, updated_at_ms
              FROM pim_calendars
              WHERE (?1 = 1 OR deleted = 0)
              ORDER BY LOWER(name) ASC, id ASC
@@ -129,7 +129,7 @@ impl PimStore {
         }
         let conn = open_read_connection(self)?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, description, color, display, calendar_type, flags, deleted
+            "SELECT id, name, description, color, display, calendar_type, flags, deleted, updated_at_ms
              FROM pim_calendars
              WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
         )?;
@@ -153,7 +153,7 @@ impl PimStore {
         let conn = open_read_connection(self)?;
         let (limit, offset) = normalize_page(page);
         let mut stmt = conn.prepare(
-            "SELECT id, calendar_id, uid, shared_event_id, start_time, end_time, deleted
+            "SELECT id, calendar_id, uid, shared_event_id, start_time, end_time, deleted, updated_at_ms
              FROM pim_calendar_events
              WHERE calendar_id = ?1
                AND (?2 = 1 OR deleted = 0)
@@ -174,6 +174,27 @@ impl PimStore {
             map_calendar_event_row,
         )?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_calendar_event(
+        &self,
+        event_id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<StoredCalendarEvent>> {
+        if event_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = open_read_connection(self)?;
+        let mut stmt = conn.prepare(
+            "SELECT id, calendar_id, uid, shared_event_id, start_time, end_time, deleted, updated_at_ms
+             FROM pim_calendar_events
+             WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![event_id, bool_to_sql(include_deleted)])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(map_calendar_event_row(row)?));
+        }
+        Ok(None)
     }
 }
 
@@ -206,6 +227,7 @@ fn map_contact_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredContact> {
         create_time: row.get(4)?,
         modify_time: row.get(5)?,
         deleted: row.get::<_, i64>(6)? != 0,
+        updated_at_ms: row.get(7)?,
     })
 }
 
@@ -219,6 +241,7 @@ fn map_calendar_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCalendar>
         calendar_type: row.get(5)?,
         flags: row.get(6)?,
         deleted: row.get::<_, i64>(7)? != 0,
+        updated_at_ms: row.get(8)?,
     })
 }
 
@@ -231,6 +254,7 @@ fn map_calendar_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredCal
         start_time: row.get(4)?,
         end_time: row.get(5)?,
         deleted: row.get::<_, i64>(6)? != 0,
+        updated_at_ms: row.get(7)?,
     })
 }
 

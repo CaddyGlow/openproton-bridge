@@ -100,6 +100,18 @@ impl RuntimeSupervisor {
             .and_then(SupervisorRuntimeHandle::pim_reconcile_metrics)
     }
 
+    #[cfg(test)]
+    pub async fn install_test_runtime_state(
+        &self,
+        running: bool,
+        metrics: PimReconcileMetricsSnapshot,
+    ) {
+        let finished = !running;
+        let test =
+            TestRuntimeHandle::new_with_metrics(finished, std::time::Duration::ZERO, metrics);
+        *self.handle.lock().await = Some(SupervisorRuntimeHandle::Test(test));
+    }
+
     async fn start_locked(
         &self,
         config: MailRuntimeConfig,
@@ -187,7 +199,7 @@ impl SupervisorRuntimeHandle {
         match self {
             Self::Live(handle) => Some(handle.pim_reconcile_metrics()),
             #[cfg(test)]
-            Self::Test(_handle) => None,
+            Self::Test(handle) => Some(handle.metrics.clone()),
         }
     }
 }
@@ -197,6 +209,7 @@ struct TestRuntimeHandle {
     finished: bool,
     stop_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     stop_delay: std::time::Duration,
+    metrics: PimReconcileMetricsSnapshot,
 }
 
 #[cfg(test)]
@@ -206,6 +219,20 @@ impl TestRuntimeHandle {
             finished,
             stop_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             stop_delay,
+            metrics: PimReconcileMetricsSnapshot::default(),
+        }
+    }
+
+    fn new_with_metrics(
+        finished: bool,
+        stop_delay: std::time::Duration,
+        metrics: PimReconcileMetricsSnapshot,
+    ) -> Self {
+        Self {
+            finished,
+            stop_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            stop_delay,
+            metrics,
         }
     }
 

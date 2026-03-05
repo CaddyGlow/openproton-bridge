@@ -9,6 +9,7 @@ pub struct StoredContact {
     pub create_time: i64,
     pub modify_time: i64,
     pub deleted: bool,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub struct StoredCalendar {
     pub calendar_type: i32,
     pub flags: i64,
     pub deleted: bool,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,4 +34,5 @@ pub struct StoredCalendarEvent {
     pub start_time: i64,
     pub end_time: i64,
     pub deleted: bool,
+    pub updated_at_ms: i64,
 }

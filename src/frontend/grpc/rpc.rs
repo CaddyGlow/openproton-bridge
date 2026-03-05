@@ -99,6 +99,7 @@ fn to_pb_pim_contact(contact: crate::pim::types::StoredContact) -> pb::PimContac
         create_time: contact.create_time,
         modify_time: contact.modify_time,
         deleted: contact.deleted,
+        updated_at_ms: contact.updated_at_ms,
     }
 }
 
@@ -112,6 +113,7 @@ fn to_pb_pim_calendar(calendar: crate::pim::types::StoredCalendar) -> pb::PimCal
         calendar_type: calendar.calendar_type,
         flags: calendar.flags,
         deleted: calendar.deleted,
+        updated_at_ms: calendar.updated_at_ms,
     }
 }
 
@@ -124,6 +126,7 @@ fn to_pb_pim_calendar_event(event: crate::pim::types::StoredCalendarEvent) -> pb
         start_time: event.start_time,
         end_time: event.end_time,
         deleted: event.deleted,
+        updated_at_ms: event.updated_at_ms,
     }
 }
 
@@ -306,6 +309,87 @@ impl BridgeService {
         let db_path = gluon_paths.account_db_path(&account.storage_user_id);
         crate::pim::store::PimStore::new(db_path)
             .map_err(|err| Status::internal(format!("failed to open pim store: {err}")))
+    }
+
+    fn ensure_expected_contact_updated_at(
+        &self,
+        store: &crate::pim::store::PimStore,
+        contact_id: &str,
+        expected_updated_at_ms: Option<i64>,
+    ) -> Result<(), Status> {
+        let Some(expected) = expected_updated_at_ms else {
+            return Ok(());
+        };
+        let current = store
+            .get_contact(contact_id, true)
+            .map_err(|err| Status::internal(format!("failed to read current contact state: {err}")))?;
+        let Some(current) = current else {
+            return Err(Status::aborted(format!(
+                "stale write rejected for contact {}; current row missing",
+                contact_id
+            )));
+        };
+        if current.updated_at_ms != expected {
+            return Err(Status::aborted(format!(
+                "stale write rejected for contact {}; expected updatedAtMs {}, current {}",
+                contact_id, expected, current.updated_at_ms
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_expected_calendar_updated_at(
+        &self,
+        store: &crate::pim::store::PimStore,
+        calendar_id: &str,
+        expected_updated_at_ms: Option<i64>,
+    ) -> Result<(), Status> {
+        let Some(expected) = expected_updated_at_ms else {
+            return Ok(());
+        };
+        let current = store
+            .get_calendar(calendar_id, true)
+            .map_err(|err| Status::internal(format!("failed to read current calendar state: {err}")))?;
+        let Some(current) = current else {
+            return Err(Status::aborted(format!(
+                "stale write rejected for calendar {}; current row missing",
+                calendar_id
+            )));
+        };
+        if current.updated_at_ms != expected {
+            return Err(Status::aborted(format!(
+                "stale write rejected for calendar {}; expected updatedAtMs {}, current {}",
+                calendar_id, expected, current.updated_at_ms
+            )));
+        }
+        Ok(())
+    }
+
+    fn ensure_expected_calendar_event_updated_at(
+        &self,
+        store: &crate::pim::store::PimStore,
+        event_id: &str,
+        expected_updated_at_ms: Option<i64>,
+    ) -> Result<(), Status> {
+        let Some(expected) = expected_updated_at_ms else {
+            return Ok(());
+        };
+        let current = store
+            .get_calendar_event(event_id, true)
+            .map_err(|err| Status::internal(format!("failed to read current calendar event state: {err}")))?;
+        let Some(current) = current else {
+            return Err(Status::aborted(format!(
+                "stale write rejected for calendar event {}; current row missing",
+                event_id
+            )));
+        };
+        if current.updated_at_ms != expected {
+            return Err(Status::aborted(format!(
+                "stale write rejected for calendar event {}; expected updatedAtMs {}, current {}",
+                event_id, expected, current.updated_at_ms
+            )));
+        }
+        Ok(())
     }
 
     async fn stage_two_password_login(&self, pending: PendingLogin) {
@@ -1675,6 +1759,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
         let api_contact = to_api_contact(contact, req.emails, req.cards);
         let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        self.ensure_expected_contact_updated_at(
+            &store,
+            api_contact.metadata.id.as_str(),
+            req.expected_updated_at_ms,
+        )?;
         store
             .upsert_contact(&api_contact)
             .map_err(|err| Status::internal(format!("failed to upsert contact: {err}")))?;
@@ -1690,6 +1779,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("contactID is required"));
         }
         let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        self.ensure_expected_contact_updated_at(
+            &store,
+            req.contact_id.as_str(),
+            req.expected_updated_at_ms,
+        )?;
         let result = if req.hard_delete {
             store.hard_delete_contact(req.contact_id.as_str())
         } else {
@@ -1712,6 +1806,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
         let api_calendar = to_api_calendar(calendar);
         let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        self.ensure_expected_calendar_updated_at(
+            &store,
+            api_calendar.id.as_str(),
+            req.expected_updated_at_ms,
+        )?;
         store
             .upsert_calendar(&api_calendar)
             .map_err(|err| Status::internal(format!("failed to upsert calendar: {err}")))?;
@@ -1727,6 +1826,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("calendarID is required"));
         }
         let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        self.ensure_expected_calendar_updated_at(
+            &store,
+            req.calendar_id.as_str(),
+            req.expected_updated_at_ms,
+        )?;
         let result = if req.hard_delete {
             store.hard_delete_calendar(req.calendar_id.as_str())
         } else {
@@ -1752,6 +1856,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
         let api_event = to_api_calendar_event(event);
         let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        self.ensure_expected_calendar_event_updated_at(
+            &store,
+            api_event.id.as_str(),
+            req.expected_updated_at_ms,
+        )?;
         store
             .upsert_calendar_event(&api_event)
             .map_err(|err| Status::internal(format!("failed to upsert calendar event: {err}")))?;
@@ -1767,6 +1876,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("eventID is required"));
         }
         let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        self.ensure_expected_calendar_event_updated_at(
+            &store,
+            req.event_id.as_str(),
+            req.expected_updated_at_ms,
+        )?;
         let result = if req.hard_delete {
             store.hard_delete_calendar_event(req.event_id.as_str())
         } else {

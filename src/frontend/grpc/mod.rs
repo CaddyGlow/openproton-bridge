@@ -1799,6 +1799,7 @@ mod tests {
                     create_time: 1000,
                     modify_time: 1001,
                     deleted: false,
+                    updated_at_ms: 0,
                 }),
                 emails: vec![pb::PimContactEmail {
                     id: "email-write-1".to_string(),
@@ -1815,6 +1816,7 @@ mod tests {
                     data: "BEGIN:VCARD".to_string(),
                     signature: None,
                 }],
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -1839,6 +1841,7 @@ mod tests {
                 account_id: session.uid.clone(),
                 contact_id: "contact-write-1".to_string(),
                 hard_delete: false,
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -1863,6 +1866,7 @@ mod tests {
                 account_id: session.uid.clone(),
                 contact_id: "contact-write-1".to_string(),
                 hard_delete: true,
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -1910,7 +1914,9 @@ mod tests {
                     calendar_type: 0,
                     flags: 0,
                     deleted: false,
+                    updated_at_ms: 0,
                 }),
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -1928,7 +1934,9 @@ mod tests {
                     start_time: 500,
                     end_time: 550,
                     deleted: false,
+                    updated_at_ms: 0,
                 }),
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -1960,6 +1968,7 @@ mod tests {
                 account_id: session.uid.clone(),
                 event_id: "evt-write-1".to_string(),
                 hard_delete: true,
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -1991,6 +2000,7 @@ mod tests {
                 account_id: session.uid.clone(),
                 calendar_id: "cal-write-1".to_string(),
                 hard_delete: true,
+                expected_updated_at_ms: None,
             }),
         )
         .await
@@ -2025,6 +2035,196 @@ mod tests {
         assert_eq!(metrics.sweeps_total, 0);
         assert_eq!(metrics.contacts_success_total, 0);
         assert_eq!(metrics.calendar_full_success_total, 0);
+    }
+
+    #[tokio::test]
+    async fn pim_reconcile_metrics_returns_non_zero_snapshot_when_runtime_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        service
+            .state
+            .runtime_supervisor
+            .install_test_runtime_state(
+                true,
+                crate::bridge::mail_runtime::PimReconcileMetricsSnapshot {
+                    sweeps_total: 3,
+                    contacts_success_total: 4,
+                    calendar_full_success_total: 5,
+                    last_sweep_elapsed_ms: 123,
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let metrics = <BridgeService as pb::bridge_server::Bridge>::pim_reconcile_metrics(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(metrics.runtime_running);
+        assert_eq!(metrics.sweeps_total, 3);
+        assert_eq!(metrics.contacts_success_total, 4);
+        assert_eq!(metrics.calendar_full_success_total, 5);
+        assert_eq!(metrics.last_sweep_elapsed_ms, 123);
+    }
+
+    #[tokio::test]
+    async fn pim_upsert_contact_rejects_stale_expected_updated_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-stale-contact-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim-stale-contact@example.com".to_string(),
+            display_name: "Pim Stale Contact User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let store = pim_setup_account_store(&service, &session);
+        store
+            .upsert_contact(&pim_test_contact(
+                "contact-stale-1",
+                "Alice",
+                "alice@proton.me",
+                100,
+            ))
+            .unwrap();
+
+        let first = <BridgeService as pb::bridge_server::Bridge>::pim_get_contact(
+            &service,
+            Request::new(pb::PimGetContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-stale-1".to_string(),
+                include_deleted: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let initial_updated_at = first.updated_at_ms;
+        assert!(initial_updated_at > 0);
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_upsert_contact(
+            &service,
+            Request::new(pb::PimUpsertContactRequest {
+                account_id: session.uid.clone(),
+                contact: Some(pb::PimContact {
+                    id: "contact-stale-1".to_string(),
+                    uid: "uid-contact-stale-1".to_string(),
+                    name: "Alice v2".to_string(),
+                    size: 10,
+                    create_time: 100,
+                    modify_time: 101,
+                    deleted: false,
+                    updated_at_ms: initial_updated_at,
+                }),
+                emails: vec![],
+                cards: vec![],
+                expected_updated_at_ms: Some(initial_updated_at),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let stale = <BridgeService as pb::bridge_server::Bridge>::pim_upsert_contact(
+            &service,
+            Request::new(pb::PimUpsertContactRequest {
+                account_id: session.uid.clone(),
+                contact: Some(pb::PimContact {
+                    id: "contact-stale-1".to_string(),
+                    uid: "uid-contact-stale-1".to_string(),
+                    name: "Alice stale".to_string(),
+                    size: 10,
+                    create_time: 100,
+                    modify_time: 102,
+                    deleted: false,
+                    updated_at_ms: initial_updated_at,
+                }),
+                emails: vec![],
+                cards: vec![],
+                expected_updated_at_ms: Some(initial_updated_at),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn pim_delete_calendar_event_rejects_stale_expected_updated_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-stale-event-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim-stale-event@example.com".to_string(),
+            display_name: "Pim Stale Event User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let store = pim_setup_account_store(&service, &session);
+        store
+            .upsert_calendar(&pim_test_calendar("cal-stale-1", "Stale"))
+            .unwrap();
+        store
+            .upsert_calendar_event(&pim_test_calendar_event(
+                "evt-stale-1",
+                "cal-stale-1",
+                200,
+                250,
+            ))
+            .unwrap();
+
+        let first = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendar_events(
+            &service,
+            Request::new(pb::PimListCalendarEventsRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-stale-1".to_string(),
+                include_deleted: true,
+                start_time_from: None,
+                start_time_to: None,
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let initial_updated_at = first.events[0].updated_at_ms;
+        assert!(initial_updated_at > 0);
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        store
+            .upsert_calendar_event(&pim_test_calendar_event(
+                "evt-stale-1",
+                "cal-stale-1",
+                300,
+                350,
+            ))
+            .unwrap();
+
+        let stale_delete = <BridgeService as pb::bridge_server::Bridge>::pim_delete_calendar_event(
+            &service,
+            Request::new(pb::PimDeleteCalendarEventRequest {
+                account_id: session.uid.clone(),
+                event_id: "evt-stale-1".to_string(),
+                hard_delete: true,
+                expected_updated_at_ms: Some(initial_updated_at),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(stale_delete.code(), tonic::Code::Aborted);
     }
 
     #[tokio::test]

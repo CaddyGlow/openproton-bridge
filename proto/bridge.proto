@@ -217,6 +217,7 @@ message PimContact {
   int64 createTime = 5;
   int64 modifyTime = 6;
   bool deleted = 7;
+  int64 updatedAtMs = 8;
 }
 
 message PimCalendar {
@@ -228,6 +229,7 @@ message PimCalendar {
   int32 calendarType = 6;
   int64 flags = 7;
   bool deleted = 8;
+  int64 updatedAtMs = 9;
 }
 
 message PimCalendarEvent {
@@ -238,6 +240,7 @@ message PimCalendarEvent {
   int64 startTime = 5;
   int64 endTime = 6;
   bool deleted = 7;
+  int64 updatedAtMs = 8;
 }
 
 message PimContactEmail {
@@ -313,34 +316,40 @@ message PimUpsertContactRequest {
   PimContact contact = 2;
   repeated PimContactEmail emails = 3;
   repeated PimContactCard cards = 4;
+  optional int64 expectedUpdatedAtMs = 5;
 }
 
 message PimDeleteContactRequest {
   string accountID = 1;
   string contactID = 2;
   bool hardDelete = 3;
+  optional int64 expectedUpdatedAtMs = 4;
 }
 
 message PimUpsertCalendarRequest {
   string accountID = 1;
   PimCalendar calendar = 2;
+  optional int64 expectedUpdatedAtMs = 3;
 }
 
 message PimDeleteCalendarRequest {
   string accountID = 1;
   string calendarID = 2;
   bool hardDelete = 3;
+  optional int64 expectedUpdatedAtMs = 4;
 }
 
 message PimUpsertCalendarEventRequest {
   string accountID = 1;
   PimCalendarEvent event = 2;
+  optional int64 expectedUpdatedAtMs = 3;
 }
 
 message PimDeleteCalendarEventRequest {
   string accountID = 1;
   string eventID = 2;
   bool hardDelete = 3;
+  optional int64 expectedUpdatedAtMs = 4;
 }
 
 message PimReconcileMetricsResponse {

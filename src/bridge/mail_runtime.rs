@@ -573,6 +573,7 @@ async fn run_runtime(
         });
 
     let pim_stores_for_reconcile = pim_stores.clone();
+    let dav_auth_router = auth_router.clone();
     let event_workers = super::events::start_event_worker_group_with_sync_progress_and_pim(
         runtime_accounts.clone(),
         runtime_snapshot,
@@ -606,7 +607,12 @@ async fn run_runtime(
         smtp::server::run_server_with_listener(smtp_listener, smtp_config).await
     });
     let mut dav_task = dav_listener.map(|listener| {
-        tokio::spawn(async move { dav::server::run_server_with_listener(listener).await })
+        let config = dav::server::DavServerConfig {
+            auth_router: dav_auth_router,
+        };
+        tokio::spawn(async move {
+            dav::server::run_server_with_listener_and_config(listener, config).await
+        })
     });
 
     let mut shutdown_rx = shutdown_rx;

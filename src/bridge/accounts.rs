@@ -508,8 +508,7 @@ impl RuntimeAccountRegistry {
         let (refreshed, refreshed_api_mode) = match refresh_with_mode_fallback(&existing).await {
             Ok((auth, api_mode)) => (auth, api_mode),
             Err(err) => {
-                self.handle_refresh_failure(account_id, &existing, &err)
-                    .await;
+                self.handle_refresh_failure(account_id, &err).await;
                 return Err(err.into());
             }
         };
@@ -551,12 +550,7 @@ impl RuntimeAccountRegistry {
         Ok(updated)
     }
 
-    async fn handle_refresh_failure(
-        &self,
-        account_id: &AccountId,
-        session: &Session,
-        err: &ApiError,
-    ) {
+    async fn handle_refresh_failure(&self, account_id: &AccountId, err: &ApiError) {
         let next_health = refresh_failure_health(err);
         debug!(
             account_id = %account_id.0,
@@ -566,42 +560,10 @@ impl RuntimeAccountRegistry {
         );
         let _ = self.set_health(account_id, next_health).await;
         if next_health == AccountHealth::Unavailable {
-            self.clear_persisted_session(session);
-        }
-    }
-
-    fn clear_persisted_session(&self, session: &Session) {
-        let Some(vault_dir) = &self.vault_dir else {
-            return;
-        };
-        match crate::vault::remove_session_by_account_id(vault_dir, &session.uid) {
-            Ok(()) => {
-                warn!(
-                    account_id = %session.uid,
-                    email = %session.email,
-                    "removed persisted account session after invalid refresh token"
-                );
-            }
-            Err(account_id_err) => {
-                match crate::vault::remove_session_by_email(vault_dir, &session.email) {
-                    Ok(()) => {
-                        warn!(
-                            account_id = %session.uid,
-                            email = %session.email,
-                            "removed persisted account session by email fallback after invalid refresh token"
-                        );
-                    }
-                    Err(email_err) => {
-                        warn!(
-                            account_id = %session.uid,
-                            email = %session.email,
-                            account_id_error = %account_id_err,
-                            email_error = %email_err,
-                            "failed to remove persisted account session after invalid refresh token"
-                        );
-                    }
-                }
-            }
+            warn!(
+                account_id = %account_id.0,
+                "invalid refresh token detected; keeping persisted account session"
+            );
         }
     }
 }
@@ -951,7 +913,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_refresh_failure_marks_unavailable_and_clears_persisted_session() {
+    async fn invalid_refresh_failure_marks_unavailable_and_keeps_persisted_session() {
         let tmp = tempfile::tempdir().unwrap();
         let session = session("uid-1", "alice@proton.me");
         crate::vault::save_session(&session, tmp.path()).unwrap();
@@ -965,7 +927,7 @@ mod tests {
         };
 
         runtime
-            .handle_refresh_failure(&account_id, &session, &invalid_refresh)
+            .handle_refresh_failure(&account_id, &invalid_refresh)
             .await;
 
         let health = runtime.get_health(&account_id).await.unwrap();
@@ -975,22 +937,18 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].health, AccountHealth::Unavailable);
 
-        let removed = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me")
-            .err()
-            .is_some();
-        assert!(removed);
+        let persisted = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me").is_ok();
+        assert!(persisted);
     }
 
     #[tokio::test]
-    async fn invalid_refresh_failure_uses_account_id_removal_when_email_changes() {
+    async fn invalid_refresh_failure_keeps_persisted_session_when_email_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let stored = session("uid-1", "stored@proton.me");
         crate::vault::save_session(&stored, tmp.path()).unwrap();
 
         let runtime = RuntimeAccountRegistry::new(vec![stored.clone()], tmp.path().to_path_buf());
         let account_id = AccountId("uid-1".to_string());
-        let mut stale_runtime_session = stored.clone();
-        stale_runtime_session.email = "stale-runtime@proton.me".to_string();
 
         let invalid_refresh = ApiError::Api {
             code: 10013,
@@ -999,9 +957,9 @@ mod tests {
         };
 
         runtime
-            .handle_refresh_failure(&account_id, &stale_runtime_session, &invalid_refresh)
+            .handle_refresh_failure(&account_id, &invalid_refresh)
             .await;
 
-        assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_err());
+        assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_ok());
     }
 }

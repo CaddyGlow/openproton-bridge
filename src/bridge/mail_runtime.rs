@@ -665,7 +665,7 @@ async fn refresh_session(
     )
     .await
     .map_err(|err| {
-        handle_startup_refresh_failure(&session, settings_dir, &err);
+        handle_startup_refresh_failure(&session, &err);
         tracing::warn!(
             pkg = "bridge/token",
             user_id = %session.uid,
@@ -721,45 +721,17 @@ async fn refresh_session(
     Ok(refreshed)
 }
 
-fn handle_startup_refresh_failure(
-    session: &Session,
-    settings_dir: &std::path::Path,
-    err: &api::error::ApiError,
-) {
+fn handle_startup_refresh_failure(session: &Session, err: &api::error::ApiError) {
     if !api::error::is_invalid_refresh_token_error(err) {
         return;
     }
 
-    match vault::remove_session_by_account_id(settings_dir, &session.uid) {
-        Ok(()) => {
-            tracing::warn!(
-                pkg = "bridge/token",
-                user_id = %session.uid,
-                email = %session.email,
-                "stored refresh token is invalid; removed account session from vault"
-            );
-        }
-        Err(account_id_err) => match vault::remove_session_by_email(settings_dir, &session.email) {
-            Ok(()) => {
-                tracing::warn!(
-                    pkg = "bridge/token",
-                    user_id = %session.uid,
-                    email = %session.email,
-                    "stored refresh token is invalid; removed account session from vault by email fallback"
-                );
-            }
-            Err(email_err) => {
-                tracing::warn!(
-                    pkg = "bridge/token",
-                    user_id = %session.uid,
-                    email = %session.email,
-                    account_id_error = %account_id_err,
-                    email_error = %email_err,
-                    "stored refresh token is invalid; failed to remove account session from vault"
-                );
-            }
-        },
-    }
+    tracing::warn!(
+        pkg = "bridge/token",
+        user_id = %session.uid,
+        email = %session.email,
+        "stored refresh token is invalid; keeping account session in vault"
+    );
 }
 
 fn generate_bridge_password() -> String {
@@ -861,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_invalid_refresh_failure_clears_persisted_session() {
+    fn startup_invalid_refresh_failure_keeps_persisted_session() {
         let tmp = tempfile::tempdir().unwrap();
         let session = session("uid-1", "alice@proton.me");
         crate::vault::save_session(&session, tmp.path()).unwrap();
@@ -871,12 +843,10 @@ mod tests {
             message: "Invalid refresh token".to_string(),
             details: None,
         };
-        handle_startup_refresh_failure(&session, tmp.path(), &err);
+        handle_startup_refresh_failure(&session, &err);
 
-        let removed = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me")
-            .err()
-            .is_some();
-        assert!(removed);
+        let persisted = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me").is_ok();
+        assert!(persisted);
     }
 
     #[test]
@@ -886,27 +856,25 @@ mod tests {
         crate::vault::save_session(&session, tmp.path()).unwrap();
 
         let err = ApiError::Auth("temporary auth failure".to_string());
-        handle_startup_refresh_failure(&session, tmp.path(), &err);
+        handle_startup_refresh_failure(&session, &err);
 
         let persisted = crate::vault::load_session_by_email(tmp.path(), "alice@proton.me").is_ok();
         assert!(persisted);
     }
 
     #[test]
-    fn startup_invalid_refresh_failure_removes_by_account_id_when_email_changes() {
+    fn startup_invalid_refresh_failure_keeps_session_when_email_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let stored = session("uid-1", "stored@proton.me");
         crate::vault::save_session(&stored, tmp.path()).unwrap();
 
-        let mut stale_runtime = stored.clone();
-        stale_runtime.email = "stale@proton.me".to_string();
         let err = ApiError::Api {
             code: 10013,
             message: "Invalid refresh token".to_string(),
             details: None,
         };
-        handle_startup_refresh_failure(&stale_runtime, tmp.path(), &err);
+        handle_startup_refresh_failure(&stored, &err);
 
-        assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_err());
+        assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_ok());
     }
 }

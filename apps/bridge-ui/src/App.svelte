@@ -182,6 +182,19 @@
     return 'is-offline'
   }
 
+  function grpcLifecycleDescription(state: GrpcLifecycleState): string {
+    if (state === 'connecting' || state === 'retrying') {
+      return 'Establishing the Bridge gRPC session and loading runtime data.'
+    }
+    if (state === 'error') {
+      return 'Bridge connection failed. Retry to reconnect and reload accounts.'
+    }
+    if (state === 'disconnected') {
+      return 'Bridge is disconnected. Retry to reconnect and load accounts.'
+    }
+    return 'Waiting for Bridge runtime status.'
+  }
+
   function normalizeThemeMode(value: string | undefined): ThemeMode {
     if (value === 'light' || value === 'dark') {
       return value
@@ -361,6 +374,7 @@
   let showOnboardingOnlyWizard = $derived(canShowAccountWizard())
   let grpcStatusLabel = $derived(grpcLifecycleStatusLabel(grpcLifecycleState))
   let grpcStatusClass = $derived(grpcLifecycleStatusClass(grpcLifecycleState))
+  let grpcStatusDescription = $derived(grpcLifecycleDescription(grpcLifecycleState))
   let canRetryGrpc = $derived(
     !startupLoading && !grpcActionInFlight && (grpcLifecycleState === 'disconnected' || grpcLifecycleState === 'error'),
   )
@@ -1421,24 +1435,39 @@
             out:fade={{ duration: Math.max(sectionTransitionDuration - 40, 0) }}
           >
             {#if activeSection === 'accounts'}
-              <UsersCard
-                hostname={hostname}
-                usersLoading={usersLoading}
-                users={users}
-                activeUserId={clientConfigUserId}
-                activeUserIndex={activeAccountIndex}
-                userParityById={userParityById}
-                syncPhase={parityState.sync.phase}
-                syncProgressPercent={parityState.sync.progress_percent}
-                imapPort={imapPort}
-                smtpPort={smtpPort}
-                useSslImap={useSslImap}
-                useSslSmtp={useSslSmtp}
-                onConfigureClient={(userId) => openClientConfigWizard(userId)}
-                onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
-                onLogout={(userId) => logout(userId)}
-                onRemove={(userId) => remove(userId)}
-              />
+              {#if grpcLifecycleState !== 'ready'}
+                <article class="card connection-state-card" data-testid="accounts-connection-state">
+                  <p class="connection-state-title">{grpcStatusLabel}</p>
+                  <p class="muted">{grpcStatusDescription}</p>
+                  {#if grpcErrorMessage.length > 0}
+                    <p class="connection-error connection-error-block">{grpcErrorMessage}</p>
+                  {/if}
+                  {#if canRetryGrpc}
+                    <div class="connection-state-actions">
+                      <button onclick={() => void retryGrpcConnection()}>Retry Connection</button>
+                    </div>
+                  {/if}
+                </article>
+              {:else}
+                <UsersCard
+                  hostname={hostname}
+                  usersLoading={usersLoading}
+                  users={users}
+                  activeUserId={clientConfigUserId}
+                  activeUserIndex={activeAccountIndex}
+                  userParityById={userParityById}
+                  syncPhase={parityState.sync.phase}
+                  syncProgressPercent={parityState.sync.progress_percent}
+                  imapPort={imapPort}
+                  smtpPort={smtpPort}
+                  useSslImap={useSslImap}
+                  useSslSmtp={useSslSmtp}
+                  onConfigureClient={(userId) => openClientConfigWizard(userId)}
+                  onToggleSplitMode={(userId, current) => toggleSplitMode(userId, current)}
+                  onLogout={(userId) => logout(userId)}
+                  onRemove={(userId) => remove(userId)}
+                />
+              {/if}
             {:else if activeSection === 'mail'}
               <MailSettingsCard
                 bind:imapPort

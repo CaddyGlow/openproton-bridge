@@ -207,6 +207,33 @@ body {
   color: color-mix(in oklab, var(--danger) 80%, var(--text));
   font-size: 0.78rem;
   line-height: 1.4;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.connection-error-block {
+  margin-top: 10px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 10px;
+  border-radius: 9px;
+  border: 1px solid color-mix(in oklab, var(--danger) 45%, var(--panel-border));
+  background: color-mix(in oklab, var(--danger) 14%, var(--panel-muted));
+}
+
+.connection-state-card {
+  min-height: 280px;
+}
+
+.connection-state-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 630;
+}
+
+.connection-state-actions {
+  margin-top: 12px;
 }
 
 .icon-btn {

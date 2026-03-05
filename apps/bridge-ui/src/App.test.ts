@@ -250,6 +250,8 @@ describe('App bootstrap and connection flow', () => {
     await waitFor(() => {
       expect(screen.getByTestId('grpc-connection-status')).toHaveTextContent('Disconnected')
     })
+    expect(screen.getByTestId('accounts-connection-state')).toBeInTheDocument()
+    expect(screen.queryByText('No users returned.')).not.toBeInTheDocument()
 
     await fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
 

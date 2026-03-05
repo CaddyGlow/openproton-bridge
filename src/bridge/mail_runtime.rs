@@ -33,6 +33,7 @@ pub struct MailRuntimeConfig {
 const PIM_RECONCILE_TICK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 const PIM_CONTACTS_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const PIM_CALENDAR_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailRuntimeTransition {
@@ -774,9 +775,44 @@ async fn run_pim_reconcile_periodically(
                 continue;
             };
 
-            if !is_pim_contacts_due(store).unwrap_or(true)
-                && !is_pim_calendar_due(store).unwrap_or(true)
-            {
+            let contacts_due = match is_pim_contacts_due(store) {
+                Ok(due) => due,
+                Err(err) => {
+                    tracing::warn!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        error = %err,
+                        "failed to evaluate contacts reconciliation schedule; forcing run"
+                    );
+                    true
+                }
+            };
+            let calendar_full_due = match is_pim_calendar_due(store) {
+                Ok(due) => due,
+                Err(err) => {
+                    tracing::warn!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        error = %err,
+                        "failed to evaluate calendar full reconciliation schedule; forcing run"
+                    );
+                    true
+                }
+            };
+            let calendar_horizon_due = match is_pim_calendar_horizon_due(store) {
+                Ok(due) => due,
+                Err(err) => {
+                    tracing::warn!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        error = %err,
+                        "failed to evaluate calendar horizon schedule; forcing run"
+                    );
+                    true
+                }
+            };
+
+            if !contacts_due && !calendar_full_due && !calendar_horizon_due {
                 continue;
             }
 
@@ -820,7 +856,7 @@ async fn run_pim_reconcile_periodically(
                 }
             };
 
-            if is_pim_contacts_due(store).unwrap_or(true) {
+            if contacts_due {
                 match sync_contacts::bootstrap_contacts(&client, store, 0).await {
                     Ok(summary) => {
                         tracing::info!(
@@ -855,7 +891,7 @@ async fn run_pim_reconcile_periodically(
                 }
             }
 
-            if is_pim_calendar_due(store).unwrap_or(true) {
+            if calendar_full_due {
                 match sync_calendar::bootstrap_calendars(
                     &client,
                     store,
@@ -894,6 +930,38 @@ async fn run_pim_reconcile_periodically(
                             .await;
                     }
                 }
+            } else if calendar_horizon_due {
+                match sync_calendar::refresh_calendar_event_horizon(
+                    &client,
+                    store,
+                    &api::calendar::CalendarEventsQuery::default(),
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        tracing::info!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            calendars_scanned = summary.calendars_scanned,
+                            events_upserted = summary.events_upserted,
+                            "periodic calendar event horizon refresh completed"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            error = %err,
+                            "periodic calendar event horizon refresh failed"
+                        );
+                        let _ = runtime_accounts
+                            .set_health(
+                                &account.account_id,
+                                super::accounts::AccountHealth::Degraded,
+                            )
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -912,6 +980,14 @@ fn is_pim_calendar_due(store: &PimStore) -> anyhow::Result<bool> {
         store,
         "calendar.last_full_sync_ms",
         PIM_CALENDAR_RECONCILE_INTERVAL,
+    )
+}
+
+fn is_pim_calendar_horizon_due(store: &PimStore) -> anyhow::Result<bool> {
+    is_sync_scope_due(
+        store,
+        "calendar.last_horizon_sync_ms",
+        PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL,
     )
 }
 

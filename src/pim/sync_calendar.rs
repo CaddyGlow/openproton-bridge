@@ -9,6 +9,8 @@ use crate::api::client::ProtonClient;
 use super::store::PimStore;
 use super::{PimError, Result};
 
+const CALENDAR_LAST_HORIZON_SYNC_KEY: &str = "calendar.last_horizon_sync_ms";
+
 #[derive(Debug, Clone, Default)]
 pub struct BootstrapCalendarsSummary {
     pub calendars_seen: usize,
@@ -82,7 +84,9 @@ pub async fn bootstrap_calendars(
         }
     }
 
-    store.set_sync_state_int("calendar.last_full_sync_ms", epoch_millis() as i64)?;
+    let finished_at_ms = epoch_millis() as i64;
+    store.set_sync_state_int("calendar.last_full_sync_ms", finished_at_ms)?;
+    store.set_sync_state_int(CALENDAR_LAST_HORIZON_SYNC_KEY, finished_at_ms)?;
     Ok(summary)
 }
 
@@ -93,6 +97,40 @@ fn load_cached_calendar_ids(store: &PimStore) -> Result<HashSet<String>> {
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let ids = rows.collect::<std::result::Result<HashSet<String>, _>>()?;
     Ok(ids)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RefreshCalendarEventsSummary {
+    pub calendars_scanned: usize,
+    pub events_upserted: usize,
+}
+
+pub async fn refresh_calendar_event_horizon(
+    client: &ProtonClient,
+    store: &PimStore,
+    event_query: &calendar::CalendarEventsQuery,
+) -> Result<RefreshCalendarEventsSummary> {
+    let mut summary = RefreshCalendarEventsSummary::default();
+    for calendar_id in load_active_calendar_ids(store)? {
+        summary.calendars_scanned += 1;
+        let events = calendar::get_calendar_events(client, &calendar_id, event_query)
+            .await
+            .map_err(map_api_error)?;
+        for event in events {
+            store.upsert_calendar_event(&event)?;
+            summary.events_upserted += 1;
+        }
+    }
+    store.set_sync_state_int(CALENDAR_LAST_HORIZON_SYNC_KEY, epoch_millis() as i64)?;
+    Ok(summary)
+}
+
+fn load_active_calendar_ids(store: &PimStore) -> Result<Vec<String>> {
+    let conn = Connection::open(store.db_path())?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let mut stmt = conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0 ORDER BY id")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 fn epoch_millis() -> u64 {
@@ -378,5 +416,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stale_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_calendar_event_horizon_updates_event_rows_and_state() {
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+        let store = setup_store();
+
+        store
+            .upsert_calendar(&calendar::Calendar {
+                id: "cal-1".to_string(),
+                name: "Personal".to_string(),
+                description: "".to_string(),
+                color: "#00AAFF".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Events": [{
+                    "ID": "event-horizon-1",
+                    "UID": "uid-horizon-1",
+                    "CalendarID": "cal-1",
+                    "SharedEventID": "shared-1",
+                    "CreateTime": 1700000000,
+                    "LastEditTime": 1700000001,
+                    "StartTime": 1700001000,
+                    "StartTimezone": "UTC",
+                    "EndTime": 1700004600,
+                    "EndTimezone": "UTC",
+                    "FullDay": 0,
+                    "Author": "alice@proton.me",
+                    "Permissions": 2
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let summary =
+            refresh_calendar_event_horizon(&client, &store, &CalendarEventsQuery::default())
+                .await
+                .unwrap();
+        assert_eq!(summary.calendars_scanned, 1);
+        assert_eq!(summary.events_upserted, 1);
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let event_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pim_calendar_events WHERE deleted = 0 AND id = 'event-horizon-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let last_horizon = store
+            .get_sync_state_int("calendar.last_horizon_sync_ms")
+            .unwrap()
+            .unwrap();
+        assert!(last_horizon > 0);
     }
 }

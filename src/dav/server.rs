@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -23,20 +24,106 @@ use super::propfind;
 use super::report;
 
 const MAX_DAV_BODY_BYTES: usize = 1_048_576;
+const DAV_CAPABILITIES_HEADER: &str = "1, 2, calendar-access, addressbook";
 
-#[derive(Clone)]
+static DAV_METRICS: LazyLock<DavServerMetrics> = LazyLock::new(DavServerMetrics::default);
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DavAccountMetrics {
+    requests: u64,
+    errors: u64,
+}
+
+#[derive(Debug, Default)]
+struct DavServerMetrics {
+    requests_total: AtomicU64,
+    errors_total: AtomicU64,
+    auth_failures_total: AtomicU64,
+    rejected_paths_total: AtomicU64,
+    total_latency_ms: AtomicU64,
+    per_account: Mutex<HashMap<String, DavAccountMetrics>>,
+}
+
+impl DavServerMetrics {
+    fn record_request(&self, account_id: Option<&str>, status: &str, latency_ms: u64) {
+        let requests_total = self.requests_total.fetch_add(1, Ordering::Relaxed) + 1;
+        self.total_latency_ms
+            .fetch_add(latency_ms, Ordering::Relaxed);
+        let status_code = parse_status_code(status).unwrap_or(500);
+        if status_code >= 400 {
+            self.errors_total.fetch_add(1, Ordering::Relaxed);
+        }
+
+        if let Some(account_id) = account_id.filter(|value| !value.is_empty()) {
+            if let Ok(mut per_account) = self.per_account.lock() {
+                let entry = per_account.entry(account_id.to_string()).or_default();
+                entry.requests = entry.requests.saturating_add(1);
+                if status_code >= 400 {
+                    entry.errors = entry.errors.saturating_add(1);
+                }
+            }
+        }
+
+        if requests_total.is_multiple_of(100) {
+            self.log_snapshot(requests_total);
+        }
+    }
+
+    fn record_auth_failure(&self) {
+        self.auth_failures_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_rejected_path(&self) {
+        self.rejected_paths_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn log_snapshot(&self, requests_total: u64) {
+        let errors_total = self.errors_total.load(Ordering::Relaxed);
+        let auth_failures_total = self.auth_failures_total.load(Ordering::Relaxed);
+        let rejected_paths_total = self.rejected_paths_total.load(Ordering::Relaxed);
+        let total_latency_ms = self.total_latency_ms.load(Ordering::Relaxed);
+        let avg_latency_ms = if requests_total == 0 {
+            0
+        } else {
+            total_latency_ms / requests_total
+        };
+
+        let mut highest_error_rate_account = String::new();
+        let mut highest_error_rate = 0.0f64;
+        if let Ok(per_account) = self.per_account.lock() {
+            for (account_id, metrics) in per_account.iter() {
+                if metrics.requests == 0 {
+                    continue;
+                }
+                let error_rate = metrics.errors as f64 / metrics.requests as f64;
+                if error_rate > highest_error_rate {
+                    highest_error_rate = error_rate;
+                    highest_error_rate_account = account_id.clone();
+                }
+            }
+        }
+
+        tracing::info!(
+            requests_total,
+            errors_total,
+            auth_failures_total,
+            rejected_paths_total,
+            avg_latency_ms,
+            highest_error_rate_account = if highest_error_rate_account.is_empty() {
+                "n/a"
+            } else {
+                highest_error_rate_account.as_str()
+            },
+            highest_error_rate = format!("{highest_error_rate:.3}"),
+            "DAV metrics snapshot"
+        );
+    }
+}
+
+#[derive(Clone, Default)]
 pub struct DavServerConfig {
     pub auth_router: AuthRouter,
     pub pim_stores: HashMap<String, Arc<PimStore>>,
-}
-
-impl Default for DavServerConfig {
-    fn default() -> Self {
-        Self {
-            auth_router: AuthRouter::default(),
-            pim_stores: HashMap::new(),
-        }
-    }
 }
 
 pub struct DavServer {
@@ -161,18 +248,35 @@ pub async fn handle_connection(mut stream: TcpStream, config: Arc<DavServerConfi
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(0);
                 if content_length > MAX_DAV_BODY_BYTES {
-                    return Err(DavError::InvalidRequest("request body too large"));
+                    let mut response = payload_too_large_response();
+                    add_default_dav_headers(&mut response);
+                    DAV_METRICS.record_request(
+                        account_id_hint(path_without_query(&request.path)),
+                        response.status,
+                        0,
+                    );
+                    let wire = response.to_bytes();
+                    stream.write_all(&wire).await?;
+                    stream.flush().await?;
+                    return Ok(());
                 }
                 if received.len() < head_end + content_length {
                     continue;
                 }
                 let body = &received[head_end..head_end + content_length];
                 let started = Instant::now();
-                let response = route_request(&request, body, &config)?;
+                let mut response = route_request(&request, body, &config)?;
+                add_default_dav_headers(&mut response);
                 let elapsed_ms = started.elapsed().as_millis() as u64;
+                let account_hint = account_id_hint(path_without_query(&request.path));
+                DAV_METRICS.record_request(account_hint, response.status, elapsed_ms);
+                if response.status.starts_with("401") {
+                    DAV_METRICS.record_auth_failure();
+                }
                 tracing::info!(
                     method = %request.method,
                     path = %request.path,
+                    account_id = account_hint.unwrap_or("n/a"),
                     status = response.status,
                     elapsed_ms,
                     "DAV request handled"
@@ -207,6 +311,7 @@ fn route_request(
         .next()
         .unwrap_or(request.path.as_str());
     if !is_safe_path(path_without_query) {
+        DAV_METRICS.record_rejected_path();
         return Ok(DavResponse {
             status: "400 Bad Request",
             headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
@@ -275,7 +380,7 @@ fn options_response() -> DavResponse {
     DavResponse {
         status: "200 OK",
         headers: vec![
-            ("DAV", "1, 2, calendar-access, addressbook".to_string()),
+            ("DAV", DAV_CAPABILITIES_HEADER.to_string()),
             (
                 "Allow",
                 "OPTIONS, PROPFIND, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE".to_string(),
@@ -316,6 +421,14 @@ fn service_unavailable_response() -> DavResponse {
     }
 }
 
+fn payload_too_large_response() -> DavResponse {
+    DavResponse {
+        status: "413 Payload Too Large",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"request body too large\n".to_vec(),
+    }
+}
+
 fn is_safe_path(path: &str) -> bool {
     if path.is_empty() || !path.starts_with('/') || path.contains('\0') || path.contains('\\') {
         return false;
@@ -324,10 +437,65 @@ fn is_safe_path(path: &str) -> bool {
         return false;
     }
     let lower = path.to_ascii_lowercase();
-    if lower.contains("%2e%2e") || lower.contains("%2f") || lower.contains("%5c") {
+    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
         return false;
     }
-    !path.split('/').any(|segment| segment == "..")
+    !path
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
+}
+
+fn account_id_hint(path: &str) -> Option<&str> {
+    let mut segments = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty());
+    if segments.next()? != "dav" {
+        return None;
+    }
+    let account_id = segments.next()?;
+    if account_id.eq_ignore_ascii_case("principals") {
+        return None;
+    }
+    Some(account_id)
+}
+
+fn path_without_query(path: &str) -> &str {
+    path.split_once('?').map(|(head, _)| head).unwrap_or(path)
+}
+
+fn parse_status_code(status: &str) -> Option<u16> {
+    status.split_whitespace().next()?.parse::<u16>().ok()
+}
+
+fn add_default_dav_headers(response: &mut DavResponse) {
+    let has_dav = response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("dav"));
+    if !has_dav {
+        response
+            .headers
+            .push(("DAV", DAV_CAPABILITIES_HEADER.to_string()));
+    }
+
+    let has_server = response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("server"));
+    if !has_server {
+        response
+            .headers
+            .push(("Server", "openproton-bridge-dav".to_string()));
+    }
+
+    let has_ms_author_via = response
+        .headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("ms-author-via"));
+    if !has_ms_author_via {
+        response.headers.push(("MS-Author-Via", "DAV".to_string()));
+    }
 }
 
 #[cfg(test)]
@@ -413,6 +581,24 @@ mod tests {
     fn rejects_traversal_paths() {
         let request = parse_request_head(
             b"GET /dav/uid-1/addressbooks/default/../x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("request should parse");
+        let response = route_request(
+            &request,
+            &[],
+            &DavServerConfig {
+                auth_router: auth_router(),
+                pim_stores: HashMap::new(),
+            },
+        )
+        .expect("route should succeed");
+        assert_eq!(response.status, "400 Bad Request");
+    }
+
+    #[test]
+    fn rejects_percent_encoded_dot_segments() {
+        let request = parse_request_head(
+            b"GET /dav/uid-1/addressbooks/default/%2e%2e/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .expect("request should parse");
         let response = route_request(
@@ -678,6 +864,35 @@ mod tests {
         assert!(wire.contains("calendar events="));
 
         server.await.expect("server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn oversized_body_returns_413() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores: HashMap::new(),
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, config)
+                .await
+                .expect("handle request");
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        let request =
+            "PUT /dav/uid-1/addressbooks/default/big.vcf HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1048577\r\n\r\n";
+        client.write_all(request.as_bytes()).await?;
+        let mut response = vec![0_u8; 1024];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+        assert!(wire.contains("request body too large"));
+
+        server.await.expect("server task");
         Ok(())
     }
 }

@@ -15,6 +15,7 @@ use crate::api::types::Session;
 use crate::imap;
 use crate::paths::RuntimePaths;
 use crate::pim::store::PimStore;
+use crate::pim::{sync_calendar, sync_contacts};
 use crate::smtp;
 use crate::vault;
 
@@ -28,6 +29,10 @@ pub struct MailRuntimeConfig {
     pub use_ssl_for_smtp: bool,
     pub event_poll_interval: Duration,
 }
+
+const PIM_RECONCILE_TICK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const PIM_CONTACTS_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const PIM_CALENDAR_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailRuntimeTransition {
@@ -468,6 +473,7 @@ async fn run_runtime(
             }
         });
 
+    let pim_stores_for_reconcile = pim_stores.clone();
     let event_workers = super::events::start_event_worker_group_with_sync_progress_and_pim(
         runtime_accounts.clone(),
         runtime_snapshot,
@@ -480,6 +486,11 @@ async fn run_runtime(
         poll_interval,
     );
 
+    let pim_reconcile_task = tokio::spawn(run_pim_reconcile_periodically(
+        runtime_accounts.clone(),
+        pim_stores_for_reconcile,
+        notify_tx.clone(),
+    ));
     let health_task = tokio::spawn(report_runtime_health_periodically(
         runtime_accounts,
         notify_tx.clone(),
@@ -524,6 +535,8 @@ async fn run_runtime(
 
     health_task.abort();
     let _ = health_task.await;
+    pim_reconcile_task.abort();
+    let _ = pim_reconcile_task.await;
     event_workers.shutdown().await;
 
     tracing::info!(
@@ -742,6 +755,187 @@ fn generate_bridge_password() -> String {
     BASE64_URL_NO_PAD.encode(token)
 }
 
+async fn run_pim_reconcile_periodically(
+    runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    notify_tx: Option<mpsc::UnboundedSender<String>>,
+) {
+    use tokio::time::{interval, MissedTickBehavior};
+
+    let mut ticker = interval(PIM_RECONCILE_TICK_INTERVAL);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    ticker.tick().await;
+
+    loop {
+        ticker.tick().await;
+        let snapshot = runtime_accounts.snapshot().await;
+        for account in snapshot {
+            let Some(store) = pim_stores.get(&account.account_id.0) else {
+                continue;
+            };
+
+            if !is_pim_contacts_due(store).unwrap_or(true)
+                && !is_pim_calendar_due(store).unwrap_or(true)
+            {
+                continue;
+            }
+
+            let session = match runtime_accounts
+                .with_valid_access_token(&account.account_id)
+                .await
+            {
+                Ok(session) => session,
+                Err(err) => {
+                    tracing::debug!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        error = %err,
+                        "skipping periodic PIM reconciliation: no valid session"
+                    );
+                    continue;
+                }
+            };
+
+            let client = match api::client::ProtonClient::authenticated_with_mode(
+                session.api_mode.base_url(),
+                session.api_mode,
+                &session.uid,
+                &session.access_token,
+            ) {
+                Ok(client) => client,
+                Err(err) => {
+                    tracing::warn!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        error = %err,
+                        "failed to initialize API client for periodic PIM reconciliation"
+                    );
+                    let _ = runtime_accounts
+                        .set_health(
+                            &account.account_id,
+                            super::accounts::AccountHealth::Degraded,
+                        )
+                        .await;
+                    continue;
+                }
+            };
+
+            if is_pim_contacts_due(store).unwrap_or(true) {
+                match sync_contacts::bootstrap_contacts(&client, store, 0).await {
+                    Ok(summary) => {
+                        tracing::info!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            contacts_seen = summary.contacts_seen,
+                            contacts_soft_deleted = summary.contacts_soft_deleted,
+                            contacts_upserted = summary.contacts_upserted,
+                            "periodic contacts reconciliation completed"
+                        );
+                        if let Some(tx) = notify_tx.as_ref() {
+                            let _ = tx.send(format!(
+                                "[event] contacts reconciled: {} ({})",
+                                account.email, account.account_id.0
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            error = %err,
+                            "periodic contacts reconciliation failed"
+                        );
+                        let _ = runtime_accounts
+                            .set_health(
+                                &account.account_id,
+                                super::accounts::AccountHealth::Degraded,
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            if is_pim_calendar_due(store).unwrap_or(true) {
+                match sync_calendar::bootstrap_calendars(
+                    &client,
+                    store,
+                    &api::calendar::CalendarEventsQuery::default(),
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        tracing::info!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            calendars_seen = summary.calendars_seen,
+                            calendars_soft_deleted = summary.calendars_soft_deleted,
+                            events_upserted = summary.events_upserted,
+                            "periodic calendar reconciliation completed"
+                        );
+                        if let Some(tx) = notify_tx.as_ref() {
+                            let _ = tx.send(format!(
+                                "[event] calendars reconciled: {} ({})",
+                                account.email, account.account_id.0
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            error = %err,
+                            "periodic calendar reconciliation failed"
+                        );
+                        let _ = runtime_accounts
+                            .set_health(
+                                &account.account_id,
+                                super::accounts::AccountHealth::Degraded,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn is_pim_contacts_due(store: &PimStore) -> anyhow::Result<bool> {
+    is_sync_scope_due(
+        store,
+        "contacts.last_full_sync_ms",
+        PIM_CONTACTS_RECONCILE_INTERVAL,
+    )
+}
+
+fn is_pim_calendar_due(store: &PimStore) -> anyhow::Result<bool> {
+    is_sync_scope_due(
+        store,
+        "calendar.last_full_sync_ms",
+        PIM_CALENDAR_RECONCILE_INTERVAL,
+    )
+}
+
+fn is_sync_scope_due(store: &PimStore, scope: &str, interval: Duration) -> anyhow::Result<bool> {
+    let now_ms = unix_now_millis() as i64;
+    let Some(last_sync_ms) = store.get_sync_state_int(scope)? else {
+        return Ok(true);
+    };
+    if last_sync_ms <= 0 {
+        return Ok(true);
+    }
+
+    let due_after_ms = interval.as_millis() as i64;
+    Ok(now_ms.saturating_sub(last_sync_ms) >= due_after_ms)
+}
+
+fn unix_now_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 async fn report_runtime_health_periodically(
     runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
@@ -817,9 +1011,12 @@ async fn report_runtime_health_periodically(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_startup_refresh_failure, Session};
+    use std::time::Duration;
+
+    use super::{handle_startup_refresh_failure, is_sync_scope_due, Session};
     use crate::api::error::ApiError;
     use crate::api::types::ApiMode;
+    use crate::pim::store::PimStore;
 
     fn session(uid: &str, email: &str) -> Session {
         Session {
@@ -832,6 +1029,13 @@ mod tests {
             key_passphrase: None,
             bridge_password: Some("bridge-password".to_string()),
         }
+    }
+
+    fn pim_store() -> PimStore {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("account.db");
+        Box::leak(Box::new(tmp));
+        PimStore::new(db_path).unwrap()
     }
 
     #[test]
@@ -878,5 +1082,50 @@ mod tests {
         handle_startup_refresh_failure(&stored, &err);
 
         assert!(crate::vault::load_session_by_account_id(tmp.path(), "uid-1").is_ok());
+    }
+
+    #[test]
+    fn pim_scope_due_when_sync_state_missing() {
+        let store = pim_store();
+        let due = is_sync_scope_due(
+            &store,
+            "contacts.last_full_sync_ms",
+            Duration::from_secs(60),
+        )
+        .unwrap();
+        assert!(due);
+    }
+
+    #[test]
+    fn pim_scope_not_due_when_recent() {
+        let store = pim_store();
+        let now_ms = super::unix_now_millis() as i64;
+        store
+            .set_sync_state_int("contacts.last_full_sync_ms", now_ms)
+            .unwrap();
+        let due = is_sync_scope_due(
+            &store,
+            "contacts.last_full_sync_ms",
+            Duration::from_secs(24 * 60 * 60),
+        )
+        .unwrap();
+        assert!(!due);
+    }
+
+    #[test]
+    fn pim_scope_due_when_stale() {
+        let store = pim_store();
+        let now_ms = super::unix_now_millis() as i64;
+        let stale_ms = now_ms - (3 * 24 * 60 * 60 * 1000);
+        store
+            .set_sync_state_int("contacts.last_full_sync_ms", stale_ms)
+            .unwrap();
+        let due = is_sync_scope_due(
+            &store,
+            "contacts.last_full_sync_ms",
+            Duration::from_secs(24 * 60 * 60),
+        )
+        .unwrap();
+        assert!(due);
     }
 }

@@ -2,6 +2,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use super::mail_runtime::{
     self, MailRuntimeConfig, MailRuntimeHandle, MailRuntimeStartError, MailRuntimeTransition,
+    PimReconcileMetricsSnapshot,
 };
 use crate::paths::RuntimePaths;
 
@@ -92,6 +93,13 @@ impl RuntimeSupervisor {
         guard.as_ref().is_some_and(|runtime| !runtime.is_finished())
     }
 
+    pub async fn pim_reconcile_metrics(&self) -> Option<PimReconcileMetricsSnapshot> {
+        let guard = self.handle.lock().await;
+        guard
+            .as_ref()
+            .and_then(SupervisorRuntimeHandle::pim_reconcile_metrics)
+    }
+
     async fn start_locked(
         &self,
         config: MailRuntimeConfig,
@@ -172,6 +180,14 @@ impl SupervisorRuntimeHandle {
             Self::Live(handle) => handle.wait().await,
             #[cfg(test)]
             Self::Test(_handle) => Ok(()),
+        }
+    }
+
+    fn pim_reconcile_metrics(&self) -> Option<PimReconcileMetricsSnapshot> {
+        match self {
+            Self::Live(handle) => Some(handle.pim_reconcile_metrics()),
+            #[cfg(test)]
+            Self::Test(_handle) => None,
         }
     }
 }

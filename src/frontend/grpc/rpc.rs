@@ -127,6 +127,109 @@ fn to_pb_pim_calendar_event(event: crate::pim::types::StoredCalendarEvent) -> pb
     }
 }
 
+fn unix_now_millis_i64() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn to_api_contact(
+    contact: pb::PimContact,
+    emails: Vec<pb::PimContactEmail>,
+    cards: Vec<pb::PimContactCard>,
+) -> crate::api::contacts::Contact {
+    let contact_id = contact.id.clone();
+    let mapped_emails = emails
+        .into_iter()
+        .enumerate()
+        .map(|(index, email)| crate::api::contacts::ContactEmail {
+            id: if email.id.trim().is_empty() {
+                format!("{contact_id}:email:{index}")
+            } else {
+                email.id
+            },
+            email: email.email,
+            name: email.name,
+            kind: email.kind,
+            defaults: email.defaults,
+            order: email.order,
+            contact_id: contact_id.clone(),
+            label_ids: email.label_i_ds,
+            last_used_time: email.last_used_time,
+        })
+        .collect::<Vec<_>>();
+    let mapped_cards = cards
+        .into_iter()
+        .map(|card| crate::api::contacts::ContactCard {
+            card_type: card.card_type,
+            data: card.data,
+            signature: card.signature,
+        })
+        .collect::<Vec<_>>();
+    crate::api::contacts::Contact {
+        metadata: crate::api::contacts::ContactMetadata {
+            id: contact.id.clone(),
+            name: contact.name,
+            uid: if contact.uid.trim().is_empty() {
+                contact.id
+            } else {
+                contact.uid
+            },
+            size: contact.size,
+            create_time: if contact.create_time > 0 {
+                contact.create_time
+            } else {
+                unix_now_millis_i64()
+            },
+            modify_time: if contact.modify_time > 0 {
+                contact.modify_time
+            } else {
+                unix_now_millis_i64()
+            },
+            contact_emails: mapped_emails,
+            label_ids: Vec::new(),
+        },
+        cards: mapped_cards,
+    }
+}
+
+fn to_api_calendar(calendar: pb::PimCalendar) -> crate::api::calendar::Calendar {
+    crate::api::calendar::Calendar {
+        id: calendar.id,
+        name: calendar.name,
+        description: calendar.description,
+        color: calendar.color,
+        display: calendar.display,
+        calendar_type: calendar.calendar_type,
+        flags: calendar.flags,
+    }
+}
+
+fn to_api_calendar_event(event: pb::PimCalendarEvent) -> crate::api::calendar::CalendarEvent {
+    let create_time = if event.start_time > 0 {
+        event.start_time
+    } else {
+        unix_now_millis_i64()
+    };
+    crate::api::calendar::CalendarEvent {
+        id: event.id.clone(),
+        uid: if event.uid.trim().is_empty() {
+            event.id
+        } else {
+            event.uid
+        },
+        calendar_id: event.calendar_id,
+        shared_event_id: event.shared_event_id,
+        create_time,
+        last_edit_time: create_time,
+        start_time: event.start_time,
+        end_time: event.end_time,
+        ..crate::api::calendar::CalendarEvent::default()
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Session, Status> {
     let selector = selector.trim();
@@ -1556,6 +1659,156 @@ impl pb::bridge_server::Bridge for BridgeService {
             .map_err(|err| Status::internal(format!("failed to list calendar events: {err}")))?;
         Ok(Response::new(pb::PimCalendarEventListResponse {
             events: events.into_iter().map(to_pb_pim_calendar_event).collect(),
+        }))
+    }
+
+    async fn pim_upsert_contact(
+        &self,
+        request: Request<pb::PimUpsertContactRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let Some(contact) = req.contact else {
+            return Err(Status::invalid_argument("contact is required"));
+        };
+        if contact.id.trim().is_empty() {
+            return Err(Status::invalid_argument("contact.id is required"));
+        }
+        let api_contact = to_api_contact(contact, req.emails, req.cards);
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        store
+            .upsert_contact(&api_contact)
+            .map_err(|err| Status::internal(format!("failed to upsert contact: {err}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn pim_delete_contact(
+        &self,
+        request: Request<pb::PimDeleteContactRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        if req.contact_id.trim().is_empty() {
+            return Err(Status::invalid_argument("contactID is required"));
+        }
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let result = if req.hard_delete {
+            store.hard_delete_contact(req.contact_id.as_str())
+        } else {
+            store.soft_delete_contact(req.contact_id.as_str())
+        };
+        result.map_err(|err| Status::internal(format!("failed to delete contact: {err}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn pim_upsert_calendar(
+        &self,
+        request: Request<pb::PimUpsertCalendarRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let Some(calendar) = req.calendar else {
+            return Err(Status::invalid_argument("calendar is required"));
+        };
+        if calendar.id.trim().is_empty() {
+            return Err(Status::invalid_argument("calendar.id is required"));
+        }
+        let api_calendar = to_api_calendar(calendar);
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        store
+            .upsert_calendar(&api_calendar)
+            .map_err(|err| Status::internal(format!("failed to upsert calendar: {err}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn pim_delete_calendar(
+        &self,
+        request: Request<pb::PimDeleteCalendarRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        if req.calendar_id.trim().is_empty() {
+            return Err(Status::invalid_argument("calendarID is required"));
+        }
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let result = if req.hard_delete {
+            store.hard_delete_calendar(req.calendar_id.as_str())
+        } else {
+            store.soft_delete_calendar(req.calendar_id.as_str())
+        };
+        result.map_err(|err| Status::internal(format!("failed to delete calendar: {err}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn pim_upsert_calendar_event(
+        &self,
+        request: Request<pb::PimUpsertCalendarEventRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        let Some(event) = req.event else {
+            return Err(Status::invalid_argument("event is required"));
+        };
+        if event.id.trim().is_empty() {
+            return Err(Status::invalid_argument("event.id is required"));
+        }
+        if event.calendar_id.trim().is_empty() {
+            return Err(Status::invalid_argument("event.calendarID is required"));
+        }
+        let api_event = to_api_calendar_event(event);
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        store
+            .upsert_calendar_event(&api_event)
+            .map_err(|err| Status::internal(format!("failed to upsert calendar event: {err}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn pim_delete_calendar_event(
+        &self,
+        request: Request<pb::PimDeleteCalendarEventRequest>,
+    ) -> Result<Response<()>, Status> {
+        let req = request.into_inner();
+        if req.event_id.trim().is_empty() {
+            return Err(Status::invalid_argument("eventID is required"));
+        }
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let result = if req.hard_delete {
+            store.hard_delete_calendar_event(req.event_id.as_str())
+        } else {
+            store.soft_delete_calendar_event(req.event_id.as_str())
+        };
+        result.map_err(|err| Status::internal(format!("failed to delete calendar event: {err}")))?;
+        Ok(Response::new(()))
+    }
+
+    async fn pim_reconcile_metrics(
+        &self,
+        _request: Request<()>,
+    ) -> Result<Response<pb::PimReconcileMetricsResponse>, Status> {
+        let runtime_running = self.state.runtime_supervisor.is_running().await;
+        let snapshot = self
+            .state
+            .runtime_supervisor
+            .pim_reconcile_metrics()
+            .await
+            .unwrap_or_default();
+        Ok(Response::new(pb::PimReconcileMetricsResponse {
+            runtime_running,
+            sweeps_total: snapshot.sweeps_total,
+            last_sweep_elapsed_ms: snapshot.last_sweep_elapsed_ms,
+            last_sweep_completed_at_ms: snapshot.last_sweep_completed_at_ms,
+            accounts_seen_total: snapshot.accounts_seen_total,
+            accounts_with_store_total: snapshot.accounts_with_store_total,
+            accounts_skipped_no_session_total: snapshot.accounts_skipped_no_session_total,
+            client_init_failures_total: snapshot.client_init_failures_total,
+            contacts_runs_due_total: snapshot.contacts_runs_due_total,
+            contacts_success_total: snapshot.contacts_success_total,
+            contacts_failures_total: snapshot.contacts_failures_total,
+            calendar_full_runs_due_total: snapshot.calendar_full_runs_due_total,
+            calendar_full_success_total: snapshot.calendar_full_success_total,
+            calendar_full_failures_total: snapshot.calendar_full_failures_total,
+            calendar_horizon_runs_due_total: snapshot.calendar_horizon_runs_due_total,
+            calendar_horizon_success_total: snapshot.calendar_horizon_success_total,
+            calendar_horizon_failures_total: snapshot.calendar_horizon_failures_total,
+            contacts_rows_upserted_total: snapshot.contacts_rows_upserted_total,
+            contacts_rows_soft_deleted_total: snapshot.contacts_rows_soft_deleted_total,
+            calendar_rows_upserted_total: snapshot.calendar_rows_upserted_total,
+            calendar_rows_soft_deleted_total: snapshot.calendar_rows_soft_deleted_total,
         }))
     }
 

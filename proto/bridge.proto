@@ -91,6 +91,13 @@ service Bridge {
   rpc PimListCalendars(PimListCalendarsRequest) returns (PimCalendarListResponse);
   rpc PimGetCalendar(PimGetCalendarRequest) returns (PimCalendar);
   rpc PimListCalendarEvents(PimListCalendarEventsRequest) returns (PimCalendarEventListResponse);
+  rpc PimUpsertContact(PimUpsertContactRequest) returns (google.protobuf.Empty);
+  rpc PimDeleteContact(PimDeleteContactRequest) returns (google.protobuf.Empty);
+  rpc PimUpsertCalendar(PimUpsertCalendarRequest) returns (google.protobuf.Empty);
+  rpc PimDeleteCalendar(PimDeleteCalendarRequest) returns (google.protobuf.Empty);
+  rpc PimUpsertCalendarEvent(PimUpsertCalendarEventRequest) returns (google.protobuf.Empty);
+  rpc PimDeleteCalendarEvent(PimDeleteCalendarEventRequest) returns (google.protobuf.Empty);
+  rpc PimReconcileMetrics(google.protobuf.Empty) returns (PimReconcileMetricsResponse);
 
   // keychain
   rpc AvailableKeychains(google.protobuf.Empty) returns (AvailableKeychainsResponse);
@@ -233,6 +240,23 @@ message PimCalendarEvent {
   bool deleted = 7;
 }
 
+message PimContactEmail {
+  string id = 1;
+  string email = 2;
+  string name = 3;
+  repeated string kind = 4;
+  optional int32 defaults = 5;
+  optional int32 order = 6;
+  repeated string labelIDs = 7;
+  optional int64 lastUsedTime = 8;
+}
+
+message PimContactCard {
+  int32 cardType = 1;
+  string data = 2;
+  optional string signature = 3;
+}
+
 message PimListContactsRequest {
   string accountID = 1;
   bool includeDeleted = 2;
@@ -282,6 +306,65 @@ message PimCalendarListResponse {
 
 message PimCalendarEventListResponse {
   repeated PimCalendarEvent events = 1;
+}
+
+message PimUpsertContactRequest {
+  string accountID = 1;
+  PimContact contact = 2;
+  repeated PimContactEmail emails = 3;
+  repeated PimContactCard cards = 4;
+}
+
+message PimDeleteContactRequest {
+  string accountID = 1;
+  string contactID = 2;
+  bool hardDelete = 3;
+}
+
+message PimUpsertCalendarRequest {
+  string accountID = 1;
+  PimCalendar calendar = 2;
+}
+
+message PimDeleteCalendarRequest {
+  string accountID = 1;
+  string calendarID = 2;
+  bool hardDelete = 3;
+}
+
+message PimUpsertCalendarEventRequest {
+  string accountID = 1;
+  PimCalendarEvent event = 2;
+}
+
+message PimDeleteCalendarEventRequest {
+  string accountID = 1;
+  string eventID = 2;
+  bool hardDelete = 3;
+}
+
+message PimReconcileMetricsResponse {
+  bool runtimeRunning = 1;
+  uint64 sweepsTotal = 2;
+  uint64 lastSweepElapsedMs = 3;
+  int64 lastSweepCompletedAtMs = 4;
+  uint64 accountsSeenTotal = 5;
+  uint64 accountsWithStoreTotal = 6;
+  uint64 accountsSkippedNoSessionTotal = 7;
+  uint64 clientInitFailuresTotal = 8;
+  uint64 contactsRunsDueTotal = 9;
+  uint64 contactsSuccessTotal = 10;
+  uint64 contactsFailuresTotal = 11;
+  uint64 calendarFullRunsDueTotal = 12;
+  uint64 calendarFullSuccessTotal = 13;
+  uint64 calendarFullFailuresTotal = 14;
+  uint64 calendarHorizonRunsDueTotal = 15;
+  uint64 calendarHorizonSuccessTotal = 16;
+  uint64 calendarHorizonFailuresTotal = 17;
+  uint64 contactsRowsUpsertedTotal = 18;
+  uint64 contactsRowsSoftDeletedTotal = 19;
+  uint64 calendarRowsUpsertedTotal = 20;
+  uint64 calendarRowsSoftDeletedTotal = 21;
 }
 
 //**********************************************************

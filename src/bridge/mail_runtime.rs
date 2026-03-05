@@ -40,6 +40,30 @@ pub const DEFAULT_PIM_CALENDAR_RECONCILE_INTERVAL: Duration = Duration::from_sec
 pub const DEFAULT_PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL: Duration =
     Duration::from_secs(12 * 60 * 60);
 
+#[derive(Debug, Clone, Default)]
+pub struct PimReconcileMetricsSnapshot {
+    pub sweeps_total: u64,
+    pub last_sweep_elapsed_ms: u64,
+    pub last_sweep_completed_at_ms: i64,
+    pub accounts_seen_total: u64,
+    pub accounts_with_store_total: u64,
+    pub accounts_skipped_no_session_total: u64,
+    pub client_init_failures_total: u64,
+    pub contacts_runs_due_total: u64,
+    pub contacts_success_total: u64,
+    pub contacts_failures_total: u64,
+    pub calendar_full_runs_due_total: u64,
+    pub calendar_full_success_total: u64,
+    pub calendar_full_failures_total: u64,
+    pub calendar_horizon_runs_due_total: u64,
+    pub calendar_horizon_success_total: u64,
+    pub calendar_horizon_failures_total: u64,
+    pub contacts_rows_upserted_total: u64,
+    pub contacts_rows_soft_deleted_total: u64,
+    pub calendar_rows_upserted_total: u64,
+    pub calendar_rows_soft_deleted_total: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailRuntimeTransition {
     Startup,
@@ -95,6 +119,7 @@ pub struct MailRuntimeHandle {
     config: MailRuntimeConfig,
     active_sessions: Vec<Session>,
     runtime_snapshot: Vec<super::accounts::RuntimeAccountInfo>,
+    pim_reconcile_metrics: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
 }
 
 impl MailRuntimeHandle {
@@ -112,6 +137,13 @@ impl MailRuntimeHandle {
 
     pub fn runtime_snapshot(&self) -> &[super::accounts::RuntimeAccountInfo] {
         &self.runtime_snapshot
+    }
+
+    pub fn pim_reconcile_metrics(&self) -> PimReconcileMetricsSnapshot {
+        self.pim_reconcile_metrics
+            .read()
+            .map(|snapshot| snapshot.clone())
+            .unwrap_or_default()
     }
 
     pub async fn wait(self) -> anyhow::Result<()> {
@@ -160,6 +192,9 @@ pub async fn start(
 
     let active_sessions = prepared.active_sessions.clone();
     let runtime_snapshot = prepared.runtime_snapshot.clone();
+    let pim_reconcile_metrics = Arc::new(std::sync::RwLock::new(
+        PimReconcileMetricsSnapshot::default(),
+    ));
     let (stop_tx, stop_rx) = oneshot::channel();
 
     let join_handle = tokio::spawn(run_runtime(
@@ -170,6 +205,7 @@ pub async fn start(
         smtp_listener,
         stop_rx,
         notify_tx,
+        pim_reconcile_metrics.clone(),
     ));
 
     Ok(MailRuntimeHandle {
@@ -178,6 +214,7 @@ pub async fn start(
         config,
         active_sessions,
         runtime_snapshot,
+        pim_reconcile_metrics,
     })
 }
 
@@ -425,6 +462,7 @@ async fn run_runtime(
     smtp_listener: TcpListener,
     shutdown_rx: oneshot::Receiver<()>,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
+    pim_reconcile_metrics: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
 ) -> anyhow::Result<()> {
     let PreparedMailRuntime {
         imap_config,
@@ -512,6 +550,7 @@ async fn run_runtime(
         pim_calendar_reconcile_interval,
         pim_calendar_horizon_reconcile_interval,
         notify_tx.clone(),
+        pim_reconcile_metrics,
     ));
     let health_task = tokio::spawn(report_runtime_health_periodically(
         runtime_accounts,
@@ -785,6 +824,7 @@ async fn run_pim_reconcile_periodically(
     calendar_reconcile_interval: Duration,
     calendar_horizon_reconcile_interval: Duration,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
+    metrics_snapshot: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
 ) {
     use tokio::time::{interval, MissedTickBehavior};
 
@@ -1037,6 +1077,63 @@ async fn run_pim_reconcile_periodically(
             calendar_rows_soft_deleted = metrics.calendar_rows_soft_deleted,
             "pim reconciliation sweep metrics"
         );
+        if let Ok(mut snapshot) = metrics_snapshot.write() {
+            let elapsed_ms = started_at.elapsed().as_millis() as u64;
+            snapshot.sweeps_total = snapshot.sweeps_total.saturating_add(1);
+            snapshot.last_sweep_elapsed_ms = elapsed_ms;
+            snapshot.last_sweep_completed_at_ms = unix_now_millis() as i64;
+            snapshot.accounts_seen_total = snapshot
+                .accounts_seen_total
+                .saturating_add(metrics.accounts_seen as u64);
+            snapshot.accounts_with_store_total = snapshot
+                .accounts_with_store_total
+                .saturating_add(metrics.accounts_with_store as u64);
+            snapshot.accounts_skipped_no_session_total = snapshot
+                .accounts_skipped_no_session_total
+                .saturating_add(metrics.accounts_skipped_no_session as u64);
+            snapshot.client_init_failures_total = snapshot
+                .client_init_failures_total
+                .saturating_add(metrics.client_init_failures as u64);
+            snapshot.contacts_runs_due_total = snapshot
+                .contacts_runs_due_total
+                .saturating_add(metrics.contacts_runs_due as u64);
+            snapshot.contacts_success_total = snapshot
+                .contacts_success_total
+                .saturating_add(metrics.contacts_success as u64);
+            snapshot.contacts_failures_total = snapshot
+                .contacts_failures_total
+                .saturating_add(metrics.contacts_failures as u64);
+            snapshot.calendar_full_runs_due_total = snapshot
+                .calendar_full_runs_due_total
+                .saturating_add(metrics.calendar_full_runs_due as u64);
+            snapshot.calendar_full_success_total = snapshot
+                .calendar_full_success_total
+                .saturating_add(metrics.calendar_full_success as u64);
+            snapshot.calendar_full_failures_total = snapshot
+                .calendar_full_failures_total
+                .saturating_add(metrics.calendar_full_failures as u64);
+            snapshot.calendar_horizon_runs_due_total = snapshot
+                .calendar_horizon_runs_due_total
+                .saturating_add(metrics.calendar_horizon_runs_due as u64);
+            snapshot.calendar_horizon_success_total = snapshot
+                .calendar_horizon_success_total
+                .saturating_add(metrics.calendar_horizon_success as u64);
+            snapshot.calendar_horizon_failures_total = snapshot
+                .calendar_horizon_failures_total
+                .saturating_add(metrics.calendar_horizon_failures as u64);
+            snapshot.contacts_rows_upserted_total = snapshot
+                .contacts_rows_upserted_total
+                .saturating_add(metrics.contacts_rows_upserted as u64);
+            snapshot.contacts_rows_soft_deleted_total = snapshot
+                .contacts_rows_soft_deleted_total
+                .saturating_add(metrics.contacts_rows_soft_deleted as u64);
+            snapshot.calendar_rows_upserted_total = snapshot
+                .calendar_rows_upserted_total
+                .saturating_add(metrics.calendar_rows_upserted as u64);
+            snapshot.calendar_rows_soft_deleted_total = snapshot
+                .calendar_rows_soft_deleted_total
+                .saturating_add(metrics.calendar_rows_soft_deleted as u64);
+        }
     }
 }
 

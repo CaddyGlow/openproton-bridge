@@ -1772,6 +1772,262 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pim_write_contact_roundtrip_supports_soft_and_hard_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-write-contact-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim-write-contact@example.com".to_string(),
+            display_name: "Pim Write Contact User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let _ = pim_setup_account_store(&service, &session);
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_upsert_contact(
+            &service,
+            Request::new(pb::PimUpsertContactRequest {
+                account_id: session.uid.clone(),
+                contact: Some(pb::PimContact {
+                    id: "contact-write-1".to_string(),
+                    uid: "uid-contact-write-1".to_string(),
+                    name: "Alice Writable".to_string(),
+                    size: 11,
+                    create_time: 1000,
+                    modify_time: 1001,
+                    deleted: false,
+                }),
+                emails: vec![pb::PimContactEmail {
+                    id: "email-write-1".to_string(),
+                    email: "alice.writable@proton.me".to_string(),
+                    name: "Alice Writable".to_string(),
+                    kind: vec!["home".to_string()],
+                    defaults: Some(1),
+                    order: Some(1),
+                    label_i_ds: vec![],
+                    last_used_time: None,
+                }],
+                cards: vec![pb::PimContactCard {
+                    card_type: 0,
+                    data: "BEGIN:VCARD".to_string(),
+                    signature: None,
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let inserted = <BridgeService as pb::bridge_server::Bridge>::pim_get_contact(
+            &service,
+            Request::new(pb::PimGetContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-write-1".to_string(),
+                include_deleted: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(inserted.name, "Alice Writable");
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_delete_contact(
+            &service,
+            Request::new(pb::PimDeleteContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-write-1".to_string(),
+                hard_delete: false,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let soft_deleted = <BridgeService as pb::bridge_server::Bridge>::pim_get_contact(
+            &service,
+            Request::new(pb::PimGetContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-write-1".to_string(),
+                include_deleted: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(soft_deleted.deleted);
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_delete_contact(
+            &service,
+            Request::new(pb::PimDeleteContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-write-1".to_string(),
+                hard_delete: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let missing = <BridgeService as pb::bridge_server::Bridge>::pim_get_contact(
+            &service,
+            Request::new(pb::PimGetContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-write-1".to_string(),
+                include_deleted: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn pim_write_calendar_and_event_roundtrip_supports_hard_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-write-calendar-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim-write-calendar@example.com".to_string(),
+            display_name: "Pim Write Calendar User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let _ = pim_setup_account_store(&service, &session);
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_upsert_calendar(
+            &service,
+            Request::new(pb::PimUpsertCalendarRequest {
+                account_id: session.uid.clone(),
+                calendar: Some(pb::PimCalendar {
+                    id: "cal-write-1".to_string(),
+                    name: "Writable".to_string(),
+                    description: "".to_string(),
+                    color: "#00AAFF".to_string(),
+                    display: 1,
+                    calendar_type: 0,
+                    flags: 0,
+                    deleted: false,
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_upsert_calendar_event(
+            &service,
+            Request::new(pb::PimUpsertCalendarEventRequest {
+                account_id: session.uid.clone(),
+                event: Some(pb::PimCalendarEvent {
+                    id: "evt-write-1".to_string(),
+                    calendar_id: "cal-write-1".to_string(),
+                    uid: "uid-evt-write-1".to_string(),
+                    shared_event_id: "shared-evt-write-1".to_string(),
+                    start_time: 500,
+                    end_time: 550,
+                    deleted: false,
+                }),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let events = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendar_events(
+            &service,
+            Request::new(pb::PimListCalendarEventsRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-write-1".to_string(),
+                include_deleted: false,
+                start_time_from: None,
+                start_time_to: None,
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(events.events.len(), 1);
+        assert_eq!(events.events[0].id, "evt-write-1");
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_delete_calendar_event(
+            &service,
+            Request::new(pb::PimDeleteCalendarEventRequest {
+                account_id: session.uid.clone(),
+                event_id: "evt-write-1".to_string(),
+                hard_delete: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let post_delete_events =
+            <BridgeService as pb::bridge_server::Bridge>::pim_list_calendar_events(
+                &service,
+                Request::new(pb::PimListCalendarEventsRequest {
+                    account_id: session.uid.clone(),
+                    calendar_id: "cal-write-1".to_string(),
+                    include_deleted: true,
+                    start_time_from: None,
+                    start_time_to: None,
+                    page: Some(pb::PimPage {
+                        limit: 50,
+                        offset: 0,
+                    }),
+                }),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(post_delete_events.events.is_empty());
+
+        <BridgeService as pb::bridge_server::Bridge>::pim_delete_calendar(
+            &service,
+            Request::new(pb::PimDeleteCalendarRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-write-1".to_string(),
+                hard_delete: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let missing_calendar = <BridgeService as pb::bridge_server::Bridge>::pim_get_calendar(
+            &service,
+            Request::new(pb::PimGetCalendarRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-write-1".to_string(),
+                include_deleted: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(missing_calendar.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn pim_reconcile_metrics_returns_defaults_when_runtime_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let metrics = <BridgeService as pb::bridge_server::Bridge>::pim_reconcile_metrics(
+            &service,
+            Request::new(()),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(!metrics.runtime_running);
+        assert_eq!(metrics.sweeps_total, 0);
+        assert_eq!(metrics.contacts_success_total, 0);
+        assert_eq!(metrics.calendar_full_success_total, 0);
+    }
+
+    #[tokio::test]
     async fn logs_path_uses_runtime_logs_directory() {
         let root = tempfile::tempdir().unwrap();
         let runtime_paths = RuntimePaths::from_bases(

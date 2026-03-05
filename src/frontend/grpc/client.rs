@@ -234,6 +234,124 @@ impl CliGrpcClient {
             .map_err(|status| anyhow::anyhow!("grpc pim_list_calendar_events failed: {status}"))?;
         Ok(response.into_inner().events)
     }
+
+    pub async fn pim_upsert_contact(
+        &mut self,
+        account_id: &str,
+        contact: pb::PimContact,
+        emails: Vec<pb::PimContactEmail>,
+        cards: Vec<pb::PimContactCard>,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::PimUpsertContactRequest {
+            account_id: account_id.to_string(),
+            contact: Some(contact),
+            emails,
+            cards,
+        })?;
+        self.inner
+            .pim_upsert_contact(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_upsert_contact failed: {status}"))?;
+        Ok(())
+    }
+
+    pub async fn pim_delete_contact(
+        &mut self,
+        account_id: &str,
+        contact_id: &str,
+        hard_delete: bool,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::PimDeleteContactRequest {
+            account_id: account_id.to_string(),
+            contact_id: contact_id.to_string(),
+            hard_delete,
+        })?;
+        self.inner
+            .pim_delete_contact(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_delete_contact failed: {status}"))?;
+        Ok(())
+    }
+
+    pub async fn pim_upsert_calendar(
+        &mut self,
+        account_id: &str,
+        calendar: pb::PimCalendar,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::PimUpsertCalendarRequest {
+            account_id: account_id.to_string(),
+            calendar: Some(calendar),
+        })?;
+        self.inner
+            .pim_upsert_calendar(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_upsert_calendar failed: {status}"))?;
+        Ok(())
+    }
+
+    pub async fn pim_delete_calendar(
+        &mut self,
+        account_id: &str,
+        calendar_id: &str,
+        hard_delete: bool,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::PimDeleteCalendarRequest {
+            account_id: account_id.to_string(),
+            calendar_id: calendar_id.to_string(),
+            hard_delete,
+        })?;
+        self.inner
+            .pim_delete_calendar(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_delete_calendar failed: {status}"))?;
+        Ok(())
+    }
+
+    pub async fn pim_upsert_calendar_event(
+        &mut self,
+        account_id: &str,
+        event: pb::PimCalendarEvent,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::PimUpsertCalendarEventRequest {
+            account_id: account_id.to_string(),
+            event: Some(event),
+        })?;
+        self.inner
+            .pim_upsert_calendar_event(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_upsert_calendar_event failed: {status}"))?;
+        Ok(())
+    }
+
+    pub async fn pim_delete_calendar_event(
+        &mut self,
+        account_id: &str,
+        event_id: &str,
+        hard_delete: bool,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::PimDeleteCalendarEventRequest {
+            account_id: account_id.to_string(),
+            event_id: event_id.to_string(),
+            hard_delete,
+        })?;
+        self.inner
+            .pim_delete_calendar_event(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_delete_calendar_event failed: {status}"))?;
+        Ok(())
+    }
+
+    pub async fn pim_reconcile_metrics(
+        &mut self,
+    ) -> anyhow::Result<pb::PimReconcileMetricsResponse> {
+        let request = self.request_with_token(())?;
+        let response = self
+            .inner
+            .pim_reconcile_metrics(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_reconcile_metrics failed: {status}"))?;
+        Ok(response.into_inner())
+    }
 }
 
 fn parse_server_config(payload: &[u8]) -> anyhow::Result<CliGrpcServerConfig> {

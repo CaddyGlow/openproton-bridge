@@ -651,6 +651,8 @@ async fn refresh_session(
     session: Session,
     settings_dir: &std::path::Path,
 ) -> anyhow::Result<Session> {
+    let refresh_lock = super::token_refresh::lock_for_account(&session.uid);
+    let _refresh_guard = refresh_lock.lock().await;
     tracing::info!(
         pkg = "bridge/token",
         user_id = %session.uid,

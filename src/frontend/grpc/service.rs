@@ -32,10 +32,12 @@ impl BridgeService {
         &self,
         settings: &StoredMailSettings,
     ) -> anyhow::Result<bridge::mail_runtime::MailRuntimeConfig> {
-        let imap_port = u16::try_from(settings.imap_port)
-            .with_context(|| format!("invalid IMAP port in grpc settings: {}", settings.imap_port))?;
-        let smtp_port = u16::try_from(settings.smtp_port)
-            .with_context(|| format!("invalid SMTP port in grpc settings: {}", settings.smtp_port))?;
+        let imap_port = u16::try_from(settings.imap_port).with_context(|| {
+            format!("invalid IMAP port in grpc settings: {}", settings.imap_port)
+        })?;
+        let smtp_port = u16::try_from(settings.smtp_port).with_context(|| {
+            format!("invalid SMTP port in grpc settings: {}", settings.smtp_port)
+        })?;
         Ok(bridge::mail_runtime::MailRuntimeConfig {
             bind_host: self.state.bind_host.clone(),
             imap_port,
@@ -76,7 +78,9 @@ impl BridgeService {
                     error = %err,
                     "Failed to start IMAP server on bridge start"
                 );
-                self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortStartupError);
+                self.emit_mail_settings_error(
+                    pb::MailServerSettingsErrorType::ImapPortStartupError,
+                );
             }
             Some(bridge::mail_runtime::MailProtocol::Smtp) => {
                 warn!(
@@ -87,7 +91,9 @@ impl BridgeService {
                     error = %err,
                     "Failed to start SMTP server on bridge start"
                 );
-                self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortStartupError);
+                self.emit_mail_settings_error(
+                    pb::MailServerSettingsErrorType::SmtpPortStartupError,
+                );
             }
             None => {
                 warn!(
@@ -143,8 +149,7 @@ impl BridgeService {
         if self.state.runtime_supervisor.is_running().await {
             info!(
                 pkg = "grpc/bridge",
-                transition,
-                "stopping grpc mail runtime"
+                transition, "stopping grpc mail runtime"
             );
             if let Err(err) = self.state.runtime_supervisor.stop(transition).await {
                 warn!(
@@ -949,33 +954,61 @@ impl BridgeService {
     }
 
     async fn refresh_session_access_token(&self, session: &Session) -> Option<String> {
-        if cfg!(test) || session.uid.trim().is_empty() || session.refresh_token.trim().is_empty() {
+        if cfg!(test) || session.uid.trim().is_empty() {
             return None;
         }
 
-        let mut client = ProtonClient::with_api_mode(session.api_mode).ok()?;
-        let refreshed =
-            match api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None)
-                .await
-            {
-                Ok(refreshed) => refreshed,
-                Err(err) => {
-                    warn!(
-                        user_id = %session.uid,
-                        error = %err,
-                        "failed to refresh access token for grpc user metadata"
-                    );
-                    return None;
+        let lock = crate::bridge::token_refresh::lock_for_account(&session.uid);
+        let _guard = lock.lock().await;
+
+        let mut latest_session =
+            vault::load_session_by_account_id(self.settings_dir(), &session.uid)
+                .or_else(|_| vault::load_session_by_email(self.settings_dir(), &session.email))
+                .unwrap_or_else(|_| session.clone());
+
+        if !latest_session.access_token.trim().is_empty() {
+            self.cache_session_access_token(&latest_session).await;
+            return Some(latest_session.access_token.clone());
+        }
+        if latest_session.refresh_token.trim().is_empty() {
+            return None;
+        }
+
+        let mut client = ProtonClient::with_api_mode(latest_session.api_mode).ok()?;
+        let refreshed = match api::auth::refresh_auth(
+            &mut client,
+            &latest_session.uid,
+            &latest_session.refresh_token,
+            None,
+        )
+        .await
+        {
+            Ok(refreshed) => refreshed,
+            Err(err) => {
+                if let Ok(recovered) =
+                    vault::load_session_by_account_id(self.settings_dir(), &latest_session.uid)
+                {
+                    if !recovered.access_token.trim().is_empty() {
+                        self.cache_session_access_token(&recovered).await;
+                        return Some(recovered.access_token);
+                    }
                 }
-            };
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to refresh access token for grpc user metadata"
+                );
+                return None;
+            }
+        };
 
         if refreshed.access_token.trim().is_empty() {
             return None;
         }
 
-        let mut updated = session.clone();
-        updated.access_token = refreshed.access_token.clone();
-        updated.refresh_token = refreshed.refresh_token;
+        latest_session.access_token = refreshed.access_token.clone();
+        latest_session.refresh_token = refreshed.refresh_token;
+        let updated = latest_session;
         let canonical_user_id = match api::users::get_user(&client).await {
             Ok(user_resp) => Some(user_resp.user.id),
             Err(err) => {

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
+use tokio::sync::{watch, RwLock};
 use tracing::{debug, warn};
 
 use crate::api::auth;
@@ -54,7 +54,6 @@ pub struct RuntimeAccountRegistry {
     auth_material: RwLock<HashMap<AccountId, Arc<RuntimeAuthMaterial>>>,
     runtime_generations: RwLock<HashMap<AccountId, u64>>,
     generation_watchers: Mutex<HashMap<AccountId, watch::Sender<u64>>>,
-    refresh_locks: Mutex<HashMap<AccountId, Arc<AsyncMutex<()>>>>,
     vault_dir: Option<PathBuf>,
 }
 
@@ -268,17 +267,8 @@ impl RuntimeAccountRegistry {
             auth_material: RwLock::new(HashMap::new()),
             runtime_generations: RwLock::new(runtime_generations),
             generation_watchers: Mutex::new(generation_watchers),
-            refresh_locks: Mutex::new(HashMap::new()),
             vault_dir,
         }
-    }
-
-    fn refresh_lock_for(&self, account_id: &AccountId) -> Arc<AsyncMutex<()>> {
-        let mut locks = self.refresh_locks.lock().expect("refresh lock poisoned");
-        locks
-            .entry(account_id.clone())
-            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-            .clone()
     }
 
     fn generation_sender_for(&self, account_id: &AccountId) -> Option<watch::Sender<u64>> {
@@ -478,7 +468,7 @@ impl RuntimeAccountRegistry {
         account_id: &AccountId,
         stale_access_token: Option<&str>,
     ) -> Result<Session, AccountRuntimeError> {
-        let lock = self.refresh_lock_for(account_id);
+        let lock = super::token_refresh::lock_for_account(&account_id.0);
         let _guard = lock.lock().await;
 
         let existing = self

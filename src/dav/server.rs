@@ -433,16 +433,48 @@ fn is_safe_path(path: &str) -> bool {
     if path.is_empty() || !path.starts_with('/') || path.contains('\0') || path.contains('\\') {
         return false;
     }
-    if path.contains("//") {
+    let Some(decoded) = decode_percent_path(path) else {
+        return false;
+    };
+    if decoded.contains('\0') || decoded.contains('\\') || decoded.contains("//") {
         return false;
     }
     let lower = path.to_ascii_lowercase();
-    if lower.contains("%2e") || lower.contains("%2f") || lower.contains("%5c") {
+    if lower.contains("%2f") || lower.contains("%5c") {
         return false;
     }
-    !path
+    !decoded
         .split('/')
         .any(|segment| segment == ".." || segment == ".")
+}
+
+fn decode_percent_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            let high = hex_value(*bytes.get(idx + 1)?)?;
+            let low = hex_value(*bytes.get(idx + 2)?)?;
+            out.push((high << 4) | low);
+            idx += 3;
+            continue;
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn account_id_hint(path: &str) -> Option<&str> {
@@ -599,6 +631,42 @@ mod tests {
     fn rejects_percent_encoded_dot_segments() {
         let request = parse_request_head(
             b"GET /dav/uid-1/addressbooks/default/%2e%2e/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("request should parse");
+        let response = route_request(
+            &request,
+            &[],
+            &DavServerConfig {
+                auth_router: auth_router(),
+                pim_stores: HashMap::new(),
+            },
+        )
+        .expect("route should succeed");
+        assert_eq!(response.status, "400 Bad Request");
+    }
+
+    #[test]
+    fn allows_percent_encoded_dots_in_regular_segments() {
+        let request = parse_request_head(
+            b"GET /dav/uid-1/addressbooks/default/c1%2Evcf HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("request should parse");
+        let response = route_request(
+            &request,
+            &[],
+            &DavServerConfig {
+                auth_router: auth_router(),
+                pim_stores: HashMap::new(),
+            },
+        )
+        .expect("route should succeed");
+        assert_eq!(response.status, "401 Unauthorized");
+    }
+
+    #[test]
+    fn rejects_invalid_percent_encoding() {
+        let request = parse_request_head(
+            b"GET /dav/uid-1/addressbooks/default/c1%ZZ.vcf HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .expect("request should parse");
         let response = route_request(

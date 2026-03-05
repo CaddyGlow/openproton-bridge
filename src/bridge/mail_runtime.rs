@@ -14,6 +14,7 @@ use crate::api;
 use crate::api::types::Session;
 use crate::imap;
 use crate::paths::RuntimePaths;
+use crate::pim::store::PimStore;
 use crate::smtp;
 use crate::vault;
 
@@ -178,6 +179,7 @@ struct PreparedMailRuntime {
     api_base_url: String,
     auth_router: super::auth_router::AuthRouter,
     event_store: Arc<dyn imap::store::MessageStore>,
+    pim_stores: HashMap<String, Arc<PimStore>>,
     checkpoint_store: super::events::SharedCheckpointStore,
     poll_interval: Duration,
 }
@@ -345,6 +347,17 @@ async fn prepare_runtime_context(
     )
     .context("failed to initialize runtime IMAP store")?;
     let event_store = store.clone();
+    let mut pim_stores = HashMap::new();
+    for account in &gluon_bootstrap.accounts {
+        let pim_store = PimStore::new(gluon_paths.account_db_path(&account.storage_user_id))
+            .with_context(|| {
+                format!(
+                    "failed to initialize PIM store for account {}",
+                    account.account_id
+                )
+            })?;
+        pim_stores.insert(account.account_id.clone(), Arc::new(pim_store));
+    }
 
     let imap_config = Arc::new(imap::session::SessionConfig {
         api_base_url: api_base_url.clone(),
@@ -377,6 +390,7 @@ async fn prepare_runtime_context(
         api_base_url,
         auth_router,
         event_store,
+        pim_stores,
         checkpoint_store: Arc::new(super::events::VaultCheckpointStore::new(
             settings_dir.to_path_buf(),
         )),
@@ -401,6 +415,7 @@ async fn run_runtime(
         api_base_url,
         auth_router,
         event_store,
+        pim_stores,
         checkpoint_store,
         poll_interval,
         ..
@@ -453,13 +468,14 @@ async fn run_runtime(
             }
         });
 
-    let event_workers = super::events::start_event_worker_group_with_sync_progress(
+    let event_workers = super::events::start_event_worker_group_with_sync_progress_and_pim(
         runtime_accounts.clone(),
         runtime_snapshot,
         api_base_url,
         auth_router,
         event_store,
         checkpoint_store,
+        pim_stores,
         Some(sync_progress_callback),
         poll_interval,
     );

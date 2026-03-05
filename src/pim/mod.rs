@@ -1,6 +1,6 @@
+pub mod incremental;
 pub mod schema;
 pub mod store;
-pub mod incremental;
 pub mod sync_calendar;
 pub mod sync_contacts;
 pub mod types;

@@ -22,6 +22,7 @@ mod frontend;
 mod imap;
 mod observability;
 mod paths;
+mod pim;
 mod single_instance;
 mod smtp;
 mod vault;

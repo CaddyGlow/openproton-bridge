@@ -18,6 +18,8 @@ use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
 use crate::imap::mailbox;
 use crate::imap::store::MessageStore;
+use crate::pim::incremental as pim_incremental;
+use crate::pim::store::PimStore;
 
 use super::accounts::{
     AccountHealth, AccountRuntimeError, RuntimeAccountInfo, RuntimeAccountRegistry,
@@ -374,6 +376,7 @@ pub struct EventWorkerConfig {
     pub runtime_accounts: Arc<RuntimeAccountRegistry>,
     pub auth_router: AuthRouter,
     pub store: Arc<dyn MessageStore>,
+    pub pim_store: Option<Arc<PimStore>>,
     pub checkpoint_store: SharedCheckpointStore,
     pub sync_progress_callback: Option<SyncProgressCallback>,
 }
@@ -396,9 +399,15 @@ impl EventWorkerConfig {
             runtime_accounts,
             auth_router,
             store,
+            pim_store: None,
             checkpoint_store,
             sync_progress_callback: None,
         }
+    }
+
+    pub fn with_pim_store(mut self, store: Arc<PimStore>) -> Self {
+        self.pim_store = Some(store);
+        self
     }
 
     pub fn with_sync_progress_callback(mut self, callback: SyncProgressCallback) -> Self {
@@ -1451,6 +1460,32 @@ async fn poll_account_once_for_generation(
                     }
                 }
             }
+
+            if let Some(pim_store) = config.pim_store.as_ref() {
+                ensure_account_generation(config, expected_generation, "poll_event_pim_delta")
+                    .await?;
+                let pim_summary =
+                    pim_incremental::apply_incremental_event(&client, pim_store, event)
+                        .await
+                        .map_err(|err| {
+                            EventWorkerError::Payload(format!(
+                                "pim incremental apply failed: {err}"
+                            ))
+                        })?;
+                if pim_summary != pim_incremental::IncrementalPimSummary::default() {
+                    debug!(
+                        account_id = %config.account_id.0,
+                        account_email = %config.account_email,
+                        contacts_refreshed = pim_summary.contacts_refreshed,
+                        contacts_deleted = pim_summary.contacts_deleted,
+                        calendars_refreshed = pim_summary.calendars_refreshed,
+                        calendars_deleted = pim_summary.calendars_deleted,
+                        calendar_events_upserted = pim_summary.calendar_events_upserted,
+                        calendar_events_deleted = pim_summary.calendar_events_deleted,
+                        "applied pim incremental event changes"
+                    );
+                }
+            }
         }
 
         if labels_changed && resync_state.is_none() {
@@ -1849,11 +1884,37 @@ pub fn start_event_worker_group_with_sync_progress(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
 ) -> EventWorkerGroup {
+    start_event_worker_group_with_sync_progress_and_pim(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        checkpoint_store,
+        HashMap::new(),
+        sync_progress_callback,
+        poll_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_worker_group_with_sync_progress_and_pim(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> EventWorkerGroup {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let handles = accounts
         .into_iter()
         .map(|account| {
             let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
+            let account_id_key = account.account_id.0.clone();
             let mut config = EventWorkerConfig::new(
                 account.account_id,
                 account.email,
@@ -1863,6 +1924,9 @@ pub fn start_event_worker_group_with_sync_progress(
                 store.clone(),
                 checkpoint_store.clone(),
             );
+            if let Some(pim_store) = pim_stores.get(&account_id_key) {
+                config = config.with_pim_store(pim_store.clone());
+            }
             if let Some(callback) = sync_progress_callback.as_ref() {
                 config = config.with_sync_progress_callback(callback.clone());
             }
@@ -1913,10 +1977,36 @@ pub fn start_event_workers_with_sync_progress(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
 ) -> Vec<JoinHandle<()>> {
+    start_event_workers_with_sync_progress_and_pim(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        checkpoint_store,
+        HashMap::new(),
+        sync_progress_callback,
+        poll_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_workers_with_sync_progress_and_pim(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> Vec<JoinHandle<()>> {
     accounts
         .into_iter()
         .map(|account| {
             let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
+            let account_id_key = account.account_id.0.clone();
             let mut config = EventWorkerConfig::new(
                 account.account_id,
                 account.email,
@@ -1926,6 +2016,9 @@ pub fn start_event_workers_with_sync_progress(
                 store.clone(),
                 checkpoint_store.clone(),
             );
+            if let Some(pim_store) = pim_stores.get(&account_id_key) {
+                config = config.with_pim_store(pim_store.clone());
+            }
             if let Some(callback) = sync_progress_callback.as_ref() {
                 config = config.with_sync_progress_callback(callback.clone());
             }

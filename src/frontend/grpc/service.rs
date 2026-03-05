@@ -46,6 +46,18 @@ impl BridgeService {
             use_ssl_for_imap: settings.use_ssl_for_imap,
             use_ssl_for_smtp: settings.use_ssl_for_smtp,
             event_poll_interval: std::time::Duration::from_secs(30),
+            pim_reconcile_tick_interval: std::time::Duration::from_secs(
+                settings.pim_reconcile_tick_secs as u64,
+            ),
+            pim_contacts_reconcile_interval: std::time::Duration::from_secs(
+                settings.pim_contacts_reconcile_secs as u64,
+            ),
+            pim_calendar_reconcile_interval: std::time::Duration::from_secs(
+                settings.pim_calendar_reconcile_secs as u64,
+            ),
+            pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(
+                settings.pim_calendar_horizon_reconcile_secs as u64,
+            ),
         })
     }
 

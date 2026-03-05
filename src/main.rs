@@ -140,6 +140,18 @@ enum Command {
         /// Event worker poll interval in seconds
         #[arg(long, default_value = "30")]
         event_poll_secs: u64,
+        /// PIM reconciliation scheduler tick interval in seconds
+        #[arg(long, default_value = "600")]
+        pim_reconcile_tick_secs: u64,
+        /// Contacts full reconciliation interval in seconds
+        #[arg(long, default_value = "86400")]
+        pim_contacts_reconcile_secs: u64,
+        /// Calendar full reconciliation interval in seconds
+        #[arg(long, default_value = "86400")]
+        pim_calendar_reconcile_secs: u64,
+        /// Calendar event-horizon reconciliation interval in seconds
+        #[arg(long, default_value = "43200")]
+        pim_calendar_horizon_reconcile_secs: u64,
     },
     /// Start the gRPC frontend control service
     Grpc {
@@ -372,6 +384,10 @@ async fn execute_non_interactive_command_direct(
             bind,
             no_tls,
             event_poll_secs,
+            pim_reconcile_tick_secs,
+            pim_contacts_reconcile_secs,
+            pim_calendar_reconcile_secs,
+            pim_calendar_horizon_reconcile_secs,
         } => {
             cmd_serve(
                 imap_port,
@@ -379,6 +395,10 @@ async fn execute_non_interactive_command_direct(
                 &bind,
                 no_tls,
                 event_poll_secs,
+                pim_reconcile_tick_secs,
+                pim_contacts_reconcile_secs,
+                pim_calendar_reconcile_secs,
+                pim_calendar_horizon_reconcile_secs,
                 dir,
                 runtime_paths,
             )
@@ -572,6 +592,10 @@ struct InteractiveServeConfig {
     bind: String,
     no_tls: bool,
     event_poll_secs: u64,
+    pim_reconcile_tick_secs: u64,
+    pim_contacts_reconcile_secs: u64,
+    pim_calendar_reconcile_secs: u64,
+    pim_calendar_horizon_reconcile_secs: u64,
 }
 
 impl Default for InteractiveServeConfig {
@@ -582,6 +606,10 @@ impl Default for InteractiveServeConfig {
             bind: "127.0.0.1".to_string(),
             no_tls: false,
             event_poll_secs: 30,
+            pim_reconcile_tick_secs: 600,
+            pim_contacts_reconcile_secs: 86400,
+            pim_calendar_reconcile_secs: 86400,
+            pim_calendar_horizon_reconcile_secs: 43200,
         }
     }
 }
@@ -593,6 +621,10 @@ struct ServeCommandOverrides {
     bind: Option<String>,
     no_tls: Option<bool>,
     event_poll_secs: Option<u64>,
+    pim_reconcile_tick_secs: Option<u64>,
+    pim_contacts_reconcile_secs: Option<u64>,
+    pim_calendar_reconcile_secs: Option<u64>,
+    pim_calendar_horizon_reconcile_secs: Option<u64>,
 }
 
 struct InteractiveServeRuntime {
@@ -627,6 +659,14 @@ struct CliStoredMailSettings {
     smtp_port: i32,
     use_ssl_for_imap: bool,
     use_ssl_for_smtp: bool,
+    #[serde(default = "default_pim_reconcile_tick_secs")]
+    pim_reconcile_tick_secs: i32,
+    #[serde(default = "default_pim_contacts_reconcile_secs")]
+    pim_contacts_reconcile_secs: i32,
+    #[serde(default = "default_pim_calendar_reconcile_secs")]
+    pim_calendar_reconcile_secs: i32,
+    #[serde(default = "default_pim_calendar_horizon_reconcile_secs")]
+    pim_calendar_horizon_reconcile_secs: i32,
 }
 
 impl Default for CliStoredMailSettings {
@@ -636,8 +676,28 @@ impl Default for CliStoredMailSettings {
             smtp_port: 1025,
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
+            pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
+            pim_contacts_reconcile_secs: default_pim_contacts_reconcile_secs(),
+            pim_calendar_reconcile_secs: default_pim_calendar_reconcile_secs(),
+            pim_calendar_horizon_reconcile_secs: default_pim_calendar_horizon_reconcile_secs(),
         }
     }
+}
+
+const fn default_pim_reconcile_tick_secs() -> i32 {
+    600
+}
+
+const fn default_pim_contacts_reconcile_secs() -> i32 {
+    86400
+}
+
+const fn default_pim_calendar_reconcile_secs() -> i32 {
+    86400
+}
+
+const fn default_pim_calendar_horizon_reconcile_secs() -> i32 {
+    43200
 }
 
 impl CliStoredAppSettings {
@@ -667,6 +727,18 @@ impl InteractiveServeConfig {
             bind: overrides.bind.unwrap_or_else(|| self.bind.clone()),
             no_tls: overrides.no_tls.unwrap_or(self.no_tls),
             event_poll_secs: overrides.event_poll_secs.unwrap_or(self.event_poll_secs),
+            pim_reconcile_tick_secs: overrides
+                .pim_reconcile_tick_secs
+                .unwrap_or(self.pim_reconcile_tick_secs),
+            pim_contacts_reconcile_secs: overrides
+                .pim_contacts_reconcile_secs
+                .unwrap_or(self.pim_contacts_reconcile_secs),
+            pim_calendar_reconcile_secs: overrides
+                .pim_calendar_reconcile_secs
+                .unwrap_or(self.pim_calendar_reconcile_secs),
+            pim_calendar_horizon_reconcile_secs: overrides
+                .pim_calendar_horizon_reconcile_secs
+                .unwrap_or(self.pim_calendar_horizon_reconcile_secs),
         }
     }
 }
@@ -1498,12 +1570,16 @@ async fn cmd_cli(
                     "serve-status" => {
                         if let Some(state) = runtime_state.as_ref() {
                             println!(
-                                "Serve runtime: running (bind={}, imap={}, smtp={}, tls={}, poll={}s)",
+                                "Serve runtime: running (bind={}, imap={}, smtp={}, tls={}, poll={}s, pim_tick={}s, pim_contacts={}s, pim_calendar={}s, pim_calendar_horizon={}s)",
                                 state.config.bind,
                                 state.config.imap_port,
                                 state.config.smtp_port,
                                 if state.config.no_tls { "off" } else { "starttls" },
-                                state.config.event_poll_secs
+                                state.config.event_poll_secs,
+                                state.config.pim_reconcile_tick_secs,
+                                state.config.pim_contacts_reconcile_secs,
+                                state.config.pim_calendar_reconcile_secs,
+                                state.config.pim_calendar_horizon_reconcile_secs
                             );
                         } else {
                             println!("Serve runtime: stopped");
@@ -1860,6 +1936,42 @@ fn parse_serve_overrides(args: &[String]) -> anyhow::Result<ServeCommandOverride
                     .context("invalid --event-poll-secs value")?;
                 overrides.event_poll_secs = Some(value);
             }
+            "--pim-reconcile-tick-secs" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --pim-reconcile-tick-secs")?
+                    .parse::<u64>()
+                    .context("invalid --pim-reconcile-tick-secs value")?;
+                overrides.pim_reconcile_tick_secs = Some(value);
+            }
+            "--pim-contacts-reconcile-secs" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --pim-contacts-reconcile-secs")?
+                    .parse::<u64>()
+                    .context("invalid --pim-contacts-reconcile-secs value")?;
+                overrides.pim_contacts_reconcile_secs = Some(value);
+            }
+            "--pim-calendar-reconcile-secs" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --pim-calendar-reconcile-secs")?
+                    .parse::<u64>()
+                    .context("invalid --pim-calendar-reconcile-secs value")?;
+                overrides.pim_calendar_reconcile_secs = Some(value);
+            }
+            "--pim-calendar-horizon-reconcile-secs" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --pim-calendar-horizon-reconcile-secs")?
+                    .parse::<u64>()
+                    .context("invalid --pim-calendar-horizon-reconcile-secs value")?;
+                overrides.pim_calendar_horizon_reconcile_secs = Some(value);
+            }
             "--no-tls" => {
                 overrides.no_tls = Some(true);
             }
@@ -1868,7 +1980,7 @@ fn parse_serve_overrides(args: &[String]) -> anyhow::Result<ServeCommandOverride
             }
             unknown => {
                 anyhow::bail!(
-                    "unsupported serve option `{unknown}`. supported: --imap-port, --smtp-port, --bind, --event-poll-secs, --no-tls, --tls"
+                    "unsupported serve option `{unknown}`. supported: --imap-port, --smtp-port, --bind, --event-poll-secs, --pim-reconcile-tick-secs, --pim-contacts-reconcile-secs, --pim-calendar-reconcile-secs, --pim-calendar-horizon-reconcile-secs, --no-tls, --tls"
                 );
             }
         }
@@ -1885,7 +1997,7 @@ fn handle_interactive_change_command(
 ) -> anyhow::Result<()> {
     if args.is_empty() {
         anyhow::bail!(
-            "usage: change <imap-port|smtp-port|bind|event-poll-secs> <value> | change <imap-security|smtp-security> [starttls|none]"
+            "usage: change <imap-port|smtp-port|bind|event-poll-secs|pim-reconcile-tick-secs|pim-contacts-reconcile-secs|pim-calendar-reconcile-secs|pim-calendar-horizon-reconcile-secs> <value> | change <imap-security|smtp-security> [starttls|none]"
         );
     }
 
@@ -1921,6 +2033,46 @@ fn handle_interactive_change_command(
                 serve_config.event_poll_secs
             );
         }
+        "pim-reconcile-tick-secs" => {
+            let value = value.context("missing PIM reconcile tick interval value")?;
+            serve_config.pim_reconcile_tick_secs = value
+                .parse::<u64>()
+                .context("invalid PIM reconcile tick interval value")?;
+            println!(
+                "Updated PIM reconcile tick interval: {} seconds",
+                serve_config.pim_reconcile_tick_secs
+            );
+        }
+        "pim-contacts-reconcile-secs" => {
+            let value = value.context("missing contacts reconcile interval value")?;
+            serve_config.pim_contacts_reconcile_secs = value
+                .parse::<u64>()
+                .context("invalid contacts reconcile interval value")?;
+            println!(
+                "Updated contacts reconcile interval: {} seconds",
+                serve_config.pim_contacts_reconcile_secs
+            );
+        }
+        "pim-calendar-reconcile-secs" => {
+            let value = value.context("missing calendar reconcile interval value")?;
+            serve_config.pim_calendar_reconcile_secs = value
+                .parse::<u64>()
+                .context("invalid calendar reconcile interval value")?;
+            println!(
+                "Updated calendar reconcile interval: {} seconds",
+                serve_config.pim_calendar_reconcile_secs
+            );
+        }
+        "pim-calendar-horizon-reconcile-secs" => {
+            let value = value.context("missing calendar horizon reconcile interval value")?;
+            serve_config.pim_calendar_horizon_reconcile_secs = value
+                .parse::<u64>()
+                .context("invalid calendar horizon reconcile interval value")?;
+            println!(
+                "Updated calendar horizon reconcile interval: {} seconds",
+                serve_config.pim_calendar_horizon_reconcile_secs
+            );
+        }
         "imap-security" | "smtp-security" => {
             match value.map(|value| value.to_ascii_lowercase()) {
                 Some(mode) => match mode.as_str() {
@@ -1951,7 +2103,7 @@ fn handle_interactive_change_command(
             }
         }
         _ => anyhow::bail!(
-            "unknown change target `{}`; expected imap-port, smtp-port, bind, event-poll-secs, imap-security, smtp-security",
+            "unknown change target `{}`; expected imap-port, smtp-port, bind, event-poll-secs, pim-reconcile-tick-secs, pim-contacts-reconcile-secs, pim-calendar-reconcile-secs, pim-calendar-horizon-reconcile-secs, imap-security, smtp-security",
             args[0]
         ),
     }
@@ -2121,6 +2273,10 @@ fn print_interactive_serve_help() {
     println!("  --smtp-port <port>");
     println!("  --bind <ip>");
     println!("  --event-poll-secs <seconds>");
+    println!("  --pim-reconcile-tick-secs <seconds>");
+    println!("  --pim-contacts-reconcile-secs <seconds>");
+    println!("  --pim-calendar-reconcile-secs <seconds>");
+    println!("  --pim-calendar-horizon-reconcile-secs <seconds>");
     println!("  --no-tls | --tls");
 }
 
@@ -2159,6 +2315,26 @@ async fn load_interactive_serve_config(
             if let Ok(smtp_port) = u16::try_from(settings.smtp_port) {
                 if smtp_port > 0 {
                     config.smtp_port = smtp_port;
+                }
+            }
+            if let Ok(value) = u64::try_from(settings.pim_reconcile_tick_secs) {
+                if value > 0 {
+                    config.pim_reconcile_tick_secs = value;
+                }
+            }
+            if let Ok(value) = u64::try_from(settings.pim_contacts_reconcile_secs) {
+                if value > 0 {
+                    config.pim_contacts_reconcile_secs = value;
+                }
+            }
+            if let Ok(value) = u64::try_from(settings.pim_calendar_reconcile_secs) {
+                if value > 0 {
+                    config.pim_calendar_reconcile_secs = value;
+                }
+            }
+            if let Ok(value) = u64::try_from(settings.pim_calendar_horizon_reconcile_secs) {
+                if value > 0 {
+                    config.pim_calendar_horizon_reconcile_secs = value;
                 }
             }
         }
@@ -2227,6 +2403,14 @@ async fn persist_mail_ports_from_serve_config(
     update_mail_settings(runtime_paths, |settings| {
         settings.imap_port = i32::from(serve_config.imap_port);
         settings.smtp_port = i32::from(serve_config.smtp_port);
+        settings.pim_reconcile_tick_secs =
+            i32::try_from(serve_config.pim_reconcile_tick_secs).unwrap_or(i32::MAX);
+        settings.pim_contacts_reconcile_secs =
+            i32::try_from(serve_config.pim_contacts_reconcile_secs).unwrap_or(i32::MAX);
+        settings.pim_calendar_reconcile_secs =
+            i32::try_from(serve_config.pim_calendar_reconcile_secs).unwrap_or(i32::MAX);
+        settings.pim_calendar_horizon_reconcile_secs =
+            i32::try_from(serve_config.pim_calendar_horizon_reconcile_secs).unwrap_or(i32::MAX);
     })
     .await
 }
@@ -2623,6 +2807,22 @@ fn print_interactive_serve_config(config: &InteractiveServeConfig) {
         if config.no_tls { "None" } else { "STARTTLS" }
     );
     println!("  Event poll secs: {}", config.event_poll_secs);
+    println!(
+        "  PIM reconcile tick secs: {}",
+        config.pim_reconcile_tick_secs
+    );
+    println!(
+        "  PIM contacts reconcile secs: {}",
+        config.pim_contacts_reconcile_secs
+    );
+    println!(
+        "  PIM calendar reconcile secs: {}",
+        config.pim_calendar_reconcile_secs
+    );
+    println!(
+        "  PIM calendar horizon reconcile secs: {}",
+        config.pim_calendar_horizon_reconcile_secs
+    );
 }
 
 async fn cmd_login(
@@ -4017,6 +4217,10 @@ async fn cmd_serve(
     bind: &str,
     no_tls: bool,
     event_poll_secs: u64,
+    pim_reconcile_tick_secs: u64,
+    pim_contacts_reconcile_secs: u64,
+    pim_calendar_reconcile_secs: u64,
+    pim_calendar_horizon_reconcile_secs: u64,
     _dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
@@ -4028,6 +4232,16 @@ async fn cmd_serve(
         use_ssl_for_imap: !no_tls,
         use_ssl_for_smtp: !no_tls,
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(pim_reconcile_tick_secs),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(
+            pim_contacts_reconcile_secs,
+        ),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(
+            pim_calendar_reconcile_secs,
+        ),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(
+            pim_calendar_horizon_reconcile_secs,
+        ),
     };
     let supervisor = std::sync::Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
         runtime_paths.clone(),
@@ -4123,6 +4337,16 @@ async fn start_interactive_runtime(
         use_ssl_for_imap: !config.no_tls,
         use_ssl_for_smtp: !config.no_tls,
         event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(config.pim_reconcile_tick_secs),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(
+            config.pim_contacts_reconcile_secs,
+        ),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(
+            config.pim_calendar_reconcile_secs,
+        ),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(
+            config.pim_calendar_horizon_reconcile_secs,
+        ),
     };
     let supervisor = std::sync::Arc::new(bridge::runtime_supervisor::RuntimeSupervisor::new(
         runtime_paths.clone(),
@@ -4460,6 +4684,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_pim_reconcile_interval_flags() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "serve",
+            "--pim-reconcile-tick-secs",
+            "60",
+            "--pim-contacts-reconcile-secs",
+            "120",
+            "--pim-calendar-reconcile-secs",
+            "180",
+            "--pim-calendar-horizon-reconcile-secs",
+            "240",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Serve {
+                pim_reconcile_tick_secs,
+                pim_contacts_reconcile_secs,
+                pim_calendar_reconcile_secs,
+                pim_calendar_horizon_reconcile_secs,
+                ..
+            } => {
+                assert_eq!(pim_reconcile_tick_secs, 60);
+                assert_eq!(pim_contacts_reconcile_secs, 120);
+                assert_eq!(pim_calendar_reconcile_secs, 180);
+                assert_eq!(pim_calendar_horizon_reconcile_secs, 240);
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
     fn parse_cli_subcommand() {
         let cli = Cli::try_parse_from(["openproton-bridge", "cli"]).unwrap();
         assert!(matches!(cli.command, Command::Cli));
@@ -4595,6 +4852,14 @@ mod tests {
             "0.0.0.0".to_string(),
             "--event-poll-secs".to_string(),
             "12".to_string(),
+            "--pim-reconcile-tick-secs".to_string(),
+            "600".to_string(),
+            "--pim-contacts-reconcile-secs".to_string(),
+            "86400".to_string(),
+            "--pim-calendar-reconcile-secs".to_string(),
+            "86400".to_string(),
+            "--pim-calendar-horizon-reconcile-secs".to_string(),
+            "43200".to_string(),
             "--no-tls".to_string(),
         ])
         .unwrap();
@@ -4603,6 +4868,10 @@ mod tests {
         assert_eq!(parsed.smtp_port, Some(2025));
         assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(parsed.event_poll_secs, Some(12));
+        assert_eq!(parsed.pim_reconcile_tick_secs, Some(600));
+        assert_eq!(parsed.pim_contacts_reconcile_secs, Some(86400));
+        assert_eq!(parsed.pim_calendar_reconcile_secs, Some(86400));
+        assert_eq!(parsed.pim_calendar_horizon_reconcile_secs, Some(43200));
         assert_eq!(parsed.no_tls, Some(true));
     }
 

@@ -72,6 +72,61 @@ fn handle_stream_recv_error(
     }
 }
 
+fn to_pim_page(page: Option<pb::PimPage>) -> crate::pim::query::QueryPage {
+    let defaults = crate::pim::query::QueryPage::default();
+    match page {
+        Some(page) => {
+            let limit = if page.limit == 0 {
+                defaults.limit
+            } else {
+                page.limit as usize
+            };
+            crate::pim::query::QueryPage {
+                limit,
+                offset: page.offset as usize,
+            }
+        }
+        None => defaults,
+    }
+}
+
+fn to_pb_pim_contact(contact: crate::pim::types::StoredContact) -> pb::PimContact {
+    pb::PimContact {
+        id: contact.id,
+        uid: contact.uid,
+        name: contact.name,
+        size: contact.size,
+        create_time: contact.create_time,
+        modify_time: contact.modify_time,
+        deleted: contact.deleted,
+    }
+}
+
+fn to_pb_pim_calendar(calendar: crate::pim::types::StoredCalendar) -> pb::PimCalendar {
+    pb::PimCalendar {
+        id: calendar.id,
+        name: calendar.name,
+        description: calendar.description,
+        color: calendar.color,
+        display: calendar.display,
+        calendar_type: calendar.calendar_type,
+        flags: calendar.flags,
+        deleted: calendar.deleted,
+    }
+}
+
+fn to_pb_pim_calendar_event(event: crate::pim::types::StoredCalendarEvent) -> pb::PimCalendarEvent {
+    pb::PimCalendarEvent {
+        id: event.id,
+        calendar_id: event.calendar_id,
+        uid: event.uid,
+        shared_event_id: event.shared_event_id,
+        start_time: event.start_time,
+        end_time: event.end_time,
+        deleted: event.deleted,
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Session, Status> {
     let selector = selector.trim();
@@ -110,6 +165,46 @@ fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Se
 }
 
 impl BridgeService {
+    fn resolve_pim_store_for_account_selector(
+        &self,
+        account_selector: &str,
+    ) -> Result<crate::pim::store::PimStore, Status> {
+        let selector = account_selector.trim();
+        if selector.is_empty() {
+            return Err(Status::invalid_argument("accountID is required"));
+        }
+
+        let sessions = vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let Some(session) = sessions.into_iter().find(|session| {
+            session.uid == selector || session.email.eq_ignore_ascii_case(selector)
+        }) else {
+            return Err(Status::not_found(format!(
+                "unknown account selector: {selector}"
+            )));
+        };
+
+        let bootstrap = vault::load_gluon_store_bootstrap(self.settings_dir(), &[session.uid])
+            .map_err(|err| match err {
+                vault::VaultError::AccountNotFound(_) => {
+                    Status::not_found(format!("no gluon bootstrap account for selector: {selector}"))
+                }
+                other => status_from_vault_error(other),
+            })?;
+        let Some(account) = bootstrap.accounts.first() else {
+            return Err(Status::not_found(format!(
+                "no gluon account for selector: {selector}"
+            )));
+        };
+
+        let gluon_paths = self
+            .state
+            .runtime_paths
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()));
+        let db_path = gluon_paths.account_db_path(&account.storage_user_id);
+        crate::pim::store::PimStore::new(db_path)
+            .map_err(|err| Status::internal(format!("failed to open pim store: {err}")))
+    }
+
     async fn stage_two_password_login(&self, pending: PendingLogin) {
         let username = pending.username.clone();
         info!(
@@ -1299,6 +1394,10 @@ impl pb::bridge_server::Bridge for BridgeService {
             smtp_port: incoming.smtp_port,
             use_ssl_for_imap: incoming.use_ssl_for_imap,
             use_ssl_for_smtp: incoming.use_ssl_for_smtp,
+            pim_reconcile_tick_secs: previous.pim_reconcile_tick_secs,
+            pim_contacts_reconcile_secs: previous.pim_contacts_reconcile_secs,
+            pim_calendar_reconcile_secs: previous.pim_calendar_reconcile_secs,
+            pim_calendar_horizon_reconcile_secs: previous.pim_calendar_horizon_reconcile_secs,
         };
         *settings = next.clone();
         save_mail_settings(&self.grpc_mail_settings_path(), &next)
@@ -1335,6 +1434,129 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Ok(Response::new(false));
         }
         Ok(Response::new(is_port_free(port as u16).await))
+    }
+
+    async fn pim_list_contacts(
+        &self,
+        request: Request<pb::PimListContactsRequest>,
+    ) -> Result<Response<pb::PimContactListResponse>, Status> {
+        let req = request.into_inner();
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let contacts = store
+            .list_contacts(req.include_deleted, to_pim_page(req.page))
+            .map_err(|err| Status::internal(format!("failed to list contacts: {err}")))?;
+        Ok(Response::new(pb::PimContactListResponse {
+            contacts: contacts.into_iter().map(to_pb_pim_contact).collect(),
+        }))
+    }
+
+    async fn pim_get_contact(
+        &self,
+        request: Request<pb::PimGetContactRequest>,
+    ) -> Result<Response<pb::PimContact>, Status> {
+        let req = request.into_inner();
+        if req.contact_id.trim().is_empty() {
+            return Err(Status::invalid_argument("contactID is required"));
+        }
+
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let contact = store
+            .get_contact(req.contact_id.as_str(), req.include_deleted)
+            .map_err(|err| Status::internal(format!("failed to get contact: {err}")))?;
+        let Some(contact) = contact else {
+            return Err(Status::not_found(format!(
+                "contact not found: {}",
+                req.contact_id
+            )));
+        };
+        Ok(Response::new(to_pb_pim_contact(contact)))
+    }
+
+    async fn pim_search_contacts_by_email(
+        &self,
+        request: Request<pb::PimSearchContactsByEmailRequest>,
+    ) -> Result<Response<pb::PimContactListResponse>, Status> {
+        let req = request.into_inner();
+        if req.email_like.trim().is_empty() {
+            return Err(Status::invalid_argument("emailLike is required"));
+        }
+
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let contacts = store
+            .search_contacts_by_email(req.email_like.as_str(), to_pim_page(req.page))
+            .map_err(|err| Status::internal(format!("failed to search contacts: {err}")))?;
+        Ok(Response::new(pb::PimContactListResponse {
+            contacts: contacts.into_iter().map(to_pb_pim_contact).collect(),
+        }))
+    }
+
+    async fn pim_list_calendars(
+        &self,
+        request: Request<pb::PimListCalendarsRequest>,
+    ) -> Result<Response<pb::PimCalendarListResponse>, Status> {
+        let req = request.into_inner();
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let calendars = store
+            .list_calendars(req.include_deleted, to_pim_page(req.page))
+            .map_err(|err| Status::internal(format!("failed to list calendars: {err}")))?;
+        Ok(Response::new(pb::PimCalendarListResponse {
+            calendars: calendars.into_iter().map(to_pb_pim_calendar).collect(),
+        }))
+    }
+
+    async fn pim_get_calendar(
+        &self,
+        request: Request<pb::PimGetCalendarRequest>,
+    ) -> Result<Response<pb::PimCalendar>, Status> {
+        let req = request.into_inner();
+        if req.calendar_id.trim().is_empty() {
+            return Err(Status::invalid_argument("calendarID is required"));
+        }
+
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let calendar = store
+            .get_calendar(req.calendar_id.as_str(), req.include_deleted)
+            .map_err(|err| Status::internal(format!("failed to get calendar: {err}")))?;
+        let Some(calendar) = calendar else {
+            return Err(Status::not_found(format!(
+                "calendar not found: {}",
+                req.calendar_id
+            )));
+        };
+        Ok(Response::new(to_pb_pim_calendar(calendar)))
+    }
+
+    async fn pim_list_calendar_events(
+        &self,
+        request: Request<pb::PimListCalendarEventsRequest>,
+    ) -> Result<Response<pb::PimCalendarEventListResponse>, Status> {
+        let req = request.into_inner();
+        if req.calendar_id.trim().is_empty() {
+            return Err(Status::invalid_argument("calendarID is required"));
+        }
+        if let (Some(start), Some(end)) = (req.start_time_from, req.start_time_to) {
+            if start > end {
+                return Err(Status::invalid_argument(
+                    "startTimeFrom must be <= startTimeTo",
+                ));
+            }
+        }
+
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let events = store
+            .list_calendar_events(
+                req.calendar_id.as_str(),
+                req.include_deleted,
+                crate::pim::query::CalendarEventRange {
+                    start_time_from: req.start_time_from,
+                    start_time_to: req.start_time_to,
+                },
+                to_pim_page(req.page),
+            )
+            .map_err(|err| Status::internal(format!("failed to list calendar events: {err}")))?;
+        Ok(Response::new(pb::PimCalendarEventListResponse {
+            events: events.into_iter().map(to_pb_pim_calendar_event).collect(),
+        }))
     }
 
     async fn is_tls_certificate_installed(

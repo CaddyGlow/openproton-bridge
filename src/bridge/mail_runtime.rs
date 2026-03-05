@@ -28,12 +28,17 @@ pub struct MailRuntimeConfig {
     pub use_ssl_for_imap: bool,
     pub use_ssl_for_smtp: bool,
     pub event_poll_interval: Duration,
+    pub pim_reconcile_tick_interval: Duration,
+    pub pim_contacts_reconcile_interval: Duration,
+    pub pim_calendar_reconcile_interval: Duration,
+    pub pim_calendar_horizon_reconcile_interval: Duration,
 }
 
-const PIM_RECONCILE_TICK_INTERVAL: Duration = Duration::from_secs(10 * 60);
-const PIM_CONTACTS_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const PIM_CALENDAR_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-const PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
+pub const DEFAULT_PIM_RECONCILE_TICK_INTERVAL: Duration = Duration::from_secs(10 * 60);
+pub const DEFAULT_PIM_CONTACTS_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_PIM_CALENDAR_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+pub const DEFAULT_PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL: Duration =
+    Duration::from_secs(12 * 60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailRuntimeTransition {
@@ -188,6 +193,10 @@ struct PreparedMailRuntime {
     pim_stores: HashMap<String, Arc<PimStore>>,
     checkpoint_store: super::events::SharedCheckpointStore,
     poll_interval: Duration,
+    pim_reconcile_tick_interval: Duration,
+    pim_contacts_reconcile_interval: Duration,
+    pim_calendar_reconcile_interval: Duration,
+    pim_calendar_horizon_reconcile_interval: Duration,
 }
 
 async fn prepare_runtime_context(
@@ -401,6 +410,10 @@ async fn prepare_runtime_context(
             settings_dir.to_path_buf(),
         )),
         poll_interval: config.event_poll_interval,
+        pim_reconcile_tick_interval: config.pim_reconcile_tick_interval,
+        pim_contacts_reconcile_interval: config.pim_contacts_reconcile_interval,
+        pim_calendar_reconcile_interval: config.pim_calendar_reconcile_interval,
+        pim_calendar_horizon_reconcile_interval: config.pim_calendar_horizon_reconcile_interval,
     })
 }
 
@@ -424,6 +437,10 @@ async fn run_runtime(
         pim_stores,
         checkpoint_store,
         poll_interval,
+        pim_reconcile_tick_interval,
+        pim_contacts_reconcile_interval,
+        pim_calendar_reconcile_interval,
+        pim_calendar_horizon_reconcile_interval,
         ..
     } = prepared;
 
@@ -490,6 +507,10 @@ async fn run_runtime(
     let pim_reconcile_task = tokio::spawn(run_pim_reconcile_periodically(
         runtime_accounts.clone(),
         pim_stores_for_reconcile,
+        pim_reconcile_tick_interval,
+        pim_contacts_reconcile_interval,
+        pim_calendar_reconcile_interval,
+        pim_calendar_horizon_reconcile_interval,
         notify_tx.clone(),
     ));
     let health_task = tokio::spawn(report_runtime_health_periodically(
@@ -759,23 +780,31 @@ fn generate_bridge_password() -> String {
 async fn run_pim_reconcile_periodically(
     runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
     pim_stores: HashMap<String, Arc<PimStore>>,
+    reconcile_tick_interval: Duration,
+    contacts_reconcile_interval: Duration,
+    calendar_reconcile_interval: Duration,
+    calendar_horizon_reconcile_interval: Duration,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
 ) {
     use tokio::time::{interval, MissedTickBehavior};
 
-    let mut ticker = interval(PIM_RECONCILE_TICK_INTERVAL);
+    let mut ticker = interval(reconcile_tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     ticker.tick().await;
 
     loop {
         ticker.tick().await;
+        let started_at = std::time::Instant::now();
+        let mut metrics = PimReconcileSweepMetrics::default();
         let snapshot = runtime_accounts.snapshot().await;
+        metrics.accounts_seen = snapshot.len();
         for account in snapshot {
             let Some(store) = pim_stores.get(&account.account_id.0) else {
                 continue;
             };
+            metrics.accounts_with_store += 1;
 
-            let contacts_due = match is_pim_contacts_due(store) {
+            let contacts_due = match is_pim_contacts_due(store, contacts_reconcile_interval) {
                 Ok(due) => due,
                 Err(err) => {
                     tracing::warn!(
@@ -787,7 +816,7 @@ async fn run_pim_reconcile_periodically(
                     true
                 }
             };
-            let calendar_full_due = match is_pim_calendar_due(store) {
+            let calendar_full_due = match is_pim_calendar_due(store, calendar_reconcile_interval) {
                 Ok(due) => due,
                 Err(err) => {
                     tracing::warn!(
@@ -799,18 +828,28 @@ async fn run_pim_reconcile_periodically(
                     true
                 }
             };
-            let calendar_horizon_due = match is_pim_calendar_horizon_due(store) {
-                Ok(due) => due,
-                Err(err) => {
-                    tracing::warn!(
-                        account_id = %account.account_id.0,
-                        email = %account.email,
-                        error = %err,
-                        "failed to evaluate calendar horizon schedule; forcing run"
-                    );
-                    true
-                }
-            };
+            let calendar_horizon_due =
+                match is_pim_calendar_horizon_due(store, calendar_horizon_reconcile_interval) {
+                    Ok(due) => due,
+                    Err(err) => {
+                        tracing::warn!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            error = %err,
+                            "failed to evaluate calendar horizon schedule; forcing run"
+                        );
+                        true
+                    }
+                };
+            if contacts_due {
+                metrics.contacts_runs_due += 1;
+            }
+            if calendar_full_due {
+                metrics.calendar_full_runs_due += 1;
+            }
+            if calendar_horizon_due {
+                metrics.calendar_horizon_runs_due += 1;
+            }
 
             if !contacts_due && !calendar_full_due && !calendar_horizon_due {
                 continue;
@@ -822,6 +861,7 @@ async fn run_pim_reconcile_periodically(
             {
                 Ok(session) => session,
                 Err(err) => {
+                    metrics.accounts_skipped_no_session += 1;
                     tracing::debug!(
                         account_id = %account.account_id.0,
                         email = %account.email,
@@ -840,6 +880,7 @@ async fn run_pim_reconcile_periodically(
             ) {
                 Ok(client) => client,
                 Err(err) => {
+                    metrics.client_init_failures += 1;
                     tracing::warn!(
                         account_id = %account.account_id.0,
                         email = %account.email,
@@ -859,6 +900,9 @@ async fn run_pim_reconcile_periodically(
             if contacts_due {
                 match sync_contacts::bootstrap_contacts(&client, store, 0).await {
                     Ok(summary) => {
+                        metrics.contacts_success += 1;
+                        metrics.contacts_rows_upserted += summary.contacts_upserted;
+                        metrics.contacts_rows_soft_deleted += summary.contacts_soft_deleted;
                         tracing::info!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -875,6 +919,7 @@ async fn run_pim_reconcile_periodically(
                         }
                     }
                     Err(err) => {
+                        metrics.contacts_failures += 1;
                         tracing::warn!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -900,6 +945,9 @@ async fn run_pim_reconcile_periodically(
                 .await
                 {
                     Ok(summary) => {
+                        metrics.calendar_full_success += 1;
+                        metrics.calendar_rows_upserted += summary.events_upserted;
+                        metrics.calendar_rows_soft_deleted += summary.calendars_soft_deleted;
                         tracing::info!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -916,6 +964,7 @@ async fn run_pim_reconcile_periodically(
                         }
                     }
                     Err(err) => {
+                        metrics.calendar_full_failures += 1;
                         tracing::warn!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -939,6 +988,8 @@ async fn run_pim_reconcile_periodically(
                 .await
                 {
                     Ok(summary) => {
+                        metrics.calendar_horizon_success += 1;
+                        metrics.calendar_rows_upserted += summary.events_upserted;
                         tracing::info!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -948,6 +999,7 @@ async fn run_pim_reconcile_periodically(
                         );
                     }
                     Err(err) => {
+                        metrics.calendar_horizon_failures += 1;
                         tracing::warn!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -964,31 +1016,61 @@ async fn run_pim_reconcile_periodically(
                 }
             }
         }
+        tracing::info!(
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            accounts_seen = metrics.accounts_seen,
+            accounts_with_store = metrics.accounts_with_store,
+            accounts_skipped_no_session = metrics.accounts_skipped_no_session,
+            client_init_failures = metrics.client_init_failures,
+            contacts_runs_due = metrics.contacts_runs_due,
+            contacts_success = metrics.contacts_success,
+            contacts_failures = metrics.contacts_failures,
+            calendar_full_runs_due = metrics.calendar_full_runs_due,
+            calendar_full_success = metrics.calendar_full_success,
+            calendar_full_failures = metrics.calendar_full_failures,
+            calendar_horizon_runs_due = metrics.calendar_horizon_runs_due,
+            calendar_horizon_success = metrics.calendar_horizon_success,
+            calendar_horizon_failures = metrics.calendar_horizon_failures,
+            contacts_rows_upserted = metrics.contacts_rows_upserted,
+            contacts_rows_soft_deleted = metrics.contacts_rows_soft_deleted,
+            calendar_rows_upserted = metrics.calendar_rows_upserted,
+            calendar_rows_soft_deleted = metrics.calendar_rows_soft_deleted,
+            "pim reconciliation sweep metrics"
+        );
     }
 }
 
-fn is_pim_contacts_due(store: &PimStore) -> anyhow::Result<bool> {
-    is_sync_scope_due(
-        store,
-        "contacts.last_full_sync_ms",
-        PIM_CONTACTS_RECONCILE_INTERVAL,
-    )
+#[derive(Debug, Default)]
+struct PimReconcileSweepMetrics {
+    accounts_seen: usize,
+    accounts_with_store: usize,
+    accounts_skipped_no_session: usize,
+    client_init_failures: usize,
+    contacts_runs_due: usize,
+    contacts_success: usize,
+    contacts_failures: usize,
+    calendar_full_runs_due: usize,
+    calendar_full_success: usize,
+    calendar_full_failures: usize,
+    calendar_horizon_runs_due: usize,
+    calendar_horizon_success: usize,
+    calendar_horizon_failures: usize,
+    contacts_rows_upserted: usize,
+    contacts_rows_soft_deleted: usize,
+    calendar_rows_upserted: usize,
+    calendar_rows_soft_deleted: usize,
 }
 
-fn is_pim_calendar_due(store: &PimStore) -> anyhow::Result<bool> {
-    is_sync_scope_due(
-        store,
-        "calendar.last_full_sync_ms",
-        PIM_CALENDAR_RECONCILE_INTERVAL,
-    )
+fn is_pim_contacts_due(store: &PimStore, interval: Duration) -> anyhow::Result<bool> {
+    is_sync_scope_due(store, "contacts.last_full_sync_ms", interval)
 }
 
-fn is_pim_calendar_horizon_due(store: &PimStore) -> anyhow::Result<bool> {
-    is_sync_scope_due(
-        store,
-        "calendar.last_horizon_sync_ms",
-        PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL,
-    )
+fn is_pim_calendar_due(store: &PimStore, interval: Duration) -> anyhow::Result<bool> {
+    is_sync_scope_due(store, "calendar.last_full_sync_ms", interval)
+}
+
+fn is_pim_calendar_horizon_due(store: &PimStore, interval: Duration) -> anyhow::Result<bool> {
+    is_sync_scope_due(store, "calendar.last_horizon_sync_ms", interval)
 }
 
 fn is_sync_scope_due(store: &PimStore, scope: &str, interval: Duration) -> anyhow::Result<bool> {

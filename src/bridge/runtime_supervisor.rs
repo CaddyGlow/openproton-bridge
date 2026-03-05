@@ -220,6 +220,14 @@ mod tests {
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
             event_poll_interval: Duration::from_secs(30),
+            pim_reconcile_tick_interval:
+                crate::bridge::mail_runtime::DEFAULT_PIM_RECONCILE_TICK_INTERVAL,
+            pim_contacts_reconcile_interval:
+                crate::bridge::mail_runtime::DEFAULT_PIM_CONTACTS_RECONCILE_INTERVAL,
+            pim_calendar_reconcile_interval:
+                crate::bridge::mail_runtime::DEFAULT_PIM_CALENDAR_RECONCILE_INTERVAL,
+            pim_calendar_horizon_reconcile_interval:
+                crate::bridge::mail_runtime::DEFAULT_PIM_CALENDAR_HORIZON_RECONCILE_INTERVAL,
         }
     }
 

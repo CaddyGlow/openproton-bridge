@@ -89,6 +89,14 @@ struct StoredMailSettings {
     smtp_port: i32,
     use_ssl_for_imap: bool,
     use_ssl_for_smtp: bool,
+    #[serde(default = "default_pim_reconcile_tick_secs")]
+    pim_reconcile_tick_secs: i32,
+    #[serde(default = "default_pim_contacts_reconcile_secs")]
+    pim_contacts_reconcile_secs: i32,
+    #[serde(default = "default_pim_calendar_reconcile_secs")]
+    pim_calendar_reconcile_secs: i32,
+    #[serde(default = "default_pim_calendar_horizon_reconcile_secs")]
+    pim_calendar_horizon_reconcile_secs: i32,
 }
 
 impl Default for StoredMailSettings {
@@ -98,8 +106,28 @@ impl Default for StoredMailSettings {
             smtp_port: 1025,
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
+            pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
+            pim_contacts_reconcile_secs: default_pim_contacts_reconcile_secs(),
+            pim_calendar_reconcile_secs: default_pim_calendar_reconcile_secs(),
+            pim_calendar_horizon_reconcile_secs: default_pim_calendar_horizon_reconcile_secs(),
         }
     }
+}
+
+const fn default_pim_reconcile_tick_secs() -> i32 {
+    600
+}
+
+const fn default_pim_contacts_reconcile_secs() -> i32 {
+    86400
+}
+
+const fn default_pim_calendar_reconcile_secs() -> i32 {
+    86400
+}
+
+const fn default_pim_calendar_horizon_reconcile_secs() -> i32 {
+    43200
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1100,6 +1128,18 @@ mod tests {
         build_test_service_with_paths(runtime_paths)
     }
 
+    fn pim_test_calendar(id: &str, name: &str) -> crate::api::calendar::Calendar {
+        crate::api::calendar::Calendar {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            color: "#00AAFF".to_string(),
+            display: 1,
+            calendar_type: 0,
+            flags: 0,
+        }
+    }
+
     #[tokio::test]
     async fn startup_mail_runtime_port_conflict_emits_startup_error_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -1316,6 +1356,10 @@ mod tests {
             smtp_port: 1026,
             use_ssl_for_imap: true,
             use_ssl_for_smtp: true,
+            pim_reconcile_tick_secs: 600,
+            pim_contacts_reconcile_secs: 86400,
+            pim_calendar_reconcile_secs: 86400,
+            pim_calendar_horizon_reconcile_secs: 43200,
         };
         save_mail_settings(&path, &settings).await.unwrap();
         let loaded = load_mail_settings(&path).await.unwrap();
@@ -1323,6 +1367,10 @@ mod tests {
         assert_eq!(loaded.smtp_port, 1026);
         assert!(loaded.use_ssl_for_imap);
         assert!(loaded.use_ssl_for_smtp);
+        assert_eq!(loaded.pim_reconcile_tick_secs, 600);
+        assert_eq!(loaded.pim_contacts_reconcile_secs, 86400);
+        assert_eq!(loaded.pim_calendar_reconcile_secs, 86400);
+        assert_eq!(loaded.pim_calendar_horizon_reconcile_secs, 43200);
     }
 
     #[tokio::test]
@@ -1367,6 +1415,93 @@ mod tests {
 
         let loaded = load_app_settings(&path, &disk_cache_dir).await.unwrap();
         assert_eq!(loaded.disk_cache_path, disk_cache_dir.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn pim_list_calendars_returns_rows_for_uid_and_email_selectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim@example.com".to_string(),
+            display_name: "Pim User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+        vault::set_gluon_key_by_account_id(service.settings_dir(), &session.uid, vec![9u8; 32])
+            .unwrap();
+
+        let bootstrap = vault::load_gluon_store_bootstrap(
+            service.settings_dir(),
+            std::slice::from_ref(&session.uid),
+        )
+        .unwrap();
+        let account = bootstrap.accounts.first().unwrap();
+        let db_path = service
+            .state
+            .runtime_paths
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()))
+            .account_db_path(&account.storage_user_id);
+        let store = crate::pim::store::PimStore::new(db_path).unwrap();
+        store
+            .upsert_calendar(&pim_test_calendar("cal-1", "Primary"))
+            .unwrap();
+
+        let by_uid = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendars(
+            &service,
+            Request::new(pb::PimListCalendarsRequest {
+                account_id: session.uid.clone(),
+                include_deleted: false,
+                page: Some(pb::PimPage {
+                    limit: 20,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(by_uid.calendars.len(), 1);
+        assert_eq!(by_uid.calendars[0].id, "cal-1");
+
+        let by_email = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendars(
+            &service,
+            Request::new(pb::PimListCalendarsRequest {
+                account_id: session.email.clone(),
+                include_deleted: false,
+                page: Some(pb::PimPage {
+                    limit: 20,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(by_email.calendars.len(), 1);
+        assert_eq!(by_email.calendars[0].name, "Primary");
+    }
+
+    #[tokio::test]
+    async fn pim_list_calendars_returns_not_found_for_unknown_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+
+        let status = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendars(
+            &service,
+            Request::new(pb::PimListCalendarsRequest {
+                account_id: "missing@example.com".to_string(),
+                include_deleted: false,
+                page: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]

@@ -1140,6 +1140,82 @@ mod tests {
         }
     }
 
+    fn pim_test_contact(
+        id: &str,
+        name: &str,
+        email: &str,
+        modify_time: i64,
+    ) -> crate::api::contacts::Contact {
+        crate::api::contacts::Contact {
+            metadata: crate::api::contacts::ContactMetadata {
+                id: id.to_string(),
+                name: name.to_string(),
+                uid: format!("uid-{id}"),
+                size: 10,
+                create_time: modify_time - 1,
+                modify_time,
+                contact_emails: vec![crate::api::contacts::ContactEmail {
+                    id: format!("email-{id}"),
+                    email: email.to_string(),
+                    name: name.to_string(),
+                    kind: vec![],
+                    defaults: None,
+                    order: None,
+                    contact_id: id.to_string(),
+                    label_ids: vec![],
+                    last_used_time: None,
+                }],
+                label_ids: vec![],
+            },
+            cards: vec![crate::api::contacts::ContactCard {
+                card_type: 0,
+                data: "BEGIN:VCARD".to_string(),
+                signature: None,
+            }],
+        }
+    }
+
+    fn pim_test_calendar_event(
+        id: &str,
+        calendar_id: &str,
+        start_time: i64,
+        end_time: i64,
+    ) -> crate::api::calendar::CalendarEvent {
+        crate::api::calendar::CalendarEvent {
+            id: id.to_string(),
+            uid: format!("uid-{id}"),
+            calendar_id: calendar_id.to_string(),
+            shared_event_id: format!("shared-{id}"),
+            create_time: start_time - 10,
+            last_edit_time: start_time - 5,
+            start_time,
+            end_time,
+            ..crate::api::calendar::CalendarEvent::default()
+        }
+    }
+
+    fn pim_setup_account_store(
+        service: &BridgeService,
+        session: &Session,
+    ) -> crate::pim::store::PimStore {
+        vault::save_session(session, service.settings_dir()).unwrap();
+        vault::set_gluon_key_by_account_id(service.settings_dir(), &session.uid, vec![9u8; 32])
+            .unwrap();
+
+        let bootstrap = vault::load_gluon_store_bootstrap(
+            service.settings_dir(),
+            std::slice::from_ref(&session.uid),
+        )
+        .unwrap();
+        let account = bootstrap.accounts.first().unwrap();
+        let db_path = service
+            .state
+            .runtime_paths
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()))
+            .account_db_path(&account.storage_user_id);
+        crate::pim::store::PimStore::new(db_path).unwrap()
+    }
+
     #[tokio::test]
     async fn startup_mail_runtime_port_conflict_emits_startup_error_event() {
         let dir = tempfile::tempdir().unwrap();
@@ -1502,6 +1578,197 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(status.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn pim_contact_queries_support_listing_get_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-contact-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim-contacts@example.com".to_string(),
+            display_name: "Pim Contacts User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let store = pim_setup_account_store(&service, &session);
+        store
+            .upsert_contact(&pim_test_contact(
+                "contact-1",
+                "Alice",
+                "alice@proton.me",
+                20,
+            ))
+            .unwrap();
+        store
+            .upsert_contact(&pim_test_contact("contact-2", "Bob", "bob@proton.me", 10))
+            .unwrap();
+        store.soft_delete_contact("contact-2").unwrap();
+
+        let listed = <BridgeService as pb::bridge_server::Bridge>::pim_list_contacts(
+            &service,
+            Request::new(pb::PimListContactsRequest {
+                account_id: session.uid.clone(),
+                include_deleted: false,
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.contacts.len(), 1);
+        assert_eq!(listed.contacts[0].id, "contact-1");
+
+        let listed_with_deleted = <BridgeService as pb::bridge_server::Bridge>::pim_list_contacts(
+            &service,
+            Request::new(pb::PimListContactsRequest {
+                account_id: session.uid.clone(),
+                include_deleted: true,
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed_with_deleted.contacts.len(), 2);
+
+        let hidden_deleted = <BridgeService as pb::bridge_server::Bridge>::pim_get_contact(
+            &service,
+            Request::new(pb::PimGetContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-2".to_string(),
+                include_deleted: false,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(hidden_deleted.code(), tonic::Code::NotFound);
+
+        let deleted_contact = <BridgeService as pb::bridge_server::Bridge>::pim_get_contact(
+            &service,
+            Request::new(pb::PimGetContactRequest {
+                account_id: session.uid.clone(),
+                contact_id: "contact-2".to_string(),
+                include_deleted: true,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(deleted_contact.id, "contact-2");
+        assert!(deleted_contact.deleted);
+
+        let searched = <BridgeService as pb::bridge_server::Bridge>::pim_search_contacts_by_email(
+            &service,
+            Request::new(pb::PimSearchContactsByEmailRequest {
+                account_id: session.uid.clone(),
+                email_like: "alice@".to_string(),
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(searched.contacts.len(), 1);
+        assert_eq!(searched.contacts[0].id, "contact-1");
+    }
+
+    #[tokio::test]
+    async fn pim_list_calendar_events_validates_and_filters_time_ranges() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-pim-events-1".to_string(),
+            access_token: String::new(),
+            refresh_token: String::new(),
+            email: "pim-events@example.com".to_string(),
+            display_name: "Pim Events User".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        let store = pim_setup_account_store(&service, &session);
+        store
+            .upsert_calendar(&pim_test_calendar("cal-events-1", "Events"))
+            .unwrap();
+        store
+            .upsert_calendar_event(&pim_test_calendar_event("evt-1", "cal-events-1", 100, 150))
+            .unwrap();
+        store
+            .upsert_calendar_event(&pim_test_calendar_event("evt-2", "cal-events-1", 300, 350))
+            .unwrap();
+        store.soft_delete_calendar_event("evt-2").unwrap();
+
+        let invalid_range = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendar_events(
+            &service,
+            Request::new(pb::PimListCalendarEventsRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-events-1".to_string(),
+                include_deleted: false,
+                start_time_from: Some(400),
+                start_time_to: Some(200),
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid_range.code(), tonic::Code::InvalidArgument);
+
+        let filtered = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendar_events(
+            &service,
+            Request::new(pb::PimListCalendarEventsRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-events-1".to_string(),
+                include_deleted: false,
+                start_time_from: Some(50),
+                start_time_to: Some(250),
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(filtered.events.len(), 1);
+        assert_eq!(filtered.events[0].id, "evt-1");
+
+        let with_deleted = <BridgeService as pb::bridge_server::Bridge>::pim_list_calendar_events(
+            &service,
+            Request::new(pb::PimListCalendarEventsRequest {
+                account_id: session.uid.clone(),
+                calendar_id: "cal-events-1".to_string(),
+                include_deleted: true,
+                start_time_from: Some(50),
+                start_time_to: Some(400),
+                page: Some(pb::PimPage {
+                    limit: 50,
+                    offset: 0,
+                }),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(with_deleted.events.len(), 2);
+        assert_eq!(with_deleted.events[0].id, "evt-1");
+        assert_eq!(with_deleted.events[1].id, "evt-2");
     }
 
     #[tokio::test]

@@ -108,6 +108,132 @@ impl CliGrpcClient {
             .map_err(|status| anyhow::anyhow!("grpc render_mutt_config failed: {status}"))?;
         Ok(response.into_inner().rendered_config)
     }
+
+    pub async fn pim_list_contacts(
+        &mut self,
+        account_id: &str,
+        include_deleted: bool,
+        limit: u32,
+        offset: u32,
+    ) -> anyhow::Result<Vec<pb::PimContact>> {
+        let request = self.request_with_token(pb::PimListContactsRequest {
+            account_id: account_id.to_string(),
+            include_deleted,
+            page: Some(pb::PimPage { limit, offset }),
+        })?;
+        let response = self
+            .inner
+            .pim_list_contacts(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_list_contacts failed: {status}"))?;
+        Ok(response.into_inner().contacts)
+    }
+
+    pub async fn pim_get_contact(
+        &mut self,
+        account_id: &str,
+        contact_id: &str,
+        include_deleted: bool,
+    ) -> anyhow::Result<pb::PimContact> {
+        let request = self.request_with_token(pb::PimGetContactRequest {
+            account_id: account_id.to_string(),
+            contact_id: contact_id.to_string(),
+            include_deleted,
+        })?;
+        let response = self
+            .inner
+            .pim_get_contact(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_get_contact failed: {status}"))?;
+        Ok(response.into_inner())
+    }
+
+    pub async fn pim_search_contacts_by_email(
+        &mut self,
+        account_id: &str,
+        email_like: &str,
+        limit: u32,
+        offset: u32,
+    ) -> anyhow::Result<Vec<pb::PimContact>> {
+        let request = self.request_with_token(pb::PimSearchContactsByEmailRequest {
+            account_id: account_id.to_string(),
+            email_like: email_like.to_string(),
+            page: Some(pb::PimPage { limit, offset }),
+        })?;
+        let response = self
+            .inner
+            .pim_search_contacts_by_email(request)
+            .await
+            .map_err(|status| {
+                anyhow::anyhow!("grpc pim_search_contacts_by_email failed: {status}")
+            })?;
+        Ok(response.into_inner().contacts)
+    }
+
+    pub async fn pim_list_calendars(
+        &mut self,
+        account_id: &str,
+        include_deleted: bool,
+        limit: u32,
+        offset: u32,
+    ) -> anyhow::Result<Vec<pb::PimCalendar>> {
+        let request = self.request_with_token(pb::PimListCalendarsRequest {
+            account_id: account_id.to_string(),
+            include_deleted,
+            page: Some(pb::PimPage { limit, offset }),
+        })?;
+        let response = self
+            .inner
+            .pim_list_calendars(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_list_calendars failed: {status}"))?;
+        Ok(response.into_inner().calendars)
+    }
+
+    pub async fn pim_get_calendar(
+        &mut self,
+        account_id: &str,
+        calendar_id: &str,
+        include_deleted: bool,
+    ) -> anyhow::Result<pb::PimCalendar> {
+        let request = self.request_with_token(pb::PimGetCalendarRequest {
+            account_id: account_id.to_string(),
+            calendar_id: calendar_id.to_string(),
+            include_deleted,
+        })?;
+        let response = self
+            .inner
+            .pim_get_calendar(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_get_calendar failed: {status}"))?;
+        Ok(response.into_inner())
+    }
+
+    pub async fn pim_list_calendar_events(
+        &mut self,
+        account_id: &str,
+        calendar_id: &str,
+        include_deleted: bool,
+        start_time_from: Option<i64>,
+        start_time_to: Option<i64>,
+        limit: u32,
+        offset: u32,
+    ) -> anyhow::Result<Vec<pb::PimCalendarEvent>> {
+        let request = self.request_with_token(pb::PimListCalendarEventsRequest {
+            account_id: account_id.to_string(),
+            calendar_id: calendar_id.to_string(),
+            include_deleted,
+            start_time_from,
+            start_time_to,
+            page: Some(pb::PimPage { limit, offset }),
+        })?;
+        let response = self
+            .inner
+            .pim_list_calendar_events(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc pim_list_calendar_events failed: {status}"))?;
+        Ok(response.into_inner().events)
+    }
 }
 
 fn parse_server_config(payload: &[u8]) -> anyhow::Result<CliGrpcServerConfig> {

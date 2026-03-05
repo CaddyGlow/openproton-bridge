@@ -6,5 +6,6 @@ pub mod error;
 pub mod etag;
 pub mod http;
 pub mod propfind;
+pub mod report;
 pub mod server;
 pub mod xml;

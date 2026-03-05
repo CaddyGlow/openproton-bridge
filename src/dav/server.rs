@@ -19,6 +19,7 @@ use super::http::{
     not_implemented_response, parse_request_head, split_head_from_buffer, DavRequest, DavResponse,
 };
 use super::propfind;
+use super::report;
 
 #[derive(Clone)]
 pub struct DavServerConfig {
@@ -197,7 +198,7 @@ fn route_request(
 
     match method.as_str() {
         "OPTIONS" => Ok(options_response()),
-        "PROPFIND" | "GET" | "HEAD" | "PUT" | "DELETE" => {
+        "PROPFIND" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" => {
             if !path_without_query.starts_with("/dav") {
                 return Ok(not_found_response());
             }
@@ -215,6 +216,12 @@ fn route_request(
             let Some(store) = config.pim_stores.get(&auth.account_id.0) else {
                 return Ok(service_unavailable_response());
             };
+            if method == "REPORT" {
+                if let Some(response) = report::handle_report(&request.path, body, &auth, store)? {
+                    return Ok(response);
+                }
+                return Ok(not_found_response());
+            }
             if let Some(response) = carddav::handle_request(
                 &method,
                 &request.path,
@@ -513,6 +520,60 @@ mod tests {
         let mut response = vec![0; 512];
         let n = client.read(&mut response).await?;
         assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        server.await.expect("server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn report_addressbook_query_lists_contacts() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+        });
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, config.clone())
+                    .await
+                    .expect("handle");
+            }
+        });
+
+        let auth = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let card = "BEGIN:VCARD\nVERSION:3.0\nUID:c1\nFN:Alice\nEMAIL:alice@proton.me\nEND:VCARD\n";
+        let put = format!(
+            "PUT /dav/uid-1/addressbooks/default/c1.vcf HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            card.len(),
+            card
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(put.as_bytes()).await?;
+        let mut response = vec![0; 1024];
+        let _ = client.read(&mut response).await?;
+
+        let report_body =
+            r#"<card:addressbook-query xmlns:card="urn:ietf:params:xml:ns:carddav"/>"#;
+        let report = format!(
+            "REPORT /dav/uid-1/addressbooks/default/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            report_body.len(),
+            report_body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(report.as_bytes()).await?;
+        let mut response = vec![0; 4096];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
+        assert!(wire.contains("/dav/uid-1/addressbooks/default/c1.vcf"));
 
         server.await.expect("server");
         Ok(())

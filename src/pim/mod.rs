@@ -1,3 +1,4 @@
+pub mod dav;
 pub mod incremental;
 pub mod query;
 pub mod schema;

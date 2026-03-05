@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -20,6 +21,8 @@ use super::http::{
 };
 use super::propfind;
 use super::report;
+
+const MAX_DAV_BODY_BYTES: usize = 1_048_576;
 
 #[derive(Clone)]
 pub struct DavServerConfig {
@@ -157,11 +160,23 @@ pub async fn handle_connection(mut stream: TcpStream, config: Arc<DavServerConfi
                     .get("content-length")
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(0);
+                if content_length > MAX_DAV_BODY_BYTES {
+                    return Err(DavError::InvalidRequest("request body too large"));
+                }
                 if received.len() < head_end + content_length {
                     continue;
                 }
                 let body = &received[head_end..head_end + content_length];
+                let started = Instant::now();
                 let response = route_request(&request, body, &config)?;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                tracing::info!(
+                    method = %request.method,
+                    path = %request.path,
+                    status = response.status,
+                    elapsed_ms,
+                    "DAV request handled"
+                );
                 let wire = response.to_bytes();
                 stream.write_all(&wire).await?;
                 stream.flush().await?;
@@ -191,6 +206,13 @@ fn route_request(
         .split('?')
         .next()
         .unwrap_or(request.path.as_str());
+    if !is_safe_path(path_without_query) {
+        return Ok(DavResponse {
+            status: "400 Bad Request",
+            headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+            body: b"invalid path\n".to_vec(),
+        });
+    }
 
     if let Some(response) = discovery::discovery_redirect(path_without_query) {
         return Ok(response);
@@ -294,6 +316,20 @@ fn service_unavailable_response() -> DavResponse {
     }
 }
 
+fn is_safe_path(path: &str) -> bool {
+    if path.is_empty() || !path.starts_with('/') || path.contains('\0') || path.contains('\\') {
+        return false;
+    }
+    if path.contains("//") {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2e%2e") || lower.contains("%2f") || lower.contains("%5c") {
+        return false;
+    }
+    !path.split('/').any(|segment| segment == "..")
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -371,6 +407,24 @@ mod tests {
         )
         .expect("router should succeed");
         assert_eq!(response.status, "401 Unauthorized");
+    }
+
+    #[test]
+    fn rejects_traversal_paths() {
+        let request = parse_request_head(
+            b"GET /dav/uid-1/addressbooks/default/../x HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .expect("request should parse");
+        let response = route_request(
+            &request,
+            &[],
+            &DavServerConfig {
+                auth_router: auth_router(),
+                pim_stores: HashMap::new(),
+            },
+        )
+        .expect("route should succeed");
+        assert_eq!(response.status, "400 Bad Request");
     }
 
     #[tokio::test]

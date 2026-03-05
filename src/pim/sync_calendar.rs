@@ -19,6 +19,7 @@ pub struct BootstrapCalendarsSummary {
     pub keys_upserted: usize,
     pub settings_upserted: usize,
     pub events_upserted: usize,
+    pub events_soft_deleted: usize,
 }
 
 pub async fn bootstrap_calendars(
@@ -26,7 +27,7 @@ pub async fn bootstrap_calendars(
     store: &PimStore,
     event_query: &calendar::CalendarEventsQuery,
 ) -> Result<BootstrapCalendarsSummary> {
-    let calendars = calendar::get_calendars(client)
+    let calendars = super::run_with_api_retry(|| calendar::get_calendars(client))
         .await
         .map_err(map_api_error)?;
     let mut seen_calendar_ids = HashSet::new();
@@ -37,7 +38,7 @@ pub async fn bootstrap_calendars(
         store.upsert_calendar(&cal)?;
         summary.calendars_seen += 1;
 
-        let members = calendar::get_calendar_members(client, &cal.id)
+        let members = super::run_with_api_retry(|| calendar::get_calendar_members(client, &cal.id))
             .await
             .map_err(map_api_error)?;
         for member in members {
@@ -45,7 +46,7 @@ pub async fn bootstrap_calendars(
             summary.members_upserted += 1;
         }
 
-        let keys = calendar::get_calendar_keys(client, &cal.id)
+        let keys = super::run_with_api_retry(|| calendar::get_calendar_keys(client, &cal.id))
             .await
             .map_err(map_api_error)?;
         for key in keys {
@@ -53,27 +54,43 @@ pub async fn bootstrap_calendars(
             summary.keys_upserted += 1;
         }
 
-        let settings = calendar::get_calendar_settings(client, &cal.id)
-            .await
-            .map_err(map_api_error)?;
+        let settings =
+            super::run_with_api_retry(|| calendar::get_calendar_settings(client, &cal.id))
+                .await
+                .map_err(map_api_error)?;
         store.upsert_calendar_settings(&settings)?;
         summary.settings_upserted += 1;
 
-        let latest_model_event_id = calendar::get_calendar_model_event_latest(client, &cal.id)
-            .await
-            .map_err(map_api_error)?;
+        let latest_model_event_id = super::run_with_api_retry(|| {
+            calendar::get_calendar_model_event_latest(client, &cal.id)
+        })
+        .await
+        .map_err(map_api_error)?;
         store.set_sync_state_text(
             &format!("calendar.{}.model_event_id", cal.id),
             &latest_model_event_id,
         )?;
 
-        let events = calendar::get_calendar_events(client, &cal.id, event_query)
-            .await
-            .map_err(map_api_error)?;
+        let events = super::run_with_api_retry(|| {
+            calendar::get_calendar_events(client, &cal.id, event_query)
+        })
+        .await
+        .map_err(map_api_error)?;
+        let mut fetched_event_ids = HashSet::new();
         for event in events {
+            if !event.id.trim().is_empty() {
+                fetched_event_ids.insert(event.id.clone());
+            }
             store.upsert_calendar_event(&event)?;
             summary.events_upserted += 1;
         }
+        summary.events_soft_deleted += reconcile_removed_calendar_events(
+            store,
+            &cal.id,
+            &fetched_event_ids,
+            event_query.start,
+            event_query.end,
+        )?;
     }
 
     let cached_ids = load_cached_calendar_ids(store)?;
@@ -81,6 +98,8 @@ pub async fn bootstrap_calendars(
         if !seen_calendar_ids.contains(&cached_id) {
             store.soft_delete_calendar(&cached_id)?;
             summary.calendars_soft_deleted += 1;
+            summary.events_soft_deleted +=
+                reconcile_removed_calendar_events(store, &cached_id, &HashSet::new(), None, None)?;
         }
     }
 
@@ -103,6 +122,7 @@ fn load_cached_calendar_ids(store: &PimStore) -> Result<HashSet<String>> {
 pub struct RefreshCalendarEventsSummary {
     pub calendars_scanned: usize,
     pub events_upserted: usize,
+    pub events_soft_deleted: usize,
 }
 
 pub async fn refresh_calendar_event_horizon(
@@ -113,13 +133,26 @@ pub async fn refresh_calendar_event_horizon(
     let mut summary = RefreshCalendarEventsSummary::default();
     for calendar_id in load_active_calendar_ids(store)? {
         summary.calendars_scanned += 1;
-        let events = calendar::get_calendar_events(client, &calendar_id, event_query)
-            .await
-            .map_err(map_api_error)?;
+        let events = super::run_with_api_retry(|| {
+            calendar::get_calendar_events(client, &calendar_id, event_query)
+        })
+        .await
+        .map_err(map_api_error)?;
+        let mut fetched_event_ids = HashSet::new();
         for event in events {
+            if !event.id.trim().is_empty() {
+                fetched_event_ids.insert(event.id.clone());
+            }
             store.upsert_calendar_event(&event)?;
             summary.events_upserted += 1;
         }
+        summary.events_soft_deleted += reconcile_removed_calendar_events(
+            store,
+            &calendar_id,
+            &fetched_event_ids,
+            event_query.start,
+            event_query.end,
+        )?;
     }
     store.set_sync_state_int(CALENDAR_LAST_HORIZON_SYNC_KEY, epoch_millis() as i64)?;
     Ok(summary)
@@ -131,6 +164,47 @@ fn load_active_calendar_ids(store: &PimStore) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0 ORDER BY id")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn reconcile_removed_calendar_events(
+    store: &PimStore,
+    calendar_id: &str,
+    fetched_event_ids: &HashSet<String>,
+    start_from: Option<i64>,
+    start_to: Option<i64>,
+) -> Result<usize> {
+    let mut soft_deleted = 0usize;
+    let cached_ids = load_cached_calendar_event_ids(store, calendar_id, start_from, start_to)?;
+    for event_id in cached_ids {
+        if !fetched_event_ids.contains(&event_id) {
+            store.soft_delete_calendar_event(&event_id)?;
+            soft_deleted += 1;
+        }
+    }
+    Ok(soft_deleted)
+}
+
+fn load_cached_calendar_event_ids(
+    store: &PimStore,
+    calendar_id: &str,
+    start_from: Option<i64>,
+    start_to: Option<i64>,
+) -> Result<HashSet<String>> {
+    let conn = Connection::open(store.db_path())?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    let mut stmt = conn.prepare(
+        "SELECT id
+         FROM pim_calendar_events
+         WHERE calendar_id = ?1
+           AND deleted = 0
+           AND (?2 IS NULL OR start_time >= ?2)
+           AND (?3 IS NULL OR start_time <= ?3)",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![calendar_id, start_from, start_to],
+        |row| row.get::<_, String>(0),
+    )?;
+    Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
 }
 
 fn epoch_millis() -> u64 {
@@ -255,6 +329,28 @@ mod tests {
             .await;
     }
 
+    fn calendar_event_json(
+        calendar_id: &str,
+        event_id: &str,
+        start_time: i64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "ID": event_id,
+            "UID": format!("uid-{event_id}"),
+            "CalendarID": calendar_id,
+            "SharedEventID": format!("shared-{event_id}"),
+            "CreateTime": 1700000000,
+            "LastEditTime": 1700000001,
+            "StartTime": start_time,
+            "StartTimezone": "UTC",
+            "EndTime": start_time + 3600,
+            "EndTimezone": "UTC",
+            "FullDay": 0,
+            "Author": "alice@proton.me",
+            "Permissions": 2
+        })
+    }
+
     #[tokio::test]
     async fn bootstrap_calendars_multi_calendar_upserts_all_resources() {
         let server = MockServer::start().await;
@@ -301,6 +397,7 @@ mod tests {
         assert_eq!(summary.keys_upserted, 2);
         assert_eq!(summary.settings_upserted, 2);
         assert_eq!(summary.events_upserted, 2);
+        assert_eq!(summary.events_soft_deleted, 0);
 
         let conn = Connection::open(store.db_path()).unwrap();
         let calendars_count: i64 = conn
@@ -351,6 +448,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.calendars_seen, 1);
+        assert_eq!(summary.events_soft_deleted, 0);
         assert_eq!(
             store
                 .get_sync_state_text("calendar.cal-1.model_event_id")
@@ -407,6 +505,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.calendars_soft_deleted, 1);
+        assert_eq!(summary.events_soft_deleted, 0);
         let conn = Connection::open(store.db_path()).unwrap();
         let stale_deleted: i64 = conn
             .query_row(
@@ -465,6 +564,7 @@ mod tests {
                 .unwrap();
         assert_eq!(summary.calendars_scanned, 1);
         assert_eq!(summary.events_upserted, 1);
+        assert_eq!(summary.events_soft_deleted, 0);
 
         let conn = Connection::open(store.db_path()).unwrap();
         let event_count: i64 = conn
@@ -481,5 +581,268 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(last_horizon > 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_calendars_soft_deletes_missing_events_for_seen_calendar() {
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+        let store = setup_store();
+
+        store
+            .upsert_calendar(&calendar::Calendar {
+                id: "cal-1".to_string(),
+                name: "Personal".to_string(),
+                description: "".to_string(),
+                color: "#00AAFF".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar::CalendarEvent {
+                id: "event-keep".to_string(),
+                uid: "uid-event-keep".to_string(),
+                calendar_id: "cal-1".to_string(),
+                shared_event_id: "shared-keep".to_string(),
+                create_time: 1700000000,
+                last_edit_time: 1700000001,
+                start_time: 1700001000,
+                end_time: 1700004600,
+                start_timezone: "UTC".to_string(),
+                end_timezone: "UTC".to_string(),
+                full_day: 0,
+                author: "alice@proton.me".to_string(),
+                permissions: 2,
+                ..calendar::CalendarEvent::default()
+            })
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar::CalendarEvent {
+                id: "event-stale".to_string(),
+                uid: "uid-event-stale".to_string(),
+                calendar_id: "cal-1".to_string(),
+                shared_event_id: "shared-stale".to_string(),
+                create_time: 1700000000,
+                last_edit_time: 1700000001,
+                start_time: 1700002000,
+                end_time: 1700005600,
+                start_timezone: "UTC".to_string(),
+                end_timezone: "UTC".to_string(),
+                full_day: 0,
+                author: "alice@proton.me".to_string(),
+                permissions: 2,
+                ..calendar::CalendarEvent::default()
+            })
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Calendars": [{
+                    "ID": "cal-1",
+                    "Name": "Personal",
+                    "Description": "",
+                    "Color": "#00AAFF",
+                    "Display": 1,
+                    "Type": 0,
+                    "Flags": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/members"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Members": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/keys"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Keys": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/settings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "CalendarSettings": {
+                    "ID": "settings-1",
+                    "CalendarID": "cal-1",
+                    "DefaultEventDuration": 30,
+                    "DefaultPartDayNotifications": [],
+                    "DefaultFullDayNotifications": []
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/modelevents/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "CalendarModelEventID": "cme-1"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Events": [calendar_event_json("cal-1", "event-keep", 1700001000)]
+            })))
+            .mount(&server)
+            .await;
+
+        let summary = bootstrap_calendars(&client, &store, &CalendarEventsQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(summary.events_soft_deleted, 1);
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let keep_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stale_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_deleted, 0);
+        assert_eq!(stale_deleted, 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_calendar_event_horizon_soft_deletes_missing_events_in_window() {
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+        let store = setup_store();
+
+        store
+            .upsert_calendar(&calendar::Calendar {
+                id: "cal-1".to_string(),
+                name: "Personal".to_string(),
+                description: "".to_string(),
+                color: "#00AAFF".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar::CalendarEvent {
+                id: "event-keep".to_string(),
+                uid: "uid-event-keep".to_string(),
+                calendar_id: "cal-1".to_string(),
+                shared_event_id: "shared-keep".to_string(),
+                create_time: 1700000000,
+                last_edit_time: 1700000001,
+                start_time: 1700001000,
+                end_time: 1700004600,
+                start_timezone: "UTC".to_string(),
+                end_timezone: "UTC".to_string(),
+                full_day: 0,
+                author: "alice@proton.me".to_string(),
+                permissions: 2,
+                ..calendar::CalendarEvent::default()
+            })
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar::CalendarEvent {
+                id: "event-delete-in-range".to_string(),
+                uid: "uid-event-delete-in-range".to_string(),
+                calendar_id: "cal-1".to_string(),
+                shared_event_id: "shared-delete".to_string(),
+                create_time: 1700000000,
+                last_edit_time: 1700000001,
+                start_time: 1700002000,
+                end_time: 1700005600,
+                start_timezone: "UTC".to_string(),
+                end_timezone: "UTC".to_string(),
+                full_day: 0,
+                author: "alice@proton.me".to_string(),
+                permissions: 2,
+                ..calendar::CalendarEvent::default()
+            })
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar::CalendarEvent {
+                id: "event-out-of-range".to_string(),
+                uid: "uid-event-out-of-range".to_string(),
+                calendar_id: "cal-1".to_string(),
+                shared_event_id: "shared-out".to_string(),
+                create_time: 1700000000,
+                last_edit_time: 1700000001,
+                start_time: 1701000000,
+                end_time: 1701003600,
+                start_timezone: "UTC".to_string(),
+                end_timezone: "UTC".to_string(),
+                full_day: 0,
+                author: "alice@proton.me".to_string(),
+                permissions: 2,
+                ..calendar::CalendarEvent::default()
+            })
+            .unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Events": [calendar_event_json("cal-1", "event-keep", 1700001000)]
+            })))
+            .mount(&server)
+            .await;
+
+        let summary = refresh_calendar_event_horizon(
+            &client,
+            &store,
+            &CalendarEventsQuery {
+                start: Some(1700000000),
+                end: Some(1700009999),
+                ..CalendarEventsQuery::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(summary.events_soft_deleted, 1);
+
+        let conn = Connection::open(store.db_path()).unwrap();
+        let keep_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-keep'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let in_range_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-delete-in-range'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let out_of_range_deleted: i64 = conn
+            .query_row(
+                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-out-of-range'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(keep_deleted, 0);
+        assert_eq!(in_range_deleted, 1);
+        assert_eq!(out_of_range_deleted, 0);
     }
 }

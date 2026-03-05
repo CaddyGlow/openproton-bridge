@@ -987,7 +987,8 @@ async fn run_pim_reconcile_periodically(
                     Ok(summary) => {
                         metrics.calendar_full_success += 1;
                         metrics.calendar_rows_upserted += summary.events_upserted;
-                        metrics.calendar_rows_soft_deleted += summary.calendars_soft_deleted;
+                        metrics.calendar_rows_soft_deleted +=
+                            summary.calendars_soft_deleted + summary.events_soft_deleted;
                         tracing::info!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -1030,6 +1031,7 @@ async fn run_pim_reconcile_periodically(
                     Ok(summary) => {
                         metrics.calendar_horizon_success += 1;
                         metrics.calendar_rows_upserted += summary.events_upserted;
+                        metrics.calendar_rows_soft_deleted += summary.events_soft_deleted;
                         tracing::info!(
                             account_id = %account.account_id.0,
                             email = %account.email,
@@ -1266,17 +1268,34 @@ async fn report_runtime_health_periodically(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{handle_startup_refresh_failure, is_sync_scope_due, Session};
     use crate::api::error::ApiError;
     use crate::api::types::ApiMode;
+    use crate::bridge::accounts::{AccountHealth, RuntimeAccountRegistry};
+    use crate::bridge::types::AccountId;
     use crate::pim::store::PimStore;
 
     fn session(uid: &str, email: &str) -> Session {
         Session {
             uid: uid.to_string(),
             access_token: String::new(),
+            refresh_token: format!("refresh-{uid}"),
+            email: email.to_string(),
+            display_name: uid.to_string(),
+            api_mode: ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-password".to_string()),
+        }
+    }
+
+    fn session_with_access_token(uid: &str, email: &str, access_token: &str) -> Session {
+        Session {
+            uid: uid.to_string(),
+            access_token: access_token.to_string(),
             refresh_token: format!("refresh-{uid}"),
             email: email.to_string(),
             display_name: uid.to_string(),
@@ -1382,5 +1401,107 @@ mod tests {
         )
         .unwrap();
         assert!(due);
+    }
+
+    #[tokio::test]
+    async fn periodic_pim_reconcile_skips_when_not_due() {
+        let account_id = AccountId("uid-1".to_string());
+        let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
+            session_with_access_token("uid-1", "alice@proton.me", "\x00invalid"),
+        ]));
+        let store = Arc::new(pim_store());
+        let now_ms = super::unix_now_millis() as i64;
+        store
+            .set_sync_state_int("contacts.last_full_sync_ms", now_ms)
+            .unwrap();
+        store
+            .set_sync_state_int("calendar.last_full_sync_ms", now_ms)
+            .unwrap();
+        store
+            .set_sync_state_int("calendar.last_horizon_sync_ms", now_ms)
+            .unwrap();
+
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert(account_id.0.clone(), store);
+        let metrics = Arc::new(std::sync::RwLock::new(
+            super::PimReconcileMetricsSnapshot::default(),
+        ));
+
+        let task = tokio::spawn(super::run_pim_reconcile_periodically(
+            runtime_accounts.clone(),
+            pim_stores,
+            Duration::from_millis(20),
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(12 * 60 * 60),
+            None,
+            metrics.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(90)).await;
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(
+            runtime_accounts.get_health(&account_id).await,
+            Some(AccountHealth::Healthy)
+        );
+
+        let snapshot = metrics.read().unwrap().clone();
+        assert!(snapshot.sweeps_total >= 1);
+        assert_eq!(snapshot.contacts_runs_due_total, 0);
+        assert_eq!(snapshot.calendar_full_runs_due_total, 0);
+        assert_eq!(snapshot.calendar_horizon_runs_due_total, 0);
+        assert_eq!(snapshot.client_init_failures_total, 0);
+    }
+
+    #[tokio::test]
+    async fn periodic_pim_reconcile_marks_account_degraded_on_client_init_failure() {
+        let account_id = AccountId("uid-1".to_string());
+        let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
+            session_with_access_token("uid-1", "alice@proton.me", "\x00invalid"),
+        ]));
+        let store = Arc::new(pim_store());
+
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert(account_id.0.clone(), store);
+        let metrics = Arc::new(std::sync::RwLock::new(
+            super::PimReconcileMetricsSnapshot::default(),
+        ));
+
+        let task = tokio::spawn(super::run_pim_reconcile_periodically(
+            runtime_accounts.clone(),
+            pim_stores,
+            Duration::from_millis(20),
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+            Duration::from_secs(12 * 60 * 60),
+            None,
+            metrics.clone(),
+        ));
+
+        let start = std::time::Instant::now();
+        loop {
+            if runtime_accounts.get_health(&account_id).await == Some(AccountHealth::Degraded) {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("timed out waiting for degraded health transition");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        task.abort();
+        let _ = task.await;
+
+        let snapshot = metrics.read().unwrap().clone();
+        assert!(
+            snapshot.client_init_failures_total
+                + snapshot.contacts_failures_total
+                + snapshot.calendar_full_failures_total
+                + snapshot.calendar_horizon_failures_total
+                >= 1
+        );
+        assert!(snapshot.contacts_runs_due_total >= 1);
     }
 }

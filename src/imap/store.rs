@@ -1143,11 +1143,10 @@ impl MessageStore for GluonStore {
         meta: MessageMetadata,
     ) -> Result<u32> {
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
+        // Reload account state from disk before mutating so concurrent store instances
+        // do not clobber each other's UID assignment/index updates.
+        let mut next_state = self.load_account_from_disk(&storage_user_id)?;
         let mut accounts = self.accounts.write().await;
-        let mut next_state = accounts
-            .get(&storage_user_id)
-            .cloned()
-            .unwrap_or_else(Self::empty_account_state);
         let mailbox_was_missing = !next_state.mailboxes.contains_key(&mailbox_name);
 
         let mailbox = next_state

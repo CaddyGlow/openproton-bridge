@@ -44,9 +44,10 @@ pub async fn bootstrap_contacts(
             page_size: Some(page_size),
         };
 
-        let (contacts_page, total) = contacts::get_contacts(client, &query)
-            .await
-            .map_err(|err| pim_api_error("contacts bootstrap: get_contacts", err))?;
+        let (contacts_page, total) =
+            super::run_with_api_retry(|| contacts::get_contacts(client, &query))
+                .await
+                .map_err(|err| pim_api_error("contacts bootstrap: get_contacts", err))?;
         if contacts_page.is_empty() {
             break;
         }
@@ -58,9 +59,10 @@ pub async fn bootstrap_contacts(
             if item.metadata.id.trim().is_empty() {
                 continue;
             }
-            let full = contacts::get_contact(client, &item.metadata.id)
-                .await
-                .map_err(|err| pim_api_error("contacts bootstrap: get_contact", err))?;
+            let full =
+                super::run_with_api_retry(|| contacts::get_contact(client, &item.metadata.id))
+                    .await
+                    .map_err(|err| pim_api_error("contacts bootstrap: get_contact", err))?;
             seen_ids.insert(full.metadata.id.clone());
             store.upsert_contact(&full)?;
             contacts_upserted += 1;
@@ -335,5 +337,85 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(sync_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_contacts_retries_transient_rate_limit_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let list_calls_task = list_calls.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]);
+
+                let (status, body) = if request.contains("GET /contacts/v4/contact-1 ") {
+                    (
+                        "200 OK",
+                        full_contact_response("contact-1", "Alice").to_string(),
+                    )
+                } else if request.contains("GET /contacts/v4?") {
+                    let call = list_calls_task.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        (
+                            "429 Too Many Requests",
+                            serde_json::json!({
+                                "Code": 429,
+                                "Error": "rate limit"
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "Code": 1000,
+                                "Total": 1,
+                                "Contacts": [{
+                                    "ID": "contact-1",
+                                    "Name": "Alice",
+                                    "UID": "uid-contact-1",
+                                    "Size": 10,
+                                    "CreateTime": 1700000000,
+                                    "ModifyTime": 1700000001
+                                }]
+                            })
+                            .to_string(),
+                        )
+                    }
+                } else {
+                    panic!("unexpected request: {request}");
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nRetry-After: 0\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let tmp = tempdir().unwrap();
+        let store = PimStore::new(tmp.path().join("contacts.db")).unwrap();
+
+        let summary = bootstrap_contacts(&client, &store, 2).await.unwrap();
+        assert_eq!(summary.contacts_upserted, 1);
+        assert_eq!(summary.contacts_seen, 1);
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+
+        server.await.unwrap();
     }
 }

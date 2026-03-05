@@ -9,7 +9,6 @@ use crate::pim::dav::{CalDavRepository, DeleteMode, StoreBackedDavAdapter};
 use crate::pim::query::{CalendarEventRange, QueryPage};
 use crate::pim::store::PimStore;
 
-use super::discovery;
 use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
@@ -23,15 +22,15 @@ pub fn handle_request(
     store: &Arc<PimStore>,
 ) -> Result<Option<DavResponse>> {
     let path = normalize_path(raw_path);
-    let collection = discovery::default_calendar_path(&auth.account_id.0);
+    let calendars_root = format!("/dav/{}/calendars/", auth.account_id.0);
     let adapter = StoreBackedDavAdapter::new(store.clone());
 
-    if path == collection {
+    if let Some(calendar_id) = parse_calendar_collection_id(&calendars_root, &path) {
         return match method {
             "GET" | "HEAD" => {
                 let count = adapter
                     .list_calendar_events(
-                        "default",
+                        &calendar_id,
                         false,
                         CalendarEventRange::default(),
                         QueryPage::default(),
@@ -48,11 +47,57 @@ pub fn handle_request(
                 }
                 Ok(Some(response))
             }
+            "MKCALENDAR" => {
+                let exists = adapter
+                    .get_calendar(&calendar_id, false)
+                    .map_err(|err| DavError::Backend(err.to_string()))?
+                    .is_some();
+                if exists {
+                    return Ok(Some(DavResponse {
+                        status: "405 Method Not Allowed",
+                        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+                        body: b"calendar already exists\n".to_vec(),
+                    }));
+                }
+                adapter
+                    .upsert_calendar(&Calendar {
+                        id: calendar_id,
+                        name: "Calendar".to_string(),
+                        description: "".to_string(),
+                        color: "#3A7AFE".to_string(),
+                        display: 1,
+                        calendar_type: 0,
+                        flags: 0,
+                    })
+                    .map_err(|err| DavError::Backend(err.to_string()))?;
+                Ok(Some(DavResponse {
+                    status: "201 Created",
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }))
+            }
+            "DELETE" => {
+                let exists = adapter
+                    .get_calendar(&calendar_id, false)
+                    .map_err(|err| DavError::Backend(err.to_string()))?
+                    .is_some();
+                if !exists {
+                    return Ok(Some(not_found_response()));
+                }
+                adapter
+                    .delete_calendar(&calendar_id, DeleteMode::Soft)
+                    .map_err(|err| DavError::Backend(err.to_string()))?;
+                Ok(Some(DavResponse {
+                    status: "204 No Content",
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                }))
+            }
             _ => Ok(None),
         };
     }
 
-    let Some(event_id) = parse_event_resource_id(&collection, &path) else {
+    let Some((calendar_id, event_id)) = parse_event_resource_id(&calendars_root, &path) else {
         return Ok(None);
     };
 
@@ -101,12 +146,12 @@ pub fn handle_request(
                 return Ok(Some(precondition_failed_response()));
             }
 
-            ensure_default_calendar_exists(&adapter)?;
+            ensure_calendar_exists(&adapter, &calendar_id)?;
             let payload = std::str::from_utf8(body)
                 .map_err(|_| DavError::InvalidRequest("CalDAV PUT body is not utf-8"))?;
             let now = epoch_seconds();
             let create_time = now;
-            let event = parse_ics(&event_id, payload, create_time, now);
+            let event = parse_ics(&event_id, &calendar_id, payload, create_time, now);
             adapter
                 .upsert_calendar_event(&event)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
@@ -152,16 +197,16 @@ pub fn handle_request(
     }
 }
 
-fn ensure_default_calendar_exists(adapter: &StoreBackedDavAdapter) -> Result<()> {
+fn ensure_calendar_exists(adapter: &StoreBackedDavAdapter, calendar_id: &str) -> Result<()> {
     let exists = adapter
-        .get_calendar("default", true)
+        .get_calendar(calendar_id, true)
         .map_err(|err| DavError::Backend(err.to_string()))?
         .is_some();
     if !exists {
         adapter
             .upsert_calendar(&Calendar {
-                id: "default".to_string(),
-                name: "Default Calendar".to_string(),
+                id: calendar_id.to_string(),
+                name: "Calendar".to_string(),
                 description: "".to_string(),
                 color: "#3A7AFE".to_string(),
                 display: 1,
@@ -173,23 +218,45 @@ fn ensure_default_calendar_exists(adapter: &StoreBackedDavAdapter) -> Result<()>
     Ok(())
 }
 
-fn parse_event_resource_id(collection: &str, path: &str) -> Option<String> {
-    if !path.starts_with(collection) {
+fn parse_calendar_collection_id(calendars_root: &str, path: &str) -> Option<String> {
+    if !path.starts_with(calendars_root) {
         return None;
     }
-    let remainder = path.strip_prefix(collection)?;
-    if remainder.is_empty() || remainder.contains('/') || !remainder.ends_with(".ics") {
+    let remainder = path.strip_prefix(calendars_root)?;
+    if remainder.is_empty() || !remainder.ends_with('/') {
         return None;
     }
-    let id = remainder.trim_end_matches(".ics");
-    if id.is_empty() {
+    let id = remainder.trim_end_matches('/');
+    if id.is_empty() || id.contains('/') {
         None
     } else {
         Some(id.to_string())
     }
 }
 
-fn parse_ics(id: &str, raw: &str, create_time: i64, edit_time: i64) -> CalendarEvent {
+fn parse_event_resource_id(calendars_root: &str, path: &str) -> Option<(String, String)> {
+    if !path.starts_with(calendars_root) {
+        return None;
+    }
+    let remainder = path.strip_prefix(calendars_root)?;
+    let (calendar_id, file_name) = remainder.split_once('/')?;
+    if calendar_id.is_empty() || file_name.is_empty() || !file_name.ends_with(".ics") {
+        return None;
+    }
+    let event_id = file_name.trim_end_matches(".ics");
+    if event_id.is_empty() {
+        return None;
+    }
+    Some((calendar_id.to_string(), event_id.to_string()))
+}
+
+fn parse_ics(
+    id: &str,
+    calendar_id: &str,
+    raw: &str,
+    create_time: i64,
+    edit_time: i64,
+) -> CalendarEvent {
     let mut uid = None;
     let mut dtstart = None;
     let mut dtend = None;
@@ -215,7 +282,7 @@ fn parse_ics(id: &str, raw: &str, create_time: i64, edit_time: i64) -> CalendarE
     CalendarEvent {
         id: id.to_string(),
         uid,
-        calendar_id: "default".to_string(),
+        calendar_id: calendar_id.to_string(),
         shared_event_id: format!("shared-{id}"),
         create_time,
         last_edit_time: edit_time,

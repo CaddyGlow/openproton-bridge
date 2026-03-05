@@ -198,7 +198,7 @@ fn route_request(
 
     match method.as_str() {
         "OPTIONS" => Ok(options_response()),
-        "PROPFIND" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" => {
+        "PROPFIND" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" | "MKCALENDAR" => {
             if !path_without_query.starts_with("/dav") {
                 return Ok(not_found_response());
             }
@@ -256,7 +256,7 @@ fn options_response() -> DavResponse {
             ("DAV", "1, 2, calendar-access, addressbook".to_string()),
             (
                 "Allow",
-                "OPTIONS, PROPFIND, REPORT, GET, HEAD, PUT, DELETE".to_string(),
+                "OPTIONS, PROPFIND, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE".to_string(),
             ),
             ("Content-Type", "text/plain; charset=utf-8".to_string()),
         ],
@@ -574,6 +574,54 @@ mod tests {
         let wire = String::from_utf8_lossy(&response[..n]);
         assert!(wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
         assert!(wire.contains("/dav/uid-1/addressbooks/default/c1.vcf"));
+
+        server.await.expect("server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mkcalendar_creates_named_calendar_collection() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+        });
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, config.clone())
+                    .await
+                    .expect("handle");
+            }
+        });
+
+        let auth = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let mkcalendar = format!(
+            "MKCALENDAR /dav/uid-1/calendars/work/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(mkcalendar.as_bytes()).await?;
+        let mut response = vec![0; 1024];
+        let n = client.read(&mut response).await?;
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 201 Created\r\n"));
+
+        let get = format!(
+            "GET /dav/uid-1/calendars/work/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(get.as_bytes()).await?;
+        let mut response = vec![0; 1024];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(wire.contains("calendar events="));
 
         server.await.expect("server");
         Ok(())

@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::api;
 use crate::api::types::Session;
+use crate::dav;
 use crate::imap;
 use crate::paths::RuntimePaths;
 use crate::pim::store::PimStore;
@@ -19,11 +20,29 @@ use crate::pim::{sync_calendar, sync_contacts};
 use crate::smtp;
 use crate::vault;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DavTlsMode {
+    None,
+    StartTls,
+}
+
+impl DavTlsMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::StartTls => "starttls",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MailRuntimeConfig {
     pub bind_host: String,
     pub imap_port: u16,
     pub smtp_port: u16,
+    pub dav_enable: bool,
+    pub dav_port: u16,
+    pub dav_tls_mode: DavTlsMode,
     pub disable_tls: bool,
     pub use_ssl_for_imap: bool,
     pub use_ssl_for_smtp: bool,
@@ -83,6 +102,7 @@ impl MailRuntimeTransition {
 pub enum MailProtocol {
     Imap,
     Smtp,
+    Dav,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +119,12 @@ pub enum MailRuntimeStartError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to bind DAV listener on {addr}: {source}")]
+    DavBind {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Prepare(#[from] anyhow::Error),
 }
@@ -108,6 +134,7 @@ impl MailRuntimeStartError {
         match self {
             Self::ImapBind { .. } => Some(MailProtocol::Imap),
             Self::SmtpBind { .. } => Some(MailProtocol::Smtp),
+            Self::DavBind { .. } => Some(MailProtocol::Dav),
             Self::Prepare(_) => None,
         }
     }
@@ -171,6 +198,7 @@ pub async fn start(
 
     let imap_addr = format!("{}:{}", config.bind_host, config.imap_port);
     let smtp_addr = format!("{}:{}", config.bind_host, config.smtp_port);
+    let dav_addr = format!("{}:{}", config.bind_host, config.dav_port);
 
     let imap_listener =
         TcpListener::bind(&imap_addr)
@@ -186,9 +214,22 @@ pub async fn start(
                 addr: smtp_addr.clone(),
                 source,
             })?;
+    let dav_listener = if config.dav_enable {
+        Some(TcpListener::bind(&dav_addr).await.map_err(|source| {
+            MailRuntimeStartError::DavBind {
+                addr: dav_addr.clone(),
+                source,
+            }
+        })?)
+    } else {
+        None
+    };
 
     log_protocol_start(MailProtocol::Imap, &config, transition);
     log_protocol_start(MailProtocol::Smtp, &config, transition);
+    if config.dav_enable {
+        log_protocol_start(MailProtocol::Dav, &config, transition);
+    }
 
     let active_sessions = prepared.active_sessions.clone();
     let runtime_snapshot = prepared.runtime_snapshot.clone();
@@ -203,6 +244,7 @@ pub async fn start(
         transition,
         imap_listener,
         smtp_listener,
+        dav_listener,
         stop_rx,
         notify_tx,
         pim_reconcile_metrics.clone(),
@@ -460,6 +502,7 @@ async fn run_runtime(
     transition: MailRuntimeTransition,
     imap_listener: TcpListener,
     smtp_listener: TcpListener,
+    dav_listener: Option<TcpListener>,
     shutdown_rx: oneshot::Receiver<()>,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
     pim_reconcile_metrics: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
@@ -562,6 +605,9 @@ async fn run_runtime(
     let mut smtp_task = tokio::spawn(async move {
         smtp::server::run_server_with_listener(smtp_listener, smtp_config).await
     });
+    let mut dav_task = dav_listener.map(|listener| {
+        tokio::spawn(async move { dav::server::run_server_with_listener(listener).await })
+    });
 
     let mut shutdown_rx = shutdown_rx;
     let serve_result: anyhow::Result<()> = tokio::select! {
@@ -580,10 +626,19 @@ async fn run_runtime(
                 Err(err) => Err(anyhow::Error::new(err).context("SMTP server task failed")),
             }
         }
+        result = async { dav_task.as_mut().expect("dav task missing despite guard").await }, if dav_task.is_some() => {
+            match result {
+                Ok(inner) => inner.map_err(anyhow::Error::from),
+                Err(err) => Err(anyhow::Error::new(err).context("DAV server task failed")),
+            }
+        }
     };
 
     log_protocol_stopping(MailProtocol::Imap, &config, transition);
     log_protocol_stopping(MailProtocol::Smtp, &config, transition);
+    if config.dav_enable {
+        log_protocol_stopping(MailProtocol::Dav, &config, transition);
+    }
 
     if !imap_task.is_finished() {
         imap_task.abort();
@@ -591,8 +646,16 @@ async fn run_runtime(
     if !smtp_task.is_finished() {
         smtp_task.abort();
     }
+    if let Some(task) = dav_task.as_mut() {
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
     let _ = imap_task.await;
     let _ = smtp_task.await;
+    if let Some(task) = dav_task {
+        let _ = task.await;
+    }
 
     health_task.abort();
     let _ = health_task.await;
@@ -612,6 +675,14 @@ async fn run_runtime(
         transition = transition.as_str(),
         "SMTP server listener closed"
     );
+    if config.dav_enable {
+        tracing::info!(
+            port = config.dav_port,
+            tls_mode = config.dav_tls_mode.as_str(),
+            transition = transition.as_str(),
+            "DAV server listener closed"
+        );
+    }
 
     if let Some(tx) = notify_tx.as_ref() {
         if serve_result.is_ok() {
@@ -648,6 +719,16 @@ fn log_protocol_start(
                 "Restarting SMTP server"
             );
         }
+        (MailProtocol::Dav, MailRuntimeTransition::SettingsChange) => {
+            tracing::info!(
+                service = "server-manager",
+                port = config.dav_port,
+                tls_mode = config.dav_tls_mode.as_str(),
+                transition = transition.as_str(),
+                msg = "Restarting DAV server",
+                "Restarting DAV server"
+            );
+        }
         (MailProtocol::Imap, _) => {
             tracing::info!(
                 service = "server-manager",
@@ -666,6 +747,16 @@ fn log_protocol_start(
                 transition = transition.as_str(),
                 msg = "Starting SMTP server",
                 "Starting SMTP server"
+            );
+        }
+        (MailProtocol::Dav, _) => {
+            tracing::info!(
+                service = "server-manager",
+                port = config.dav_port,
+                tls_mode = config.dav_tls_mode.as_str(),
+                transition = transition.as_str(),
+                msg = "Starting DAV server",
+                "Starting DAV server"
             );
         }
     }
@@ -697,6 +788,16 @@ fn log_protocol_stopping(
                 "Stopping SMTP server"
             );
         }
+        MailProtocol::Dav => {
+            tracing::info!(
+                service = "server-manager",
+                port = config.dav_port,
+                tls_mode = config.dav_tls_mode.as_str(),
+                transition = transition.as_str(),
+                msg = "Stopping DAV server",
+                "Stopping DAV server"
+            );
+        }
     }
 }
 
@@ -716,6 +817,14 @@ pub fn log_bridge_start_failure(protocol: MailProtocol, config: &MailRuntimeConf
                 ssl = config.use_ssl_for_smtp,
                 error = %error,
                 "Failed to start SMTP server on bridge start"
+            );
+        }
+        MailProtocol::Dav => {
+            tracing::warn!(
+                port = config.dav_port,
+                tls_mode = config.dav_tls_mode.as_str(),
+                error = %error,
+                "Failed to start DAV server on bridge start"
             );
         }
     }

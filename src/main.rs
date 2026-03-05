@@ -18,6 +18,7 @@ mod api;
 mod bridge;
 mod client_config;
 mod crypto;
+mod dav;
 mod frontend;
 mod imap;
 mod observability;
@@ -123,7 +124,7 @@ enum Command {
         #[arg(short, long, default_value = "10")]
         limit: usize,
     },
-    /// Start the IMAP/SMTP servers with the gRPC control service
+    /// Start the IMAP/SMTP/DAV servers with the gRPC control service
     Serve {
         /// IMAP port to listen on
         #[arg(long, default_value = "1143")]
@@ -131,6 +132,15 @@ enum Command {
         /// SMTP port to listen on
         #[arg(long, default_value = "1025")]
         smtp_port: u16,
+        /// Enable local DAV server (CardDAV + CalDAV)
+        #[arg(long, default_value_t = false)]
+        dav_enable: bool,
+        /// DAV port to listen on
+        #[arg(long, default_value = "8080")]
+        dav_port: u16,
+        /// DAV transport mode
+        #[arg(long, value_enum, default_value = "none")]
+        dav_tls_mode: DavTlsModeArg,
         /// Address to bind to
         #[arg(long, default_value = "127.0.0.1")]
         bind: String,
@@ -207,6 +217,12 @@ enum ExecutionModeArg {
     Grpc,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum DavTlsModeArg {
+    None,
+    Starttls,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutionMode {
     Direct,
@@ -227,6 +243,15 @@ impl From<ExecutionModeArg> for ExecutionMode {
         match value {
             ExecutionModeArg::Direct => ExecutionMode::Direct,
             ExecutionModeArg::Grpc => ExecutionMode::Grpc,
+        }
+    }
+}
+
+impl From<DavTlsModeArg> for bridge::mail_runtime::DavTlsMode {
+    fn from(value: DavTlsModeArg) -> Self {
+        match value {
+            DavTlsModeArg::None => bridge::mail_runtime::DavTlsMode::None,
+            DavTlsModeArg::Starttls => bridge::mail_runtime::DavTlsMode::StartTls,
         }
     }
 }
@@ -381,6 +406,9 @@ async fn execute_non_interactive_command_direct(
         Command::Serve {
             imap_port,
             smtp_port,
+            dav_enable,
+            dav_port,
+            dav_tls_mode,
             bind,
             no_tls,
             event_poll_secs,
@@ -392,6 +420,9 @@ async fn execute_non_interactive_command_direct(
             cmd_serve(
                 imap_port,
                 smtp_port,
+                dav_enable,
+                dav_port,
+                dav_tls_mode.into(),
                 &bind,
                 no_tls,
                 event_poll_secs,
@@ -589,6 +620,9 @@ fn resolve_credential_store_overrides(
 struct InteractiveServeConfig {
     imap_port: u16,
     smtp_port: u16,
+    dav_enable: bool,
+    dav_port: u16,
+    dav_tls_mode: bridge::mail_runtime::DavTlsMode,
     bind: String,
     no_tls: bool,
     event_poll_secs: u64,
@@ -603,6 +637,9 @@ impl Default for InteractiveServeConfig {
         Self {
             imap_port: 1143,
             smtp_port: 1025,
+            dav_enable: false,
+            dav_port: 8080,
+            dav_tls_mode: bridge::mail_runtime::DavTlsMode::None,
             bind: "127.0.0.1".to_string(),
             no_tls: false,
             event_poll_secs: 30,
@@ -618,6 +655,9 @@ impl Default for InteractiveServeConfig {
 struct ServeCommandOverrides {
     imap_port: Option<u16>,
     smtp_port: Option<u16>,
+    dav_enable: Option<bool>,
+    dav_port: Option<u16>,
+    dav_tls_mode: Option<bridge::mail_runtime::DavTlsMode>,
     bind: Option<String>,
     no_tls: Option<bool>,
     event_poll_secs: Option<u64>,
@@ -657,6 +697,12 @@ struct CliStoredAppSettings {
 struct CliStoredMailSettings {
     imap_port: i32,
     smtp_port: i32,
+    #[serde(default = "default_dav_enable")]
+    dav_enable: bool,
+    #[serde(default = "default_dav_port")]
+    dav_port: i32,
+    #[serde(default = "default_dav_tls_mode")]
+    dav_tls_mode: String,
     use_ssl_for_imap: bool,
     use_ssl_for_smtp: bool,
     #[serde(default = "default_pim_reconcile_tick_secs")]
@@ -674,6 +720,9 @@ impl Default for CliStoredMailSettings {
         Self {
             imap_port: 1143,
             smtp_port: 1025,
+            dav_enable: default_dav_enable(),
+            dav_port: default_dav_port(),
+            dav_tls_mode: default_dav_tls_mode(),
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
             pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
@@ -686,6 +735,26 @@ impl Default for CliStoredMailSettings {
 
 const fn default_pim_reconcile_tick_secs() -> i32 {
     600
+}
+
+const fn default_dav_enable() -> bool {
+    false
+}
+
+const fn default_dav_port() -> i32 {
+    8080
+}
+
+fn default_dav_tls_mode() -> String {
+    "none".to_string()
+}
+
+fn parse_dav_tls_mode(value: &str) -> bridge::mail_runtime::DavTlsMode {
+    if value.eq_ignore_ascii_case("starttls") || value.eq_ignore_ascii_case("tls") {
+        bridge::mail_runtime::DavTlsMode::StartTls
+    } else {
+        bridge::mail_runtime::DavTlsMode::None
+    }
 }
 
 const fn default_pim_contacts_reconcile_secs() -> i32 {
@@ -724,6 +793,9 @@ impl InteractiveServeConfig {
         Self {
             imap_port: overrides.imap_port.unwrap_or(self.imap_port),
             smtp_port: overrides.smtp_port.unwrap_or(self.smtp_port),
+            dav_enable: overrides.dav_enable.unwrap_or(self.dav_enable),
+            dav_port: overrides.dav_port.unwrap_or(self.dav_port),
+            dav_tls_mode: overrides.dav_tls_mode.unwrap_or(self.dav_tls_mode),
             bind: overrides.bind.unwrap_or_else(|| self.bind.clone()),
             no_tls: overrides.no_tls.unwrap_or(self.no_tls),
             event_poll_secs: overrides.event_poll_secs.unwrap_or(self.event_poll_secs),
@@ -1570,10 +1642,13 @@ async fn cmd_cli(
                     "serve-status" => {
                         if let Some(state) = runtime_state.as_ref() {
                             println!(
-                                "Serve runtime: running (bind={}, imap={}, smtp={}, tls={}, poll={}s, pim_tick={}s, pim_contacts={}s, pim_calendar={}s, pim_calendar_horizon={}s)",
+                                "Serve runtime: running (bind={}, imap={}, smtp={}, dav={}:{}, dav_tls={}, tls={}, poll={}s, pim_tick={}s, pim_contacts={}s, pim_calendar={}s, pim_calendar_horizon={}s)",
                                 state.config.bind,
                                 state.config.imap_port,
                                 state.config.smtp_port,
+                                if state.config.dav_enable { "on" } else { "off" },
+                                state.config.dav_port,
+                                state.config.dav_tls_mode.as_str(),
                                 if state.config.no_tls { "off" } else { "starttls" },
                                 state.config.event_poll_secs,
                                 state.config.pim_reconcile_tick_secs,
@@ -1919,6 +1994,36 @@ fn parse_serve_overrides(args: &[String]) -> anyhow::Result<ServeCommandOverride
                     .context("invalid --smtp-port value")?;
                 overrides.smtp_port = Some(value);
             }
+            "--dav-enable" => {
+                overrides.dav_enable = Some(true);
+            }
+            "--dav-disable" => {
+                overrides.dav_enable = Some(false);
+            }
+            "--dav-port" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --dav-port")?
+                    .parse::<u16>()
+                    .context("invalid --dav-port value")?;
+                overrides.dav_port = Some(value);
+            }
+            "--dav-tls-mode" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .context("missing value for --dav-tls-mode")?
+                    .to_ascii_lowercase();
+                let parsed = match value.as_str() {
+                    "none" => bridge::mail_runtime::DavTlsMode::None,
+                    "starttls" => bridge::mail_runtime::DavTlsMode::StartTls,
+                    _ => anyhow::bail!(
+                        "invalid --dav-tls-mode value `{value}`; expected none or starttls"
+                    ),
+                };
+                overrides.dav_tls_mode = Some(parsed);
+            }
             "--bind" => {
                 idx += 1;
                 let value = args.get(idx).context("missing value for --bind")?.trim();
@@ -1980,7 +2085,7 @@ fn parse_serve_overrides(args: &[String]) -> anyhow::Result<ServeCommandOverride
             }
             unknown => {
                 anyhow::bail!(
-                    "unsupported serve option `{unknown}`. supported: --imap-port, --smtp-port, --bind, --event-poll-secs, --pim-reconcile-tick-secs, --pim-contacts-reconcile-secs, --pim-calendar-reconcile-secs, --pim-calendar-horizon-reconcile-secs, --no-tls, --tls"
+                    "unsupported serve option `{unknown}`. supported: --imap-port, --smtp-port, --dav-enable, --dav-disable, --dav-port, --dav-tls-mode, --bind, --event-poll-secs, --pim-reconcile-tick-secs, --pim-contacts-reconcile-secs, --pim-calendar-reconcile-secs, --pim-calendar-horizon-reconcile-secs, --no-tls, --tls"
                 );
             }
         }
@@ -1997,7 +2102,7 @@ fn handle_interactive_change_command(
 ) -> anyhow::Result<()> {
     if args.is_empty() {
         anyhow::bail!(
-            "usage: change <imap-port|smtp-port|bind|event-poll-secs|pim-reconcile-tick-secs|pim-contacts-reconcile-secs|pim-calendar-reconcile-secs|pim-calendar-horizon-reconcile-secs> <value> | change <imap-security|smtp-security> [starttls|none]"
+            "usage: change <imap-port|smtp-port|dav-port|dav-enable|dav-tls-mode|bind|event-poll-secs|pim-reconcile-tick-secs|pim-contacts-reconcile-secs|pim-calendar-reconcile-secs|pim-calendar-horizon-reconcile-secs> <value> | change <imap-security|smtp-security> [starttls|none]"
         );
     }
 
@@ -2014,6 +2119,53 @@ fn handle_interactive_change_command(
             let value = value.context("missing SMTP port value")?;
             serve_config.smtp_port = value.parse::<u16>().context("invalid SMTP port")?;
             println!("Updated SMTP port: {}", serve_config.smtp_port);
+        }
+        "dav-port" => {
+            let value = value.context("missing DAV port value")?;
+            serve_config.dav_port = value.parse::<u16>().context("invalid DAV port")?;
+            println!("Updated DAV port: {}", serve_config.dav_port);
+        }
+        "dav-enable" => match value.map(|value| value.to_ascii_lowercase()) {
+            Some(mode) => match mode.as_str() {
+                "1" | "on" | "true" | "yes" => {
+                    serve_config.dav_enable = true;
+                    println!("Updated DAV state: enabled");
+                }
+                "0" | "off" | "false" | "no" => {
+                    serve_config.dav_enable = false;
+                    println!("Updated DAV state: disabled");
+                }
+                _ => anyhow::bail!(
+                    "invalid dav-enable value `{mode}`; expected on/off, true/false, or 1/0"
+                ),
+            },
+            None => {
+                serve_config.dav_enable = !serve_config.dav_enable;
+                println!(
+                    "Updated DAV state: {}",
+                    if serve_config.dav_enable {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+        },
+        "dav-tls-mode" => {
+            let value = value
+                .context("missing DAV TLS mode value")?
+                .to_ascii_lowercase();
+            serve_config.dav_tls_mode = match value.as_str() {
+                "none" => bridge::mail_runtime::DavTlsMode::None,
+                "starttls" | "tls" => bridge::mail_runtime::DavTlsMode::StartTls,
+                _ => anyhow::bail!(
+                    "invalid DAV TLS mode `{value}`; expected none or starttls"
+                ),
+            };
+            println!(
+                "Updated DAV TLS mode: {}",
+                serve_config.dav_tls_mode.as_str()
+            );
         }
         "bind" => {
             let value = value.context("missing bind value")?;
@@ -2103,7 +2255,7 @@ fn handle_interactive_change_command(
             }
         }
         _ => anyhow::bail!(
-            "unknown change target `{}`; expected imap-port, smtp-port, bind, event-poll-secs, pim-reconcile-tick-secs, pim-contacts-reconcile-secs, pim-calendar-reconcile-secs, pim-calendar-horizon-reconcile-secs, imap-security, smtp-security",
+            "unknown change target `{}`; expected imap-port, smtp-port, dav-port, dav-enable, dav-tls-mode, bind, event-poll-secs, pim-reconcile-tick-secs, pim-contacts-reconcile-secs, pim-calendar-reconcile-secs, pim-calendar-horizon-reconcile-secs, imap-security, smtp-security",
             args[0]
         ),
     }
@@ -2153,7 +2305,7 @@ fn print_interactive_help() {
     println!("  change mode <email|index> <split|combined> Set account address mode");
     println!("  serve-config                     Print interactive serve defaults");
     println!("  serve-status                     Show background serve runtime status");
-    println!("  serve [serve flags]              Start IMAP+SMTP server (background)");
+    println!("  serve [serve flags]              Start IMAP+SMTP(+DAV) server (background)");
     println!("  grpc-status                      Show background gRPC runtime status");
     println!("  grpc [grpc flags]                Start gRPC frontend service (background)");
     println!("  grpc-stop                        Stop background gRPC runtime");
@@ -2271,6 +2423,9 @@ fn print_interactive_serve_help() {
     println!("Serve flags:");
     println!("  --imap-port <port>");
     println!("  --smtp-port <port>");
+    println!("  --dav-enable | --dav-disable");
+    println!("  --dav-port <port>");
+    println!("  --dav-tls-mode <none|starttls>");
     println!("  --bind <ip>");
     println!("  --event-poll-secs <seconds>");
     println!("  --pim-reconcile-tick-secs <seconds>");
@@ -2317,6 +2472,13 @@ async fn load_interactive_serve_config(
                     config.smtp_port = smtp_port;
                 }
             }
+            config.dav_enable = settings.dav_enable;
+            if let Ok(dav_port) = u16::try_from(settings.dav_port) {
+                if dav_port > 0 {
+                    config.dav_port = dav_port;
+                }
+            }
+            config.dav_tls_mode = parse_dav_tls_mode(&settings.dav_tls_mode);
             if let Ok(value) = u64::try_from(settings.pim_reconcile_tick_secs) {
                 if value > 0 {
                     config.pim_reconcile_tick_secs = value;
@@ -2403,6 +2565,9 @@ async fn persist_mail_ports_from_serve_config(
     update_mail_settings(runtime_paths, |settings| {
         settings.imap_port = i32::from(serve_config.imap_port);
         settings.smtp_port = i32::from(serve_config.smtp_port);
+        settings.dav_enable = serve_config.dav_enable;
+        settings.dav_port = i32::from(serve_config.dav_port);
+        settings.dav_tls_mode = serve_config.dav_tls_mode.as_str().to_string();
         settings.pim_reconcile_tick_secs =
             i32::try_from(serve_config.pim_reconcile_tick_secs).unwrap_or(i32::MAX);
         settings.pim_contacts_reconcile_secs =
@@ -2801,6 +2966,16 @@ fn print_interactive_serve_config(config: &InteractiveServeConfig) {
     println!("Interactive serve defaults:");
     println!("  IMAP port: {}", config.imap_port);
     println!("  SMTP port: {}", config.smtp_port);
+    println!(
+        "  DAV: {} (port={}, tls_mode={})",
+        if config.dav_enable {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        config.dav_port,
+        config.dav_tls_mode.as_str()
+    );
     println!("  Bind: {}", config.bind);
     println!(
         "  Security: {}",
@@ -4214,6 +4389,9 @@ async fn cmd_fetch(limit: usize, dir: &std::path::Path) -> anyhow::Result<()> {
 async fn cmd_serve(
     imap_port: u16,
     smtp_port: u16,
+    dav_enable: bool,
+    dav_port: u16,
+    dav_tls_mode: bridge::mail_runtime::DavTlsMode,
     bind: &str,
     no_tls: bool,
     event_poll_secs: u64,
@@ -4228,6 +4406,9 @@ async fn cmd_serve(
         bind_host: bind.to_string(),
         imap_port,
         smtp_port,
+        dav_enable,
+        dav_port,
+        dav_tls_mode,
         disable_tls: no_tls,
         use_ssl_for_imap: !no_tls,
         use_ssl_for_smtp: !no_tls,
@@ -4257,6 +4438,9 @@ async fn cmd_serve(
         bind,
         imap_port,
         smtp_port,
+        dav_enable,
+        dav_port,
+        dav_tls_mode,
         no_tls,
         &snapshot.active_sessions,
         &snapshot.runtime_snapshot,
@@ -4277,6 +4461,9 @@ fn print_serve_configuration(
     bind: &str,
     imap_port: u16,
     smtp_port: u16,
+    dav_enable: bool,
+    dav_port: u16,
+    dav_tls_mode: bridge::mail_runtime::DavTlsMode,
     no_tls: bool,
     active_sessions: &[api::types::Session],
     runtime_snapshot: &[bridge::accounts::RuntimeAccountInfo],
@@ -4300,6 +4487,12 @@ fn print_serve_configuration(
             info.email, info.account_id.0, info.health
         );
     }
+    println!();
+    println!("DAV server configuration:");
+    println!("  Enabled: {}", if dav_enable { "yes" } else { "no" });
+    println!("  Server: {}", bind);
+    println!("  Port: {}", dav_port);
+    println!("  TLS mode: {}", dav_tls_mode.as_str());
     println!();
     println!("SMTP server configuration:");
     println!("  Server: {}", bind);
@@ -4333,6 +4526,9 @@ async fn start_interactive_runtime(
         bind_host: config.bind.clone(),
         imap_port: config.imap_port,
         smtp_port: config.smtp_port,
+        dav_enable: config.dav_enable,
+        dav_port: config.dav_port,
+        dav_tls_mode: config.dav_tls_mode,
         disable_tls: config.no_tls,
         use_ssl_for_imap: !config.no_tls,
         use_ssl_for_smtp: !config.no_tls,
@@ -4362,6 +4558,9 @@ async fn start_interactive_runtime(
         &config.bind,
         config.imap_port,
         config.smtp_port,
+        config.dav_enable,
+        config.dav_port,
+        config.dav_tls_mode,
         config.no_tls,
         &snapshot.active_sessions,
         &snapshot.runtime_snapshot,
@@ -4717,6 +4916,34 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_dav_flags() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "serve",
+            "--dav-enable",
+            "--dav-port",
+            "8088",
+            "--dav-tls-mode",
+            "starttls",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Serve {
+                dav_enable,
+                dav_port,
+                dav_tls_mode,
+                ..
+            } => {
+                assert!(dav_enable);
+                assert_eq!(dav_port, 8088);
+                assert_eq!(dav_tls_mode, DavTlsModeArg::Starttls);
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
     fn parse_cli_subcommand() {
         let cli = Cli::try_parse_from(["openproton-bridge", "cli"]).unwrap();
         assert!(matches!(cli.command, Command::Cli));
@@ -4848,6 +5075,11 @@ mod tests {
             "2143".to_string(),
             "--smtp-port".to_string(),
             "2025".to_string(),
+            "--dav-enable".to_string(),
+            "--dav-port".to_string(),
+            "8088".to_string(),
+            "--dav-tls-mode".to_string(),
+            "starttls".to_string(),
             "--bind".to_string(),
             "0.0.0.0".to_string(),
             "--event-poll-secs".to_string(),
@@ -4866,6 +5098,12 @@ mod tests {
 
         assert_eq!(parsed.imap_port, Some(2143));
         assert_eq!(parsed.smtp_port, Some(2025));
+        assert_eq!(parsed.dav_enable, Some(true));
+        assert_eq!(parsed.dav_port, Some(8088));
+        assert_eq!(
+            parsed.dav_tls_mode,
+            Some(bridge::mail_runtime::DavTlsMode::StartTls)
+        );
         assert_eq!(parsed.bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(parsed.event_poll_secs, Some(12));
         assert_eq!(parsed.pim_reconcile_tick_secs, Some(600));

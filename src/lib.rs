@@ -2,6 +2,7 @@ pub mod api;
 pub mod bridge;
 pub mod client_config;
 pub mod crypto;
+pub mod dav;
 pub mod frontend;
 pub mod imap;
 pub mod observability;

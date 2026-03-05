@@ -42,6 +42,9 @@ impl BridgeService {
             bind_host: self.state.bind_host.clone(),
             imap_port,
             smtp_port,
+            dav_enable: false,
+            dav_port: 8080,
+            dav_tls_mode: bridge::mail_runtime::DavTlsMode::None,
             disable_tls: false,
             use_ssl_for_imap: settings.use_ssl_for_imap,
             use_ssl_for_smtp: settings.use_ssl_for_smtp,
@@ -107,6 +110,14 @@ impl BridgeService {
                     pb::MailServerSettingsErrorType::SmtpPortStartupError,
                 );
             }
+            Some(bridge::mail_runtime::MailProtocol::Dav) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "startup",
+                    error = %err,
+                    "Failed to start DAV server on bridge start"
+                );
+            }
             None => {
                 warn!(
                     pkg = "grpc/bridge",
@@ -145,6 +156,14 @@ impl BridgeService {
                     "failed to restart SMTP server after settings change"
                 );
                 self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
+            }
+            Some(bridge::mail_runtime::MailProtocol::Dav) => {
+                warn!(
+                    pkg = "grpc/bridge",
+                    transition = "settings_change",
+                    error = %err,
+                    "failed to restart DAV server after settings change"
+                );
             }
             None => {
                 warn!(
@@ -338,6 +357,9 @@ impl BridgeService {
                     }
                     Some(bridge::mail_runtime::MailProtocol::Smtp) => {
                         Err(Status::failed_precondition("SMTP port is not available"))
+                    }
+                    Some(bridge::mail_runtime::MailProtocol::Dav) => {
+                        Err(Status::failed_precondition("DAV port is not available"))
                     }
                     None => Err(Status::internal(format!(
                         "failed to apply mail runtime settings: {err}"

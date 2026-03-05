@@ -72,6 +72,43 @@ fn handle_stream_recv_error(
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Session, Status> {
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return vault::load_session(settings_dir).map_err(|err| match err {
+            vault::VaultError::NotLoggedIn => Status::failed_precondition(
+                "no active account found; pass account_selector or login first",
+            ),
+            other => status_from_vault_error(other),
+        });
+    }
+
+    let sessions = vault::list_sessions(settings_dir).map_err(status_from_vault_error)?;
+    if sessions.is_empty() {
+        return Err(Status::failed_precondition("no accounts are configured"));
+    }
+
+    if let Ok(index) = selector.parse::<usize>() {
+        if let Some(session) = sessions.get(index) {
+            return Ok(session.clone());
+        }
+        return Err(Status::invalid_argument(format!(
+            "account index {index} is out of range (max {})",
+            sessions.len().saturating_sub(1)
+        )));
+    }
+
+    sessions
+        .into_iter()
+        .find(|session| {
+            session.uid == selector
+                || session.email.eq_ignore_ascii_case(selector)
+                || session.display_name.eq_ignore_ascii_case(selector)
+        })
+        .ok_or_else(|| Status::not_found(format!("unknown account selector: {selector}")))
+}
+
 impl BridgeService {
     async fn stage_two_password_login(&self, pending: PendingLogin) {
         let username = pending.username.clone();
@@ -1055,6 +1092,66 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn remove_user(&self, request: Request<String>) -> Result<Response<()>, Status> {
         self.logout_user(request).await
+    }
+
+    async fn render_mutt_config(
+        &self,
+        request: Request<pb::RenderMuttConfigRequest>,
+    ) -> Result<Response<pb::RenderMuttConfigResponse>, Status> {
+        let req = request.into_inner();
+        let session = resolve_mutt_config_session(self.settings_dir(), &req.account_selector)?;
+        let settings = self.state.mail_settings.lock().await.clone();
+
+        let account_address = if req.address_override.trim().is_empty() {
+            session.email.clone()
+        } else {
+            req.address_override.trim().to_string()
+        };
+
+        let bridge_password = session
+            .bridge_password
+            .clone()
+            .filter(|value| !value.trim().is_empty());
+        if req.include_password && bridge_password.is_none() {
+            return Err(Status::failed_precondition(format!(
+                "bridge password is missing for {}; re-login to regenerate it or omit include_password",
+                session.email
+            )));
+        }
+
+        let imap_port = u16::try_from(settings.imap_port)
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "invalid IMAP port in mail settings: {}",
+                    settings.imap_port
+                ))
+            })?;
+        let smtp_port = u16::try_from(settings.smtp_port)
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "invalid SMTP port in mail settings: {}",
+                    settings.smtp_port
+                ))
+            })?;
+
+        let rendered_config = client_config::render_mutt_config(
+            &client_config::MuttConfigTemplate {
+                account_address,
+                display_name: session.display_name,
+                hostname: "127.0.0.1".to_string(),
+                imap_port,
+                smtp_port,
+                use_ssl_for_imap: settings.use_ssl_for_imap,
+                use_ssl_for_smtp: settings.use_ssl_for_smtp,
+                bridge_password,
+            },
+            req.include_password,
+        );
+        Ok(Response::new(pb::RenderMuttConfigResponse { rendered_config }))
     }
 
     async fn configure_user_apple_mail(

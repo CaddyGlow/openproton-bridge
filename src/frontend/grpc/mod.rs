@@ -28,6 +28,7 @@ use crate::api::client::ProtonClient;
 use crate::api::error::{any_human_verification_details, human_verification_details, ApiError};
 use crate::api::types::{HumanVerificationDetails, Session};
 use crate::bridge;
+use crate::client_config;
 use crate::paths::RuntimePaths;
 use crate::vault;
 
@@ -62,6 +63,7 @@ fn next_interrupt_action(shutdown_requested: bool) -> InterruptAction {
 pub mod pb {
     tonic::include_proto!("grpc");
 }
+pub mod client;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GrpcServerConfig {
@@ -1937,6 +1939,94 @@ mod tests {
             }
             other => panic!("unexpected apple mail event payload: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn render_mutt_config_returns_stdout_equivalent_rendered_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-mutt-render-1".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "mutt-render@proton.me".to_string(),
+            display_name: "Mutt Render".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: Some("bridge-pass".to_string()),
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        {
+            let mut settings = service.state.mail_settings.lock().await;
+            settings.imap_port = 1143;
+            settings.smtp_port = 1025;
+            settings.use_ssl_for_imap = false;
+            settings.use_ssl_for_smtp = false;
+        }
+
+        let response = <BridgeService as pb::bridge_server::Bridge>::render_mutt_config(
+            &service,
+            Request::new(pb::RenderMuttConfigRequest {
+                account_selector: String::new(),
+                address_override: String::new(),
+                include_password: false,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let expected = client_config::render_mutt_config(
+            &client_config::MuttConfigTemplate {
+                account_address: session.email.clone(),
+                display_name: session.display_name.clone(),
+                hostname: "127.0.0.1".to_string(),
+                imap_port: 1143,
+                smtp_port: 1025,
+                use_ssl_for_imap: false,
+                use_ssl_for_smtp: false,
+                bridge_password: session.bridge_password.clone(),
+            },
+            false,
+        );
+        assert_eq!(response.rendered_config, expected);
+        assert!(response
+            .rendered_config
+            .contains("# set imap_pass = \"<bridge-password>\""));
+    }
+
+    #[tokio::test]
+    async fn render_mutt_config_rejects_include_password_when_bridge_password_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let service = build_test_service(dir.path().to_path_buf());
+        let session = Session {
+            uid: "uid-mutt-render-2".to_string(),
+            access_token: "access".to_string(),
+            refresh_token: "refresh".to_string(),
+            email: "mutt-missing@proton.me".to_string(),
+            display_name: "Mutt Missing".to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            key_passphrase: None,
+            bridge_password: None,
+        };
+        vault::save_session(&session, service.settings_dir()).unwrap();
+
+        let result = <BridgeService as pb::bridge_server::Bridge>::render_mutt_config(
+            &service,
+            Request::new(pb::RenderMuttConfigRequest {
+                account_selector: session.uid.clone(),
+                address_override: String::new(),
+                include_password: true,
+            }),
+        )
+        .await;
+
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status
+            .message()
+            .contains("bridge password is missing for mutt-missing@proton.me"));
     }
 
     #[tokio::test]

@@ -99,6 +99,7 @@ service Bridge {
   rpc LogoutUser(google.protobuf.StringValue) returns (google.protobuf.Empty);
   rpc RemoveUser(google.protobuf.StringValue) returns (google.protobuf.Empty);
   rpc ConfigureUserAppleMail(ConfigureAppleMailRequest) returns (google.protobuf.Empty);
+  rpc RenderMuttConfig(RenderMuttConfigRequest) returns (RenderMuttConfigResponse);
 
   // TLS certificate related calls
   rpc IsTLSCertificateInstalled(google.protobuf.Empty) returns (google.protobuf.BoolValue);
@@ -243,6 +244,16 @@ message UserListResponse {
 message ConfigureAppleMailRequest {
   string userID = 1;
   string address = 2;
+}
+
+message RenderMuttConfigRequest {
+  string accountSelector = 1;
+  string addressOverride = 2;
+  bool includePassword = 3;
+}
+
+message RenderMuttConfigResponse {
+  string renderedConfig = 1;
 }
 
 //**********************************************************************************************************************

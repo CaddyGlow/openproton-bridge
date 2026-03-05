@@ -60,6 +60,10 @@ struct Cli {
     #[arg(long, global = true)]
     credential_store_file_path: Option<std::path::PathBuf>,
 
+    /// Command execution mode: direct (local) or grpc (frontend service)
+    #[arg(long, global = true, value_enum)]
+    mode: Option<ExecutionModeArg>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -184,11 +188,32 @@ enum ApiModeArg {
     Webmail,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionModeArg {
+    Direct,
+    Grpc,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExecutionMode {
+    Direct,
+    Grpc,
+}
+
 impl From<ApiModeArg> for api::types::ApiMode {
     fn from(value: ApiModeArg) -> Self {
         match value {
             ApiModeArg::Bridge => api::types::ApiMode::Bridge,
             ApiModeArg::Webmail => api::types::ApiMode::Webmail,
+        }
+    }
+}
+
+impl From<ExecutionModeArg> for ExecutionMode {
+    fn from(value: ExecutionModeArg) -> Self {
+        match value {
+            ExecutionModeArg::Direct => ExecutionMode::Direct,
+            ExecutionModeArg::Grpc => ExecutionMode::Grpc,
         }
     }
 }
@@ -212,6 +237,7 @@ const ENV_OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE: &str =
     "OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE";
 const ENV_OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY: &str = "OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY";
 const ENV_OPENPROTON_CREDENTIAL_STORE_FILE_PATH: &str = "OPENPROTON_CREDENTIAL_STORE_FILE_PATH";
+const ENV_OPENPROTON_EXEC_MODE: &str = "OPENPROTON_EXEC_MODE";
 static PANIC_HOOK_INSTALLED: Once = Once::new();
 
 #[tokio::main]
@@ -245,6 +271,8 @@ async fn main() -> anyhow::Result<()> {
     };
     install_crash_capture_hook(runtime_paths.clone());
     let dir = runtime_paths.settings_dir().to_path_buf();
+    let env_execution_mode = env_non_empty(ENV_OPENPROTON_EXEC_MODE);
+    let execution_mode = resolve_execution_mode(cli.mode, env_execution_mode.as_deref())?;
     let _instance_lock = match &cli.command {
         Command::Serve { .. } | Command::Grpc { .. } | Command::Cli => {
             let lock = single_instance::acquire_bridge_instance_lock(&runtime_paths)?;
@@ -254,17 +282,18 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
-    execute_command(cli.command, &dir, &runtime_paths).await
+    execute_command(cli.command, execution_mode, &dir, &runtime_paths).await
 }
 
 async fn execute_command(
     command: Command,
+    mode: ExecutionMode,
     dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
     match command {
-        Command::Cli => cmd_cli(dir, runtime_paths).await,
-        other => execute_non_interactive_command(other, dir, runtime_paths).await,
+        Command::Cli => cmd_cli(dir, runtime_paths, mode).await,
+        other => execute_non_interactive_command(other, mode, dir, runtime_paths).await,
     }
 }
 
@@ -284,7 +313,28 @@ fn command_name(command: &Command) -> &'static str {
     }
 }
 
+fn execution_mode_name(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Direct => "direct",
+        ExecutionMode::Grpc => "grpc",
+    }
+}
+
 async fn execute_non_interactive_command(
+    command: Command,
+    mode: ExecutionMode,
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<()> {
+    match mode {
+        ExecutionMode::Direct => {
+            execute_non_interactive_command_direct(command, dir, runtime_paths).await
+        }
+        ExecutionMode::Grpc => execute_non_interactive_command_grpc(command, runtime_paths).await,
+    }
+}
+
+async fn execute_non_interactive_command_direct(
     command: Command,
     dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
@@ -355,10 +405,75 @@ async fn execute_non_interactive_command(
     }
 }
 
+async fn execute_non_interactive_command_grpc(
+    command: Command,
+    runtime_paths: &paths::RuntimePaths,
+) -> anyhow::Result<()> {
+    let mut client = frontend::grpc::client::CliGrpcClient::connect(runtime_paths)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to initialize grpc execution mode from {}; ensure the gRPC frontend service is running (for example `openproton-bridge grpc` or interactive `grpc`)",
+                runtime_paths.grpc_server_config_path().display()
+            )
+        })?;
+    match command {
+        Command::Status => cmd_status_grpc(&mut client).await,
+        Command::Logout { email, all } => cmd_logout_grpc(&mut client, email.as_deref(), all).await,
+        Command::Accounts { command } => match command {
+            AccountsCommand::List => cmd_accounts_list_grpc(&mut client).await,
+            AccountsCommand::Use { .. } => anyhow::bail!(
+                "command `accounts use` is unsupported in grpc mode; use `--mode direct`"
+            ),
+        },
+        Command::MuttConfig {
+            account,
+            address,
+            output,
+            include_password,
+        } => {
+            cmd_mutt_config_grpc(
+                &mut client,
+                account.as_deref(),
+                address.as_deref(),
+                output.as_deref(),
+                include_password,
+            )
+            .await
+        }
+        Command::Cli => anyhow::bail!("cannot execute nested cli command"),
+        other => {
+            let name = command_name(&other);
+            anyhow::bail!("command `{name}` is unsupported in grpc mode; use `--mode direct`")
+        }
+    }
+}
+
 fn resolve_vault_dir(cli: &Cli) -> Option<std::path::PathBuf> {
     cli.vault_dir
         .clone()
         .or_else(|| env_non_empty(ENV_OPENPROTON_VAULT_DIR).map(std::path::PathBuf::from))
+}
+
+fn parse_execution_mode(raw: &str) -> anyhow::Result<ExecutionMode> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "direct" => Ok(ExecutionMode::Direct),
+        "grpc" => Ok(ExecutionMode::Grpc),
+        other => anyhow::bail!("invalid execution mode `{other}`; expected direct or grpc"),
+    }
+}
+
+fn resolve_execution_mode(
+    cli_mode: Option<ExecutionModeArg>,
+    env_mode: Option<&str>,
+) -> anyhow::Result<ExecutionMode> {
+    if let Some(mode) = cli_mode {
+        return Ok(mode.into());
+    }
+    if let Some(raw) = env_mode {
+        return parse_execution_mode(raw);
+    }
+    Ok(ExecutionMode::Direct)
 }
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -555,11 +670,17 @@ impl InteractiveServeConfig {
     }
 }
 
-async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> anyhow::Result<()> {
+async fn cmd_cli(
+    dir: &std::path::Path,
+    runtime_paths: &paths::RuntimePaths,
+    startup_mode: ExecutionMode,
+) -> anyhow::Result<()> {
     println!("Welcome to openproton-bridge interactive shell.");
+    println!("Execution mode: {}", execution_mode_name(startup_mode));
     println!("Type `help` for commands, `quit` to exit.\n");
 
     let mut serve_config = load_interactive_serve_config(runtime_paths).await;
+    let mut shell_mode = startup_mode;
     let mut runtime_state: Option<InteractiveServeRuntime> = None;
     let mut grpc_state: Option<InteractiveGrpcRuntime> = None;
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -623,6 +744,24 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     "quit" | "exit" => break,
                     "help" | "?" => {
                         print_interactive_help();
+                    }
+                    "mode" => {
+                        match tokens.get(1).map(|value| value.to_ascii_lowercase()) {
+                            None => {
+                                println!("Execution mode: {}", execution_mode_name(shell_mode));
+                            }
+                            Some(value) if value == "direct" => {
+                                shell_mode = ExecutionMode::Direct;
+                                println!("Execution mode set to direct.");
+                            }
+                            Some(value) if value == "grpc" => {
+                                shell_mode = ExecutionMode::Grpc;
+                                println!("Execution mode set to grpc.");
+                            }
+                            _ => {
+                                eprintln!("Usage: mode [direct|grpc]");
+                            }
+                        }
                     }
                     "manual" | "man" => {
                         println!("https://github.com/rickyslash/openproton-bridge");
@@ -952,6 +1091,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                             Command::Accounts {
                                 command: AccountsCommand::List,
                             },
+                            shell_mode,
                             dir,
                             runtime_paths,
                         )
@@ -962,11 +1102,37 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                     }
                     "info" | "i" => {
                         if let Some(selector) = tokens.get(1) {
-                            if let Err(err) = cmd_account_info(selector, dir, runtime_paths).await {
+                            let result = match shell_mode {
+                                ExecutionMode::Direct => {
+                                    cmd_account_info(selector, dir, runtime_paths).await
+                                }
+                                ExecutionMode::Grpc => {
+                                    let mut client = match frontend::grpc::client::CliGrpcClient::connect(
+                                        runtime_paths,
+                                    )
+                                    .await
+                                    {
+                                        Ok(client) => client,
+                                        Err(err) => {
+                                            eprintln!("Error: {err:#}");
+                                            print_cli_prompt()?;
+                                            continue;
+                                        }
+                                    };
+                                    cmd_account_info_grpc(&mut client, selector).await
+                                }
+                            };
+                            if let Err(err) = result {
                                 eprintln!("Error: {err:#}");
                             }
                         } else if let Err(err) =
-                            execute_non_interactive_command(Command::Status, dir, runtime_paths).await
+                            execute_non_interactive_command(
+                                Command::Status,
+                                shell_mode,
+                                dir,
+                                runtime_paths,
+                            )
+                            .await
                         {
                             eprintln!("Error: {err:#}");
                         }
@@ -992,6 +1158,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                     email: target,
                                 },
                             },
+                            shell_mode,
                             dir,
                             runtime_paths,
                         )
@@ -1020,6 +1187,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                 email: Some(target),
                                 all: false,
                             },
+                            shell_mode,
                             dir,
                             runtime_paths,
                         )
@@ -1039,6 +1207,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                     email: None,
                                     all: true,
                                 },
+                                shell_mode,
                                 dir,
                                 runtime_paths,
                             )
@@ -1107,6 +1276,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                                 email: None,
                                                 all: true,
                                             },
+                                            shell_mode,
                                             dir,
                                             runtime_paths,
                                         )
@@ -1129,6 +1299,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                                 email: Some(selected),
                                                 all: false,
                                             },
+                                            shell_mode,
                                             dir,
                                             runtime_paths,
                                         )
@@ -1145,6 +1316,7 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                                                     email: Some(active.email),
                                                     all: false,
                                                 },
+                                                shell_mode,
                                                 dir,
                                                 runtime_paths,
                                             )
@@ -1487,7 +1659,8 @@ async fn cmd_cli(dir: &std::path::Path, runtime_paths: &paths::RuntimePaths) -> 
                         }
 
                         if let Err(err) =
-                            execute_non_interactive_command(parsed, dir, runtime_paths).await
+                            execute_non_interactive_command(parsed, shell_mode, dir, runtime_paths)
+                                .await
                         {
                             eprintln!("Error: {err:#}");
                         }
@@ -1594,6 +1767,7 @@ fn parse_repl_clap_command(tokens: &[String]) -> anyhow::Result<Command> {
         || parsed.credential_store_system_service.is_some()
         || parsed.credential_store_pass_entry.is_some()
         || parsed.credential_store_file_path.is_some()
+        || parsed.mode.is_some()
     {
         anyhow::bail!(
             "interactive mode does not accept global override flags; restart with the desired global flags"
@@ -1788,6 +1962,7 @@ fn print_interactive_help() {
     println!("Available commands:");
     println!("  help                             Show this help");
     println!("  quit | exit                      Exit interactive shell");
+    println!("  mode [direct|grpc]               Show or switch command execution mode");
     println!("  manual | man                     Print project manual URL");
     println!("  check-updates                    Alias for updates check");
     println!("  credits                          Print credits/dependency info");
@@ -1830,7 +2005,7 @@ fn print_interactive_help() {
     println!("  grpc [grpc flags]                Start gRPC frontend service (background)");
     println!("  grpc-stop                        Stop background gRPC runtime");
     println!(
-        "  note                             start `serve` first, then `grpc` to expose control API"
+        "  note                             serve/grpc/grpc-stop are always local runtime controls"
     );
     println!("  stop                             Stop all background runtimes");
     println!("  mutt-config [flags]              Generate mutt/neomutt config snippet");
@@ -3308,6 +3483,87 @@ async fn cmd_account_info(
     Ok(())
 }
 
+async fn cmd_account_info_grpc(
+    client: &mut frontend::grpc::client::CliGrpcClient,
+    selector: &str,
+) -> anyhow::Result<()> {
+    let users = client.get_user_list().await?;
+    let user = resolve_grpc_account_selector_user(&users, selector)?;
+    let mail_settings = client.mail_server_settings().await?;
+
+    let password = if user.password.is_empty() {
+        "<not set; re-login to generate>".to_string()
+    } else {
+        std::str::from_utf8(&user.password)
+            .map(str::to_string)
+            .unwrap_or_else(|_| "<non-utf8-password>".to_string())
+    };
+
+    println!("Account: {} ({})", user.display_name, user.username);
+    println!("API mode: unknown (grpc mode)");
+    println!(
+        "Address mode: {}",
+        if user.split_mode { "split" } else { "combined" }
+    );
+    println!();
+    println!(
+        "IMAP Settings\nAddress:   127.0.0.1\nIMAP port: {}\nUsername:  {}\nPassword:  {}\nSecurity:  {}",
+        mail_settings.imap_port,
+        user.username,
+        password,
+        if mail_settings.use_ssl_for_imap {
+            "SSL"
+        } else {
+            "STARTTLS"
+        }
+    );
+    println!();
+    println!(
+        "SMTP Settings\nAddress:   127.0.0.1\nSMTP port: {}\nUsername:  {}\nPassword:  {}\nSecurity:  {}",
+        mail_settings.smtp_port,
+        user.username,
+        password,
+        if mail_settings.use_ssl_for_smtp {
+            "SSL"
+        } else {
+            "STARTTLS"
+        }
+    );
+
+    Ok(())
+}
+
+fn resolve_grpc_account_selector_user(
+    users: &[frontend::grpc::pb::User],
+    selector: &str,
+) -> anyhow::Result<frontend::grpc::pb::User> {
+    if users.is_empty() {
+        anyhow::bail!("no accounts are configured");
+    }
+
+    let selector = selector.trim();
+    if selector.is_empty() {
+        anyhow::bail!("empty account selector");
+    }
+
+    if let Ok(index) = selector.parse::<usize>() {
+        return users
+            .get(index)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("account index {index} is out of range"));
+    }
+
+    users
+        .iter()
+        .find(|user| {
+            user.id == selector
+                || user.username.eq_ignore_ascii_case(selector)
+                || user.display_name.eq_ignore_ascii_case(selector)
+        })
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("unknown account selector: {selector}"))
+}
+
 async fn cmd_mutt_config(
     account_selector: Option<&str>,
     address_override: Option<&str>,
@@ -3373,6 +3629,140 @@ async fn cmd_mutt_config(
         },
         include_password,
     );
+
+    if let Some(path) = output {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create {}", parent.display()))?;
+            }
+        }
+        std::fs::write(path, rendered.as_bytes())
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        }
+        println!("Wrote mutt config to {}", path.display());
+    } else {
+        print!("{rendered}");
+    }
+
+    Ok(())
+}
+
+async fn cmd_status_grpc(client: &mut frontend::grpc::client::CliGrpcClient) -> anyhow::Result<()> {
+    let mut users = client.get_user_list().await?;
+    users.sort_by_cached_key(|user| user.username.to_ascii_lowercase());
+    if users.is_empty() {
+        println!("Not logged in");
+        return Ok(());
+    }
+
+    println!("Accounts:");
+    for user in &users {
+        let display_name = if user.display_name.trim().is_empty() {
+            user.username.as_str()
+        } else {
+            user.display_name.as_str()
+        };
+        println!("  {} ({}) [grpc]", display_name, user.username);
+    }
+    println!();
+
+    let active = &users[0];
+    println!("Active account: {}", active.username);
+    println!("API mode: unknown (grpc mode)");
+    println!("Key passphrase: unavailable in grpc mode");
+    if active.password.is_empty() {
+        println!("Bridge password: not set");
+    } else if let Ok(password) = std::str::from_utf8(&active.password) {
+        println!("Bridge password: {password}");
+    } else {
+        println!("Bridge password: <non-utf8>");
+    }
+    Ok(())
+}
+
+async fn cmd_accounts_list_grpc(
+    client: &mut frontend::grpc::client::CliGrpcClient,
+) -> anyhow::Result<()> {
+    let mut users = client.get_user_list().await?;
+    users.sort_by_cached_key(|user| user.username.to_ascii_lowercase());
+    if users.is_empty() {
+        println!("Not logged in");
+        return Ok(());
+    }
+
+    println!(
+        "{:<3} {:<30} {:<12} {:<12} {:<8}",
+        "#", "account", "status", "address mode", "api mode"
+    );
+    for (idx, user) in users.iter().enumerate() {
+        println!(
+            "{:<3} {:<30} {:<12} {:<12} {:<8}",
+            idx,
+            user.username,
+            grpc_user_state_label(user.state),
+            if user.split_mode { "split" } else { "combined" },
+            "unknown"
+        );
+    }
+    println!();
+    Ok(())
+}
+
+async fn cmd_logout_grpc(
+    client: &mut frontend::grpc::client::CliGrpcClient,
+    email: Option<&str>,
+    all: bool,
+) -> anyhow::Result<()> {
+    let users = client.get_user_list().await?;
+    if users.is_empty() {
+        println!("Not logged in");
+        return Ok(());
+    }
+
+    let should_logout_all = all || email.is_none();
+    if should_logout_all {
+        for user in users {
+            client.logout_user(user.id.as_str()).await?;
+        }
+        println!("Logged out all accounts");
+        return Ok(());
+    }
+
+    let target_email = email.unwrap_or_default();
+    let target_user = users
+        .into_iter()
+        .find(|user| user.username.eq_ignore_ascii_case(target_email))
+        .ok_or_else(|| anyhow::anyhow!("account `{target_email}` not found"))?;
+    client.logout_user(target_user.id.as_str()).await?;
+    println!("Removed account: {}", target_user.username);
+    Ok(())
+}
+
+fn grpc_user_state_label(state: i32) -> &'static str {
+    match frontend::grpc::pb::UserState::try_from(state) {
+        Ok(frontend::grpc::pb::UserState::Connected) => "connected",
+        Ok(frontend::grpc::pb::UserState::Locked) => "locked",
+        Ok(frontend::grpc::pb::UserState::SignedOut) => "signed-out",
+        Err(_) => "unknown",
+    }
+}
+
+async fn cmd_mutt_config_grpc(
+    client: &mut frontend::grpc::client::CliGrpcClient,
+    account_selector: Option<&str>,
+    address_override: Option<&str>,
+    output: Option<&std::path::Path>,
+    include_password: bool,
+) -> anyhow::Result<()> {
+    let rendered = client
+        .render_mutt_config(account_selector, address_override, include_password)
+        .await?;
 
     if let Some(path) = output {
         if let Some(parent) = path.parent() {
@@ -4072,6 +4462,39 @@ mod tests {
     fn parse_cli_subcommand() {
         let cli = Cli::try_parse_from(["openproton-bridge", "cli"]).unwrap();
         assert!(matches!(cli.command, Command::Cli));
+    }
+
+    #[test]
+    fn parse_global_mode_flag() {
+        let cli = Cli::try_parse_from(["openproton-bridge", "--mode", "grpc", "status"]).unwrap();
+        assert_eq!(cli.mode, Some(ExecutionModeArg::Grpc));
+        assert!(matches!(cli.command, Command::Status));
+    }
+
+    #[test]
+    fn parse_execution_mode_accepts_expected_values() {
+        assert_eq!(
+            parse_execution_mode("direct").unwrap(),
+            ExecutionMode::Direct
+        );
+        assert_eq!(parse_execution_mode("grpc").unwrap(), ExecutionMode::Grpc);
+        assert!(parse_execution_mode("invalid").is_err());
+    }
+
+    #[test]
+    fn resolve_execution_mode_prioritizes_cli_over_env() {
+        assert_eq!(
+            resolve_execution_mode(Some(ExecutionModeArg::Direct), Some("grpc")).unwrap(),
+            ExecutionMode::Direct
+        );
+        assert_eq!(
+            resolve_execution_mode(None, Some("grpc")).unwrap(),
+            ExecutionMode::Grpc
+        );
+        assert_eq!(
+            resolve_execution_mode(None, None).unwrap(),
+            ExecutionMode::Direct
+        );
     }
 
     #[test]

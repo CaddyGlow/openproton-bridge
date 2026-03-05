@@ -10,7 +10,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,6 +33,12 @@ use uuid::Uuid;
 
 type BridgeClient = pb::bridge_client::BridgeClient<InterceptedService<Channel, TokenInterceptor>>;
 const CONFIG_CREATION_WAIT_TIMEOUT: Duration = Duration::from_secs(6);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConfigFileFingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
 
 #[derive(Debug, Clone)]
 struct TokenInterceptor {
@@ -225,61 +231,51 @@ impl GrpcAdapter {
 
         let explicit_path = state.snapshot().await.config_path;
         let explicit_path_ref = explicit_path.as_deref().map(Path::new);
-        let candidate_paths = match resolve_server_config_paths(explicit_path_ref) {
+        let watch_candidates = resolve_server_config_candidates(explicit_path_ref);
+        let mut candidate_paths = match resolve_server_config_paths(explicit_path_ref) {
             Ok(paths) => paths,
             Err(initial_error) => {
-                let candidate_paths = resolve_server_config_candidates(explicit_path_ref);
-                let created_path =
-                    wait_for_any_config_creation(&candidate_paths, CONFIG_CREATION_WAIT_TIMEOUT)
+                let changed_path =
+                    wait_for_any_config_change(&watch_candidates, CONFIG_CREATION_WAIT_TIMEOUT)
                         .await?;
-                if let Some(path) = created_path.as_ref() {
+                if let Some(path) = changed_path.as_ref() {
                     info!(
                         config_path = %path.display(),
                         timeout_secs = CONFIG_CREATION_WAIT_TIMEOUT.as_secs(),
-                        "detected grpc server config creation event"
+                        "detected grpc server config creation/change event"
                     );
                 }
 
                 resolve_server_config_paths(explicit_path_ref).map_err(|resolve_error| {
-                    if created_path.is_some() {
+                    if changed_path.is_some() {
                         format!("{initial_error}; {resolve_error}")
                     } else {
                         format!(
-                            "{initial_error}; timed out waiting for grpc config creation; {resolve_error}"
+                            "{initial_error}; timed out waiting for grpc config creation/change; {resolve_error}"
                         )
                     }
                 })?
             }
         };
-        let mut attempt_errors = Vec::new();
-        let mut selected: Option<(std::path::PathBuf, GrpcServerConfig, BridgeClient)> = None;
+        let (mut selected, mut attempt_errors) = select_working_config(&candidate_paths).await;
 
-        for config_path in candidate_paths {
-            info!(config_path = %config_path.display(), "starting grpc bridge connection");
-            let server_config = match GrpcServerConfig::from_json_file(&config_path) {
-                Ok(server_config) => server_config,
-                Err(err) => {
-                    attempt_errors.push(err);
-                    continue;
-                }
-            };
-            let mut client = match connect_client(&server_config).await {
-                Ok(client) => client,
-                Err(err) => {
-                    attempt_errors.push(format!("{}: {err}", config_path.display()));
-                    continue;
-                }
-            };
-            if let Err(err) = check_tokens(&mut client).await {
-                attempt_errors.push(format!(
-                    "{}: token validation failed: {err}",
-                    config_path.display()
-                ));
-                continue;
+        if selected.is_none() {
+            let changed_path =
+                wait_for_any_config_change(&watch_candidates, CONFIG_CREATION_WAIT_TIMEOUT).await?;
+            if let Some(path) = changed_path.as_ref() {
+                info!(
+                    config_path = %path.display(),
+                    timeout_secs = CONFIG_CREATION_WAIT_TIMEOUT.as_secs(),
+                    "detected grpc config update after failed connection; retrying"
+                );
+                candidate_paths =
+                    resolve_server_config_paths(explicit_path_ref).map_err(|err| {
+                        format!("failed to re-resolve grpc config paths after update: {err}")
+                    })?;
+                let (retry_selected, retry_errors) = select_working_config(&candidate_paths).await;
+                selected = retry_selected;
+                attempt_errors.extend(retry_errors);
             }
-
-            selected = Some((config_path, server_config, client));
-            break;
         }
 
         let (config_path, server_config, mut client) = selected.ok_or_else(|| {
@@ -888,30 +884,69 @@ impl GrpcAdapter {
     }
 }
 
-async fn wait_for_any_config_creation(
+async fn select_working_config(
+    candidate_paths: &[PathBuf],
+) -> (
+    Option<(std::path::PathBuf, GrpcServerConfig, BridgeClient)>,
+    Vec<String>,
+) {
+    let mut attempt_errors = Vec::new();
+
+    for config_path in candidate_paths {
+        info!(config_path = %config_path.display(), "starting grpc bridge connection");
+        let server_config = match GrpcServerConfig::from_json_file(config_path) {
+            Ok(server_config) => server_config,
+            Err(err) => {
+                attempt_errors.push(err);
+                continue;
+            }
+        };
+        let mut client = match connect_client(&server_config).await {
+            Ok(client) => client,
+            Err(err) => {
+                attempt_errors.push(format!("{}: {err}", config_path.display()));
+                continue;
+            }
+        };
+        if let Err(err) = check_tokens(&mut client).await {
+            attempt_errors.push(format!(
+                "{}: token validation failed: {err}",
+                config_path.display()
+            ));
+            continue;
+        }
+
+        return (
+            Some((config_path.clone(), server_config, client)),
+            attempt_errors,
+        );
+    }
+
+    (None, attempt_errors)
+}
+
+async fn wait_for_any_config_change(
     candidate_paths: &[PathBuf],
     timeout: Duration,
 ) -> Result<Option<PathBuf>, String> {
     let candidate_paths = candidate_paths.to_vec();
     tokio::task::spawn_blocking(move || {
-        wait_for_any_config_creation_blocking(candidate_paths, timeout)
+        wait_for_any_config_change_blocking(candidate_paths, timeout)
     })
     .await
     .map_err(|err| format!("failed to join config watcher task: {err}"))?
 }
 
-fn wait_for_any_config_creation_blocking(
+fn wait_for_any_config_change_blocking(
     candidate_paths: Vec<PathBuf>,
     timeout: Duration,
 ) -> Result<Option<PathBuf>, String> {
-    let missing_paths: Vec<PathBuf> = candidate_paths
-        .into_iter()
-        .filter(|path| !path.exists())
-        .collect();
-
-    if missing_paths.is_empty() {
+    let candidates: Vec<PathBuf> = candidate_paths;
+    if candidates.is_empty() {
         return Ok(None);
     }
+
+    let baseline = capture_config_fingerprints(&candidates);
 
     let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
     let mut watcher = notify::recommended_watcher(move |event| {
@@ -920,7 +955,7 @@ fn wait_for_any_config_creation_blocking(
     .map_err(|err| format!("failed to initialize grpc config watcher: {err}"))?;
 
     let mut watched_dirs = HashSet::new();
-    for path in &missing_paths {
+    for path in &candidates {
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -933,8 +968,8 @@ fn wait_for_any_config_creation_blocking(
         }
     }
 
-    if let Some(existing) = missing_paths.iter().find(|path| path.exists()) {
-        return Ok(Some(existing.clone()));
+    if let Some(changed) = detect_changed_config_path(&baseline) {
+        return Ok(Some(changed));
     }
 
     let deadline = Instant::now()
@@ -949,8 +984,8 @@ fn wait_for_any_config_creation_blocking(
 
         match rx.recv_timeout(remaining) {
             Ok(Ok(_)) => {
-                if let Some(existing) = missing_paths.iter().find(|path| path.exists()) {
-                    return Ok(Some(existing.clone()));
+                if let Some(changed) = detect_changed_config_path(&baseline) {
+                    return Ok(Some(changed));
                 }
             }
             Ok(Err(err)) => {
@@ -962,6 +997,42 @@ fn wait_for_any_config_creation_blocking(
             }
         }
     }
+}
+
+fn capture_config_fingerprints(
+    candidate_paths: &[PathBuf],
+) -> HashMap<PathBuf, Option<ConfigFileFingerprint>> {
+    candidate_paths
+        .iter()
+        .cloned()
+        .map(|path| {
+            let fingerprint = read_config_fingerprint(&path);
+            (path, fingerprint)
+        })
+        .collect()
+}
+
+fn detect_changed_config_path(
+    baseline: &HashMap<PathBuf, Option<ConfigFileFingerprint>>,
+) -> Option<PathBuf> {
+    for (path, old_fingerprint) in baseline {
+        let current = read_config_fingerprint(path);
+        if current.is_some() && current != *old_fingerprint {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
+fn read_config_fingerprint(path: &Path) -> Option<ConfigFileFingerprint> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(ConfigFileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
 }
 
 async fn connect_client(config: &GrpcServerConfig) -> Result<BridgeClient, String> {
@@ -1615,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_any_config_creation_blocking_detects_created_file() {
+    fn wait_for_any_config_change_blocking_detects_created_file() {
         let temp_dir = std::env::temp_dir().join(format!(
             "bridge-ui-adapter-config-watch-{}",
             uuid::Uuid::new_v4()
@@ -1629,11 +1700,9 @@ mod tests {
             std::fs::write(&delayed_path, "{}").expect("write grpc config fixture");
         });
 
-        let detected = wait_for_any_config_creation_blocking(
-            vec![config_path.clone()],
-            Duration::from_secs(2),
-        )
-        .expect("watcher should not fail");
+        let detected =
+            wait_for_any_config_change_blocking(vec![config_path.clone()], Duration::from_secs(2))
+                .expect("watcher should not fail");
         writer.join().expect("writer thread");
 
         assert_eq!(detected, Some(config_path.clone()));
@@ -1642,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_any_config_creation_blocking_times_out_when_missing() {
+    fn wait_for_any_config_change_blocking_times_out_when_unchanged() {
         let temp_dir = std::env::temp_dir().join(format!(
             "bridge-ui-adapter-config-watch-timeout-{}",
             uuid::Uuid::new_v4()
@@ -1650,11 +1719,42 @@ mod tests {
         std::fs::create_dir_all(&temp_dir).expect("create temp directory");
         let missing_path = temp_dir.join("grpcServerConfig.json");
 
-        let detected =
-            wait_for_any_config_creation_blocking(vec![missing_path], Duration::from_millis(250))
-                .expect("watcher should not fail");
+        std::fs::write(&missing_path, "{}").expect("write initial config fixture");
+
+        let detected = wait_for_any_config_change_blocking(
+            vec![missing_path.clone()],
+            Duration::from_millis(250),
+        )
+        .expect("watcher should not fail");
 
         assert_eq!(detected, None);
+        let _ = std::fs::remove_file(&missing_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn wait_for_any_config_change_blocking_detects_modified_file() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "bridge-ui-adapter-config-watch-modify-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temp directory");
+        let config_path = temp_dir.join("grpcServerConfig.json");
+        std::fs::write(&config_path, "{\"port\":1}").expect("write initial config fixture");
+
+        let delayed_path = config_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            std::fs::write(&delayed_path, "{\"port\":2}").expect("rewrite grpc config fixture");
+        });
+
+        let detected =
+            wait_for_any_config_change_blocking(vec![config_path.clone()], Duration::from_secs(2))
+                .expect("watcher should not fail");
+        writer.join().expect("writer thread");
+
+        assert_eq!(detected, Some(config_path.clone()));
+        let _ = std::fs::remove_file(&config_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -1,6 +1,9 @@
 pub mod auth;
+pub mod caldav;
+pub mod carddav;
 pub mod discovery;
 pub mod error;
+pub mod etag;
 pub mod http;
 pub mod propfind;
 pub mod server;

@@ -1,4 +1,6 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
+
+use crate::api::{calendar, contacts};
 
 use super::store::PimStore;
 use super::types::{StoredCalendar, StoredCalendarEvent, StoredContact};
@@ -69,6 +71,30 @@ impl PimStore {
             return Ok(Some(map_contact_row(row)?));
         }
         Ok(None)
+    }
+
+    pub fn get_contact_payload(
+        &self,
+        contact_id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<contacts::Contact>> {
+        if contact_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = open_read_connection(self)?;
+        let raw_json = conn
+            .query_row(
+                "SELECT raw_json
+                 FROM pim_contacts
+                 WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
+                rusqlite::params![contact_id, bool_to_sql(include_deleted)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match raw_json {
+            Some(raw) => Ok(Some(serde_json::from_str::<contacts::Contact>(&raw)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn search_contacts_by_email(
@@ -195,6 +221,30 @@ impl PimStore {
             return Ok(Some(map_calendar_event_row(row)?));
         }
         Ok(None)
+    }
+
+    pub fn get_calendar_event_payload(
+        &self,
+        event_id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<calendar::CalendarEvent>> {
+        if event_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = open_read_connection(self)?;
+        let raw_json = conn
+            .query_row(
+                "SELECT raw_json
+                 FROM pim_calendar_events
+                 WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
+                rusqlite::params![event_id, bool_to_sql(include_deleted)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match raw_json {
+            Some(raw) => Ok(Some(serde_json::from_str::<calendar::CalendarEvent>(&raw)?)),
+            None => Ok(None),
+        }
     }
 }
 

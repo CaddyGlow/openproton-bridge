@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -7,8 +8,11 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::bridge::auth_router::AuthRouter;
+use crate::pim::store::PimStore;
 
 use super::auth::{resolve_basic_auth, DavAuthError};
+use super::caldav;
+use super::carddav;
 use super::discovery;
 use super::error::{DavError, Result};
 use super::http::{
@@ -16,15 +20,17 @@ use super::http::{
 };
 use super::propfind;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DavServerConfig {
     pub auth_router: AuthRouter,
+    pub pim_stores: HashMap<String, Arc<PimStore>>,
 }
 
 impl Default for DavServerConfig {
     fn default() -> Self {
         Self {
             auth_router: AuthRouter::default(),
+            pim_stores: HashMap::new(),
         }
     }
 }
@@ -145,7 +151,16 @@ pub async fn handle_connection(mut stream: TcpStream, config: Arc<DavServerConfi
         match split_head_from_buffer(&received) {
             Ok(head_end) => {
                 let request = parse_request_head(&received[..head_end])?;
-                let response = route_request(&request, &config)?;
+                let content_length = request
+                    .headers
+                    .get("content-length")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                if received.len() < head_end + content_length {
+                    continue;
+                }
+                let body = &received[head_end..head_end + content_length];
+                let response = route_request(&request, body, &config)?;
                 let wire = response.to_bytes();
                 stream.write_all(&wire).await?;
                 stream.flush().await?;
@@ -164,7 +179,11 @@ pub async fn handle_connection(mut stream: TcpStream, config: Arc<DavServerConfi
     }
 }
 
-fn route_request(request: &DavRequest, config: &DavServerConfig) -> Result<DavResponse> {
+fn route_request(
+    request: &DavRequest,
+    body: &[u8],
+    config: &DavServerConfig,
+) -> Result<DavResponse> {
     let method = request.method.to_ascii_uppercase();
     let path_without_query = request
         .path
@@ -178,39 +197,46 @@ fn route_request(request: &DavRequest, config: &DavServerConfig) -> Result<DavRe
 
     match method.as_str() {
         "OPTIONS" => Ok(options_response()),
-        "PROPFIND" => {
+        "PROPFIND" | "GET" | "HEAD" | "PUT" | "DELETE" => {
+            if !path_without_query.starts_with("/dav") {
+                return Ok(not_found_response());
+            }
             let auth = match resolve_basic_auth(&request.headers, &config.auth_router) {
                 Ok(auth) => auth,
                 Err(DavAuthError::MissingAuthorization)
                 | Err(DavAuthError::InvalidAuthorization)
                 | Err(DavAuthError::InvalidCredentials) => return Ok(unauthorized_response()),
             };
-            propfind::handle_propfind(&request.path, &request.headers, &auth)
-        }
-        "GET" | "HEAD" => {
-            if request.path.starts_with("/dav") {
-                let auth = match resolve_basic_auth(&request.headers, &config.auth_router) {
-                    Ok(auth) => auth,
-                    Err(DavAuthError::MissingAuthorization)
-                    | Err(DavAuthError::InvalidAuthorization)
-                    | Err(DavAuthError::InvalidCredentials) => return Ok(unauthorized_response()),
-                };
-                let body = format!(
-                    "OpenProton DAV endpoint for account {}\n",
-                    auth.primary_email
-                );
-                let mut response = DavResponse {
-                    status: "200 OK",
-                    headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
-                    body: body.into_bytes(),
-                };
-                if method == "HEAD" {
-                    response.body.clear();
-                }
-                Ok(response)
-            } else {
-                Ok(not_found_response())
+
+            if method == "PROPFIND" {
+                return propfind::handle_propfind(&request.path, &request.headers, &auth);
             }
+
+            let Some(store) = config.pim_stores.get(&auth.account_id.0) else {
+                return Ok(service_unavailable_response());
+            };
+            if let Some(response) = carddav::handle_request(
+                &method,
+                &request.path,
+                &request.headers,
+                body,
+                &auth,
+                store,
+            )? {
+                return Ok(response);
+            }
+            if let Some(response) = caldav::handle_request(
+                &method,
+                &request.path,
+                &request.headers,
+                body,
+                &auth,
+                store,
+            )? {
+                return Ok(response);
+            }
+
+            Ok(not_found_response())
         }
         _ => Ok(not_implemented_response()),
     }
@@ -253,8 +279,17 @@ fn not_found_response() -> DavResponse {
     }
 }
 
+fn service_unavailable_response() -> DavResponse {
+    DavResponse {
+        status: "503 Service Unavailable",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"account store unavailable\n".to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -265,6 +300,7 @@ mod tests {
     use crate::api::types::Session;
     use crate::bridge::accounts::AccountRegistry;
     use crate::bridge::auth_router::AuthRouter;
+    use crate::pim::store::PimStore;
 
     use super::{handle_connection, route_request, DavServer, DavServerConfig, Result};
     use crate::dav::http::parse_request_head;
@@ -290,6 +326,7 @@ mod tests {
             listener,
             DavServerConfig {
                 auth_router: auth_router(),
+                pim_stores: HashMap::new(),
             },
         );
         let addr = server.local_addr()?;
@@ -319,8 +356,10 @@ mod tests {
         .expect("request should parse");
         let response = route_request(
             &request,
+            &[],
             &DavServerConfig {
                 auth_router: auth_router(),
+                pim_stores: HashMap::new(),
             },
         )
         .expect("router should succeed");
@@ -333,6 +372,7 @@ mod tests {
         let addr = listener.local_addr()?;
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
+            pim_stores: HashMap::new(),
         });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -355,6 +395,126 @@ mod tests {
         assert!(wire.contains("<d:multistatus"));
 
         server.await.expect("server task");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn carddav_put_get_delete_roundtrip() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+        });
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, config.clone())
+                    .await
+                    .expect("handle");
+            }
+        });
+
+        let auth = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let body = "BEGIN:VCARD\nVERSION:3.0\nUID:c1\nFN:Alice\nEMAIL:alice@proton.me\nEND:VCARD\n";
+        let put = format!(
+            "PUT /dav/uid-1/addressbooks/default/c1.vcf HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(put.as_bytes()).await?;
+        let mut response = vec![0; 1024];
+        let n = client.read(&mut response).await?;
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 201 Created\r\n"));
+
+        let get = format!(
+            "GET /dav/uid-1/addressbooks/default/c1.vcf HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(get.as_bytes()).await?;
+        let mut response = vec![0; 2048];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(wire.contains("BEGIN:VCARD"));
+
+        let delete = format!(
+            "DELETE /dav/uid-1/addressbooks/default/c1.vcf HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(delete.as_bytes()).await?;
+        let mut response = vec![0; 512];
+        let n = client.read(&mut response).await?;
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        server.await.expect("server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caldav_put_get_delete_roundtrip() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+        });
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, config.clone())
+                    .await
+                    .expect("handle");
+            }
+        });
+
+        let auth = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let body = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:event-1\nDTSTART:20260305T120000Z\nDTEND:20260305T130000Z\nSUMMARY:Test\nEND:VEVENT\nEND:VCALENDAR\n";
+        let put = format!(
+            "PUT /dav/uid-1/calendars/default/e1.ics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(put.as_bytes()).await?;
+        let mut response = vec![0; 1024];
+        let n = client.read(&mut response).await?;
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 201 Created\r\n"));
+
+        let get = format!(
+            "GET /dav/uid-1/calendars/default/e1.ics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(get.as_bytes()).await?;
+        let mut response = vec![0; 2048];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(wire.contains("BEGIN:VCALENDAR"));
+
+        let delete = format!(
+            "DELETE /dav/uid-1/calendars/default/e1.ics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\n\r\n"
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(delete.as_bytes()).await?;
+        let mut response = vec![0; 512];
+        let n = client.read(&mut response).await?;
+        assert!(String::from_utf8_lossy(&response[..n]).starts_with("HTTP/1.1 204 No Content\r\n"));
+
+        server.await.expect("server");
         Ok(())
     }
 }

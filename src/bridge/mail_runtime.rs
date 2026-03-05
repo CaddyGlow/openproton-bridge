@@ -573,6 +573,7 @@ async fn run_runtime(
         });
 
     let pim_stores_for_reconcile = pim_stores.clone();
+    let dav_pim_stores = pim_stores.clone();
     let dav_auth_router = auth_router.clone();
     let event_workers = super::events::start_event_worker_group_with_sync_progress_and_pim(
         runtime_accounts.clone(),
@@ -609,6 +610,7 @@ async fn run_runtime(
     let mut dav_task = dav_listener.map(|listener| {
         let config = dav::server::DavServerConfig {
             auth_router: dav_auth_router,
+            pim_stores: dav_pim_stores,
         };
         tokio::spawn(async move {
             dav::server::run_server_with_listener_and_config(listener, config).await

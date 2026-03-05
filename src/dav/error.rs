@@ -6,6 +6,8 @@ pub enum DavError {
     Io(#[from] io::Error),
     #[error("invalid http request: {0}")]
     InvalidRequest(&'static str),
+    #[error("backend error: {0}")]
+    Backend(String),
 }
 
 impl DavError {
@@ -13,6 +15,7 @@ impl DavError {
         match self {
             Self::Io(_) => "500 Internal Server Error",
             Self::InvalidRequest(_) => "400 Bad Request",
+            Self::Backend(_) => "500 Internal Server Error",
         }
     }
 }

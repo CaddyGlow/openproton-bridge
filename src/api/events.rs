@@ -58,8 +58,16 @@ pub fn parse_typed_event_payload(value: &serde_json::Value) -> Option<TypedEvent
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::types::TypedEventItem;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn find_item<'a>(items: &'a [TypedEventItem], id: &str) -> &'a TypedEventItem {
+        items
+            .iter()
+            .find(|item| item.id == id)
+            .expect("missing typed event item")
+    }
 
     #[tokio::test]
     async fn get_events_with_cursor() {
@@ -167,7 +175,10 @@ mod tests {
         let payload = serde_json::json!({
             "Messages": [{"ID": "msg-1", "Action": 1}],
             "Labels": {"label-1": {"Action": 2}},
-            "Addresses": ["addr-1"]
+            "Addresses": ["addr-1"],
+            "Contacts": [{"Action": 1, "Contact": {"ID": "contact-1"}}],
+            "ContactEmails": [{"Action": 0, "ContactEmail": {"ID": "contact-email-1"}}],
+            "Calendars": [{"Action": 2, "Calendar": {"ID": "calendar-1"}}]
         });
 
         let parsed = parse_typed_event_payload(&payload).unwrap();
@@ -175,5 +186,98 @@ mod tests {
         assert_eq!(parsed.messages.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(parsed.labels.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(parsed.addresses.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(parsed.contacts.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(parsed.contact_emails.as_ref().map(|v| v.len()), Some(1));
+        assert_eq!(parsed.calendars.as_ref().map(|v| v.len()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn get_events_stream_tracks_calendar_contact_changes_across_cursors() {
+        let server = MockServer::start().await;
+        let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-101",
+                "More": 1,
+                "Refresh": 0,
+                "Events": [{
+                    "Contacts": [
+                        {"Action": 1, "Contact": {"ID": "contact-1"}}
+                    ],
+                    "ContactEmails": [
+                        {"Action": 2, "ContactEmail": {"ID": "email-1"}}
+                    ],
+                    "Calendars": [
+                        {"Action": 2, "Calendar": {"ID": "cal-1"}}
+                    ],
+                    "CalendarMembers": [
+                        {"Action": 1, "Member": {"ID": "member-1"}}
+                    ]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-101"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-102",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Contacts": {
+                        "contact-1": null,
+                        "contact-2": {"Action": 2}
+                    },
+                    "ContactEmails": {
+                        "email-1": null
+                    },
+                    "Calendars": {
+                        "cal-1": {"Action": "0"}
+                    },
+                    "CalendarMembers": {
+                        "member-1": {"Action": 0}
+                    }
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let first = get_events(&client, "").await.unwrap();
+        assert_eq!(first.event_id, "event-101");
+        assert_eq!(first.more, 1);
+        assert_eq!(first.events.len(), 1);
+
+        let first_typed = parse_typed_event_payload(&first.events[0]).unwrap();
+        let first_contacts = first_typed.contacts.as_ref().unwrap();
+        assert_eq!(first_contacts.len(), 1);
+        assert!(find_item(first_contacts, "contact-1").is_create());
+        let first_contact_emails = first_typed.contact_emails.as_ref().unwrap();
+        assert!(find_item(first_contact_emails, "email-1").is_update());
+        let first_calendars = first_typed.calendars.as_ref().unwrap();
+        assert!(find_item(first_calendars, "cal-1").is_update());
+        let first_members = first_typed.calendar_members.as_ref().unwrap();
+        assert!(find_item(first_members, "member-1").is_create());
+
+        let second = get_events(&client, &first.event_id).await.unwrap();
+        assert_eq!(second.event_id, "event-102");
+        assert_eq!(second.more, 0);
+        assert_eq!(second.events.len(), 1);
+
+        let second_typed = parse_typed_event_payload(&second.events[0]).unwrap();
+        let second_contacts = second_typed.contacts.as_ref().unwrap();
+        assert_eq!(second_contacts.len(), 2);
+        assert!(find_item(second_contacts, "contact-1").is_delete());
+        assert!(find_item(second_contacts, "contact-2").is_update());
+        let second_contact_emails = second_typed.contact_emails.as_ref().unwrap();
+        assert!(find_item(second_contact_emails, "email-1").is_delete());
+        let second_calendars = second_typed.calendars.as_ref().unwrap();
+        assert!(find_item(second_calendars, "cal-1").is_delete());
+        let second_members = second_typed.calendar_members.as_ref().unwrap();
+        assert!(find_item(second_members, "member-1").is_delete());
     }
 }

@@ -1,5 +1,7 @@
 pub mod auth;
+pub mod calendar;
 pub mod client;
+pub mod contacts;
 pub mod error;
 pub mod events;
 pub mod keys;

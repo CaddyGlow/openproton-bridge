@@ -491,6 +491,14 @@ pub struct TypedEventPayload {
     pub addresses: Option<Vec<TypedEventItem>>,
     #[serde(default)]
     pub address: Option<TypedEventItem>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_event_items")]
+    pub calendars: Option<Vec<TypedEventItem>>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_event_items")]
+    pub calendar_members: Option<Vec<TypedEventItem>>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_event_items")]
+    pub contacts: Option<Vec<TypedEventItem>>,
+    #[serde(default, deserialize_with = "deserialize_optional_typed_event_items")]
+    pub contact_emails: Option<Vec<TypedEventItem>>,
     #[serde(default)]
     pub notifications: Option<Value>,
     #[serde(default)]
@@ -507,6 +515,10 @@ impl TypedEventPayload {
             || self.label.is_some()
             || self.addresses.is_some()
             || self.address.is_some()
+            || self.calendars.is_some()
+            || self.calendar_members.is_some()
+            || self.contacts.is_some()
+            || self.contact_emails.is_some()
     }
 }
 
@@ -519,6 +531,24 @@ pub struct TypedEventItem {
     pub action: Option<Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+impl TypedEventItem {
+    pub fn action_code(&self) -> Option<i64> {
+        parse_action_code(self.action.as_ref())
+    }
+
+    pub fn is_create(&self) -> bool {
+        self.action_code() == Some(1)
+    }
+
+    pub fn is_update(&self) -> bool {
+        matches!(self.action_code(), Some(2 | 3))
+    }
+
+    pub fn is_delete(&self) -> bool {
+        self.action_code() == Some(0)
+    }
 }
 
 fn deserialize_events_payload<'de, D>(deserializer: D) -> std::result::Result<Vec<Value>, D::Error>
@@ -574,6 +604,7 @@ fn typed_event_item_from_value(
                 .get("ID")
                 .and_then(|value| value.as_str())
                 .map(str::to_string)
+                .or_else(|| infer_nested_event_id(&fields))
                 .or(fallback_id)?;
             let action = fields.get("Action").cloned();
             Some(TypedEventItem {
@@ -607,6 +638,42 @@ fn typed_event_item_from_value(
             action: Some(primitive),
             extra: HashMap::new(),
         }),
+    }
+}
+
+fn parse_action_code(action: Option<&Value>) -> Option<i64> {
+    let action = action?;
+    match action {
+        Value::Number(value) => value.as_i64(),
+        Value::String(value) => value.parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn infer_nested_event_id(fields: &serde_json::Map<String, Value>) -> Option<String> {
+    for value in fields.values() {
+        if let Some(id) = extract_nested_id(value) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn extract_nested_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(obj) => {
+            if let Some(id) = obj.get("ID").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+            for nested in obj.values() {
+                if let Some(id) = extract_nested_id(nested) {
+                    return Some(id);
+                }
+            }
+            None
+        }
+        Value::Array(values) => values.iter().find_map(extract_nested_id),
+        _ => None,
     }
 }
 
@@ -1410,6 +1477,47 @@ mod tests {
         assert_eq!(typed.labels.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(typed.addresses.as_ref().map(|v| v.len()), Some(1));
         assert_eq!(typed.used_space, Some(1234));
+    }
+
+    #[test]
+    fn test_typed_event_payload_deserializes_contact_and_calendar_items_with_nested_ids() {
+        let payload = serde_json::json!({
+            "Contacts": [
+                { "Action": 1, "Contact": { "ID": "contact-1" } },
+                { "Action": 0, "Contact": { "ID": "contact-2" } }
+            ],
+            "ContactEmails": [
+                { "Action": 2, "ContactEmail": { "ID": "contact-email-1" } }
+            ],
+            "Calendars": [
+                { "Action": 2, "Calendar": { "ID": "calendar-1" } }
+            ],
+            "CalendarMembers": [
+                { "Action": 0, "Member": { "ID": "member-1" } }
+            ]
+        });
+
+        let typed: TypedEventPayload = serde_json::from_value(payload).unwrap();
+        assert!(typed.has_recognized_event_fields());
+
+        let contacts = typed.contacts.unwrap();
+        assert_eq!(contacts.len(), 2);
+        assert_eq!(contacts[0].id, "contact-1");
+        assert!(contacts[0].is_create());
+        assert_eq!(contacts[1].id, "contact-2");
+        assert!(contacts[1].is_delete());
+
+        let contact_emails = typed.contact_emails.unwrap();
+        assert_eq!(contact_emails[0].id, "contact-email-1");
+        assert!(contact_emails[0].is_update());
+
+        let calendars = typed.calendars.unwrap();
+        assert_eq!(calendars[0].id, "calendar-1");
+        assert!(calendars[0].is_update());
+
+        let calendar_members = typed.calendar_members.unwrap();
+        assert_eq!(calendar_members[0].id, "member-1");
+        assert!(calendar_members[0].is_delete());
     }
 
     #[test]

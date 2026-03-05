@@ -236,6 +236,11 @@ body {
   margin-top: 12px;
 }
 
+.connection-retry-hint {
+  margin: 8px 0 0;
+  font-size: 0.78rem;
+}
+
 .icon-btn {
   min-width: 28px;
   min-height: 28px;

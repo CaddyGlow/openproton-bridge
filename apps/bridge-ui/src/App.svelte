@@ -77,6 +77,7 @@
   type CacheMoveUiState = 'idle' | 'in_flight' | 'success' | 'failure'
   type GrpcLifecycleState = 'booting' | 'connecting' | 'ready' | 'disconnected' | 'retrying' | 'error'
   type GrpcConnectReason = 'startup' | 'retry' | 'login' | 'captcha'
+  type RetryTrigger = 'manual' | 'auto'
   type UserParityHook = {
     syncProgress?: number | null
     disconnected?: boolean
@@ -107,6 +108,10 @@
   let grpcLifecycleState = $state<GrpcLifecycleState>('booting')
   let grpcActionInFlight = $state(false)
   let grpcErrorMessage = $state('')
+  let autoReconnectAttempts = $state(0)
+  let autoReconnectHint = $state('')
+  let autoReconnectTimer = $state<ReturnType<typeof setTimeout> | null>(null)
+  let manualDisconnectRequested = $state(false)
   let appSettings = $state<AppSettings>({ ...defaultAppSettings })
   let settingsStatus = $state('')
   let diskCachePathInput = $state('')
@@ -145,6 +150,16 @@
   let clientConfigWizardOpen = $state(false)
   let clientConfigUserId = $state('')
   let selectedAccountKey = $state('')
+
+  const AUTO_RECONNECT_BASE_DELAY_MS = 1200
+  const AUTO_RECONNECT_MAX_DELAY_MS = 15000
+
+  function clearAutoReconnectTimer() {
+    if (autoReconnectTimer) {
+      clearTimeout(autoReconnectTimer)
+      autoReconnectTimer = null
+    }
+  }
 
   function canShowAccountWizard(): boolean {
     return grpcLifecycleState === 'ready' && initialUsersLoadDone && users.length === 0
@@ -435,6 +450,36 @@
     if (grpcLifecycleState === 'ready' || grpcLifecycleState === 'connecting' || grpcLifecycleState === 'retrying') {
       grpcLifecycleState = 'disconnected'
     }
+  })
+
+  $effect(() => {
+    if (grpcLifecycleState === 'ready') {
+      autoReconnectAttempts = 0
+      autoReconnectHint = ''
+      clearAutoReconnectTimer()
+      return
+    }
+
+    if (manualDisconnectRequested || startupLoading || grpcActionInFlight || !canRetryGrpc) {
+      autoReconnectHint = ''
+      clearAutoReconnectTimer()
+      return
+    }
+
+    if (autoReconnectTimer) {
+      return
+    }
+
+    const delayMs = Math.min(
+      AUTO_RECONNECT_BASE_DELAY_MS * Math.max(1, 2 ** autoReconnectAttempts),
+      AUTO_RECONNECT_MAX_DELAY_MS,
+    )
+    const delaySeconds = Math.max(1, Math.ceil(delayMs / 1000))
+    autoReconnectHint = `Auto reconnect in ${delaySeconds}s...`
+    autoReconnectTimer = setTimeout(() => {
+      autoReconnectTimer = null
+      void retryGrpcConnection('auto')
+    }, delayMs)
   })
 
   $effect(() => {
@@ -860,6 +905,9 @@
     logger.info('app', 'grpc connect requested', { reason, refresh_data: options.refreshData === true })
     grpcActionInFlight = true
     grpcErrorMessage = ''
+    manualDisconnectRequested = false
+    autoReconnectHint = ''
+    clearAutoReconnectTimer()
 
     if (reason === 'retry') {
       grpcLifecycleState = 'retrying'
@@ -878,12 +926,15 @@
         initialUsersLoadDone = true
       }
       grpcLifecycleState = 'ready'
+      autoReconnectAttempts = 0
+      autoReconnectHint = ''
       logger.info('app', 'grpc connect completed', { reason })
       return true
     } catch (error) {
       const message = String(error)
       grpcErrorMessage = message
       grpcLifecycleState = 'error'
+      autoReconnectAttempts = Math.min(autoReconnectAttempts + 1, 8)
       logger.error('app', 'grpc connect failed', { reason, error: message })
       return false
     } finally {
@@ -899,7 +950,13 @@
     return establishGrpcConnection(reason)
   }
 
-  async function retryGrpcConnection() {
+  async function retryGrpcConnection(trigger: RetryTrigger = 'manual') {
+    if (trigger === 'manual') {
+      manualDisconnectRequested = false
+      autoReconnectAttempts = 0
+    }
+    autoReconnectHint = ''
+    clearAutoReconnectTimer()
     const connected = await establishGrpcConnection('retry', { refreshData: true })
     if (!connected && grpcErrorMessage.length === 0) {
       grpcErrorMessage = 'Retry failed.'
@@ -912,6 +969,10 @@
     }
     logger.info('app', 'grpc disconnect requested')
     grpcActionInFlight = true
+    manualDisconnectRequested = true
+    autoReconnectAttempts = 0
+    autoReconnectHint = ''
+    clearAutoReconnectTimer()
     try {
       await disconnect()
       await syncParitySnapshotFromBackend()
@@ -1313,6 +1374,7 @@
       stopCaptchaToken?.()
       stopCaptchaWindowClosed?.()
       stopTrayActions?.()
+      clearAutoReconnectTimer()
       void closeCaptchaVerificationWindow()
     }
   })
@@ -1372,6 +1434,9 @@
 
           {#if grpcErrorMessage.length > 0}
             <p class="connection-error">{grpcErrorMessage}</p>
+          {/if}
+          {#if autoReconnectHint.length > 0}
+            <p class="muted connection-retry-hint">{autoReconnectHint}</p>
           {/if}
 
           <h2 class="accounts-heading">Accounts</h2>
@@ -1441,6 +1506,9 @@
                   <p class="muted">{grpcStatusDescription}</p>
                   {#if grpcErrorMessage.length > 0}
                     <p class="connection-error connection-error-block">{grpcErrorMessage}</p>
+                  {/if}
+                  {#if autoReconnectHint.length > 0}
+                    <p class="muted connection-retry-hint">{autoReconnectHint}</p>
                   {/if}
                   {#if canRetryGrpc}
                     <div class="connection-state-actions">

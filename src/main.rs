@@ -16,6 +16,7 @@ use tokio::io::AsyncBufReadExt;
 
 mod api;
 mod bridge;
+mod certs;
 mod client_config;
 mod crypto;
 mod dav;
@@ -311,16 +312,23 @@ async fn main() -> anyhow::Result<()> {
     let dir = runtime_paths.settings_dir().to_path_buf();
     let env_execution_mode = env_non_empty(ENV_OPENPROTON_EXEC_MODE);
     let execution_mode = resolve_execution_mode(cli.mode, env_execution_mode.as_deref())?;
-    let _instance_lock = match &cli.command {
-        Command::Serve { .. } | Command::Grpc { .. } | Command::Cli => {
-            let lock = single_instance::acquire_bridge_instance_lock(&runtime_paths)?;
-            tracing::info!(path = %lock.path().display(), "acquired bridge instance lock");
-            Some(lock)
-        }
-        _ => None,
+    let _instance_lock = if requires_instance_lock(&cli.command, execution_mode) {
+        let lock = single_instance::acquire_bridge_instance_lock(&runtime_paths)?;
+        tracing::info!(path = %lock.path().display(), "acquired bridge instance lock");
+        Some(lock)
+    } else {
+        None
     };
 
     execute_command(cli.command, execution_mode, &dir, &runtime_paths).await
+}
+
+fn requires_instance_lock(command: &Command, mode: ExecutionMode) -> bool {
+    match command {
+        Command::Serve { .. } | Command::Grpc { .. } => true,
+        Command::Cli => mode == ExecutionMode::Direct,
+        _ => false,
+    }
 }
 
 async fn execute_command(
@@ -1491,26 +1499,46 @@ async fn cmd_cli(
                         match action.as_str() {
                             "status" => {
                                 let (cert_path, key_path) = cli_tls_paths(dir);
-                                let installed = cert_path.exists() && key_path.exists();
+                                let generated = cert_path.exists() && key_path.exists();
+                                let installed = is_cli_tls_certificate_installed(dir);
                                 println!(
-                                    "TLS cert installed: {}",
-                                    if installed { "yes" } else { "no" }
+                                    "TLS cert generated: {}",
+                                    if generated { "yes" } else { "no" }
                                 );
+                                match installed {
+                                    Ok(installed) => {
+                                        println!(
+                                            "TLS cert installed in OS keychain: {}",
+                                            if installed { "yes" } else { "no" }
+                                        );
+                                    }
+                                    Err(err) => eprintln!("Error: {err:#}"),
+                                }
                                 println!("  cert: {}", cert_path.display());
                                 println!("  key: {}", key_path.display());
                             }
                             "install" => {
-                                if let Err(err) = ensure_cli_tls_certificate(dir) {
+                                if let Err(err) = install_cli_tls_certificate(dir) {
                                     eprintln!("Error: {err:#}");
                                 } else {
-                                    println!("TLS certificate installed.");
+                                    if certs::os_supports_cert_install() {
+                                        println!("TLS certificate installed in OS keychain.");
+                                    } else {
+                                        println!("TLS certificate generated (OS keychain install is unsupported on this platform).");
+                                    }
                                 }
                             }
                             "uninstall" => {
                                 if let Err(err) = uninstall_cli_tls_certificate(dir) {
                                     eprintln!("Error: {err:#}");
                                 } else {
-                                    println!("TLS certificate removed from local runtime paths.");
+                                    if certs::os_supports_cert_install() {
+                                        println!(
+                                            "TLS certificate uninstalled from OS keychain."
+                                        );
+                                    } else {
+                                        println!("OS keychain uninstall is unsupported on this platform.");
+                                    }
                                 }
                             }
                             "export" => {
@@ -2803,6 +2831,21 @@ fn ensure_cli_tls_certificate(dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn is_cli_tls_certificate_installed(dir: &std::path::Path) -> anyhow::Result<bool> {
+    let (cert_path, key_path) = cli_tls_paths(dir);
+    if !cert_path.exists() || !key_path.exists() {
+        return Ok(false);
+    }
+
+    certs::is_certificate_installed(&cert_path)
+}
+
+fn install_cli_tls_certificate(dir: &std::path::Path) -> anyhow::Result<()> {
+    ensure_cli_tls_certificate(dir)?;
+    let (cert_path, _) = cli_tls_paths(dir);
+    certs::install_certificate(&cert_path)
+}
+
 fn export_cli_tls_certificate(dir: &std::path::Path, target_dir: &str) -> anyhow::Result<()> {
     ensure_cli_tls_certificate(dir)?;
     let (cert_path, key_path) = cli_tls_paths(dir);
@@ -2840,18 +2883,8 @@ fn import_cli_tls_certificate(dir: &std::path::Path, source_dir: &str) -> anyhow
 }
 
 fn uninstall_cli_tls_certificate(dir: &std::path::Path) -> anyhow::Result<()> {
-    let (cert_path, key_path) = cli_tls_paths(dir);
-
-    if cert_path.exists() {
-        std::fs::remove_file(&cert_path)
-            .with_context(|| format!("failed to remove {}", cert_path.display()))?;
-    }
-    if key_path.exists() {
-        std::fs::remove_file(&key_path)
-            .with_context(|| format!("failed to remove {}", key_path.display()))?;
-    }
-
-    Ok(())
+    let (cert_path, _) = cli_tls_paths(dir);
+    certs::uninstall_certificate(&cert_path)
 }
 
 async fn run_interactive_repair(
@@ -4980,6 +5013,70 @@ mod tests {
             resolve_execution_mode(None, None).unwrap(),
             ExecutionMode::Direct
         );
+    }
+
+    #[test]
+    fn requires_instance_lock_for_runtime_commands_in_all_modes() {
+        assert!(requires_instance_lock(
+            &Command::Serve {
+                imap_port: 1143,
+                smtp_port: 1025,
+                dav_enable: false,
+                dav_port: 8080,
+                dav_tls_mode: DavTlsModeArg::None,
+                bind: "127.0.0.1".to_string(),
+                no_tls: false,
+                event_poll_secs: 30,
+                pim_reconcile_tick_secs: 600,
+                pim_contacts_reconcile_secs: 86_400,
+                pim_calendar_reconcile_secs: 86_400,
+                pim_calendar_horizon_reconcile_secs: 43_200,
+            },
+            ExecutionMode::Direct
+        ));
+        assert!(requires_instance_lock(
+            &Command::Serve {
+                imap_port: 1143,
+                smtp_port: 1025,
+                dav_enable: false,
+                dav_port: 8080,
+                dav_tls_mode: DavTlsModeArg::None,
+                bind: "127.0.0.1".to_string(),
+                no_tls: false,
+                event_poll_secs: 30,
+                pim_reconcile_tick_secs: 600,
+                pim_contacts_reconcile_secs: 86_400,
+                pim_calendar_reconcile_secs: 86_400,
+                pim_calendar_horizon_reconcile_secs: 43_200,
+            },
+            ExecutionMode::Grpc
+        ));
+        assert!(requires_instance_lock(
+            &Command::Grpc {
+                bind: "127.0.0.1".to_string()
+            },
+            ExecutionMode::Direct
+        ));
+        assert!(requires_instance_lock(
+            &Command::Grpc {
+                bind: "127.0.0.1".to_string()
+            },
+            ExecutionMode::Grpc
+        ));
+    }
+
+    #[test]
+    fn requires_instance_lock_for_cli_only_in_direct_mode() {
+        assert!(requires_instance_lock(&Command::Cli, ExecutionMode::Direct));
+        assert!(!requires_instance_lock(&Command::Cli, ExecutionMode::Grpc));
+        assert!(!requires_instance_lock(
+            &Command::Status,
+            ExecutionMode::Direct
+        ));
+        assert!(!requires_instance_lock(
+            &Command::Status,
+            ExecutionMode::Grpc
+        ));
     }
 
     #[test]

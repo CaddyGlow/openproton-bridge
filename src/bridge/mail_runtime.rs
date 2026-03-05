@@ -470,9 +470,14 @@ async fn prepare_runtime_context(
         let cert_dir = settings_dir.join("tls");
         let _imap_server = imap::server::ImapServer::new().with_tls(&cert_dir)?;
         let _smtp_server = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
+        match config.dav_tls_mode {
+            DavTlsMode::None => dav::server::clear_runtime_tls_config(),
+            DavTlsMode::StartTls => dav::server::install_runtime_tls_config_from_dir(&cert_dir)?,
+        }
     } else {
         imap::server::clear_runtime_tls_config();
         smtp::server::clear_runtime_tls_config();
+        dav::server::clear_runtime_tls_config();
     }
 
     Ok(PreparedMailRuntime {

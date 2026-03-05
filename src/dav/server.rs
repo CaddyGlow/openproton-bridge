@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+use tokio_rustls::TlsAcceptor;
 
 use crate::bridge::auth_router::AuthRouter;
 use crate::pim::store::PimStore;
@@ -27,6 +29,7 @@ const MAX_DAV_BODY_BYTES: usize = 1_048_576;
 const DAV_CAPABILITIES_HEADER: &str = "1, 2, calendar-access, addressbook";
 
 static DAV_METRICS: LazyLock<DavServerMetrics> = LazyLock::new(DavServerMetrics::default);
+static RUNTIME_TLS_CONFIG: OnceLock<RwLock<Option<Arc<rustls::ServerConfig>>>> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy)]
 struct DavAccountMetrics {
@@ -120,6 +123,72 @@ impl DavServerMetrics {
     }
 }
 
+fn runtime_tls_config_store() -> &'static RwLock<Option<Arc<rustls::ServerConfig>>> {
+    RUNTIME_TLS_CONFIG.get_or_init(|| RwLock::new(None))
+}
+
+fn install_runtime_tls_config(config: Option<Arc<rustls::ServerConfig>>) {
+    let mut guard = runtime_tls_config_store()
+        .write()
+        .expect("runtime tls config lock poisoned");
+    *guard = config;
+}
+
+pub fn clear_runtime_tls_config() {
+    install_runtime_tls_config(None);
+}
+
+fn runtime_tls_config() -> Option<Arc<rustls::ServerConfig>> {
+    runtime_tls_config_store()
+        .read()
+        .expect("runtime tls config lock poisoned")
+        .clone()
+}
+
+pub fn install_runtime_tls_config_from_dir(cert_dir: &Path) -> Result<()> {
+    let cert_path = cert_dir.join("cert.pem");
+    let key_path = cert_dir.join("key.pem");
+
+    if !cert_path.exists() || !key_path.exists() {
+        generate_self_signed_cert(cert_dir)?;
+    }
+
+    let cert_pem = std::fs::read(&cert_path)
+        .map_err(|err| DavError::Tls(format!("failed to read {}: {err}", cert_path.display())))?;
+    let key_pem = std::fs::read(&key_path)
+        .map_err(|err| DavError::Tls(format!("failed to read {}: {err}", key_path.display())))?;
+
+    let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut &cert_pem[..])
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|err| DavError::Tls(format!("invalid cert pem: {err}")))?;
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])
+        .map_err(|err| DavError::Tls(format!("invalid key pem: {err}")))?
+        .ok_or_else(|| DavError::Tls("no private key found in PEM".to_string()))?;
+
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| DavError::Tls(err.to_string()))?;
+    install_runtime_tls_config(Some(Arc::new(tls_config)));
+    Ok(())
+}
+
+fn generate_self_signed_cert(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .map_err(|err| DavError::Tls(format!("failed to create {}: {err}", dir.display())))?;
+    let cert =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .map_err(|err| DavError::Tls(err.to_string()))?;
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    std::fs::write(dir.join("cert.pem"), cert_pem)
+        .map_err(|err| DavError::Tls(format!("failed to write cert.pem: {err}")))?;
+    std::fs::write(dir.join("key.pem"), key_pem)
+        .map_err(|err| DavError::Tls(format!("failed to write key.pem: {err}")))?;
+    Ok(())
+}
+
 #[derive(Clone, Default)]
 pub struct DavServerConfig {
     pub auth_router: AuthRouter,
@@ -160,7 +229,7 @@ impl DavServer {
                 }
                 accepted = self.listener.accept() => {
                     let (stream, _addr) = accepted?;
-                    spawn_connection_handler(stream, self.config.clone());
+                    spawn_connection_handler(stream, self.config.clone(), None);
                 }
             }
         }
@@ -205,28 +274,66 @@ pub async fn run_server_with_listener_and_config(
     listener: TcpListener,
     config: DavServerConfig,
 ) -> Result<()> {
+    run_server_with_listener_and_config_and_tls_config(listener, config, runtime_tls_config()).await
+}
+
+pub async fn run_server_with_listener_and_config_and_tls_config(
+    listener: TcpListener,
+    config: DavServerConfig,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
     let listener_addr = listener
         .local_addr()
         .map(|addr| addr.to_string())
         .unwrap_or_else(|_| "<unknown>".to_string());
-    tracing::info!(addr = %listener_addr, "DAV placeholder server listening");
+    tracing::info!(
+        addr = %listener_addr,
+        tls = if tls_config.is_some() { "on" } else { "off" },
+        "DAV server listening"
+    );
     let config = Arc::new(config);
 
     loop {
         let (stream, _addr) = listener.accept().await?;
-        spawn_connection_handler(stream, config.clone());
+        spawn_connection_handler(stream, config.clone(), tls_config.clone());
     }
 }
 
-fn spawn_connection_handler(stream: TcpStream, config: Arc<DavServerConfig>) {
+fn spawn_connection_handler(
+    stream: TcpStream,
+    config: Arc<DavServerConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) {
     tokio::spawn(async move {
+        if let Some(tls_config) = tls_config {
+            let acceptor = TlsAcceptor::from(tls_config);
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    if let Err(err) = handle_connection_io(tls_stream, config).await {
+                        tracing::warn!(error = %err, "dav request failed");
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "dav tls handshake failed");
+                }
+            }
+            return;
+        }
+
         if let Err(err) = handle_connection(stream, config).await {
-            tracing::warn!(error = %err, "dav placeholder request failed");
+            tracing::warn!(error = %err, "dav request failed");
         }
     });
 }
 
-pub async fn handle_connection(mut stream: TcpStream, config: Arc<DavServerConfig>) -> Result<()> {
+pub async fn handle_connection(stream: TcpStream, config: Arc<DavServerConfig>) -> Result<()> {
+    handle_connection_io(stream, config).await
+}
+
+async fn handle_connection_io<S>(mut stream: S, config: Arc<DavServerConfig>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut buffer = vec![0_u8; 4096];
     let mut received = Vec::with_capacity(4096);
 

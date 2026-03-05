@@ -1058,6 +1058,21 @@ async fn ensure_mail_tls_certificate(vault_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn is_mail_tls_certificate_installed(vault_dir: &Path) -> anyhow::Result<bool> {
+    let (cert_path, key_path) = mail_cert_paths(vault_dir);
+    if !cert_path.exists() || !key_path.exists() {
+        return Ok(false);
+    }
+
+    crate::certs::is_certificate_installed(&cert_path)
+}
+
+async fn install_mail_tls_certificate(vault_dir: &Path) -> anyhow::Result<()> {
+    ensure_mail_tls_certificate(vault_dir).await?;
+    let (cert_path, _) = mail_cert_paths(vault_dir);
+    crate::certs::install_certificate(&cert_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

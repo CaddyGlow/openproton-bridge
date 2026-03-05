@@ -15,14 +15,19 @@ async fn decode_api_json<T: DeserializeOwned>(resp: reqwest::Response) -> Result
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct Calendar {
-    #[serde(rename = "ID")]
+    #[serde(rename = "ID", default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub color: String,
+    #[serde(default)]
     pub display: i32,
-    #[serde(rename = "Type")]
+    #[serde(rename = "Type", default)]
     pub calendar_type: i32,
+    #[serde(default)]
     pub flags: i64,
 }
 
@@ -962,6 +967,34 @@ mod tests {
 
     async fn setup_authenticated_client(server: &MockServer) -> ProtonClient {
         ProtonClient::authenticated(&server.uri(), "test-uid", "test-token").unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_get_calendars_tolerates_missing_name_field() {
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Calendars": [{
+                    "ID": "cal-1",
+                    "Description": "desc",
+                    "Color": "#112233",
+                    "Display": 1,
+                    "Type": 0,
+                    "Flags": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let calendars = get_calendars(&client).await.unwrap();
+        assert_eq!(calendars.len(), 1);
+        assert_eq!(calendars[0].id, "cal-1");
+        assert_eq!(calendars[0].name, "");
+        assert_eq!(calendars[0].description, "desc");
     }
 
     #[test]

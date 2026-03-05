@@ -1930,12 +1930,14 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<bool>, Status> {
-        let (cert_path, key_path) = mail_cert_paths(self.settings_dir());
-        Ok(Response::new(cert_path.exists() && key_path.exists()))
+        let installed = is_mail_tls_certificate_installed(self.settings_dir()).await.map_err(
+            |e| Status::internal(format!("failed to check TLS certificate status: {e}")),
+        )?;
+        Ok(Response::new(installed))
     }
 
     async fn install_tls_certificate(&self, _request: Request<()>) -> Result<Response<()>, Status> {
-        ensure_mail_tls_certificate(self.settings_dir())
+        install_mail_tls_certificate(self.settings_dir())
             .await
             .map_err(|e| Status::internal(format!("failed to install TLS certificate: {e}")))?;
         Ok(Response::new(()))

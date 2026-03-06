@@ -104,7 +104,14 @@ impl CaptchaCaptureServer {
             .await
             .context("failed to bind local verification helper")?;
         let local_addr = listener.local_addr()?;
-        let local_url = format!("http://127.0.0.1:{}/captcha", local_addr.port());
+        let challenge_with_force = with_force_web_messaging(&challenge_url)?;
+        let challenge_with_force = Url::parse(&challenge_with_force)
+            .context("invalid Proton verification URL")?;
+        let local_path = match challenge_with_force.query() {
+            Some(query) if !query.trim().is_empty() => format!("/captcha?{query}"),
+            _ => "/captcha".to_string(),
+        };
+        let local_url = format!("http://127.0.0.1:{}{local_path}", local_addr.port());
 
         let (token_tx, token_rx) = oneshot::channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();

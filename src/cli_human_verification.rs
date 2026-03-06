@@ -1,14 +1,12 @@
 use std::io::Write;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
-use regex::{Captures, Regex};
-use reqwest::redirect::Policy;
 use reqwest::Url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -108,7 +106,6 @@ impl CaptchaCaptureServer {
         let (token_tx, token_rx) = oneshot::channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let token_tx = Arc::new(Mutex::new(Some(token_tx)));
-        let page_cache = Arc::new(AsyncMutex::new(None::<String>));
 
         let task = tokio::spawn(async move {
             loop {
@@ -119,10 +116,9 @@ impl CaptchaCaptureServer {
                             break;
                         };
                         let token_tx = Arc::clone(&token_tx);
-                        let page_cache = Arc::clone(&page_cache);
                         let challenge_url = challenge_url.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(stream, &challenge_url, page_cache, token_tx).await {
+                            if let Err(err) = handle_connection(stream, &challenge_url, token_tx).await {
                                 debug!(error = %err, "human verification helper connection failed");
                             }
                         });
@@ -171,7 +167,6 @@ impl CaptchaCaptureServer {
 async fn handle_connection(
     mut stream: TcpStream,
     challenge_url: &str,
-    page_cache: Arc<AsyncMutex<Option<String>>>,
     token_tx: Arc<Mutex<Option<oneshot::Sender<String>>>>,
 ) -> anyhow::Result<()> {
     let request = read_request(&mut stream).await?;
@@ -180,16 +175,7 @@ async fn handle_connection(
 
     match path.path() {
         "/" | "/captcha" => {
-            let page = {
-                let mut cached = page_cache.lock().await;
-                if let Some(page) = cached.clone() {
-                    page
-                } else {
-                    let page = fetch_and_build_page(challenge_url).await?;
-                    *cached = Some(page.clone());
-                    page
-                }
-            };
+            let page = build_local_capture_page(challenge_url)?;
             write_response(
                 &mut stream,
                 "200 OK",
@@ -270,31 +256,6 @@ fn parse_request_path(target: &str) -> Option<Url> {
     Url::parse(&format!("http://127.0.0.1{target}")).ok()
 }
 
-async fn fetch_and_build_page(challenge_url: &str) -> anyhow::Result<String> {
-    let proxy_url = with_force_web_messaging(challenge_url)?;
-    let client = reqwest::Client::builder()
-        .redirect(Policy::limited(10))
-        .build()
-        .context("failed to build verification helper HTTP client")?;
-    let html = client
-        .get(proxy_url.clone())
-        .header("Accept", "text/html,application/xhtml+xml")
-        .header(
-            "User-Agent",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        )
-        .send()
-        .await
-        .with_context(|| format!("failed to fetch Proton verification page from {proxy_url}"))?
-        .error_for_status()
-        .with_context(|| format!("Proton verification page request failed for {proxy_url}"))?
-        .text()
-        .await
-        .context("failed to read Proton verification page body")?;
-
-    build_proxied_captcha_page(challenge_url, &html)
-}
-
 fn with_force_web_messaging(challenge_url: &str) -> anyhow::Result<String> {
     let mut url = Url::parse(challenge_url).context("invalid Proton verification URL")?;
     let has_force_flag = url.query_pairs().any(|(key, _)| key == "ForceWebMessaging");
@@ -304,123 +265,80 @@ fn with_force_web_messaging(challenge_url: &str) -> anyhow::Result<String> {
     Ok(url.into())
 }
 
-fn build_proxied_captcha_page(challenge_url: &str, html: &str) -> anyhow::Result<String> {
-    let url = Url::parse(challenge_url).context("invalid Proton verification URL")?;
-    let origin = url.origin().ascii_serialization();
-
-    let mut page = strip_csp_meta_tags(html);
-    page = replace_or_insert_base_href(&page, &origin);
-    page = integrity_attr_re().replace_all(&page, "").into_owned();
-    page = crossorigin_attr_re().replace_all(&page, "").into_owned();
-    page = relative_asset_re()
-        .replace_all(&page, |captures: &Captures<'_>| {
-            format!(r#"{}="{}{}""#, &captures[1], origin, &captures[2])
-        })
-        .into_owned();
-
-    let injection = r#"
-<div id="opb-hv-banner" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#0b1020;color:#ffffff;padding:12px 16px;font-family:system-ui,sans-serif;font-size:14px;line-height:1.4;border-bottom:2px solid #2f6feb;">
-    OpenProton Bridge local verification helper is capturing the Proton CAPTCHA token for this CLI session. Complete the challenge below and the terminal will continue automatically.
-</div>
-<div style="height:58px;"></div>
-<script>
-(function () {
+fn build_local_capture_page(challenge_url: &str) -> anyhow::Result<String> {
+    let verify_url = with_force_web_messaging(challenge_url)?;
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenProton Verification Helper</title>
+  <style>
+    body {{ margin: 0; font-family: system-ui, sans-serif; background: #f6f8fa; color: #1f2328; }}
+    .banner {{ position: fixed; top: 0; left: 0; right: 0; z-index: 2; padding: 12px 16px; background: #0b1020; color: #fff; border-bottom: 2px solid #2f6feb; }}
+    .tools {{ margin-top: 64px; padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
+    .btn {{ border: 1px solid #d0d7de; border-radius: 6px; background: #fff; padding: 8px 12px; cursor: pointer; }}
+    .frame {{ width: 100%; height: calc(100vh - 130px); border: 0; background: #fff; }}
+    code {{ background: #eaedf0; padding: 2px 4px; border-radius: 4px; }}
+  </style>
+</head>
+<body>
+  <div id="opb-hv-banner" class="banner">
+    Complete the Proton verification challenge below. Token capture is automatic.
+  </div>
+  <div class="tools">
+    <button id="open-popup" class="btn" type="button">Open In New Tab</button>
+    <span>If the embedded view is blocked, open <code id="verify-url"></code> in a new tab.</span>
+  </div>
+  <iframe id="verify-frame" class="frame" referrerpolicy="no-referrer"></iframe>
+  <script>
+  (function () {{
+    const verifyUrl = {verify_url:?};
+    const frame = document.getElementById('verify-frame');
+    const banner = document.getElementById('opb-hv-banner');
+    const code = document.getElementById('verify-url');
+    const popupBtn = document.getElementById('open-popup');
+    code.textContent = verifyUrl;
+    frame.src = verifyUrl;
     let delivered = false;
-    function sendToken(token) {
-        if (delivered || !token) return;
-        delivered = true;
-        fetch('/callback?token=' + encodeURIComponent(token), { cache: 'no-store' })
-            .then(function () {
-                const banner = document.getElementById('opb-hv-banner');
-                if (banner) {
-                    banner.textContent = 'Verification complete. You can close this tab.';
-                    banner.style.borderColor = '#2da44e';
-                }
-            })
-            .catch(function () {
-                delivered = false;
-            });
-    }
-    window.addEventListener('message', function (event) {
-        if (typeof event.data === 'string' && event.data.length > 10) {
-            sendToken(event.data);
-            return;
-        }
-        if (event.data && typeof event.data === 'object' && typeof event.data.token === 'string') {
-            sendToken(event.data.token);
-        }
-    });
-})();
-</script>
-"#;
-
-    if page.contains("</body>") {
-        Ok(page.replacen("</body>", &format!("{injection}</body>"), 1))
-    } else {
-        Ok(format!("{page}{injection}"))
-    }
-}
-
-fn strip_csp_meta_tags(html: &str) -> String {
-    let mut output = String::with_capacity(html.len());
-    let mut index = 0;
-    let lower = html.to_ascii_lowercase();
-
-    while let Some(relative_start) = lower[index..].find("<meta") {
-        let start = index + relative_start;
-        output.push_str(&html[index..start]);
-        let Some(relative_end) = lower[start..].find('>') else {
-            output.push_str(&html[start..]);
-            return output;
-        };
-        let end = start + relative_end + 1;
-        let tag = &lower[start..end];
-        if !tag.contains("content-security-policy") {
-            output.push_str(&html[start..end]);
-        }
-        index = end;
-    }
-
-    output.push_str(&html[index..]);
-    output
-}
-
-fn replace_or_insert_base_href(html: &str, origin: &str) -> String {
-    let base_tag = format!(r#"<base href="{origin}/">"#);
-    if base_tag_re().is_match(html) {
-        base_tag_re().replace(html, base_tag).into_owned()
-    } else if head_re().is_match(html) {
-        head_re()
-            .replace(html, format!("<head>{base_tag}"))
-            .into_owned()
-    } else {
-        format!("{base_tag}{html}")
-    }
-}
-
-fn base_tag_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?i)<base\s+href=["'][^"']*["'][^>]*>"#).unwrap())
-}
-
-fn head_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(?i)<head>"#).unwrap())
-}
-
-fn integrity_attr_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\s+integrity=["'][^"']*["']"#).unwrap())
-}
-
-fn crossorigin_attr_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"\s+crossorigin(?:=["'][^"']*["'])?"#).unwrap())
-}
-
-fn relative_asset_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r#"(src|href)=["'](/[^"']*)["']"#).unwrap())
+    function mark(msg, ok) {{
+      banner.textContent = msg;
+      banner.style.borderColor = ok ? '#2da44e' : '#bf8700';
+    }}
+    function submitToken(token) {{
+      if (delivered || !token) return;
+      delivered = true;
+      fetch('/callback?token=' + encodeURIComponent(token), {{ cache: 'no-store' }})
+        .then(function () {{ mark('Verification complete. You can close this tab.', true); }})
+        .catch(function () {{
+          delivered = false;
+          mark('Captured token but failed to deliver to CLI. Keep this page open and retry.', false);
+        }});
+    }}
+    window.addEventListener('message', function (event) {{
+      if (typeof event.data === 'string' && event.data.length > 10) {{
+        submitToken(event.data);
+        return;
+      }}
+      if (event.data && typeof event.data === 'object') {{
+        if (typeof event.data.token === 'string') submitToken(event.data.token);
+        if (event.data.payload && typeof event.data.payload.token === 'string') submitToken(event.data.payload.token);
+      }}
+    }});
+    popupBtn.addEventListener('click', function () {{
+      const popup = window.open(verifyUrl, '_blank');
+      if (!popup) {{
+        mark('Popup blocked. Open URL manually: ' + verifyUrl, false);
+      }}
+    }});
+    mark('Waiting for verification token...', false);
+  }})();
+  </script>
+</body>
+</html>"#
+    );
+    Ok(html)
 }
 
 async fn write_response(
@@ -480,31 +398,15 @@ mod tests {
     }
 
     #[test]
-    fn build_proxied_page_rewrites_html_for_local_proxy() {
-        let html = r#"<!doctype html>
-<html>
-<head>
-<meta http-equiv="content-security-policy" content="default-src 'self'">
-<base href="/">
-<link rel="modulepreload" href="/assets/app.js" integrity="sha256-abc" crossorigin="anonymous">
-</head>
-<body>
-<script src="/assets/main.js" integrity="sha256-def" crossorigin></script>
-</body>
-</html>"#;
-
-        let page = build_proxied_captcha_page(
+    fn build_local_capture_page_contains_verify_url_and_callback_hook() {
+        let page = build_local_capture_page(
             "https://verify.proton.me/?methods=captcha&token=token-123",
-            html,
         )
         .expect("page");
 
-        assert!(!page.contains("content-security-policy"));
-        assert!(page.contains(r#"<base href="https://verify.proton.me/">"#));
-        assert!(page.contains(r#"href="https://verify.proton.me/assets/app.js""#));
-        assert!(page.contains(r#"src="https://verify.proton.me/assets/main.js""#));
-        assert!(!page.contains("integrity="));
-        assert!(!page.contains("crossorigin"));
+        assert!(page.contains("iframe"));
+        assert!(page.contains("ForceWebMessaging=1"));
+        assert!(page.contains("window.addEventListener('message'"));
         assert!(page.contains("fetch('/callback?token=' + encodeURIComponent(token)"));
     }
 

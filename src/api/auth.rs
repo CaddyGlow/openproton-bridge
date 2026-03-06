@@ -27,11 +27,9 @@ fn with_hv_headers(
     let Some(hv) = hv_details.filter(|hv| hv.is_usable()) else {
         return req;
     };
+    let methods_header = hv.methods_header_value();
     req.header(HV_TOKEN_HEADER, &hv.human_verification_token)
-        .header(
-            HV_TOKEN_TYPE_HEADER,
-            hv.human_verification_methods.join(","),
-        )
+        .header(HV_TOKEN_TYPE_HEADER, methods_header)
 }
 
 /// Perform SRP login against the Proton API.
@@ -64,8 +62,9 @@ pub async fn login(
 
     // Step 3: Submit auth request
     if let Some(hv) = hv_details.filter(|hv| hv.is_usable()) {
+        let methods = hv.normalized_methods();
         info!(
-            methods = ?hv.human_verification_methods,
+            methods = ?methods,
             token_len = hv.human_verification_token.len(),
             "submitting SRP auth with human verification headers"
         );

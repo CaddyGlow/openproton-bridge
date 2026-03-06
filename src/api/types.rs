@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // System label constants
 pub const INBOX_LABEL: &str = "0";
@@ -103,14 +103,36 @@ pub struct HumanVerificationDetails {
 }
 
 impl HumanVerificationDetails {
+    pub fn normalized_methods(&self) -> Vec<String> {
+        let mut normalized = Vec::new();
+        let mut seen = HashSet::new();
+        for method in &self.human_verification_methods {
+            let canonical = method.trim().to_ascii_lowercase();
+            if canonical.is_empty() {
+                continue;
+            }
+            if seen.insert(canonical.clone()) {
+                normalized.push(canonical);
+            }
+        }
+        if normalized.is_empty() {
+            normalized.push("captcha".to_string());
+        }
+        normalized
+    }
+
+    pub fn methods_header_value(&self) -> String {
+        self.normalized_methods().join(",")
+    }
+
     pub fn is_usable(&self) -> bool {
-        !self.human_verification_token.is_empty() && !self.human_verification_methods.is_empty()
+        !self.human_verification_token.trim().is_empty()
     }
 
     pub fn challenge_url(&self) -> String {
         format!(
             "https://verify.proton.me/?methods={}&token={}",
-            self.human_verification_methods.join(","),
+            self.methods_header_value(),
             self.human_verification_token
         )
     }
@@ -988,6 +1010,36 @@ mod tests {
             hv.challenge_url(),
             "https://verify.proton.me/?methods=captcha,ownership-email&token=token-123"
         );
+    }
+
+    #[test]
+    fn test_human_verification_details_fallbacks_to_captcha_method() {
+        let json = serde_json::json!({
+            "HumanVerificationMethods": ["", "   "],
+            "HumanVerificationToken": "token-123"
+        });
+        let hv: HumanVerificationDetails = serde_json::from_value(json).unwrap();
+        assert!(hv.is_usable());
+        assert_eq!(hv.normalized_methods(), vec!["captcha".to_string()]);
+        assert_eq!(hv.methods_header_value(), "captcha");
+        assert_eq!(
+            hv.challenge_url(),
+            "https://verify.proton.me/?methods=captcha&token=token-123"
+        );
+    }
+
+    #[test]
+    fn test_human_verification_details_normalizes_methods() {
+        let json = serde_json::json!({
+            "HumanVerificationMethods": [" CAPTCHA ", "ownership-email", "captcha"],
+            "HumanVerificationToken": "token-123"
+        });
+        let hv: HumanVerificationDetails = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            hv.normalized_methods(),
+            vec!["captcha".to_string(), "ownership-email".to_string()]
+        );
+        assert_eq!(hv.methods_header_value(), "captcha,ownership-email");
     }
 
     #[test]

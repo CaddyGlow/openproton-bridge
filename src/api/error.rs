@@ -128,6 +128,21 @@ mod tests {
     }
 
     #[test]
+    fn any_human_verification_details_accepts_empty_methods_with_token() {
+        let err = ApiError::Api {
+            code: 9001,
+            message: "Human verification required".to_string(),
+            details: Some(serde_json::json!({
+                "HumanVerificationMethods": [""],
+                "HumanVerificationToken": "token-789"
+            })),
+        };
+        let hv = any_human_verification_details(&err).expect("expected HV details");
+        assert_eq!(hv.methods_header_value(), "captcha");
+        assert_eq!(hv.human_verification_token, "token-789");
+    }
+
+    #[test]
     fn invalid_refresh_token_error_helper_matches_10013() {
         let err = ApiError::Api {
             code: 10013,

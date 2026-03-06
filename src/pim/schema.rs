@@ -175,8 +175,8 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
         let mut stmt =
             conn.prepare("SELECT version FROM openproton_schema_migrations WHERE component = ?1")?;
         let rows = stmt.query_map([PIM_SCHEMA_COMPONENT], |row| row.get::<_, u32>(0))?;
-        let versions = rows.collect::<std::result::Result<HashSet<u32>, _>>()?;
-        versions
+
+        rows.collect::<std::result::Result<HashSet<u32>, _>>()?
     };
 
     for migration in MIGRATIONS {

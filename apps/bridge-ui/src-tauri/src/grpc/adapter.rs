@@ -487,6 +487,7 @@ impl GrpcAdapter {
         secret: &str,
         use_hv_details: Option<bool>,
         human_verification_token: Option<&str>,
+        requested_scopes: Option<&[String]>,
     ) -> Result<(), String> {
         let config = self.resolve_server_config(state).await?;
         let mut client = connect_client(&config).await?;
@@ -496,6 +497,10 @@ impl GrpcAdapter {
                 password: secret.as_bytes().to_vec(),
                 use_hv_details,
                 human_verification_token: human_verification_token.map(str::to_string),
+                api_mode: None,
+                requested_scopes: requested_scopes
+                    .map(|scopes| scopes.to_vec())
+                    .unwrap_or_default(),
             })
             .await
             .map_err(|err| format!("Login failed: {err}"))?;
@@ -516,6 +521,8 @@ impl GrpcAdapter {
                 password: code.as_bytes().to_vec(),
                 use_hv_details: None,
                 human_verification_token: None,
+                api_mode: None,
+                requested_scopes: Vec::new(),
             })
             .await
             .map_err(|err| format!("Login2FA failed: {err}"))?;
@@ -536,6 +543,8 @@ impl GrpcAdapter {
                 password: mailbox_password.as_bytes().to_vec(),
                 use_hv_details: None,
                 human_verification_token: None,
+                api_mode: None,
+                requested_scopes: Vec::new(),
             })
             .await
             .map_err(|err| format!("Login2Passwords failed: {err}"))?;
@@ -568,6 +577,8 @@ impl GrpcAdapter {
                 password: assertion_payload.to_vec(),
                 use_hv_details: None,
                 human_verification_token: None,
+                api_mode: None,
+                requested_scopes: Vec::new(),
             })
             .await
             .map_err(|err| format!("LoginFido failed: {err}"))?;

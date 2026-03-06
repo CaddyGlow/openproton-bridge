@@ -448,7 +448,7 @@ fn bridge_refresh_tray_users(app: AppHandle, users: Vec<UserSummary>) -> Result<
 #[tauri::command]
 #[tracing::instrument(
     level = "debug",
-    skip(state, adapter_state, password, human_verification_token),
+    skip(state, adapter_state, password, human_verification_token, requested_scopes),
     fields(username = %username, use_hv_details = ?use_hv_details)
 )]
 async fn bridge_login(
@@ -458,6 +458,7 @@ async fn bridge_login(
     password: String,
     use_hv_details: Option<bool>,
     human_verification_token: Option<String>,
+    requested_scopes: Option<Vec<String>>,
 ) -> Result<(), String> {
     let adapter = adapter_state.adapter.lock().await;
     adapter
@@ -467,6 +468,7 @@ async fn bridge_login(
             &password,
             use_hv_details,
             human_verification_token.as_deref(),
+            requested_scopes.as_deref(),
         )
         .await
 }

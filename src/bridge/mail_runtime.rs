@@ -501,6 +501,7 @@ async fn prepare_runtime_context(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_runtime(
     prepared: PreparedMailRuntime,
     config: MailRuntimeConfig,
@@ -938,6 +939,7 @@ fn generate_bridge_password() -> String {
     BASE64_URL_NO_PAD.encode(token)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_pim_reconcile_periodically(
     runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
     pim_stores: HashMap<String, Arc<PimStore>>,
@@ -952,7 +954,6 @@ async fn run_pim_reconcile_periodically(
 
     let mut ticker = interval(reconcile_tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    ticker.tick().await;
 
     loop {
         ticker.tick().await;
@@ -966,7 +967,7 @@ async fn run_pim_reconcile_periodically(
             };
             metrics.accounts_with_store += 1;
 
-            let contacts_due = match is_pim_contacts_due(store, contacts_reconcile_interval) {
+            let raw_contacts_due = match is_pim_contacts_due(store, contacts_reconcile_interval) {
                 Ok(due) => due,
                 Err(err) => {
                     tracing::warn!(
@@ -978,19 +979,20 @@ async fn run_pim_reconcile_periodically(
                     true
                 }
             };
-            let calendar_full_due = match is_pim_calendar_due(store, calendar_reconcile_interval) {
-                Ok(due) => due,
-                Err(err) => {
-                    tracing::warn!(
-                        account_id = %account.account_id.0,
-                        email = %account.email,
-                        error = %err,
-                        "failed to evaluate calendar full reconciliation schedule; forcing run"
-                    );
-                    true
-                }
-            };
-            let calendar_horizon_due =
+            let raw_calendar_full_due =
+                match is_pim_calendar_due(store, calendar_reconcile_interval) {
+                    Ok(due) => due,
+                    Err(err) => {
+                        tracing::warn!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            error = %err,
+                            "failed to evaluate calendar full reconciliation schedule; forcing run"
+                        );
+                        true
+                    }
+                };
+            let raw_calendar_horizon_due =
                 match is_pim_calendar_horizon_due(store, calendar_horizon_reconcile_interval) {
                     Ok(due) => due,
                     Err(err) => {
@@ -1003,17 +1005,7 @@ async fn run_pim_reconcile_periodically(
                         true
                     }
                 };
-            if contacts_due {
-                metrics.contacts_runs_due += 1;
-            }
-            if calendar_full_due {
-                metrics.calendar_full_runs_due += 1;
-            }
-            if calendar_horizon_due {
-                metrics.calendar_horizon_runs_due += 1;
-            }
-
-            if !contacts_due && !calendar_full_due && !calendar_horizon_due {
+            if !raw_contacts_due && !raw_calendar_full_due && !raw_calendar_horizon_due {
                 continue;
             }
 
@@ -1058,6 +1050,65 @@ async fn run_pim_reconcile_periodically(
                     continue;
                 }
             };
+
+            let mut contacts_due = raw_contacts_due;
+            let mut calendar_full_due = raw_calendar_full_due;
+            let mut calendar_horizon_due = raw_calendar_horizon_due;
+            match api::auth::get_granted_scopes(&client).await {
+                Ok(granted_scopes) => {
+                    let contacts_enabled = api::auth::has_scope(&granted_scopes, "contacts");
+                    let calendar_enabled = api::auth::has_scope(&granted_scopes, "calendar");
+
+                    if contacts_due && !contacts_enabled {
+                        contacts_due = false;
+                        tracing::debug!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            "skipping periodic contacts reconciliation due to missing contacts scope"
+                        );
+                    }
+                    if calendar_full_due && !calendar_enabled {
+                        calendar_full_due = false;
+                        tracing::debug!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            "skipping periodic calendar reconciliation due to missing calendar scope"
+                        );
+                    }
+                    if calendar_horizon_due && !calendar_enabled {
+                        calendar_horizon_due = false;
+                        tracing::debug!(
+                            account_id = %account.account_id.0,
+                            email = %account.email,
+                            "skipping periodic calendar horizon refresh due to missing calendar scope"
+                        );
+                    }
+                }
+                Err(err) => {
+                    contacts_due = false;
+                    calendar_full_due = false;
+                    calendar_horizon_due = false;
+                    tracing::warn!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        error = %err,
+                        "failed to fetch granted auth scopes; skipping periodic contacts/calendar reconciliation"
+                    );
+                }
+            }
+
+            if contacts_due {
+                metrics.contacts_runs_due += 1;
+            }
+            if calendar_full_due {
+                metrics.calendar_full_runs_due += 1;
+            }
+            if calendar_horizon_due {
+                metrics.calendar_horizon_runs_due += 1;
+            }
+            if !contacts_due && !calendar_full_due && !calendar_horizon_due {
+                continue;
+            }
 
             if contacts_due {
                 match sync_contacts::bootstrap_contacts(&client, store, 0).await {
@@ -1578,7 +1629,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn periodic_pim_reconcile_marks_account_degraded_on_client_init_failure() {
+    async fn periodic_pim_reconcile_skips_when_scope_discovery_fails() {
         let account_id = AccountId("uid-1".to_string());
         let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
             session_with_access_token("uid-1", "alice@proton.me", "\x00invalid"),
@@ -1602,28 +1653,20 @@ mod tests {
             metrics.clone(),
         ));
 
-        let start = std::time::Instant::now();
-        loop {
-            if runtime_accounts.get_health(&account_id).await == Some(AccountHealth::Degraded) {
-                break;
-            }
-            if start.elapsed() > Duration::from_secs(2) {
-                panic!("timed out waiting for degraded health transition");
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        tokio::time::sleep(Duration::from_millis(90)).await;
 
         task.abort();
         let _ = task.await;
 
-        let snapshot = metrics.read().unwrap().clone();
-        assert!(
-            snapshot.client_init_failures_total
-                + snapshot.contacts_failures_total
-                + snapshot.calendar_full_failures_total
-                + snapshot.calendar_horizon_failures_total
-                >= 1
+        assert_eq!(
+            runtime_accounts.get_health(&account_id).await,
+            Some(AccountHealth::Healthy)
         );
-        assert!(snapshot.contacts_runs_due_total >= 1);
+
+        let snapshot = metrics.read().unwrap().clone();
+        assert_eq!(snapshot.client_init_failures_total, 0);
+        assert_eq!(snapshot.contacts_runs_due_total, 0);
+        assert_eq!(snapshot.calendar_full_runs_due_total, 0);
+        assert_eq!(snapshot.calendar_horizon_runs_due_total, 0);
     }
 }

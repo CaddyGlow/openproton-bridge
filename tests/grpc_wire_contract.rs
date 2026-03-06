@@ -8,6 +8,7 @@ fn grpc_wire_login_request_password_is_bytes() {
         use_hv_details: None,
         human_verification_token: None,
         api_mode: None,
+        requested_scopes: Vec::new(),
     };
 
     assert_eq!(req.password, b"abc");

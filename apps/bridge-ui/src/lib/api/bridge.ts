@@ -128,6 +128,7 @@ export async function login(
   password: string,
   useHvDetails?: boolean,
   humanVerificationToken?: string,
+  requestedScopes?: string[],
 ): Promise<void> {
   return invoke<void>('bridge_login', {
     username,
@@ -136,6 +137,8 @@ export async function login(
     useHvDetails,
     human_verification_token: humanVerificationToken,
     humanVerificationToken,
+    requested_scopes: requestedScopes,
+    requestedScopes,
   })
 }
 

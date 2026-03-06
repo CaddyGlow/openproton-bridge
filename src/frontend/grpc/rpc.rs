@@ -271,6 +271,7 @@ fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Se
 }
 
 impl BridgeService {
+    #[allow(clippy::result_large_err)]
     fn resolve_pim_store_for_account_selector(
         &self,
         account_selector: &str,
@@ -311,6 +312,7 @@ impl BridgeService {
             .map_err(|err| Status::internal(format!("failed to open pim store: {err}")))
     }
 
+    #[allow(clippy::result_large_err)]
     fn ensure_expected_contact_updated_at(
         &self,
         store: &crate::pim::store::PimStore,
@@ -338,6 +340,7 @@ impl BridgeService {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn ensure_expected_calendar_updated_at(
         &self,
         store: &crate::pim::store::PimStore,
@@ -365,6 +368,7 @@ impl BridgeService {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     fn ensure_expected_calendar_event_updated_at(
         &self,
         store: &crate::pim::store::PimStore,
@@ -854,6 +858,12 @@ impl pb::bridge_server::Bridge for BridgeService {
             })?,
             None => crate::api::types::ApiMode::Bridge,
         };
+        let requested_scopes = if req.requested_scopes.is_empty() {
+            None
+        } else {
+            Some(req.requested_scopes.clone())
+        };
+        let required_scopes = api::auth::normalize_scope_list(requested_scopes.as_deref());
 
         let request_use_hv_details = req.use_hv_details.unwrap_or(false);
         let request_hv_token_override = req
@@ -905,6 +915,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         info!(
             username = %username,
             request_use_hv_details,
+            requested_scope_count = required_scopes.len(),
             using_hv_details = hv_details.is_some(),
             "starting grpc login attempt"
         );
@@ -914,7 +925,15 @@ impl pb::bridge_server::Bridge for BridgeService {
         let mut client =
             ProtonClient::with_api_mode(effective_api_mode).map_err(status_from_api_error)?;
         let auth = loop {
-            match api::auth::login(&mut client, &username, &password, hv_details.as_ref()).await {
+            match api::auth::login(
+                &mut client,
+                &username,
+                &password,
+                hv_details.as_ref(),
+                requested_scopes.as_deref(),
+            )
+            .await
+            {
                 Ok(auth) => break auth,
                 Err(err) => {
                     if !tried_mode_fallback && matches!(&err, ApiError::Api { code: 10004, .. }) {
@@ -977,6 +996,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         };
         info!(username = %username, "grpc login auth phase completed");
         *self.state.pending_hv.lock().await = None;
+        let auth_granted_scopes = api::auth::normalize_scope_string(auth.scope.as_deref());
 
         if auth.two_factor.requires_second_factor() {
             if auth.two_factor.totp_required() {
@@ -987,15 +1007,17 @@ impl pb::bridge_server::Bridge for BridgeService {
                     "Requesting TOTP"
                 );
             }
-            let pending = PendingLogin {
-                username: username.clone(),
-                password,
-                api_mode: effective_api_mode,
-                uid: auth.uid,
-                access_token: auth.access_token,
-                refresh_token: auth.refresh_token,
-                client,
-                fido_authentication_options: auth.two_factor.fido_authentication_options(),
+                let pending = PendingLogin {
+                    username: username.clone(),
+                    password,
+                    api_mode: effective_api_mode,
+                    required_scopes: required_scopes.clone(),
+                    auth_granted_scopes: auth_granted_scopes.clone(),
+                    uid: auth.uid,
+                    access_token: auth.access_token,
+                    refresh_token: auth.refresh_token,
+                    client,
+                    fido_authentication_options: auth.two_factor.fido_authentication_options(),
             };
             *self.state.pending_login.lock().await = Some(pending);
             if auth.two_factor.totp_required() {
@@ -1015,6 +1037,8 @@ impl pb::bridge_server::Bridge for BridgeService {
                 username: username.clone(),
                 password,
                 api_mode: effective_api_mode,
+                required_scopes: required_scopes.clone(),
+                auth_granted_scopes: auth_granted_scopes.clone(),
                 uid: auth.uid,
                 access_token: auth.access_token,
                 refresh_token: auth.refresh_token,
@@ -1035,6 +1059,8 @@ impl pb::bridge_server::Bridge for BridgeService {
                     refresh_token: auth.refresh_token,
                     username,
                     password,
+                    required_scopes,
+                    granted_scopes: auth_granted_scopes,
                 },
             )
             .await?;
@@ -1062,15 +1088,24 @@ impl pb::bridge_server::Bridge for BridgeService {
             ));
         }
 
-        if let Err(err) = api::auth::submit_2fa(&pending.client, code.trim()).await {
-            *pending_guard = Some(pending);
-            self.emit_login_error(err.to_string());
-            warn!(username = %username, error = %err, "grpc 2FA submission failed");
-            return Err(status_from_api_error(err));
-        }
+        let second_factor = match api::auth::submit_2fa(&pending.client, code.trim()).await {
+            Ok(result) => result,
+            Err(err) => {
+                *pending_guard = Some(pending);
+                self.emit_login_error(err.to_string());
+                warn!(username = %username, error = %err, "grpc 2FA submission failed");
+                return Err(status_from_api_error(err));
+            }
+        };
         info!(username = %username, "grpc 2FA submission accepted");
 
         drop(pending_guard);
+        let granted_scopes = api::auth::normalize_scope_list(Some(&second_factor.scopes));
+        let granted_scopes = if granted_scopes.is_empty() {
+            pending.auth_granted_scopes.clone()
+        } else {
+            granted_scopes
+        };
 
         self.complete_login(
             pending.client,
@@ -1081,6 +1116,8 @@ impl pb::bridge_server::Bridge for BridgeService {
                 refresh_token: pending.refresh_token,
                 username: pending.username,
                 password: pending.password,
+                required_scopes: pending.required_scopes,
+                granted_scopes,
             },
         )
         .await?;
@@ -1128,6 +1165,8 @@ impl pb::bridge_server::Bridge for BridgeService {
                 refresh_token: pending.refresh_token,
                 username: pending.username,
                 password,
+                required_scopes: pending.required_scopes,
+                granted_scopes: pending.auth_granted_scopes,
             },
         )
         .await?;
@@ -1163,16 +1202,28 @@ impl pb::bridge_server::Bridge for BridgeService {
             ));
         };
 
-        if let Err(err) =
-            api::auth::submit_fido_2fa(&pending.client, &authentication_options, &req.password)
-                .await
+        let second_factor = match api::auth::submit_fido_2fa(
+            &pending.client,
+            &authentication_options,
+            &req.password,
+        )
+        .await
         {
-            *pending_guard = Some(pending);
-            self.emit_login_error(err.to_string());
-            return Err(status_from_api_error(err));
-        }
+            Ok(result) => result,
+            Err(err) => {
+                *pending_guard = Some(pending);
+                self.emit_login_error(err.to_string());
+                return Err(status_from_api_error(err));
+            }
+        };
 
         drop(pending_guard);
+        let granted_scopes = api::auth::normalize_scope_list(Some(&second_factor.scopes));
+        let granted_scopes = if granted_scopes.is_empty() {
+            pending.auth_granted_scopes.clone()
+        } else {
+            granted_scopes
+        };
 
         self.complete_login(
             pending.client,
@@ -1183,6 +1234,8 @@ impl pb::bridge_server::Bridge for BridgeService {
                 refresh_token: pending.refresh_token,
                 username: pending.username,
                 password: pending.password,
+                required_scopes: pending.required_scopes,
+                granted_scopes,
             },
         )
         .await?;
@@ -2139,6 +2192,7 @@ mod grpc_wire_tests {
                 use_hv_details: None,
                 human_verification_token: None,
                 api_mode: None,
+                requested_scopes: Vec::new(),
             }),
         )
         .await
@@ -2154,6 +2208,7 @@ mod grpc_wire_tests {
                 use_hv_details: None,
                 human_verification_token: None,
                 api_mode: None,
+                requested_scopes: Vec::new(),
             }),
         )
         .await
@@ -2218,6 +2273,8 @@ mod grpc_wire_tests {
                 username: "alice@example.com".to_string(),
                 password: "account-secret".to_string(),
                 api_mode: crate::api::types::ApiMode::Bridge,
+                required_scopes: Vec::new(),
+                auth_granted_scopes: vec!["mail".to_string()],
                 uid: "uid-1".to_string(),
                 access_token: "access-1".to_string(),
                 refresh_token: "refresh-1".to_string(),
@@ -2234,6 +2291,7 @@ mod grpc_wire_tests {
                 use_hv_details: None,
                 human_verification_token: None,
                 api_mode: None,
+                requested_scopes: Vec::new(),
             }),
         )
         .await

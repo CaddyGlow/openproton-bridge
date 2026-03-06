@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -29,19 +30,23 @@ pub async fn prompt_for_token(
             let opened = open_in_browser(&local_url);
 
             eprintln!("Human verification required by Proton.");
+            eprintln!("Local verification page URL:");
+            eprintln!("{local_url}");
+            eprintln!("OPENPROTON_HV_LOCAL_URL={local_url}");
             if opened {
                 eprintln!(
                     "A local verification page was opened in your browser. Complete the challenge and the CLI will continue automatically."
                 );
             } else {
                 eprintln!(
-                    "Open this local verification page in your browser to continue automatically:"
+                    "Open the local verification page in your browser to continue automatically:"
                 );
-                eprintln!("{local_url}");
             }
             eprintln!("Original Proton verification URL:");
             eprintln!("{challenge_url}");
+            eprintln!("OPENPROTON_HV_VERIFY_URL={challenge_url}");
             eprintln!("Waiting for verification token...");
+            let _ = std::io::stderr().flush();
 
             match server.wait_for_token().await {
                 Ok(token) => {

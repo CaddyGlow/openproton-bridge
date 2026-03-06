@@ -170,6 +170,8 @@ message LoginRequest {
   bytes password = 2;
   optional bool useHvDetails = 3;
   optional string humanVerificationToken = 4;
+  optional string apiMode = 5; // reserved for parity with backend contract
+  repeated string requestedScopes = 6; // serialized as space-delimited Scope for /auth/v4
 }
 
 message LoginAbortRequest {

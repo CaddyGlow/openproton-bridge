@@ -185,6 +185,7 @@ message LoginRequest {
   optional bool useHvDetails = 3;
   optional string humanVerificationToken = 4;
   optional string apiMode = 5; // bridge or webmail; defaults to bridge
+  repeated string requestedScopes = 6; // serialized as space-delimited Scope for /auth/v4
 }
 
 message LoginAbortRequest {

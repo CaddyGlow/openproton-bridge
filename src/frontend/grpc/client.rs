@@ -209,6 +209,7 @@ impl CliGrpcClient {
         Ok(response.into_inner())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn pim_list_calendar_events(
         &mut self,
         account_id: &str,

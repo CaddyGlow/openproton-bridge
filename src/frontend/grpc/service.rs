@@ -5,6 +5,8 @@ struct CompleteLoginArgs {
     refresh_token: String,
     username: String,
     password: String,
+    required_scopes: Vec<String>,
+    granted_scopes: Vec<String>,
 }
 
 impl BridgeService {
@@ -1159,6 +1161,21 @@ impl BridgeService {
         mut client: ProtonClient,
         args: CompleteLoginArgs,
     ) -> Result<Session, Status> {
+        fn missing_required_login_scopes(
+            required_scopes: &[String],
+            granted_scopes: &[String],
+        ) -> Vec<String> {
+            if required_scopes.is_empty() {
+                return Vec::new();
+            }
+
+            required_scopes
+                .iter()
+                .filter(|scope| !api::auth::has_scope(granted_scopes, scope))
+                .cloned()
+                .collect()
+        }
+
         let CompleteLoginArgs {
             api_mode,
             uid,
@@ -1166,7 +1183,21 @@ impl BridgeService {
             refresh_token,
             username,
             password,
+            required_scopes,
+            granted_scopes,
         } = args;
+
+        let missing_scopes = missing_required_login_scopes(&required_scopes, &granted_scopes);
+        if !missing_scopes.is_empty() {
+            let granted =
+                api::auth::scope_list_to_string(&granted_scopes).unwrap_or_else(|| "none".to_string());
+            warn!(
+                missing_scopes = %missing_scopes.join(" "),
+                granted_scopes = %granted,
+                "grpc login requested scopes not granted; continuing with granted scopes"
+            );
+        }
+
         let user_resp = api::users::get_user(&client)
             .await
             .map_err(status_from_api_error)?;

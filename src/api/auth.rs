@@ -4,7 +4,9 @@ use base64::engine::general_purpose::{
 use base64::Engine as _;
 use rand::distributions::Alphanumeric;
 use rand::Rng as _;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use tracing::{debug, info};
 
 use super::client::{check_api_response, send_logged, send_logged_with_pkg, ProtonClient};
@@ -41,6 +43,7 @@ pub async fn login(
     username: &str,
     password: &str,
     hv_details: Option<&HumanVerificationDetails>,
+    requested_scopes: Option<&[String]>,
 ) -> Result<AuthResponse> {
     // Step 1: Get auth info (salt, server ephemeral, modulus)
     info!(username = ?username, "fetching auth info");
@@ -69,12 +72,19 @@ pub async fn login(
     } else {
         info!("submitting SRP auth");
     }
-    let auth_body = json!({
-        "Username": username,
-        "ClientEphemeral": client_ephemeral,
-        "ClientProof": client_proof,
-        "SRPSession": auth_info.srp_session,
-    });
+    let normalized_scopes = normalize_requested_scopes(requested_scopes);
+    if let Some(scope) = normalized_scopes.as_deref() {
+        info!(
+            scope = %scope,
+            "login scope requirements provided (client-side validation only)"
+        );
+    }
+    let auth_body = build_auth_body(
+        username,
+        &client_ephemeral,
+        &client_proof,
+        &auth_info.srp_session,
+    );
 
     let auth_resp =
         send_logged(with_hv_headers(client.post("/auth/v4"), hv_details).json(&auth_body)).await?;
@@ -82,6 +92,13 @@ pub async fn login(
     check_api_response(&auth_json)?;
 
     let auth: AuthResponse = serde_json::from_value(auth_json)?;
+    if let Some(scope) = auth
+        .scope
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+    {
+        info!(scope = %scope, "login granted auth scope");
+    }
 
     // Step 4: Verify server proof
     srp::verify_server_proof(&expected_server_proof, &auth.server_proof)?;
@@ -91,6 +108,84 @@ pub async fn login(
     client.set_auth(&auth.uid, &auth.access_token);
 
     Ok(auth)
+}
+
+fn normalize_requested_scopes(requested_scopes: Option<&[String]>) -> Option<String> {
+    let normalized = normalize_scope_list(requested_scopes);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized.join(" "))
+    }
+}
+
+fn normalize_scopes_from_tokens<'a>(tokens: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for token in tokens {
+        let scope = token.trim().to_ascii_lowercase();
+        if scope.is_empty() {
+            continue;
+        }
+        let canonical = canonicalize_scope(&scope);
+        if seen.insert(canonical.to_string()) {
+            normalized.push(canonical.to_string());
+        }
+    }
+    normalized
+}
+
+pub fn normalize_scope_list(scopes: Option<&[String]>) -> Vec<String> {
+    normalize_scopes_from_tokens(
+        scopes
+            .into_iter()
+            .flatten()
+            .flat_map(|entry| entry.split_whitespace()),
+    )
+}
+
+pub fn normalize_scope_string(scope: Option<&str>) -> Vec<String> {
+    normalize_scopes_from_tokens(scope.into_iter().flat_map(|entry| entry.split_whitespace()))
+}
+
+pub fn has_scope(granted_scopes: &[String], required_scope: &str) -> bool {
+    let required = normalize_scope_string(Some(required_scope));
+    let Some(required) = required.first() else {
+        return false;
+    };
+    granted_scopes
+        .iter()
+        .any(|scope| scope == "full" || scope == required)
+}
+
+pub fn scope_list_to_string(scopes: &[String]) -> Option<String> {
+    if scopes.is_empty() {
+        None
+    } else {
+        Some(scopes.join(" "))
+    }
+}
+
+fn canonicalize_scope(scope: &str) -> &str {
+    match scope {
+        "email" | "emails" => "mail",
+        "contact" => "contacts",
+        _ => scope,
+    }
+}
+
+fn build_auth_body(
+    username: &str,
+    client_ephemeral: &str,
+    client_proof: &str,
+    srp_session: &str,
+) -> serde_json::Value {
+    json!({
+        "Username": username,
+        "ClientEphemeral": client_ephemeral,
+        "ClientProof": client_proof,
+        "SRPSession": srp_session,
+    })
 }
 
 fn build_refresh_body(
@@ -160,6 +255,13 @@ pub async fn refresh_auth(
     let auth: RefreshResponse = serde_json::from_value(json)?;
     let auth = finalize_refresh_response(uid, refresh_token, auth);
     client.set_auth(&auth.uid, &auth.access_token);
+    if let Some(scope) = auth
+        .scope
+        .as_deref()
+        .filter(|scope| !scope.trim().is_empty())
+    {
+        info!(scope = %scope, "refresh granted auth scope");
+    }
     info!(
         pkg = "api/auth",
         user_id = %auth.uid,
@@ -184,6 +286,40 @@ pub async fn refresh_auth_with_mode_fallback(
     Ok((auth, preferred_mode))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct AuthScopesResponse {
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+pub async fn get_granted_scopes(client: &ProtonClient) -> Result<Vec<String>> {
+    let resp = send_logged(client.get("/auth/v4/scopes")).await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+
+    let result: AuthScopesResponse = serde_json::from_value(json)?;
+    let mut normalized = normalize_scope_list(Some(&result.scopes));
+    if normalized.is_empty() {
+        normalized = normalize_scope_string(result.scope.as_deref());
+    }
+    if normalized.is_empty() {
+        info!("resolved granted auth scopes: none");
+    } else {
+        info!(
+            scope = %normalized.join(" "),
+            "resolved granted auth scopes"
+        );
+    }
+    debug!(
+        scope_count = normalized.len(),
+        "fetched granted auth scopes"
+    );
+    Ok(normalized)
+}
+
 /// Submit TOTP 2FA code.
 pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorResponse> {
     info!("submitting 2FA code");
@@ -194,7 +330,11 @@ pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorRe
     check_api_response(&json)?;
 
     let result: TwoFactorResponse = serde_json::from_value(json)?;
-    info!("2FA accepted");
+    if result.scopes.is_empty() {
+        info!("2FA accepted");
+    } else {
+        info!(scope = %result.scopes.join(" "), "2FA accepted");
+    }
     Ok(result)
 }
 
@@ -268,7 +408,14 @@ pub async fn submit_fido_2fa(
     check_api_response(&json)?;
 
     let result: TwoFactorResponse = serde_json::from_value(json)?;
-    info!("FIDO2 assertion accepted");
+    if result.scopes.is_empty() {
+        info!("FIDO2 assertion accepted");
+    } else {
+        info!(
+            scope = %result.scopes.join(" "),
+            "FIDO2 assertion accepted"
+        );
+    }
     Ok(result)
 }
 
@@ -332,8 +479,9 @@ fn decode_base64_flexible(input: &str) -> std::result::Result<Vec<u8>, base64::D
 #[cfg(test)]
 mod tests {
     use super::{
-        build_refresh_body, decode_base64_flexible, extract_first_binary,
-        finalize_refresh_response, RefreshResponse,
+        build_auth_body, build_refresh_body, decode_base64_flexible, extract_first_binary,
+        finalize_refresh_response, has_scope, normalize_requested_scopes, normalize_scope_string,
+        RefreshResponse,
     };
     use serde_json::json;
 
@@ -409,5 +557,58 @@ mod tests {
         let encoded = "AQIDBA";
         let decoded = decode_base64_flexible(encoded).unwrap();
         assert_eq!(decoded, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_normalize_requested_scopes_dedupes_and_normalizes() {
+        let scopes = vec![
+            " mail ".to_string(),
+            "calendar".to_string(),
+            "MAIL".to_string(),
+            "drive self".to_string(),
+            "contact email".to_string(),
+            "".to_string(),
+        ];
+        let normalized = normalize_requested_scopes(Some(&scopes));
+        assert_eq!(
+            normalized.as_deref(),
+            Some("mail calendar drive self contacts")
+        );
+    }
+
+    #[test]
+    fn test_normalize_requested_scopes_none_when_empty() {
+        let scopes = vec!["   ".to_string(), "".to_string()];
+        assert!(normalize_requested_scopes(Some(&scopes)).is_none());
+        assert!(normalize_requested_scopes(None).is_none());
+    }
+
+    #[test]
+    fn test_build_auth_body_omits_scope_field() {
+        let body = build_auth_body("alice", "ce", "cp", "srp");
+        assert!(body.get("Scope").is_none());
+    }
+
+    #[test]
+    fn test_normalize_scope_string_normalizes_aliases() {
+        let scopes = normalize_scope_string(Some("mail contact email"));
+        assert_eq!(scopes, vec!["mail", "contacts"]);
+    }
+
+    #[test]
+    fn test_has_scope_supports_aliases() {
+        let granted = vec!["contacts".to_string(), "mail".to_string()];
+        assert!(has_scope(&granted, "contact"));
+        assert!(has_scope(&granted, "email"));
+        assert!(!has_scope(&granted, "calendar"));
+    }
+
+    #[test]
+    fn test_has_scope_treats_full_as_superset() {
+        let granted = vec!["full".to_string(), "self".to_string()];
+        assert!(has_scope(&granted, "calendar"));
+        assert!(has_scope(&granted, "contacts"));
+        assert!(has_scope(&granted, "contact"));
+        assert!(has_scope(&granted, "mail"));
     }
 }

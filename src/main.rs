@@ -79,9 +79,26 @@ enum Command {
         /// Proton Mail username or email
         #[arg(short, long)]
         username: Option<String>,
+        /// Proton account password (non-interactive automation)
+        #[arg(long)]
+        password: Option<String>,
+        /// TOTP 2FA code (non-interactive automation)
+        #[arg(long)]
+        totp_code: Option<String>,
+        /// Human verification token (CAPTCHA) for non-interactive automation
+        #[arg(long)]
+        hv_token: Option<String>,
         /// Proton API mode to use for this account (default: bridge)
         #[arg(long, value_enum)]
         api_mode: Option<ApiModeArg>,
+        /// Space-delimited scopes to request (example: "mail calendar contacts self")
+        /// If omitted, server-default scopes are requested.
+        #[arg(long)]
+        scopes: Option<String>,
+        /// Repeatable scope flag (example: --scope mail --scope calendar)
+        /// If omitted, server-default scopes are requested.
+        #[arg(long)]
+        scope: Vec<String>,
     },
     /// Generate FIDO assertion JSON using a hardware security key
     FidoAssert {
@@ -387,8 +404,26 @@ async fn execute_non_interactive_command_direct(
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
     match command {
-        Command::Login { username, api_mode } => {
-            cmd_login(username, api_mode.map(Into::into), dir).await
+        Command::Login {
+            username,
+            password,
+            totp_code,
+            hv_token,
+            api_mode,
+            scopes,
+            scope,
+        } => {
+            let requested_scopes = collect_requested_scopes(scopes, scope);
+            cmd_login(
+                username,
+                password,
+                totp_code,
+                hv_token,
+                api_mode.map(Into::into),
+                requested_scopes,
+                dir,
+            )
+            .await
         }
         Command::FidoAssert {
             auth_options_json,
@@ -514,6 +549,51 @@ fn resolve_vault_dir(cli: &Cli) -> Option<std::path::PathBuf> {
     cli.vault_dir
         .clone()
         .or_else(|| env_non_empty(ENV_OPENPROTON_VAULT_DIR).map(std::path::PathBuf::from))
+}
+
+fn collect_requested_scopes(scopes: Option<String>, scope: Vec<String>) -> Option<Vec<String>> {
+    let mut requested = Vec::new();
+
+    if let Some(grouped) = scopes {
+        requested.extend(
+            grouped
+                .split_whitespace()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    for entry in scope {
+        requested.extend(
+            entry
+                .split_whitespace()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    if requested.is_empty() {
+        None
+    } else {
+        Some(requested)
+    }
+}
+
+fn missing_required_login_scopes(
+    required_scopes: &[String],
+    granted_scopes: &[String],
+) -> Vec<String> {
+    if required_scopes.is_empty() {
+        return Vec::new();
+    }
+
+    required_scopes
+        .iter()
+        .filter(|scope| !api::auth::has_scope(granted_scopes, scope))
+        .cloned()
+        .collect()
 }
 
 fn parse_execution_mode(raw: &str) -> anyhow::Result<ExecutionMode> {
@@ -2313,7 +2393,9 @@ fn print_interactive_help() {
     println!("  status                           Show account/session status");
     println!("  list | ls                        List accounts");
     println!("  info [email|index]               Show account/session info");
-    println!("  login [email|--username <email>] [--api-mode bridge|webmail] Login to Proton");
+    println!(
+        "  login [email|--username <email>] [--password <password>] [--totp-code <code>] [--hv-token <token>] [--api-mode bridge|webmail] [--scopes \"...\"] [--scope <scope>] Login to Proton (defaults: server-provided scopes)"
+    );
     println!("  logout [all|--all|--email <email>] Logout one account or all accounts");
     println!("  delete <email|index>             Remove one account");
     println!("  use <email|index>                Set default account");
@@ -3036,11 +3118,16 @@ fn print_interactive_serve_config(config: &InteractiveServeConfig) {
 
 async fn cmd_login(
     username_arg: Option<String>,
+    password_arg: Option<String>,
+    totp_code_arg: Option<String>,
+    hv_token_arg: Option<String>,
     api_mode: Option<api::types::ApiMode>,
+    requested_scopes: Option<Vec<String>>,
     dir: &std::path::Path,
 ) -> anyhow::Result<()> {
     let requested_api_mode = api_mode.unwrap_or(api::types::ApiMode::Bridge);
     let mut effective_api_mode = requested_api_mode;
+    let required_scopes = api::auth::normalize_scope_list(requested_scopes.as_deref());
     let username = match username_arg {
         Some(u) => u,
         None => {
@@ -3061,18 +3148,34 @@ async fn cmd_login(
         pkg = "bridge/login",
         username = %username,
         api_mode = requested_api_mode.as_str(),
+        requested_scope_count = required_scopes.len(),
         "login requested"
     );
 
-    let password = rpassword::prompt_password("Password: ").context("failed to read password")?;
+    let password = match password_arg {
+        Some(password) => password,
+        None => rpassword::prompt_password("Password: ").context("failed to read password")?,
+    };
 
     let mut client = api::client::ProtonClient::with_api_mode(effective_api_mode)?;
     let mut tried_mode_fallback = false;
+    let hv_token_override = hv_token_arg
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty());
+    let mut hv_token_override_used = false;
 
     // SRP authentication with optional human-verification retries.
     let mut hv_details: Option<api::types::HumanVerificationDetails> = None;
     let auth = loop {
-        match api::auth::login(&mut client, &username, &password, hv_details.as_ref()).await {
+        match api::auth::login(
+            &mut client,
+            &username,
+            &password,
+            hv_details.as_ref(),
+            requested_scopes.as_deref(),
+        )
+        .await
+        {
             Ok(auth) => break auth,
             Err(err) => {
                 if !tried_mode_fallback
@@ -3118,10 +3221,29 @@ async fn cmd_login(
                             "CAPTCHA validation failed; please complete the challenge again."
                         );
                     }
-                    if let Some(token_override) =
+                    if let Some(token_override) = hv_token_override.as_ref() {
+                        if hv_token_override_used {
+                            anyhow::bail!(
+                                "provided --hv-token was rejected; obtain a fresh token and retry login"
+                            );
+                        }
+                        hv.human_verification_token = token_override.clone();
+                        hv_token_override_used = true;
+                        tracing::info!(
+                            pkg = "bridge/login",
+                            username = %username,
+                            "using provided human verification token override"
+                        );
+                    } else if let Some(token_override) =
                         cli_human_verification::prompt_for_token(&hv).await?
                     {
                         hv.human_verification_token = token_override;
+                    }
+                    if !hv.is_usable() {
+                        anyhow::bail!(
+                            "human verification required but no token available; verification URL: {}",
+                            hv.challenge_url()
+                        );
                     }
                     hv_details = Some(hv);
                     continue;
@@ -3138,15 +3260,49 @@ async fn cmd_login(
         }
     };
 
-    if let Err(err) = complete_cli_second_factor(&client, &auth).await {
+    let second_factor_scopes =
+        match complete_cli_second_factor(&client, &auth, totp_code_arg.as_deref()).await {
+        Ok(scopes) => scopes,
+        Err(err) => {
+            tracing::warn!(
+                pkg = "bridge/login",
+                username = %username,
+                user_id = %auth.uid,
+                error = %err,
+                "second-factor login step failed"
+            );
+            return Err(err);
+        }
+    };
+
+    let mut granted_scopes = api::auth::normalize_scope_string(auth.scope.as_deref());
+    if !second_factor_scopes.is_empty() {
+        granted_scopes = second_factor_scopes;
+    }
+    let missing_scopes = missing_required_login_scopes(&required_scopes, &granted_scopes);
+    if !missing_scopes.is_empty() {
+        let granted =
+            api::auth::scope_list_to_string(&granted_scopes).unwrap_or_else(|| "none".to_string());
         tracing::warn!(
             pkg = "bridge/login",
-            username = %username,
             user_id = %auth.uid,
-            error = %err,
-            "second-factor login step failed"
+            missing_scopes = %missing_scopes.join(" "),
+            granted_scopes = %granted,
+            "requested login scopes not granted; continuing with granted scopes"
         );
-        return Err(err);
+        eprintln!(
+            "Warning: requested scope(s) not granted: {}; granted: {}",
+            missing_scopes.join(" "),
+            granted
+        );
+    }
+    if let Some(scope) = api::auth::scope_list_to_string(&granted_scopes) {
+        tracing::info!(
+            pkg = "bridge/login",
+            user_id = %auth.uid,
+            scope = %scope,
+            "effective granted login scopes"
+        );
     }
 
     // Fetch user info
@@ -3237,9 +3393,10 @@ async fn cmd_login(
 async fn complete_cli_second_factor(
     client: &api::client::ProtonClient,
     auth: &api::types::AuthResponse,
-) -> anyhow::Result<()> {
+    totp_code: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
     if !auth.two_factor.requires_second_factor() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     if auth.two_factor.totp_required() {
@@ -3248,9 +3405,12 @@ async fn complete_cli_second_factor(
             user_id = %auth.uid,
             "Requesting TOTP"
         );
-        let code = rpassword::prompt_password("2FA code: ").context("failed to read 2FA code")?;
-        api::auth::submit_2fa(client, code.trim()).await?;
-        return Ok(());
+        let code = match totp_code {
+            Some(code) => code.to_string(),
+            None => rpassword::prompt_password("2FA code: ").context("failed to read 2FA code")?,
+        };
+        let result = api::auth::submit_2fa(client, code.trim()).await?;
+        return Ok(api::auth::normalize_scope_list(Some(&result.scopes)));
     }
 
     if auth.two_factor.fido_supported() {
@@ -3259,8 +3419,9 @@ async fn complete_cli_second_factor(
             .fido_authentication_options()
             .context("FIDO authentication options missing in auth response")?;
         let assertion_payload = read_cli_fido_assertion_payload(&auth_options)?;
-        api::auth::submit_fido_2fa(client, &auth_options, assertion_payload.as_bytes()).await?;
-        return Ok(());
+        let result =
+            api::auth::submit_fido_2fa(client, &auth_options, assertion_payload.as_bytes()).await?;
+        return Ok(api::auth::normalize_scope_list(Some(&result.scopes)));
     }
 
     anyhow::bail!("unsupported second-factor mode returned by API");
@@ -5096,6 +5257,83 @@ mod tests {
             }
             _ => panic!("expected mutt-config command"),
         }
+    }
+
+    #[test]
+    fn parse_login_scopes_flags() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "login",
+            "--username",
+            "alice@proton.me",
+            "--scopes",
+            "mail calendar",
+            "--scope",
+            "drive",
+            "--scope",
+            "self",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::Login {
+                username,
+                scopes,
+                scope,
+                ..
+            } => {
+                assert_eq!(username.as_deref(), Some("alice@proton.me"));
+                assert_eq!(scopes.as_deref(), Some("mail calendar"));
+                assert_eq!(scope, vec!["drive".to_string(), "self".to_string()]);
+            }
+            _ => panic!("expected login command"),
+        }
+    }
+
+    #[test]
+    fn collect_requested_scopes_merges_grouped_and_repeatable_flags() {
+        let scopes = collect_requested_scopes(
+            Some("mail calendar".to_string()),
+            vec!["drive".to_string(), "self contacts".to_string()],
+        );
+        assert_eq!(
+            scopes,
+            Some(vec![
+                "mail".to_string(),
+                "calendar".to_string(),
+                "drive".to_string(),
+                "self".to_string(),
+                "contacts".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn collect_requested_scopes_defaults_when_not_provided() {
+        let scopes = collect_requested_scopes(None, vec![]);
+        assert_eq!(scopes, None);
+    }
+
+    #[test]
+    fn missing_required_login_scopes_accepts_subset() {
+        let missing = missing_required_login_scopes(
+            &["mail".to_string(), "contact".to_string()],
+            &[
+                "mail".to_string(),
+                "contacts".to_string(),
+                "self".to_string(),
+            ],
+        );
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn missing_required_login_scopes_reports_missing_scope() {
+        let missing = missing_required_login_scopes(
+            &["mail".to_string(), "calendar".to_string()],
+            &["mail".to_string(), "self".to_string()],
+        );
+        assert_eq!(missing, vec!["calendar".to_string()]);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod bridge;
 pub mod certs;
+pub mod cli_human_verification;
 pub mod client_config;
 pub mod crypto;
 pub mod dav;

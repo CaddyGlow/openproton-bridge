@@ -1,8 +1,11 @@
 use std::io::Write;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context};
+use regex::Regex;
+use reqwest::redirect::Policy;
 use reqwest::Url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -14,7 +17,7 @@ use crate::api::types::HumanVerificationDetails;
 
 const CAPTCHA_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_REQUEST_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 pub async fn prompt_for_token(
     details: &HumanVerificationDetails,
@@ -106,6 +109,13 @@ impl CaptchaCaptureServer {
         let (token_tx, token_rx) = oneshot::channel();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let token_tx = Arc::new(Mutex::new(Some(token_tx)));
+        let proxy_client = Arc::new(
+            reqwest::Client::builder()
+                .redirect(Policy::limited(10))
+                .cookie_store(true)
+                .build()
+                .context("failed to build verification helper proxy HTTP client")?,
+        );
 
         let task = tokio::spawn(async move {
             loop {
@@ -116,9 +126,10 @@ impl CaptchaCaptureServer {
                             break;
                         };
                         let token_tx = Arc::clone(&token_tx);
+                        let proxy_client = Arc::clone(&proxy_client);
                         let challenge_url = challenge_url.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_connection(stream, &challenge_url, token_tx).await {
+                            if let Err(err) = handle_connection(stream, &challenge_url, &proxy_client, token_tx).await {
                                 debug!(error = %err, "human verification helper connection failed");
                             }
                         });
@@ -167,26 +178,15 @@ impl CaptchaCaptureServer {
 async fn handle_connection(
     mut stream: TcpStream,
     challenge_url: &str,
+    proxy_client: &reqwest::Client,
     token_tx: Arc<Mutex<Option<oneshot::Sender<String>>>>,
 ) -> anyhow::Result<()> {
     let request = read_request(&mut stream).await?;
+    let method = parse_request_method(&request).context("missing request method")?;
     let target = parse_request_target(&request).context("missing request target")?;
     let path = parse_request_path(target).context("invalid request target")?;
 
     match path.path() {
-        "/" | "/captcha" => {
-            let page = build_local_capture_page(challenge_url)?;
-            write_response(
-                &mut stream,
-                "200 OK",
-                &[
-                    ("Content-Type", "text/html; charset=utf-8"),
-                    ("Cache-Control", "no-store"),
-                ],
-                page.as_bytes(),
-            )
-            .await?;
-        }
         "/callback" => {
             if let Some(token) = path
                 .query_pairs()
@@ -200,20 +200,28 @@ async fn handle_connection(
             write_response(
                 &mut stream,
                 "200 OK",
-                &[("Content-Type", "text/plain; charset=utf-8")],
+                &[("Content-Type".to_string(), "text/plain; charset=utf-8".to_string())],
                 b"OK",
             )
             .await?;
         }
         "/favicon.ico" => {
-            write_response(&mut stream, "204 No Content", &[], b"").await?;
+            write_response(&mut stream, "204 No Content", &Vec::new(), b"").await?;
         }
         _ => {
+            let proxied = proxy_request(
+                proxy_client,
+                challenge_url,
+                method,
+                target,
+                &request,
+            )
+            .await?;
             write_response(
                 &mut stream,
-                "404 Not Found",
-                &[("Content-Type", "text/plain; charset=utf-8")],
-                b"Not Found",
+                &proxied.status_line,
+                &proxied.headers,
+                &proxied.body,
             )
             .await?;
         }
@@ -225,6 +233,7 @@ async fn handle_connection(
 async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 1024];
+    let mut expected_total_len: Option<usize> = None;
 
     loop {
         let read = timeout(REQUEST_TIMEOUT, stream.read(&mut chunk))
@@ -234,8 +243,16 @@ async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Vec<u8>> {
             break;
         }
         request.extend_from_slice(&chunk[..read]);
-        if request.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if expected_total_len.is_none() {
+            if let Some(header_end) = find_header_end(&request) {
+                let content_length = parse_content_length(&request).unwrap_or(0);
+                expected_total_len = Some(header_end + 4 + content_length);
+            }
+        }
+        if let Some(total_len) = expected_total_len {
+            if request.len() >= total_len {
+                break;
+            }
         }
         if request.len() >= MAX_REQUEST_BYTES {
             anyhow::bail!("verification helper request exceeded {MAX_REQUEST_BYTES} bytes");
@@ -252,8 +269,50 @@ fn parse_request_target(request: &[u8]) -> Option<&str> {
     parts.next()
 }
 
+fn parse_request_method(request: &[u8]) -> Option<&str> {
+    let request = std::str::from_utf8(request).ok()?;
+    request.lines().next()?.split_whitespace().next()
+}
+
 fn parse_request_path(target: &str) -> Option<Url> {
     Url::parse(&format!("http://127.0.0.1{target}")).ok()
+}
+
+fn parse_request_headers(request: &[u8]) -> Vec<(String, String)> {
+    let text = String::from_utf8_lossy(request);
+    let mut headers = Vec::new();
+    for line in text.lines().skip(1) {
+        if line.trim().is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    headers
+}
+
+fn find_header_end(request: &[u8]) -> Option<usize> {
+    request.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(request: &[u8]) -> Option<usize> {
+    parse_request_headers(request).into_iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("content-length") {
+            value.parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn request_body<'a>(request: &'a [u8], header_end: usize) -> &'a [u8] {
+    let start = header_end + 4;
+    if request.len() <= start {
+        &[]
+    } else {
+        &request[start..]
+    }
 }
 
 fn with_force_web_messaging(challenge_url: &str) -> anyhow::Result<String> {
@@ -265,104 +324,167 @@ fn with_force_web_messaging(challenge_url: &str) -> anyhow::Result<String> {
     Ok(url.into())
 }
 
-fn build_local_capture_page(challenge_url: &str) -> anyhow::Result<String> {
-    let verify_url = with_force_web_messaging(challenge_url)?;
-    let html = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenProton Verification Helper</title>
-  <style>
-    body {{ margin: 0; font-family: system-ui, sans-serif; background: #f6f8fa; color: #1f2328; }}
-    .banner {{ position: fixed; top: 0; left: 0; right: 0; z-index: 2; padding: 12px 16px; background: #0b1020; color: #fff; border-bottom: 2px solid #2f6feb; }}
-    .tools {{ margin-top: 64px; padding: 12px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
-    .btn {{ border: 1px solid #d0d7de; border-radius: 6px; background: #fff; padding: 8px 12px; cursor: pointer; }}
-    .card {{ margin: 12px 16px; background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 12px 14px; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; word-break: break-all; }}
-    code {{ background: #eaedf0; padding: 2px 4px; border-radius: 4px; }}
-  </style>
-</head>
-<body>
-  <div id="opb-hv-banner" class="banner">
-    Click "Open Verification" and complete the Proton challenge. Token capture is automatic.
-  </div>
-  <div class="tools">
-    <button id="open-popup" class="btn" type="button">Open Verification</button>
-    <span>If popup is blocked, open this URL manually:</span>
-    <code id="verify-url"></code>
-  </div>
-  <div class="card">
-    Keep this helper tab open while solving the challenge in the opened Proton tab/window.
-    When Proton sends the token, this page will confirm and the CLI will continue.
-    <div id="status" class="mono" style="margin-top:10px;">status=waiting_for_token</div>
-  </div>
-  <script>
-  (function () {{
-    const verifyUrl = {verify_url:?};
-    const banner = document.getElementById('opb-hv-banner');
-    const code = document.getElementById('verify-url');
-    const statusEl = document.getElementById('status');
-    const popupBtn = document.getElementById('open-popup');
-    code.textContent = verifyUrl;
-    let delivered = false;
-    let popup = null;
-    function mark(msg, ok) {{
-      banner.textContent = msg;
-      banner.style.borderColor = ok ? '#2da44e' : '#bf8700';
-      statusEl.textContent = ok ? 'status=token_delivered' : 'status=waiting_for_token';
-    }}
-    function submitToken(token) {{
-      if (delivered || !token) return;
-      delivered = true;
-      fetch('/callback?token=' + encodeURIComponent(token), {{ cache: 'no-store' }})
-        .then(function () {{
-          mark('Verification complete. You can close this tab.', true);
-          if (popup && !popup.closed) {{
-            try {{ popup.close(); }} catch (e) {{}}
-          }}
-        }})
-        .catch(function () {{
-          delivered = false;
-          mark('Captured token but failed to deliver to CLI. Keep this page open and retry.', false);
-        }});
-    }}
-    window.addEventListener('message', function (event) {{
-      if (typeof event.data === 'string' && event.data.length > 10) {{
-        submitToken(event.data);
-        return;
-      }}
-      if (event.data && typeof event.data === 'object') {{
-        if (typeof event.data.token === 'string') submitToken(event.data.token);
-        if (event.data.payload && typeof event.data.payload.token === 'string') submitToken(event.data.payload.token);
-      }}
-    }});
-    function openVerifyWindow() {{
-      popup = window.open(verifyUrl, '_blank');
-      if (!popup) {{
-        mark('Popup blocked. Open URL manually: ' + verifyUrl, false);
-      }} else {{
-        mark('Waiting for verification token...', false);
-      }}
-    }}
-    popupBtn.addEventListener('click', function () {{
-      openVerifyWindow();
-    }});
-    // Try once automatically; user can always click the button if blocked.
-    openVerifyWindow();
-  }})();
-  </script>
-</body>
-</html>"#
+#[derive(Debug)]
+struct ProxiedResponse {
+    status_line: String,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+fn csp_meta_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"(?is)<meta\s+http-equiv=["']content-security-policy["'][^>]*>"#).unwrap()
+    })
+}
+
+fn strip_csp_meta_tags(html: &str) -> String {
+    csp_meta_re().replace_all(html, "").into_owned()
+}
+
+fn inject_token_capture_script(html: &str) -> String {
+    let injection = r#"
+<div id="opb-hv-banner" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#0b1020;color:#ffffff;padding:12px 16px;font-family:system-ui,sans-serif;font-size:14px;line-height:1.4;border-bottom:2px solid #2f6feb;">
+  OpenProton local verification helper is active. Complete CAPTCHA below and CLI continues automatically.
+</div>
+<div style="height:56px;"></div>
+<script>
+(function () {
+  let delivered = false;
+  function submitToken(token) {
+    if (delivered || !token) return;
+    delivered = true;
+    fetch('/callback?token=' + encodeURIComponent(token), { cache: 'no-store' })
+      .then(function () {
+        const banner = document.getElementById('opb-hv-banner');
+        if (banner) {
+          banner.textContent = 'Verification complete. You can close this tab.';
+          banner.style.borderColor = '#2da44e';
+        }
+      })
+      .catch(function () { delivered = false; });
+  }
+  window.addEventListener('message', function (event) {
+    if (typeof event.data === 'string' && event.data.length > 10) {
+      submitToken(event.data);
+      return;
+    }
+    if (event.data && typeof event.data === 'object') {
+      if (typeof event.data.token === 'string') submitToken(event.data.token);
+      if (event.data.payload && typeof event.data.payload.token === 'string') submitToken(event.data.payload.token);
+    }
+  });
+})();
+</script>
+"#;
+    if html.contains("</body>") {
+        html.replacen("</body>", &format!("{injection}</body>"), 1)
+    } else {
+        format!("{html}{injection}")
+    }
+}
+
+fn upstream_url_for_target(challenge_url: &str, target: &str) -> anyhow::Result<String> {
+    let target_path = parse_request_path(target).context("invalid request target path")?;
+    if matches!(target_path.path(), "/" | "/captcha") {
+        return with_force_web_messaging(challenge_url);
+    }
+    let challenge = Url::parse(challenge_url).context("invalid Proton verification URL")?;
+    let origin = challenge.origin().ascii_serialization();
+    Ok(format!("{origin}{target}"))
+}
+
+async fn proxy_request(
+    proxy_client: &reqwest::Client,
+    challenge_url: &str,
+    method: &str,
+    target: &str,
+    raw_request: &[u8],
+) -> anyhow::Result<ProxiedResponse> {
+    let upstream_url = upstream_url_for_target(challenge_url, target)?;
+    let method =
+        reqwest::Method::from_bytes(method.as_bytes()).context("invalid upstream HTTP method")?;
+    let mut builder = proxy_client.request(method, &upstream_url);
+
+    let challenge_origin = Url::parse(challenge_url)
+        .context("invalid Proton verification URL")?
+        .origin()
+        .ascii_serialization();
+    for (name, value) in parse_request_headers(raw_request) {
+        if name.eq_ignore_ascii_case("host")
+            || name.eq_ignore_ascii_case("connection")
+            || name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("accept-encoding")
+            || name.eq_ignore_ascii_case("proxy-connection")
+        {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("origin") {
+            builder = builder.header("Origin", &challenge_origin);
+            continue;
+        }
+        if name.eq_ignore_ascii_case("referer") {
+            builder = builder.header("Referer", &challenge_origin);
+            continue;
+        }
+        builder = builder.header(&name, &value);
+    }
+
+    let header_end = find_header_end(raw_request).context("incomplete request headers")?;
+    let body = request_body(raw_request, header_end);
+    if !body.is_empty() {
+        builder = builder.body(body.to_vec());
+    }
+
+    let response = builder
+        .send()
+        .await
+        .with_context(|| format!("verification helper proxy request failed: {upstream_url}"))?;
+    let status = response.status();
+    let status_line = format!(
+        "{} {}",
+        status.as_u16(),
+        status.canonical_reason().unwrap_or("Unknown")
     );
-    Ok(html)
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let cache_control = response
+        .headers()
+        .get("cache-control")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("no-store")
+        .to_string();
+
+    let mut body = response
+        .bytes()
+        .await
+        .context("failed to read proxy response body")?
+        .to_vec();
+    if matches!(parse_request_path(target).map(|url| url.path().to_string()).as_deref(), Some("/" | "/captcha"))
+        && content_type.to_ascii_lowercase().contains("text/html")
+    {
+        let html = String::from_utf8_lossy(&body);
+        body = inject_token_capture_script(&strip_csp_meta_tags(&html)).into_bytes();
+    }
+
+    Ok(ProxiedResponse {
+        status_line,
+        headers: vec![
+            ("Content-Type".to_string(), content_type),
+            ("Cache-Control".to_string(), cache_control),
+        ],
+        body,
+    })
 }
 
 async fn write_response(
     stream: &mut TcpStream,
     status: &str,
-    headers: &[(&str, &str)],
+    headers: &[(String, String)],
     body: &[u8],
 ) -> anyhow::Result<()> {
     let mut response = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n", body.len());
@@ -416,16 +538,21 @@ mod tests {
     }
 
     #[test]
-    fn build_local_capture_page_contains_verify_url_and_callback_hook() {
-        let page = build_local_capture_page(
-            "https://verify.proton.me/?methods=captcha&token=token-123",
-        )
-        .expect("page");
-
-        assert!(page.contains("Open Verification"));
-        assert!(page.contains("ForceWebMessaging=1"));
+    fn inject_token_capture_script_contains_callback_hook() {
+        let page = inject_token_capture_script("<html><body><main>captcha</main></body></html>");
         assert!(page.contains("window.addEventListener('message'"));
         assert!(page.contains("fetch('/callback?token=' + encodeURIComponent(token)"));
+    }
+
+    #[test]
+    fn upstream_url_for_captcha_target_uses_force_web_messaging() {
+        let upstream = upstream_url_for_target(
+            "https://verify.proton.me/?methods=captcha&token=token-123",
+            "/captcha",
+        )
+        .expect("upstream");
+        assert!(upstream.contains("verify.proton.me"));
+        assert!(upstream.contains("ForceWebMessaging=1"));
     }
 
     #[test]

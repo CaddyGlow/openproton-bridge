@@ -277,40 +277,52 @@ fn build_local_capture_page(challenge_url: &str) -> anyhow::Result<String> {
   <style>
     body {{ margin: 0; font-family: system-ui, sans-serif; background: #f6f8fa; color: #1f2328; }}
     .banner {{ position: fixed; top: 0; left: 0; right: 0; z-index: 2; padding: 12px 16px; background: #0b1020; color: #fff; border-bottom: 2px solid #2f6feb; }}
-    .tools {{ margin-top: 64px; padding: 10px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
+    .tools {{ margin-top: 64px; padding: 12px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }}
     .btn {{ border: 1px solid #d0d7de; border-radius: 6px; background: #fff; padding: 8px 12px; cursor: pointer; }}
-    .frame {{ width: 100%; height: calc(100vh - 130px); border: 0; background: #fff; }}
+    .card {{ margin: 12px 16px; background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 12px 14px; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; word-break: break-all; }}
     code {{ background: #eaedf0; padding: 2px 4px; border-radius: 4px; }}
   </style>
 </head>
 <body>
   <div id="opb-hv-banner" class="banner">
-    Complete the Proton verification challenge below. Token capture is automatic.
+    Click "Open Verification" and complete the Proton challenge. Token capture is automatic.
   </div>
   <div class="tools">
-    <button id="open-popup" class="btn" type="button">Open In New Tab</button>
-    <span>If the embedded view is blocked, open <code id="verify-url"></code> in a new tab.</span>
+    <button id="open-popup" class="btn" type="button">Open Verification</button>
+    <span>If popup is blocked, open this URL manually:</span>
+    <code id="verify-url"></code>
   </div>
-  <iframe id="verify-frame" class="frame" referrerpolicy="no-referrer"></iframe>
+  <div class="card">
+    Keep this helper tab open while solving the challenge in the opened Proton tab/window.
+    When Proton sends the token, this page will confirm and the CLI will continue.
+    <div id="status" class="mono" style="margin-top:10px;">status=waiting_for_token</div>
+  </div>
   <script>
   (function () {{
     const verifyUrl = {verify_url:?};
-    const frame = document.getElementById('verify-frame');
     const banner = document.getElementById('opb-hv-banner');
     const code = document.getElementById('verify-url');
+    const statusEl = document.getElementById('status');
     const popupBtn = document.getElementById('open-popup');
     code.textContent = verifyUrl;
-    frame.src = verifyUrl;
     let delivered = false;
+    let popup = null;
     function mark(msg, ok) {{
       banner.textContent = msg;
       banner.style.borderColor = ok ? '#2da44e' : '#bf8700';
+      statusEl.textContent = ok ? 'status=token_delivered' : 'status=waiting_for_token';
     }}
     function submitToken(token) {{
       if (delivered || !token) return;
       delivered = true;
       fetch('/callback?token=' + encodeURIComponent(token), {{ cache: 'no-store' }})
-        .then(function () {{ mark('Verification complete. You can close this tab.', true); }})
+        .then(function () {{
+          mark('Verification complete. You can close this tab.', true);
+          if (popup && !popup.closed) {{
+            try {{ popup.close(); }} catch (e) {{}}
+          }}
+        }})
         .catch(function () {{
           delivered = false;
           mark('Captured token but failed to deliver to CLI. Keep this page open and retry.', false);
@@ -326,13 +338,19 @@ fn build_local_capture_page(challenge_url: &str) -> anyhow::Result<String> {
         if (event.data.payload && typeof event.data.payload.token === 'string') submitToken(event.data.payload.token);
       }}
     }});
-    popupBtn.addEventListener('click', function () {{
-      const popup = window.open(verifyUrl, '_blank');
+    function openVerifyWindow() {{
+      popup = window.open(verifyUrl, '_blank');
       if (!popup) {{
         mark('Popup blocked. Open URL manually: ' + verifyUrl, false);
+      }} else {{
+        mark('Waiting for verification token...', false);
       }}
+    }}
+    popupBtn.addEventListener('click', function () {{
+      openVerifyWindow();
     }});
-    mark('Waiting for verification token...', false);
+    // Try once automatically; user can always click the button if blocked.
+    openVerifyWindow();
   }})();
   </script>
 </body>
@@ -404,7 +422,7 @@ mod tests {
         )
         .expect("page");
 
-        assert!(page.contains("iframe"));
+        assert!(page.contains("Open Verification"));
         assert!(page.contains("ForceWebMessaging=1"));
         assert!(page.contains("window.addEventListener('message'"));
         assert!(page.contains("fetch('/callback?token=' + encodeURIComponent(token)"));

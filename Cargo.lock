@@ -2077,6 +2077,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rand 0.8.5",
  "rcgen",
+ "regex",
  "reqwest",
  "rmp-serde",
  "rmpv",

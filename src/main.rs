@@ -17,6 +17,7 @@ use tokio::io::AsyncBufReadExt;
 mod api;
 mod bridge;
 mod certs;
+mod cli_human_verification;
 mod client_config;
 mod crypto;
 mod dav;
@@ -3116,30 +3117,11 @@ async fn cmd_login(
                         eprintln!(
                             "CAPTCHA validation failed; please complete the challenge again."
                         );
-                        eprintln!(
-                            "If it still fails, capture the `pm_captcha` token from browser DevTools \
-                             and paste it below."
-                        );
-                    } else {
-                        eprintln!("Human verification required by Proton.");
                     }
-                    eprintln!("Open this URL in your browser and complete the challenge:");
-                    eprintln!("{}", hv.challenge_url());
-                    eprint!("Press ENTER once verification is complete...");
-                    let mut line = String::new();
-                    std::io::stdin()
-                        .read_line(&mut line)
-                        .context("failed to read human verification confirmation")?;
-                    eprint!(
-                        "Paste CAPTCHA token from browser (optional, press ENTER to reuse URL token): "
-                    );
-                    line.clear();
-                    std::io::stdin()
-                        .read_line(&mut line)
-                        .context("failed to read optional human verification token")?;
-                    let token_override = line.trim();
-                    if !token_override.is_empty() {
-                        hv.human_verification_token = token_override.to_string();
+                    if let Some(token_override) =
+                        cli_human_verification::prompt_for_token(&hv).await?
+                    {
+                        hv.human_verification_token = token_override;
                     }
                     hv_details = Some(hv);
                     continue;

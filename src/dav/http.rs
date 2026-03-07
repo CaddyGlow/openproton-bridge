@@ -107,7 +107,10 @@ pub fn not_implemented_response() -> DavResponse {
         status: "501 Not Implemented",
         headers: vec![
             ("Content-Type", "text/plain; charset=utf-8".to_string()),
-            ("DAV", "1, 2, calendar-access, addressbook".to_string()),
+            (
+                "DAV",
+                "1, 2, calendar-access, addressbook, sync-collection".to_string(),
+            ),
             (
                 "Allow",
                 "OPTIONS, PROPFIND, PROPPATCH, REPORT, GET, HEAD, PUT, DELETE".to_string(),
@@ -142,7 +145,7 @@ mod tests {
         let wire = String::from_utf8(response.to_bytes()).expect("valid utf8 response");
 
         assert!(wire.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
-        assert!(wire.contains("DAV: 1, 2, calendar-access, addressbook\r\n"));
+        assert!(wire.contains("DAV: 1, 2, calendar-access, addressbook, sync-collection\r\n"));
         assert!(wire.contains("DAV support is not implemented yet"));
     }
 }

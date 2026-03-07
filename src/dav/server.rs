@@ -27,7 +27,7 @@ use super::propfind;
 use super::report;
 
 const MAX_DAV_BODY_BYTES: usize = 1_048_576;
-const DAV_CAPABILITIES_HEADER: &str = "1, 2, calendar-access, addressbook";
+const DAV_CAPABILITIES_HEADER: &str = "1, 2, calendar-access, addressbook, sync-collection";
 
 static DAV_METRICS: LazyLock<DavServerMetrics> = LazyLock::new(DavServerMetrics::default);
 static RUNTIME_TLS_CONFIG: OnceLock<RwLock<Option<Arc<rustls::ServerConfig>>>> = OnceLock::new();
@@ -726,7 +726,7 @@ mod tests {
         let wire = String::from_utf8_lossy(&response[..n]);
 
         assert!(wire.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
-        assert!(wire.contains("DAV: 1, 2, calendar-access, addressbook\r\n"));
+        assert!(wire.contains("DAV: 1, 2, calendar-access, addressbook, sync-collection\r\n"));
 
         handle.stop().await?;
         Ok(())

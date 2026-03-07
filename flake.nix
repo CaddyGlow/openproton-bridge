@@ -11,7 +11,11 @@
       let
         pkgs = import nixpkgs {
           inherit system;
-          config = {};
+          config = {
+            permittedInsecurePackages = [
+              "python-2.7.18.12"
+            ];
+          };
         };
         lib = pkgs.lib;
         bunPkg = if pkgs ? bun-bin then pkgs.bun-bin else pkgs.bun;
@@ -30,6 +34,29 @@
           else
             null;
 
+        pycalendarSrc = pkgs.fetchFromGitHub {
+          owner = "apple";
+          repo = "ccs-pycalendar";
+          rev = "a12dd4e1ce8822b022d4abf2cfe6cc93902ff03f";
+          sha256 = "1h79ycga2v6ikm4j7839bs987jay7mf39lkamvmvxrfd0q7r51qh";
+        };
+
+        caldavtesterSrc = pkgs.fetchFromGitHub {
+          owner = "apple";
+          repo = "ccs-caldavtester";
+          rev = "bed21e5924275552c1561febc8203a9f194cf737";
+          sha256 = "1h1pb6x576d5k6rxqhadrlz1p2qnlz30lp98f0g3xvplm3rra5lz";
+        };
+
+        caldavtesterPkg = pkgs.writeShellApplication {
+          name = "caldavtester";
+          runtimeInputs = [ pkgs.python2 ];
+          text = ''
+            export PYTHONPATH="${caldavtesterSrc}:${pycalendarSrc}/src''${PYTHONPATH:+:''${PYTHONPATH}}"
+            exec ${pkgs.python2}/bin/python ${caldavtesterSrc}/testcaldav.py "$@"
+          '';
+        };
+
         linuxUiLibs =
           [
             pkgs.atk
@@ -47,8 +74,10 @@
         devShells.default = pkgs.mkShell {
           nativeBuildInputs = [
             bunPkg
+            caldavtesterPkg
             pkgs.cargo
             pkgs.clippy
+            pkgs.litmus
             pkgs.pkg-config
             pkgs.protobuf
             pkgs.rustc
@@ -72,6 +101,7 @@
             echo " - Rust toolchain: rustc/cargo/clippy/rustfmt"
             echo " - Frontend tooling: bun"
             echo " - Proto tooling: protoc"
+            echo " - DAV compliance: litmus, caldavtester"
             echo " - Linux UI libs: gtk3/webkitgtk/libsoup/cairo/pango"
           '';
         };

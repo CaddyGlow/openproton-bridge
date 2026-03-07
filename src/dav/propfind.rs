@@ -129,6 +129,9 @@ fn calendar_home_resources(
                 },
             ) {
                 for calendar in calendars {
+                    if !should_advertise_calendar(&calendar) {
+                        continue;
+                    }
                     calendar_ids.insert(calendar.id.clone());
                     resources.push(calendar_collection_resource(
                         auth,
@@ -411,6 +414,30 @@ fn calendar_display_name(calendar_id: &str, calendar: Option<&StoredCalendar>) -
     }
 }
 
+fn should_advertise_calendar(calendar: &StoredCalendar) -> bool {
+    calendar.calendar_type >= 0 && !looks_like_local_uuid(&calendar.id)
+}
+
+fn looks_like_local_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    for (idx, byte) in bytes.iter().enumerate() {
+        let is_hyphen = matches!(idx, 8 | 13 | 18 | 23);
+        if is_hyphen {
+            if *byte != b'-' {
+                return false;
+            }
+            continue;
+        }
+        if !byte.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
 fn calendar_collection_tag(account_id: &str, calendar_id: &str, version: i64) -> String {
     format!("{account_id}-{calendar_id}-{}", version.max(0))
 }
@@ -596,5 +623,42 @@ mod tests {
 
         assert!(body.contains("<d:displayname>Primary Calendar</d:displayname>"));
         assert!(!body.contains("<d:displayname>Calendar opaque-cal-id</d:displayname>"));
+    }
+
+    #[test]
+    fn propfind_calendar_home_skips_local_uuid_calendars() {
+        let store = store();
+        store
+            .upsert_calendar(&Calendar {
+                id: "7A60F3B9-C6B7-429D-8AB6-8029FB968C50".to_string(),
+                name: "Apple Local".to_string(),
+                description: "".to_string(),
+                color: "".to_string(),
+                display: 1,
+                calendar_type: -1,
+                flags: 0,
+            })
+            .expect("upsert local calendar");
+        store
+            .upsert_calendar(&Calendar {
+                id: "cal-1".to_string(),
+                name: "Work".to_string(),
+                description: "".to_string(),
+                color: "".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .expect("upsert proton calendar");
+
+        let mut headers = HashMap::new();
+        headers.insert("depth".to_string(), "1".to_string());
+        let response =
+            handle_propfind_with_store("/dav/uid-1/calendars/", &headers, &auth(), Some(&store))
+                .expect("response");
+        let body = String::from_utf8(response.body).expect("utf8");
+
+        assert!(body.contains("/dav/uid-1/calendars/cal-1/"));
+        assert!(!body.contains("/dav/uid-1/calendars/7A60F3B9-C6B7-429D-8AB6-8029FB968C50/"));
     }
 }

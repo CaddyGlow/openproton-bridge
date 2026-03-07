@@ -285,6 +285,38 @@ pub fn unlock_address_keys(
     Ok(Keyring::new(unlocked))
 }
 
+/// Unlock arbitrary armored private keys using the provided passphrase.
+///
+/// This is used for non-mailbox key material, such as Proton Calendar keys
+/// that are returned from the Calendar API bootstrap endpoints.
+pub fn unlock_private_keys<'a, I>(armored_keys: I, passphrase: &[u8]) -> Result<Keyring>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut passphrase_copy = passphrase.to_vec();
+    let password = Password::from(passphrase_copy.clone());
+    passphrase_copy.zeroize();
+
+    let mut unlocked = Vec::new();
+    for armored in armored_keys {
+        match unlock_armored_key(armored, &password) {
+            Ok(cert) => unlocked.push(UnlockedKey {
+                cert,
+                password: password.clone(),
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot unlock private key");
+            }
+        }
+    }
+
+    if unlocked.is_empty() {
+        return Err(CryptoError::NoActiveKey);
+    }
+
+    Ok(Keyring::new(unlocked))
+}
+
 /// Parse an armored PGP private key and verify it can be decrypted with the given password.
 fn unlock_armored_key(armored: &str, password: &Password) -> Result<Cert> {
     let cert = Cert::from_bytes(armored.as_bytes())

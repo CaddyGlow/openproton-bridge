@@ -3262,18 +3262,18 @@ async fn cmd_login(
 
     let second_factor_scopes =
         match complete_cli_second_factor(&client, &auth, totp_code_arg.as_deref()).await {
-        Ok(scopes) => scopes,
-        Err(err) => {
-            tracing::warn!(
-                pkg = "bridge/login",
-                username = %username,
-                user_id = %auth.uid,
-                error = %err,
-                "second-factor login step failed"
-            );
-            return Err(err);
-        }
-    };
+            Ok(scopes) => scopes,
+            Err(err) => {
+                tracing::warn!(
+                    pkg = "bridge/login",
+                    username = %username,
+                    user_id = %auth.uid,
+                    error = %err,
+                    "second-factor login step failed"
+                );
+                return Err(err);
+            }
+        };
 
     let mut granted_scopes = api::auth::normalize_scope_string(auth.scope.as_deref());
     if !second_factor_scopes.is_empty() {

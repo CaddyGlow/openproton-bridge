@@ -4,22 +4,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::calendar::CalendarEvent;
 use crate::api::calendar::{Calendar, CalendarEventPart};
+use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRoute;
 use crate::pim::dav::{CalDavRepository, DeleteMode, StoreBackedDavAdapter};
 use crate::pim::query::{CalendarEventRange, QueryPage};
 use crate::pim::store::PimStore;
 
+use super::calendar_crypto;
 use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
 
-pub fn handle_request(
+pub async fn handle_request(
     method: &str,
     raw_path: &str,
     headers: &HashMap<String, String>,
     body: &[u8],
     auth: &AuthRoute,
     store: &Arc<PimStore>,
+    runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
 ) -> Result<Option<DavResponse>> {
     let path = normalize_path(raw_path);
     let calendars_root = format!("/dav/{}/calendars/", auth.account_id.0);
@@ -151,9 +154,22 @@ pub fn handle_request(
             let payload = store
                 .get_calendar_event_payload(&event_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
-            let ics = payload.map(|event| render_ics(&event)).unwrap_or_else(|| {
-                render_minimal_ics(&stored.uid, stored.start_time, stored.end_time)
-            });
+            let decrypt_context = if let Some(runtime_accounts) = runtime_accounts {
+                calendar_crypto::build_calendar_decrypt_context(
+                    runtime_accounts,
+                    &auth.account_id.0,
+                    &calendar_id,
+                )
+                .await
+            } else {
+                None
+            };
+            let ics = payload
+                .as_ref()
+                .and_then(|event| calendar_crypto::best_event_ics(event, decrypt_context.as_ref()))
+                .unwrap_or_else(|| {
+                    render_minimal_ics(&stored.uid, stored.start_time, stored.end_time)
+                });
             let mut response = DavResponse {
                 status: "200 OK",
                 headers: vec![
@@ -350,30 +366,6 @@ fn parse_ics(
     }
 }
 
-fn render_ics(event: &CalendarEvent) -> String {
-    extract_ics_payload(event).unwrap_or_else(|| {
-        let summary = "OpenProton Event";
-        format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-            event.uid,
-            format_ics_datetime(event.start_time),
-            format_ics_datetime(event.end_time),
-            summary
-        )
-    })
-}
-
-fn extract_ics_payload(event: &CalendarEvent) -> Option<String> {
-    event
-        .shared_events
-        .iter()
-        .chain(event.calendar_events.iter())
-        .chain(event.personal_events.iter())
-        .chain(event.attendees_events.iter())
-        .find(|part| part.data.contains("BEGIN:VCALENDAR"))
-        .map(|part| normalize_ics_newlines(&part.data))
-}
-
 fn render_minimal_ics(uid: &str, start_time: i64, end_time: i64) -> String {
     format!(
         "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
@@ -381,12 +373,6 @@ fn render_minimal_ics(uid: &str, start_time: i64, end_time: i64) -> String {
         format_ics_datetime(start_time),
         format_ics_datetime(end_time)
     )
-}
-
-fn normalize_ics_newlines(raw: &str) -> String {
-    raw.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', "\r\n")
 }
 
 fn parse_ics_datetime(value: &str) -> Option<i64> {

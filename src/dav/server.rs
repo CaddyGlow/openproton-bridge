@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsAcceptor;
 
+use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRouter;
 use crate::pim::store::PimStore;
 
@@ -193,6 +194,7 @@ fn generate_self_signed_cert(dir: &Path) -> Result<()> {
 pub struct DavServerConfig {
     pub auth_router: AuthRouter,
     pub pim_stores: HashMap<String, Arc<PimStore>>,
+    pub runtime_accounts: Option<Arc<RuntimeAccountRegistry>>,
 }
 
 pub struct DavServer {
@@ -372,7 +374,7 @@ where
                 }
                 let body = &received[head_end..head_end + content_length];
                 let started = Instant::now();
-                let mut response = route_request(&request, body, &config)?;
+                let mut response = route_request(&request, body, &config).await?;
                 add_default_dav_headers(&mut response);
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 let account_hint = account_id_hint(path_without_query(&request.path));
@@ -406,7 +408,7 @@ where
     }
 }
 
-fn route_request(
+async fn route_request(
     request: &DavRequest,
     body: &[u8],
     config: &DavServerConfig,
@@ -467,7 +469,15 @@ fn route_request(
                 return Ok(service_unavailable_response());
             };
             if method == "REPORT" {
-                if let Some(response) = report::handle_report(&request.path, body, &auth, store)? {
+                if let Some(response) = report::handle_report(
+                    &request.path,
+                    body,
+                    &auth,
+                    store,
+                    config.runtime_accounts.as_ref(),
+                )
+                .await?
+                {
                     return Ok(response);
                 }
                 return Ok(not_found_response());
@@ -489,7 +499,10 @@ fn route_request(
                 body,
                 &auth,
                 store,
-            )? {
+                config.runtime_accounts.as_ref(),
+            )
+            .await?
+            {
                 return Ok(response);
             }
 
@@ -694,6 +707,7 @@ mod tests {
             DavServerConfig {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
+                runtime_accounts: None,
             },
         );
         let addr = server.local_addr()?;
@@ -715,8 +729,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn propfind_without_auth_returns_401() {
+    #[tokio::test]
+    async fn propfind_without_auth_returns_401() {
         let request = parse_request_head(
             b"PROPFIND /dav/principals/me/ HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\n\r\n",
         )
@@ -727,14 +741,16 @@ mod tests {
             &DavServerConfig {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
+                runtime_accounts: None,
             },
         )
+        .await
         .expect("router should succeed");
         assert_eq!(response.status, "401 Unauthorized");
     }
 
-    #[test]
-    fn rejects_traversal_paths() {
+    #[tokio::test]
+    async fn rejects_traversal_paths() {
         let request = parse_request_head(
             b"GET /dav/uid-1/addressbooks/default/../x HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
@@ -745,14 +761,16 @@ mod tests {
             &DavServerConfig {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
+                runtime_accounts: None,
             },
         )
+        .await
         .expect("route should succeed");
         assert_eq!(response.status, "400 Bad Request");
     }
 
-    #[test]
-    fn rejects_percent_encoded_dot_segments() {
+    #[tokio::test]
+    async fn rejects_percent_encoded_dot_segments() {
         let request = parse_request_head(
             b"GET /dav/uid-1/addressbooks/default/%2e%2e/x HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
@@ -763,14 +781,16 @@ mod tests {
             &DavServerConfig {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
+                runtime_accounts: None,
             },
         )
+        .await
         .expect("route should succeed");
         assert_eq!(response.status, "400 Bad Request");
     }
 
-    #[test]
-    fn allows_percent_encoded_dots_in_regular_segments() {
+    #[tokio::test]
+    async fn allows_percent_encoded_dots_in_regular_segments() {
         let request = parse_request_head(
             b"GET /dav/uid-1/addressbooks/default/c1%2Evcf HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
@@ -781,14 +801,16 @@ mod tests {
             &DavServerConfig {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
+                runtime_accounts: None,
             },
         )
+        .await
         .expect("route should succeed");
         assert_eq!(response.status, "401 Unauthorized");
     }
 
-    #[test]
-    fn rejects_invalid_percent_encoding() {
+    #[tokio::test]
+    async fn rejects_invalid_percent_encoding() {
         let request = parse_request_head(
             b"GET /dav/uid-1/addressbooks/default/c1%ZZ.vcf HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
@@ -799,8 +821,10 @@ mod tests {
             &DavServerConfig {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
+                runtime_accounts: None,
             },
         )
+        .await
         .expect("route should succeed");
         assert_eq!(response.status, "400 Bad Request");
     }
@@ -812,6 +836,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores: HashMap::new(),
+            runtime_accounts: None,
         });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -849,6 +874,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores,
+            runtime_accounts: None,
         });
 
         let server = tokio::spawn(async move {
@@ -909,6 +935,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores,
+            runtime_accounts: None,
         });
 
         let server = tokio::spawn(async move {
@@ -969,6 +996,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores,
+            runtime_accounts: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1023,6 +1051,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores,
+            runtime_accounts: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1082,6 +1111,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores,
+            runtime_accounts: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1121,6 +1151,7 @@ mod tests {
         let config = Arc::new(DavServerConfig {
             auth_router: auth_router(),
             pim_stores: HashMap::new(),
+            runtime_accounts: None,
         });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");

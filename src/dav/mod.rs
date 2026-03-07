@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod caldav;
+pub mod calendar_crypto;
 pub mod carddav;
 pub mod discovery;
 pub mod error;

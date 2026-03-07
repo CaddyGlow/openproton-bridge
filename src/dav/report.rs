@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use regex::Regex;
 
+use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRoute;
 use crate::pim::dav::{
     CalDavRepository, CardDavRepository, DavSyncStateRepository, StoreBackedDavAdapter,
@@ -9,16 +10,18 @@ use crate::pim::dav::{
 use crate::pim::query::{CalendarEventRange, QueryPage};
 use crate::pim::store::PimStore;
 
+use super::calendar_crypto::{self, CalendarDecryptContext};
 use super::discovery;
 use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
 
-pub fn handle_report(
+pub async fn handle_report(
     raw_path: &str,
     body: &[u8],
     auth: &AuthRoute,
     store: &Arc<PimStore>,
+    runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
 ) -> Result<Option<DavResponse>> {
     let path = normalize_path(raw_path);
     let body_text = std::str::from_utf8(body)
@@ -43,30 +46,39 @@ pub fn handle_report(
 
     if let Some(calendar_id) = parse_calendar_collection_path(&path, &auth.account_id.0) {
         if body_text.contains("calendar-query") {
+            let decrypt_context =
+                build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_query(
                 &adapter,
                 store,
                 &auth.account_id.0,
                 &calendar_id,
                 body_text,
+                decrypt_context.as_ref(),
             )?));
         }
         if body_text.contains("calendar-multiget") {
+            let decrypt_context =
+                build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_multiget(
                 &adapter,
                 store,
                 &auth.account_id.0,
                 &calendar_id,
                 body_text,
+                decrypt_context.as_ref(),
             )?));
         }
         if body_text.contains("sync-collection") {
+            let decrypt_context =
+                build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(caldav_sync_collection(
                 &adapter,
                 store,
                 &auth.account_id.0,
                 &calendar_id,
                 body_text,
+                decrypt_context.as_ref(),
             )?));
         }
         return Ok(Some(not_implemented_report()));
@@ -91,6 +103,7 @@ fn addressbook_query(adapter: &StoreBackedDavAdapter, account_id: &str) -> Resul
             href: format!("/dav/{account_id}/addressbooks/default/{}.vcf", contact.id),
             etag: etag::from_updated_ms(&contact.id, contact.updated_at_ms),
             calendar_data: None,
+            content_type: Some("text/vcard; charset=utf-8".to_string()),
             not_found: false,
         })
         .collect::<Vec<_>>();
@@ -109,6 +122,7 @@ fn calendar_query(
     account_id: &str,
     calendar_id: &str,
     body: &str,
+    decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
     let range = parse_calendar_time_range(body);
     let events = adapter
@@ -127,7 +141,8 @@ fn calendar_query(
         .map(|event| ReportItem {
             href: format!("/dav/{account_id}/calendars/{calendar_id}/{}.ics", event.id),
             etag: etag::from_updated_ms(&event.id, event.updated_at_ms),
-            calendar_data: load_calendar_data(store, &event.id, false),
+            calendar_data: load_calendar_data(store, &event.id, false, decrypt_context),
+            content_type: Some("text/calendar; charset=utf-8".to_string()),
             not_found: false,
         })
         .collect::<Vec<_>>();
@@ -153,6 +168,7 @@ fn calendar_multiget(
     account_id: &str,
     calendar_id: &str,
     body: &str,
+    decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
     let hrefs = extract_report_hrefs(body);
     let mut items = Vec::with_capacity(hrefs.len());
@@ -168,6 +184,7 @@ fn calendar_multiget(
                 href,
                 etag: String::new(),
                 calendar_data: None,
+                content_type: None,
                 not_found: true,
             });
             continue;
@@ -175,7 +192,8 @@ fn calendar_multiget(
         items.push(ReportItem {
             href,
             etag: etag::from_updated_ms(&event.id, event.updated_at_ms),
-            calendar_data: load_calendar_data(store, &event.id, false),
+            calendar_data: load_calendar_data(store, &event.id, false, decrypt_context),
+            content_type: Some("text/calendar; charset=utf-8".to_string()),
             not_found: false,
         });
     }
@@ -194,6 +212,7 @@ fn calendar_multiget(
         not_found_count,
         "dav report assembled"
     );
+    debug_calendar_multiget_sample(account_id, calendar_id, &items);
     Ok(multistatus_response(&items, None))
 }
 
@@ -227,6 +246,7 @@ fn carddav_sync_collection(
             href: format!("/dav/{account_id}/addressbooks/default/{}.vcf", contact.id),
             etag: etag::from_updated_ms(&contact.id, contact.updated_at_ms),
             calendar_data: None,
+            content_type: Some("text/vcard; charset=utf-8".to_string()),
             not_found: false,
         })
         .collect::<Vec<_>>();
@@ -250,6 +270,7 @@ fn caldav_sync_collection(
     account_id: &str,
     calendar_id: &str,
     body: &str,
+    decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
     let events = adapter
         .list_calendar_events(
@@ -284,7 +305,12 @@ fn caldav_sync_collection(
             calendar_data: if event.deleted {
                 None
             } else {
-                load_calendar_data(store, &event.id, true)
+                load_calendar_data(store, &event.id, true, decrypt_context)
+            },
+            content_type: if event.deleted {
+                None
+            } else {
+                Some("text/calendar; charset=utf-8".to_string())
             },
             not_found: event.deleted,
         })
@@ -396,6 +422,7 @@ struct ReportItem {
     href: String,
     etag: String,
     calendar_data: Option<String>,
+    content_type: Option<String>,
     not_found: bool,
 }
 
@@ -404,21 +431,7 @@ fn multistatus_response(items: &[ReportItem], sync_token: Option<String>) -> Dav
         r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">"#,
     );
     for item in items {
-        body.push_str("<d:response><d:href>");
-        body.push_str(&escape_xml(&item.href));
-        if item.not_found {
-            body.push_str("</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>");
-            continue;
-        }
-        body.push_str("</d:href><d:propstat><d:prop><d:getetag>");
-        body.push_str(&escape_xml(&item.etag));
-        body.push_str("</d:getetag>");
-        if let Some(calendar_data) = &item.calendar_data {
-            body.push_str("<cal:calendar-data>");
-            body.push_str(&escape_xml(calendar_data));
-            body.push_str("</cal:calendar-data>");
-        }
-        body.push_str("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
+        body.push_str(&render_report_item_xml(item));
     }
     if let Some(token) = sync_token {
         body.push_str("<d:sync-token>");
@@ -432,6 +445,54 @@ fn multistatus_response(items: &[ReportItem], sync_token: Option<String>) -> Dav
         headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
         body: body.into_bytes(),
     }
+}
+
+fn debug_calendar_multiget_sample(account_id: &str, calendar_id: &str, items: &[ReportItem]) {
+    let Some(item) = items.iter().find(|item| !item.not_found) else {
+        return;
+    };
+    let Some(calendar_data) = item.calendar_data.as_deref() else {
+        return;
+    };
+    tracing::debug!(
+        report = "calendar-multiget",
+        account_id,
+        calendar_id,
+        href = %item.href,
+        etag = %item.etag,
+        content_type = item.content_type.as_deref().unwrap_or(""),
+        content_length = calendar_data.len(),
+        calendar_data = calendar_data,
+        response_xml = render_report_item_xml(item),
+        "dav calendar-multiget sample item"
+    );
+}
+
+fn render_report_item_xml(item: &ReportItem) -> String {
+    let mut body = String::from("<d:response><d:href>");
+    body.push_str(&escape_xml(&item.href));
+    if item.not_found {
+        body.push_str("</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>");
+        return body;
+    }
+    body.push_str("</d:href><d:propstat><d:prop><d:getetag>");
+    body.push_str(&escape_xml(&item.etag));
+    body.push_str("</d:getetag>");
+    if let Some(content_type) = &item.content_type {
+        body.push_str("<d:getcontenttype>");
+        body.push_str(&escape_xml(content_type));
+        body.push_str("</d:getcontenttype>");
+    }
+    if let Some(calendar_data) = &item.calendar_data {
+        body.push_str("<d:getcontentlength>");
+        body.push_str(&calendar_data.len().to_string());
+        body.push_str("</d:getcontentlength>");
+        body.push_str("<cal:calendar-data>");
+        body.push_str(&escape_xml(calendar_data));
+        body.push_str("</cal:calendar-data>");
+    }
+    body.push_str("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
+    body
 }
 
 fn sync_scope(protocol: &str, account_id: &str) -> String {
@@ -449,16 +510,33 @@ fn sync_token_uri(account_id: &str, calendar_id: &str, version: i64) -> String {
     )
 }
 
-fn load_calendar_data(store: &PimStore, event_id: &str, include_deleted: bool) -> Option<String> {
+async fn build_decrypt_context(
+    runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
+    account_id: &str,
+    calendar_id: &str,
+) -> Option<CalendarDecryptContext> {
+    let runtime_accounts = runtime_accounts?;
+    calendar_crypto::build_calendar_decrypt_context(runtime_accounts, account_id, calendar_id).await
+}
+
+fn load_calendar_data(
+    store: &PimStore,
+    event_id: &str,
+    include_deleted: bool,
+    decrypt_context: Option<&CalendarDecryptContext>,
+) -> Option<String> {
     store
         .get_calendar_event_payload(event_id, include_deleted)
         .ok()
         .flatten()
-        .map(|event| render_report_calendar_data(&event))
+        .map(|event| render_report_calendar_data(&event, decrypt_context))
 }
 
-fn render_report_calendar_data(event: &crate::api::calendar::CalendarEvent) -> String {
-    extract_ics_payload(event).unwrap_or_else(|| {
+fn render_report_calendar_data(
+    event: &crate::api::calendar::CalendarEvent,
+    decrypt_context: Option<&CalendarDecryptContext>,
+) -> String {
+    calendar_crypto::best_event_ics(event, decrypt_context).unwrap_or_else(|| {
         format!(
             "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
             event.uid,
@@ -466,17 +544,6 @@ fn render_report_calendar_data(event: &crate::api::calendar::CalendarEvent) -> S
             format_ics_datetime(event.end_time)
         )
     })
-}
-
-fn extract_ics_payload(event: &crate::api::calendar::CalendarEvent) -> Option<String> {
-    event
-        .shared_events
-        .iter()
-        .chain(event.calendar_events.iter())
-        .chain(event.personal_events.iter())
-        .chain(event.attendees_events.iter())
-        .find(|part| part.data.contains("BEGIN:VCALENDAR"))
-        .map(|part| normalize_ics_newlines(&part.data))
 }
 
 fn extract_report_hrefs(body: &str) -> Vec<String> {
@@ -511,12 +578,6 @@ fn normalize_report_href_path(href: &str) -> Option<String> {
     reqwest::Url::parse(href)
         .ok()
         .map(|url| url.path().to_string())
-}
-
-fn normalize_ics_newlines(raw: &str) -> String {
-    raw.replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', "\r\n")
 }
 
 fn format_ics_datetime(unix_seconds: i64) -> String {
@@ -591,6 +652,9 @@ fn normalize_path(path: &str) -> String {
 fn escape_xml(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
+        if !is_valid_xml_char(ch) {
+            continue;
+        }
         match ch {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
@@ -603,6 +667,13 @@ fn escape_xml(input: &str) -> String {
     out
 }
 
+fn is_valid_xml_char(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+    )
+}
+
 fn epoch_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -613,8 +684,9 @@ fn epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_report_hrefs, extract_sync_token, parse_calendar_collection_path,
-        parse_calendar_time_range, parse_event_id_from_href,
+        escape_xml, extract_report_hrefs, extract_sync_token, multistatus_response,
+        parse_calendar_collection_path, parse_calendar_time_range, parse_event_id_from_href,
+        ReportItem,
     };
 
     #[test]
@@ -665,5 +737,34 @@ mod tests {
                 "/dav/uid-1/calendars/work/event-2.ics".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn multistatus_includes_content_metadata_for_calendar_items() {
+        let calendar_data =
+            "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Test\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let response = multistatus_response(
+            &[ReportItem {
+                href: "/dav/uid-1/calendars/work/event-1.ics".to_string(),
+                etag: "\"etag-1\"".to_string(),
+                calendar_data: Some(calendar_data.to_string()),
+                content_type: Some("text/calendar; charset=utf-8".to_string()),
+                not_found: false,
+            }],
+            None,
+        );
+        let body = String::from_utf8(response.body).expect("response body should be utf-8");
+        assert!(body.contains("<d:getcontenttype>text/calendar; charset=utf-8</d:getcontenttype>"));
+        assert!(body.contains(&format!(
+            "<d:getcontentlength>{}</d:getcontentlength>",
+            calendar_data.len()
+        )));
+        assert!(body.contains("<cal:calendar-data>"));
+    }
+
+    #[test]
+    fn escape_xml_drops_invalid_control_characters() {
+        let escaped = escape_xml("ok\u{0}bad\u{8}<tag>");
+        assert_eq!(escaped, "okbad&lt;tag&gt;");
     }
 }

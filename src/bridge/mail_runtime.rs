@@ -604,7 +604,7 @@ async fn run_runtime(
         pim_reconcile_metrics,
     ));
     let health_task = tokio::spawn(report_runtime_health_periodically(
-        runtime_accounts,
+        runtime_accounts.clone(),
         notify_tx.clone(),
     ));
     let mut imap_task = tokio::spawn(async move {
@@ -617,6 +617,7 @@ async fn run_runtime(
         let config = dav::server::DavServerConfig {
             auth_router: dav_auth_router,
             pim_stores: dav_pim_stores,
+            runtime_accounts: Some(runtime_accounts.clone()),
         };
         tokio::spawn(async move {
             dav::server::run_server_with_listener_and_config(listener, config).await

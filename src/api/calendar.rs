@@ -33,9 +33,7 @@ where
     Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-fn deserialize_vec_or_default<'de, D, T>(
-    deserializer: D,
-) -> std::result::Result<Vec<T>, D::Error>
+fn deserialize_vec_or_default<'de, D, T>(deserializer: D) -> std::result::Result<Vec<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

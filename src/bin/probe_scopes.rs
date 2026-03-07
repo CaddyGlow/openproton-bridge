@@ -93,7 +93,10 @@ struct TotpConfig {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "probe-scopes", about = "Probe Proton scope grants across app identities")]
+#[command(
+    name = "probe-scopes",
+    about = "Probe Proton scope grants across app identities"
+)]
 struct Args {
     #[arg(long)]
     username: String,
@@ -161,11 +164,20 @@ async fn main() -> Result<()> {
     let client_versions = build_client_versions(&args)?;
     let api_mode: api::types::ApiMode = args.api_mode.into();
 
-    println!("Probing {} client identities in {} mode", client_versions.len(), api_mode.as_str());
+    println!(
+        "Probing {} client identities in {} mode",
+        client_versions.len(),
+        api_mode.as_str()
+    );
     let mut results = Vec::with_capacity(client_versions.len());
 
     for (index, client_version) in client_versions.iter().enumerate() {
-        println!("[{}/{}] {}", index + 1, client_versions.len(), client_version);
+        println!(
+            "[{}/{}] {}",
+            index + 1,
+            client_versions.len(),
+            client_version
+        );
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(args.attempt_timeout),
@@ -221,7 +233,10 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|url| format!(" hv={url}"))
             .unwrap_or_default();
-        println!("- {:11} {:40} scopes={}{}", row.status, row.client_version, scopes, hv);
+        println!(
+            "- {:11} {:40} scopes={}{}",
+            row.status, row.client_version, scopes, hv
+        );
     }
 
     if let Some(json_out) = args.json_out {
@@ -266,7 +281,10 @@ fn build_client_versions(args: &Args) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
 
     let client_ids: Vec<String> = if args.client_id.is_empty() {
-        DEFAULT_CLIENT_IDS.iter().map(|value| value.to_string()).collect()
+        DEFAULT_CLIENT_IDS
+            .iter()
+            .map(|value| value.to_string())
+            .collect()
     } else {
         args.client_id.clone()
     };
@@ -573,5 +591,9 @@ fn generate_totp_code(config: &TotpConfig) -> Result<String> {
         | ((u32::from(digest[offset + 2]) & 0xff) << 8)
         | (u32::from(digest[offset + 3]) & 0xff);
     let modulo = 10u32.saturating_pow(config.digits.max(1));
-    Ok(format!("{:0width$}", code % modulo, width = config.digits as usize))
+    Ok(format!(
+        "{:0width$}",
+        code % modulo,
+        width = config.digits as usize
+    ))
 }

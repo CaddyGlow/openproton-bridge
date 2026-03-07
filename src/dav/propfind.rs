@@ -1,6 +1,12 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use crate::bridge::auth_router::AuthRoute;
+use crate::pim::dav::CalDavRepository;
+use crate::pim::query::QueryPage;
+use crate::pim::store::PimStore;
+use crate::pim::types::StoredCalendar;
 
 use super::discovery;
 use super::error::{DavError, Result};
@@ -14,13 +20,15 @@ pub enum DavDepth {
     Infinity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum AccountResource {
     Principal,
+    ScheduleInbox,
+    ScheduleOutbox,
     AddressbooksHome,
     AddressbookDefault,
     CalendarsHome,
-    CalendarDefault,
+    CalendarCollection(String),
 }
 
 pub fn parse_depth(headers: &HashMap<String, String>) -> Result<DavDepth> {
@@ -40,6 +48,15 @@ pub fn handle_propfind(
     headers: &HashMap<String, String>,
     auth: &AuthRoute,
 ) -> Result<DavResponse> {
+    handle_propfind_with_store(raw_path, headers, auth, None)
+}
+
+pub fn handle_propfind_with_store(
+    raw_path: &str,
+    headers: &HashMap<String, String>,
+    auth: &AuthRoute,
+    store: Option<&Arc<PimStore>>,
+) -> Result<DavResponse> {
     let depth = parse_depth(headers)?;
     let path = normalize_path(raw_path);
 
@@ -57,10 +74,22 @@ pub fn handle_propfind(
 
     let resources = match target {
         AccountResource::Principal => principal_resources(auth, depth),
+        AccountResource::ScheduleInbox => vec![schedule_inbox_resource(auth)],
+        AccountResource::ScheduleOutbox => vec![schedule_outbox_resource(auth)],
         AccountResource::AddressbooksHome => addressbook_home_resources(auth, depth),
         AccountResource::AddressbookDefault => vec![default_addressbook_resource(auth)],
-        AccountResource::CalendarsHome => calendar_home_resources(auth, depth),
-        AccountResource::CalendarDefault => vec![default_calendar_resource(auth)],
+        AccountResource::CalendarsHome => calendar_home_resources(auth, depth, store),
+        AccountResource::CalendarCollection(calendar_id) => {
+            let calendar = store.and_then(|store| {
+                let adapter = crate::pim::dav::StoreBackedDavAdapter::new(store.clone());
+                adapter.get_calendar(&calendar_id, false).ok().flatten()
+            });
+            vec![calendar_collection_resource(
+                auth,
+                &calendar_id,
+                calendar.as_ref(),
+            )]
+        }
     };
     Ok(multistatus_response(resources))
 }
@@ -82,12 +111,47 @@ fn addressbook_home_resources(auth: &AuthRoute, depth: DavDepth) -> Vec<DavPropR
     resources
 }
 
-fn calendar_home_resources(auth: &AuthRoute, depth: DavDepth) -> Vec<DavPropResource> {
+fn calendar_home_resources(
+    auth: &AuthRoute,
+    depth: DavDepth,
+    store: Option<&Arc<PimStore>>,
+) -> Vec<DavPropResource> {
     let mut resources = vec![calendar_home_resource(auth)];
     if depth != DavDepth::Zero {
-        resources.push(default_calendar_resource(auth));
+        let mut calendar_ids = HashSet::new();
+        if let Some(store) = store {
+            let adapter = crate::pim::dav::StoreBackedDavAdapter::new(store.clone());
+            if let Ok(calendars) = adapter.list_calendars(
+                false,
+                QueryPage {
+                    limit: 500,
+                    offset: 0,
+                },
+            ) {
+                for calendar in calendars {
+                    calendar_ids.insert(calendar.id.clone());
+                    resources.push(calendar_collection_resource(
+                        auth,
+                        &calendar.id,
+                        Some(&calendar),
+                    ));
+                }
+            }
+        }
+        if calendar_ids.is_empty() {
+            resources.push(default_calendar_resource(auth));
+        }
     }
     resources
+}
+
+fn non_empty_display_name(name: String) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn principal_resource(auth: &AuthRoute) -> DavPropResource {
@@ -97,8 +161,91 @@ fn principal_resource(auth: &AuthRoute) -> DavPropResource {
         display_name: auth.primary_email.clone(),
         kind: DavResourceKind::Principal,
         current_user_principal: Some(principal),
+        principal_url: Some(discovery::principal_path(&auth.account_id.0)),
+        principal_collection_set: Some(discovery::principal_collection_set_path()),
         addressbook_home_set: Some(discovery::addressbook_home_path(&auth.account_id.0)),
         calendar_home_set: Some(discovery::calendar_home_path(&auth.account_id.0)),
+        calendar_user_addresses: vec![format!("mailto:{}", auth.primary_email)],
+        schedule_inbox_url: Some(discovery::schedule_inbox_path(&auth.account_id.0)),
+        schedule_outbox_url: Some(discovery::schedule_outbox_path(&auth.account_id.0)),
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read", "write", "write-properties", "bind", "unbind"],
+        quota_available_bytes: None,
+        quota_used_bytes: None,
+        resource_id: Some(auth.account_id.0.clone()),
+        calendar_free_busy_set: Vec::new(),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
+        calendar_color: None,
+        calendar_description: None,
+        calendar_ctag: None,
+        sync_token: None,
+        supported_calendar_components: Vec::new(),
+        supported_reports: vec![
+            "expand-property",
+            "principal-property-search",
+            "principal-search-property-set",
+        ],
+    }
+}
+
+fn schedule_inbox_resource(auth: &AuthRoute) -> DavPropResource {
+    DavPropResource {
+        href: discovery::schedule_inbox_path(&auth.account_id.0),
+        display_name: "Inbox".to_string(),
+        kind: DavResourceKind::ScheduleInbox,
+        current_user_principal: None,
+        principal_url: None,
+        principal_collection_set: None,
+        addressbook_home_set: None,
+        calendar_home_set: None,
+        calendar_user_addresses: Vec::new(),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read", "write"],
+        quota_available_bytes: None,
+        quota_used_bytes: None,
+        resource_id: None,
+        calendar_free_busy_set: Vec::new(),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
+        calendar_color: None,
+        calendar_description: None,
+        calendar_ctag: None,
+        sync_token: None,
+        supported_calendar_components: Vec::new(),
+        supported_reports: Vec::new(),
+    }
+}
+
+fn schedule_outbox_resource(auth: &AuthRoute) -> DavPropResource {
+    DavPropResource {
+        href: discovery::schedule_outbox_path(&auth.account_id.0),
+        display_name: "Outbox".to_string(),
+        kind: DavResourceKind::ScheduleOutbox,
+        current_user_principal: None,
+        principal_url: None,
+        principal_collection_set: None,
+        addressbook_home_set: None,
+        calendar_home_set: None,
+        calendar_user_addresses: Vec::new(),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read", "write"],
+        quota_available_bytes: None,
+        quota_used_bytes: None,
+        resource_id: None,
+        calendar_free_busy_set: Vec::new(),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
+        calendar_color: None,
+        calendar_description: None,
+        calendar_ctag: None,
+        sync_token: None,
+        supported_calendar_components: Vec::new(),
+        supported_reports: Vec::new(),
     }
 }
 
@@ -108,8 +255,27 @@ fn addressbook_home_resource(auth: &AuthRoute) -> DavPropResource {
         display_name: "Address Books".to_string(),
         kind: DavResourceKind::AddressbookHome,
         current_user_principal: None,
+        principal_url: None,
+        principal_collection_set: None,
         addressbook_home_set: None,
         calendar_home_set: None,
+        calendar_user_addresses: Vec::new(),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read"],
+        quota_available_bytes: None,
+        quota_used_bytes: None,
+        resource_id: None,
+        calendar_free_busy_set: Vec::new(),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
+        calendar_color: None,
+        calendar_description: None,
+        calendar_ctag: None,
+        sync_token: None,
+        supported_calendar_components: Vec::new(),
+        supported_reports: Vec::new(),
     }
 }
 
@@ -119,8 +285,27 @@ fn default_addressbook_resource(auth: &AuthRoute) -> DavPropResource {
         display_name: "Default Address Book".to_string(),
         kind: DavResourceKind::Addressbook,
         current_user_principal: None,
+        principal_url: None,
+        principal_collection_set: None,
         addressbook_home_set: None,
         calendar_home_set: None,
+        calendar_user_addresses: Vec::new(),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read"],
+        quota_available_bytes: None,
+        quota_used_bytes: None,
+        resource_id: None,
+        calendar_free_busy_set: Vec::new(),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
+        calendar_color: None,
+        calendar_description: None,
+        calendar_ctag: None,
+        sync_token: None,
+        supported_calendar_components: Vec::new(),
+        supported_reports: Vec::new(),
     }
 }
 
@@ -130,20 +315,111 @@ fn calendar_home_resource(auth: &AuthRoute) -> DavPropResource {
         display_name: "Calendars".to_string(),
         kind: DavResourceKind::CalendarHome,
         current_user_principal: None,
+        principal_url: None,
+        principal_collection_set: None,
         addressbook_home_set: None,
         calendar_home_set: None,
+        calendar_user_addresses: Vec::new(),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read"],
+        quota_available_bytes: None,
+        quota_used_bytes: None,
+        resource_id: None,
+        calendar_free_busy_set: Vec::new(),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
+        calendar_color: None,
+        calendar_description: None,
+        calendar_ctag: None,
+        sync_token: None,
+        supported_calendar_components: Vec::new(),
+        supported_reports: Vec::new(),
     }
 }
 
 fn default_calendar_resource(auth: &AuthRoute) -> DavPropResource {
+    calendar_collection_resource(auth, "default", None)
+}
+
+fn calendar_collection_resource(
+    auth: &AuthRoute,
+    calendar_id: &str,
+    calendar: Option<&StoredCalendar>,
+) -> DavPropResource {
+    let display_name = calendar_display_name(calendar_id, calendar);
+    let href = format!("/dav/{}/calendars/{calendar_id}/", auth.account_id.0);
     DavPropResource {
-        href: discovery::default_calendar_path(&auth.account_id.0),
-        display_name: "Default Calendar".to_string(),
+        href: href.clone(),
+        display_name,
         kind: DavResourceKind::Calendar,
         current_user_principal: None,
+        principal_url: None,
+        principal_collection_set: None,
         addressbook_home_set: None,
         calendar_home_set: None,
+        calendar_user_addresses: Vec::new(),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
+        owner: Some(discovery::principal_path(&auth.account_id.0)),
+        current_user_privileges: vec!["read", "write", "write-properties", "bind", "unbind"],
+        quota_available_bytes: Some(1_000_000_000),
+        quota_used_bytes: Some(0),
+        resource_id: Some(calendar_id.to_string()),
+        calendar_free_busy_set: vec![href.clone()],
+        schedule_calendar_transp: Some("opaque"),
+        schedule_default_calendar_url: Some(href.clone()),
+        calendar_color: calendar
+            .and_then(|calendar| non_empty_display_name(calendar.color.clone())),
+        calendar_description: calendar
+            .and_then(|calendar| non_empty_display_name(calendar.description.clone())),
+        calendar_ctag: Some(calendar_collection_tag(
+            &auth.account_id.0,
+            calendar_id,
+            calendar
+                .map(|calendar| calendar.updated_at_ms)
+                .unwrap_or_default(),
+        )),
+        sync_token: Some(calendar_sync_token(
+            &auth.account_id.0,
+            calendar_id,
+            calendar
+                .map(|calendar| calendar.updated_at_ms)
+                .unwrap_or_default(),
+        )),
+        supported_calendar_components: vec!["VEVENT"],
+        supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
     }
+}
+
+fn calendar_display_name(calendar_id: &str, calendar: Option<&StoredCalendar>) -> String {
+    if let Some(calendar) = calendar {
+        if let Some(display_name) = non_empty_display_name(calendar.name.clone()) {
+            return display_name;
+        }
+
+        if calendar.calendar_type == 2 {
+            return "Primary Calendar".to_string();
+        }
+    }
+
+    if calendar_id == "default" {
+        "Default Calendar".to_string()
+    } else {
+        "Calendar".to_string()
+    }
+}
+
+fn calendar_collection_tag(account_id: &str, calendar_id: &str, version: i64) -> String {
+    format!("{account_id}-{calendar_id}-{}", version.max(0))
+}
+
+fn calendar_sync_token(account_id: &str, calendar_id: &str, version: i64) -> String {
+    format!(
+        "https://openproton.local/dav/{account_id}/calendars/{calendar_id}/sync/{}",
+        version.max(0)
+    )
 }
 
 fn parse_account_resource_path(path: &str) -> Option<(String, AccountResource)> {
@@ -157,10 +433,17 @@ fn parse_account_resource_path(path: &str) -> Option<(String, AccountResource)> 
     let account_id = segments.next()?.to_string();
     let target = match (segments.next()?, segments.next(), segments.next()) {
         ("principal", None, None) => AccountResource::Principal,
+        ("principal", Some("inbox"), None) => AccountResource::ScheduleInbox,
+        ("principal", Some("outbox"), None) => AccountResource::ScheduleOutbox,
         ("addressbooks", None, None) => AccountResource::AddressbooksHome,
         ("addressbooks", Some("default"), None) => AccountResource::AddressbookDefault,
         ("calendars", None, None) => AccountResource::CalendarsHome,
-        ("calendars", Some("default"), None) => AccountResource::CalendarDefault,
+        ("calendars", Some(calendar_id), None) => {
+            if calendar_id.is_empty() {
+                return None;
+            }
+            AccountResource::CalendarCollection(calendar_id.to_string())
+        }
         _ => return None,
     };
     Some((account_id, target))
@@ -213,17 +496,27 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::Arc;
 
+    use crate::api::calendar::Calendar;
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
+    use crate::pim::store::PimStore;
 
-    use super::{handle_propfind, parse_depth, DavDepth};
+    use super::{handle_propfind, handle_propfind_with_store, parse_depth, DavDepth};
 
     fn auth() -> AuthRoute {
         AuthRoute {
             account_id: AccountId("uid-1".to_string()),
             primary_email: "alice@proton.me".to_string(),
         }
+    }
+
+    fn store() -> Arc<PimStore> {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let db_path = tmp.path().join("account.db");
+        Box::leak(Box::new(tmp));
+        Arc::new(PimStore::new(db_path).expect("store"))
     }
 
     #[test]
@@ -248,5 +541,60 @@ mod tests {
         let response =
             handle_propfind("/dav/uid-2/principal/", &HashMap::new(), &auth()).expect("response");
         assert_eq!(response.status, "403 Forbidden");
+    }
+
+    #[test]
+    fn propfind_calendar_home_uses_non_empty_names_and_skips_fake_default_when_store_has_rows() {
+        let store = store();
+        store
+            .upsert_calendar(&Calendar {
+                id: "cal-1".to_string(),
+                name: "".to_string(),
+                description: "".to_string(),
+                color: "#000000".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .expect("upsert calendar");
+
+        let mut headers = HashMap::new();
+        headers.insert("depth".to_string(), "1".to_string());
+        let response =
+            handle_propfind_with_store("/dav/uid-1/calendars/", &headers, &auth(), Some(&store))
+                .expect("response");
+        let body = String::from_utf8(response.body).expect("utf8");
+
+        assert!(body.contains("/dav/uid-1/calendars/cal-1/"));
+        assert!(body.contains("<d:displayname>Calendar</d:displayname>"));
+        assert!(!body.contains("/dav/uid-1/calendars/default/"));
+    }
+
+    #[test]
+    fn propfind_primary_calendar_uses_readable_fallback_name() {
+        let store = store();
+        store
+            .upsert_calendar(&Calendar {
+                id: "opaque-cal-id".to_string(),
+                name: "".to_string(),
+                description: "".to_string(),
+                color: "".to_string(),
+                display: 1,
+                calendar_type: 2,
+                flags: 0,
+            })
+            .expect("upsert calendar");
+
+        let response = handle_propfind_with_store(
+            "/dav/uid-1/calendars/opaque-cal-id/",
+            &HashMap::new(),
+            &auth(),
+            Some(&store),
+        )
+        .expect("response");
+        let body = String::from_utf8(response.body).expect("utf8");
+
+        assert!(body.contains("<d:displayname>Primary Calendar</d:displayname>"));
+        assert!(!body.contains("<d:displayname>Calendar opaque-cal-id</d:displayname>"));
     }
 }

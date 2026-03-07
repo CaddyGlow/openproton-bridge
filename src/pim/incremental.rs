@@ -14,6 +14,20 @@ use super::{PimError, Result};
 
 const MODEL_EVENT_SWEEP_LIMIT: usize = 10;
 
+fn is_remote_calendar_id(calendar_id: &str) -> bool {
+    !looks_like_local_uuid(calendar_id)
+}
+
+fn looks_like_local_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+
+    value.chars().enumerate().all(|(index, ch)| {
+        (matches!(index, 8 | 13 | 18 | 23) && ch == '-') || ch.is_ascii_hexdigit()
+    })
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct IncrementalPimSummary {
     pub contacts_refreshed: usize,
@@ -320,7 +334,11 @@ fn load_active_calendar_ids(store: &PimStore, limit: usize) -> Result<Vec<String
     let mut stmt =
         conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0 ORDER BY id LIMIT ?1")?;
     let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    Ok(rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|calendar_id| is_remote_calendar_id(calendar_id))
+        .collect())
 }
 
 fn pim_api_error(context: &str, err: crate::api::error::ApiError) -> PimError {

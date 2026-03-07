@@ -1,6 +1,8 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavResourceKind {
     Principal,
+    ScheduleInbox,
+    ScheduleOutbox,
     AddressbookHome,
     Addressbook,
     CalendarHome,
@@ -13,13 +15,32 @@ pub struct DavPropResource {
     pub display_name: String,
     pub kind: DavResourceKind,
     pub current_user_principal: Option<String>,
+    pub principal_url: Option<String>,
+    pub principal_collection_set: Option<String>,
     pub addressbook_home_set: Option<String>,
     pub calendar_home_set: Option<String>,
+    pub calendar_user_addresses: Vec<String>,
+    pub schedule_inbox_url: Option<String>,
+    pub schedule_outbox_url: Option<String>,
+    pub owner: Option<String>,
+    pub current_user_privileges: Vec<&'static str>,
+    pub quota_available_bytes: Option<u64>,
+    pub quota_used_bytes: Option<u64>,
+    pub resource_id: Option<String>,
+    pub calendar_free_busy_set: Vec<String>,
+    pub schedule_calendar_transp: Option<&'static str>,
+    pub schedule_default_calendar_url: Option<String>,
+    pub calendar_color: Option<String>,
+    pub calendar_description: Option<String>,
+    pub calendar_ctag: Option<String>,
+    pub sync_token: Option<String>,
+    pub supported_calendar_components: Vec<&'static str>,
+    pub supported_reports: Vec<&'static str>,
 }
 
 pub fn multistatus_xml(resources: &[DavPropResource]) -> Vec<u8> {
     let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav">"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">"#,
     );
     for resource in resources {
         xml.push_str("<d:response>");
@@ -39,6 +60,16 @@ pub fn multistatus_xml(resources: &[DavPropResource]) -> Vec<u8> {
             xml.push_str(&escape_xml(current));
             xml.push_str("</d:href></d:current-user-principal>");
         }
+        if let Some(principal_url) = &resource.principal_url {
+            xml.push_str("<d:principal-URL><d:href>");
+            xml.push_str(&escape_xml(principal_url));
+            xml.push_str("</d:href></d:principal-URL>");
+        }
+        if let Some(collection_set) = &resource.principal_collection_set {
+            xml.push_str("<d:principal-collection-set><d:href>");
+            xml.push_str(&escape_xml(collection_set));
+            xml.push_str("</d:href></d:principal-collection-set>");
+        }
         if let Some(home) = &resource.addressbook_home_set {
             xml.push_str("<card:addressbook-home-set><d:href>");
             xml.push_str(&escape_xml(home));
@@ -48,6 +79,128 @@ pub fn multistatus_xml(resources: &[DavPropResource]) -> Vec<u8> {
             xml.push_str("<cal:calendar-home-set><d:href>");
             xml.push_str(&escape_xml(home));
             xml.push_str("</d:href></cal:calendar-home-set>");
+        }
+        if !resource.calendar_user_addresses.is_empty() {
+            xml.push_str("<cal:calendar-user-address-set>");
+            for address in &resource.calendar_user_addresses {
+                xml.push_str("<d:href>");
+                xml.push_str(&escape_xml(address));
+                xml.push_str("</d:href>");
+            }
+            xml.push_str("</cal:calendar-user-address-set>");
+        }
+        if let Some(inbox) = &resource.schedule_inbox_url {
+            xml.push_str("<cal:schedule-inbox-URL><d:href>");
+            xml.push_str(&escape_xml(inbox));
+            xml.push_str("</d:href></cal:schedule-inbox-URL>");
+        }
+        if let Some(outbox) = &resource.schedule_outbox_url {
+            xml.push_str("<cal:schedule-outbox-URL><d:href>");
+            xml.push_str(&escape_xml(outbox));
+            xml.push_str("</d:href></cal:schedule-outbox-URL>");
+        }
+        if let Some(owner) = &resource.owner {
+            xml.push_str("<d:owner><d:href>");
+            xml.push_str(&escape_xml(owner));
+            xml.push_str("</d:href></d:owner>");
+        }
+        if !resource.current_user_privileges.is_empty() {
+            xml.push_str("<d:current-user-privilege-set>");
+            for privilege in &resource.current_user_privileges {
+                xml.push_str("<d:privilege>");
+                match *privilege {
+                    "read" => xml.push_str("<d:read/>"),
+                    "write" => xml.push_str("<d:write/>"),
+                    "write-properties" => xml.push_str("<d:write-properties/>"),
+                    "bind" => xml.push_str("<d:bind/>"),
+                    "unbind" => xml.push_str("<d:unbind/>"),
+                    _ => {}
+                }
+                xml.push_str("</d:privilege>");
+            }
+            xml.push_str("</d:current-user-privilege-set>");
+        }
+        if let Some(quota_available_bytes) = resource.quota_available_bytes {
+            xml.push_str("<d:quota-available-bytes>");
+            xml.push_str(&quota_available_bytes.to_string());
+            xml.push_str("</d:quota-available-bytes>");
+        }
+        if let Some(quota_used_bytes) = resource.quota_used_bytes {
+            xml.push_str("<d:quota-used-bytes>");
+            xml.push_str(&quota_used_bytes.to_string());
+            xml.push_str("</d:quota-used-bytes>");
+        }
+        if let Some(resource_id) = &resource.resource_id {
+            xml.push_str("<d:resource-id><d:href>urn:uuid:");
+            xml.push_str(&escape_xml(resource_id));
+            xml.push_str("</d:href></d:resource-id>");
+        }
+        if !resource.calendar_free_busy_set.is_empty() {
+            xml.push_str("<cal:calendar-free-busy-set>");
+            for href in &resource.calendar_free_busy_set {
+                xml.push_str("<d:href>");
+                xml.push_str(&escape_xml(href));
+                xml.push_str("</d:href>");
+            }
+            xml.push_str("</cal:calendar-free-busy-set>");
+        }
+        if let Some(transp) = &resource.schedule_calendar_transp {
+            xml.push_str("<cal:schedule-calendar-transp><cal:");
+            xml.push_str(transp);
+            xml.push_str("/></cal:schedule-calendar-transp>");
+        }
+        if let Some(url) = &resource.schedule_default_calendar_url {
+            xml.push_str("<cal:schedule-default-calendar-URL><d:href>");
+            xml.push_str(&escape_xml(url));
+            xml.push_str("</d:href></cal:schedule-default-calendar-URL>");
+        }
+        if let Some(color) = &resource.calendar_color {
+            xml.push_str("<ical:calendar-color>");
+            xml.push_str(&escape_xml(color));
+            xml.push_str("</ical:calendar-color>");
+        }
+        if let Some(description) = &resource.calendar_description {
+            xml.push_str("<cal:calendar-description>");
+            xml.push_str(&escape_xml(description));
+            xml.push_str("</cal:calendar-description>");
+        }
+        if let Some(ctag) = &resource.calendar_ctag {
+            xml.push_str("<cs:getctag>");
+            xml.push_str(&escape_xml(ctag));
+            xml.push_str("</cs:getctag>");
+        }
+        if let Some(sync_token) = &resource.sync_token {
+            xml.push_str("<d:sync-token>");
+            xml.push_str(&escape_xml(sync_token));
+            xml.push_str("</d:sync-token>");
+        }
+        if !resource.supported_calendar_components.is_empty() {
+            xml.push_str("<cal:supported-calendar-component-set>");
+            for component in &resource.supported_calendar_components {
+                xml.push_str(r#"<cal:comp name=""#);
+                xml.push_str(component);
+                xml.push_str(r#""/>"#);
+            }
+            xml.push_str("</cal:supported-calendar-component-set>");
+        }
+        if !resource.supported_reports.is_empty() {
+            xml.push_str("<d:supported-report-set>");
+            for report in &resource.supported_reports {
+                xml.push_str("<d:supported-report><d:report>");
+                match *report {
+                    "calendar-query" => xml.push_str("<cal:calendar-query/>"),
+                    "calendar-multiget" => xml.push_str("<cal:calendar-multiget/>"),
+                    "sync-collection" => xml.push_str("<d:sync-collection/>"),
+                    "expand-property" => xml.push_str("<d:expand-property/>"),
+                    "principal-property-search" => xml.push_str("<d:principal-property-search/>"),
+                    "principal-search-property-set" => {
+                        xml.push_str("<d:principal-search-property-set/>")
+                    }
+                    _ => {}
+                }
+                xml.push_str("</d:report></d:supported-report>");
+            }
+            xml.push_str("</d:supported-report-set>");
         }
 
         xml.push_str("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>");
@@ -60,9 +213,11 @@ pub fn multistatus_xml(resources: &[DavPropResource]) -> Vec<u8> {
 fn resource_type_xml(kind: DavResourceKind) -> &'static str {
     match kind {
         DavResourceKind::Principal => "<d:principal/>",
+        DavResourceKind::ScheduleInbox => "<d:collection/><cal:schedule-inbox/>",
+        DavResourceKind::ScheduleOutbox => "<d:collection/><cal:schedule-outbox/>",
         DavResourceKind::AddressbookHome => "<d:collection/><card:addressbook/>",
         DavResourceKind::Addressbook => "<d:collection/><card:addressbook/>",
-        DavResourceKind::CalendarHome => "<d:collection/><cal:calendar/>",
+        DavResourceKind::CalendarHome => "<d:collection/>",
         DavResourceKind::Calendar => "<d:collection/><cal:calendar/>",
     }
 }
@@ -93,14 +248,89 @@ mod tests {
             display_name: "alice@proton.me".to_string(),
             kind: DavResourceKind::Principal,
             current_user_principal: Some("/dav/uid-1/principal/".to_string()),
+            principal_url: Some("/dav/uid-1/principal/".to_string()),
+            principal_collection_set: Some("/dav/".to_string()),
             addressbook_home_set: Some("/dav/uid-1/addressbooks/".to_string()),
             calendar_home_set: Some("/dav/uid-1/calendars/".to_string()),
+            calendar_user_addresses: vec!["mailto:alice@proton.me".to_string()],
+            schedule_inbox_url: Some("/dav/uid-1/principal/inbox/".to_string()),
+            schedule_outbox_url: Some("/dav/uid-1/principal/outbox/".to_string()),
+            owner: Some("/dav/uid-1/principal/".to_string()),
+            current_user_privileges: vec!["read", "write"],
+            quota_available_bytes: None,
+            quota_used_bytes: None,
+            resource_id: None,
+            calendar_free_busy_set: Vec::new(),
+            schedule_calendar_transp: None,
+            schedule_default_calendar_url: None,
+            calendar_color: None,
+            calendar_description: None,
+            calendar_ctag: None,
+            sync_token: None,
+            supported_calendar_components: Vec::new(),
+            supported_reports: vec![
+                "expand-property",
+                "principal-property-search",
+                "principal-search-property-set",
+            ],
         }]);
         let xml = String::from_utf8(payload).expect("xml is utf8");
         assert!(xml.contains(r#"xmlns:d="DAV:""#));
         assert!(xml.contains("<d:multistatus"));
         assert!(xml.contains("<d:principal/>"));
+        assert!(xml.contains("<d:principal-URL>"));
+        assert!(xml.contains("<d:principal-collection-set>"));
+        assert!(xml.contains("<cal:calendar-user-address-set>"));
+        assert!(xml.contains("<cal:schedule-inbox-URL>"));
+        assert!(xml.contains("<cal:schedule-outbox-URL>"));
         assert!(xml.contains("<card:addressbook-home-set>"));
         assert!(xml.contains("<cal:calendar-home-set>"));
+    }
+
+    #[test]
+    fn calendar_resource_includes_collection_metadata() {
+        let payload = multistatus_xml(&[DavPropResource {
+            href: "/dav/uid-1/calendars/work/".to_string(),
+            display_name: "Work".to_string(),
+            kind: DavResourceKind::Calendar,
+            current_user_principal: None,
+            principal_url: None,
+            principal_collection_set: None,
+            addressbook_home_set: None,
+            calendar_home_set: None,
+            calendar_user_addresses: Vec::new(),
+            schedule_inbox_url: None,
+            schedule_outbox_url: None,
+            owner: None,
+            current_user_privileges: Vec::new(),
+            quota_available_bytes: Some(1_000_000_000),
+            quota_used_bytes: Some(0),
+            resource_id: Some("work".to_string()),
+            calendar_free_busy_set: vec!["/dav/uid-1/calendars/work/".to_string()],
+            schedule_calendar_transp: Some("opaque"),
+            schedule_default_calendar_url: Some("/dav/uid-1/calendars/work/".to_string()),
+            calendar_color: Some("#00AAFF".to_string()),
+            calendar_description: Some("Team calendar".to_string()),
+            calendar_ctag: Some("work-10".to_string()),
+            sync_token: Some("https://openproton.local/sync/work-10".to_string()),
+            supported_calendar_components: vec!["VEVENT"],
+            supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
+        }]);
+        let xml = String::from_utf8(payload).expect("xml is utf8");
+        assert!(xml.contains("<cs:getctag>work-10</cs:getctag>"));
+        assert!(xml.contains("<d:sync-token>https://openproton.local/sync/work-10</d:sync-token>"));
+        assert!(xml.contains(r#"<cal:comp name="VEVENT"/>"#));
+        assert!(xml.contains("<ical:calendar-color>#00AAFF</ical:calendar-color>"));
+        assert!(xml.contains("<d:supported-report-set>"));
+        assert!(xml.contains("<cal:calendar-query/>"));
+        assert!(xml.contains("<cal:calendar-multiget/>"));
+        assert!(xml.contains("<d:sync-collection/>"));
+        assert!(xml.contains("<d:quota-available-bytes>1000000000</d:quota-available-bytes>"));
+        assert!(xml.contains("<d:resource-id><d:href>urn:uuid:work</d:href></d:resource-id>"));
+        assert!(xml.contains("<cal:calendar-free-busy-set>"));
+        assert!(xml.contains(
+            "<cal:schedule-calendar-transp><cal:opaque/></cal:schedule-calendar-transp>"
+        ));
+        assert!(xml.contains("<cal:schedule-default-calendar-URL><d:href>/dav/uid-1/calendars/work/</d:href></cal:schedule-default-calendar-URL>"));
     }
 }

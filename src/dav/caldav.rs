@@ -66,7 +66,7 @@ pub fn handle_request(
                         description: "".to_string(),
                         color: "#3A7AFE".to_string(),
                         display: 1,
-                        calendar_type: 0,
+                        calendar_type: -1,
                         flags: 0,
                     })
                     .map_err(|err| DavError::Backend(err.to_string()))?;
@@ -75,6 +75,37 @@ pub fn handle_request(
                     headers: Vec::new(),
                     body: Vec::new(),
                 }))
+            }
+            "PROPPATCH" => {
+                let existing = adapter
+                    .get_calendar(&calendar_id, true)
+                    .map_err(|err| DavError::Backend(err.to_string()))?;
+                let Some(existing) = existing else {
+                    return Ok(Some(not_found_response()));
+                };
+                let display_name = extract_prop_text(body, "displayname")
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| existing.name.clone());
+                let description = extract_prop_text(body, "calendar-description")
+                    .or_else(|| extract_prop_text(body, "calendar_description"))
+                    .unwrap_or_else(|| existing.description.clone());
+                let color = extract_prop_text(body, "calendar-color")
+                    .or_else(|| extract_prop_text(body, "calendar_color"))
+                    .unwrap_or_else(|| existing.color.clone());
+
+                adapter
+                    .upsert_calendar(&Calendar {
+                        id: existing.id,
+                        name: display_name,
+                        description,
+                        color,
+                        display: existing.display,
+                        calendar_type: existing.calendar_type,
+                        flags: existing.flags,
+                    })
+                    .map_err(|err| DavError::Backend(err.to_string()))?;
+
+                Ok(Some(prop_patch_ok_response(raw_path)))
             }
             "DELETE" => {
                 let exists = adapter
@@ -109,6 +140,14 @@ pub fn handle_request(
             let Some(stored) = stored else {
                 return Ok(Some(not_found_response()));
             };
+            let current_etag = etag::from_updated_ms(&stored.id, stored.updated_at_ms);
+            if !etag::if_none_match_satisfied(headers.get("if-none-match"), Some(&current_etag)) {
+                return Ok(Some(DavResponse {
+                    status: "304 Not Modified",
+                    headers: vec![("ETag", current_etag)],
+                    body: Vec::new(),
+                }));
+            }
             let payload = store
                 .get_calendar_event_payload(&event_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
@@ -119,10 +158,7 @@ pub fn handle_request(
                 status: "200 OK",
                 headers: vec![
                     ("Content-Type", "text/calendar; charset=utf-8".to_string()),
-                    (
-                        "ETag",
-                        etag::from_updated_ms(&stored.id, stored.updated_at_ms),
-                    ),
+                    ("ETag", current_etag),
                 ],
                 body: ics.into_bytes(),
             };
@@ -150,7 +186,12 @@ pub fn handle_request(
             let payload = std::str::from_utf8(body)
                 .map_err(|_| DavError::InvalidRequest("CalDAV PUT body is not utf-8"))?;
             let now = epoch_seconds();
-            let create_time = now;
+            let create_time = store
+                .get_calendar_event_payload(&event_id, true)
+                .map_err(|err| DavError::Backend(err.to_string()))?
+                .map(|event| event.create_time)
+                .filter(|create_time| *create_time > 0)
+                .unwrap_or(now);
             let event = parse_ics(&event_id, &calendar_id, payload, create_time, now);
             adapter
                 .upsert_calendar_event(&event)
@@ -310,23 +351,42 @@ fn parse_ics(
 }
 
 fn render_ics(event: &CalendarEvent) -> String {
-    let summary = "OpenProton Event";
-    format!(
-        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//OpenProton Bridge//EN\nBEGIN:VEVENT\nUID:{}\nDTSTART:{}\nDTEND:{}\nSUMMARY:{}\nEND:VEVENT\nEND:VCALENDAR\n",
-        event.uid,
-        format_ics_datetime(event.start_time),
-        format_ics_datetime(event.end_time),
-        summary
-    )
+    extract_ics_payload(event).unwrap_or_else(|| {
+        let summary = "OpenProton Event";
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:{}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            event.uid,
+            format_ics_datetime(event.start_time),
+            format_ics_datetime(event.end_time),
+            summary
+        )
+    })
+}
+
+fn extract_ics_payload(event: &CalendarEvent) -> Option<String> {
+    event
+        .shared_events
+        .iter()
+        .chain(event.calendar_events.iter())
+        .chain(event.personal_events.iter())
+        .chain(event.attendees_events.iter())
+        .find(|part| part.data.contains("BEGIN:VCALENDAR"))
+        .map(|part| normalize_ics_newlines(&part.data))
 }
 
 fn render_minimal_ics(uid: &str, start_time: i64, end_time: i64) -> String {
     format!(
-        "BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:-//OpenProton Bridge//EN\nBEGIN:VEVENT\nUID:{}\nDTSTART:{}\nDTEND:{}\nSUMMARY:OpenProton Event\nEND:VEVENT\nEND:VCALENDAR\n",
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
         uid,
         format_ics_datetime(start_time),
         format_ics_datetime(end_time)
     )
+}
+
+fn normalize_ics_newlines(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
 }
 
 fn parse_ics_datetime(value: &str) -> Option<i64> {
@@ -441,6 +501,40 @@ fn precondition_failed_response() -> DavResponse {
         headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
         body: b"precondition failed\n".to_vec(),
     }
+}
+
+fn prop_patch_ok_response(path: &str) -> DavResponse {
+    let href = normalize_path(path);
+    DavResponse {
+        status: "207 Multi-Status",
+        headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
+        body: format!(
+            r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>{}</d:href><d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#,
+            href
+        )
+        .into_bytes(),
+    }
+}
+
+fn extract_prop_text(body: &[u8], tag: &str) -> Option<String> {
+    let body = std::str::from_utf8(body).ok()?;
+    for needle in [format!("<{tag}>"), format!(":{tag}>")] {
+        let Some((_, rest)) = body.split_once(&needle) else {
+            continue;
+        };
+        let (value, _) = rest.split_once("</")?;
+        return Some(decode_xml_entities(value.trim()));
+    }
+    None
+}
+
+fn decode_xml_entities(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 fn normalize_path(path: &str) -> String {

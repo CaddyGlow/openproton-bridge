@@ -17,27 +17,77 @@ pub fn resolve_basic_auth(
     headers: &HashMap<String, String>,
     auth_router: &AuthRouter,
 ) -> std::result::Result<AuthRoute, DavAuthError> {
-    let authorization = headers
-        .get("authorization")
-        .ok_or(DavAuthError::MissingAuthorization)?;
+    let Some(authorization) = headers.get("authorization") else {
+        tracing::debug!(
+            header_present = false,
+            "dav auth check: missing authorization header"
+        );
+        return Err(DavAuthError::MissingAuthorization);
+    };
+    tracing::debug!(
+        header_present = true,
+        header_len = authorization.len(),
+        has_basic_prefix = authorization.starts_with("Basic ")
+            || authorization.starts_with("basic "),
+        "dav auth check: authorization header received"
+    );
 
-    let encoded = authorization
+    let encoded = match authorization
         .strip_prefix("Basic ")
         .or_else(|| authorization.strip_prefix("basic "))
-        .ok_or(DavAuthError::InvalidAuthorization)?
-        .trim();
+    {
+        Some(value) => value.trim(),
+        None => {
+            tracing::debug!("dav auth check: authorization header is not Basic");
+            return Err(DavAuthError::InvalidAuthorization);
+        }
+    };
+    tracing::debug!(
+        encoded_len = encoded.len(),
+        "dav auth check: extracted basic payload"
+    );
 
-    let decoded = BASE64_STANDARD
+    let decoded = match BASE64_STANDARD
         .decode(encoded.as_bytes())
-        .map_err(|_| DavAuthError::InvalidAuthorization)?;
-    let decoded = String::from_utf8(decoded).map_err(|_| DavAuthError::InvalidAuthorization)?;
-    let (username, password) = decoded
-        .split_once(':')
-        .ok_or(DavAuthError::InvalidAuthorization)?;
+    {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::debug!("dav auth check: invalid base64 in authorization header");
+            return Err(DavAuthError::InvalidAuthorization);
+        }
+    };
+    let decoded = match String::from_utf8(decoded) {
+        Ok(value) => value,
+        Err(_) => {
+            tracing::debug!("dav auth check: decoded authorization is not utf-8");
+            return Err(DavAuthError::InvalidAuthorization);
+        }
+    };
+    let Some((username, password)) = decoded.split_once(':') else {
+        tracing::debug!("dav auth check: decoded authorization missing username:password separator");
+        return Err(DavAuthError::InvalidAuthorization);
+    };
+    tracing::debug!(
+        username = username,
+        password_len = password.len(),
+        "dav auth check: parsed basic credentials"
+    );
 
-    auth_router
+    let route = auth_router
         .resolve_login(username, password)
-        .ok_or(DavAuthError::InvalidCredentials)
+        .ok_or(DavAuthError::InvalidCredentials);
+    match &route {
+        Ok(resolved) => tracing::debug!(
+            username = username,
+            account_id = resolved.account_id.0,
+            "dav auth check: credentials resolved"
+        ),
+        Err(_) => tracing::debug!(
+            username = username,
+            "dav auth check: credentials did not match any active account"
+        ),
+    }
+    route
 }
 
 #[cfg(test)]

@@ -110,7 +110,7 @@ pub fn not_implemented_response() -> DavResponse {
             ("DAV", "1, 2, calendar-access, addressbook".to_string()),
             (
                 "Allow",
-                "OPTIONS, PROPFIND, REPORT, GET, HEAD, PUT, DELETE".to_string(),
+                "OPTIONS, PROPFIND, PROPPATCH, REPORT, GET, HEAD, PUT, DELETE".to_string(),
             ),
         ],
         body: b"DAV support is not implemented yet\n".to_vec(),

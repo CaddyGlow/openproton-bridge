@@ -432,19 +432,35 @@ fn route_request(
 
     match method.as_str() {
         "OPTIONS" => Ok(options_response()),
-        "PROPFIND" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" | "MKCALENDAR" => {
+        "PROPFIND" | "PROPPATCH" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" | "MKCALENDAR" => {
             if !path_without_query.starts_with("/dav") {
                 return Ok(not_found_response());
             }
             let auth = match resolve_basic_auth(&request.headers, &config.auth_router) {
                 Ok(auth) => auth,
-                Err(DavAuthError::MissingAuthorization)
-                | Err(DavAuthError::InvalidAuthorization)
-                | Err(DavAuthError::InvalidCredentials) => return Ok(unauthorized_response()),
+                Err(err @ DavAuthError::MissingAuthorization)
+                | Err(err @ DavAuthError::InvalidAuthorization)
+                | Err(err @ DavAuthError::InvalidCredentials) => {
+                    tracing::debug!(
+                        method = %request.method,
+                        path = %request.path,
+                        auth_error = ?err,
+                        has_authorization = request.headers.contains_key("authorization"),
+                        header_names = ?request.headers.keys().collect::<Vec<_>>(),
+                        "dav auth rejected request"
+                    );
+                    return Ok(unauthorized_response());
+                }
             };
 
             if method == "PROPFIND" {
-                return propfind::handle_propfind(&request.path, &request.headers, &auth);
+                let store = config.pim_stores.get(&auth.account_id.0);
+                return propfind::handle_propfind_with_store(
+                    &request.path,
+                    &request.headers,
+                    &auth,
+                    store,
+                );
             }
 
             let Some(store) = config.pim_stores.get(&auth.account_id.0) else {
@@ -490,7 +506,8 @@ fn options_response() -> DavResponse {
             ("DAV", DAV_CAPABILITIES_HEADER.to_string()),
             (
                 "Allow",
-                "OPTIONS, PROPFIND, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE".to_string(),
+                "OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE"
+                    .to_string(),
             ),
             ("Content-Type", "text/plain; charset=utf-8".to_string()),
         ],
@@ -1037,6 +1054,61 @@ mod tests {
         let wire = String::from_utf8_lossy(&response[..n]);
         assert!(wire.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(wire.contains("calendar events="));
+
+        server.await.expect("server");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn proppatch_updates_calendar_metadata() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        store
+            .upsert_calendar(&crate::api::calendar::Calendar {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                description: "".to_string(),
+                color: "#3A7AFE".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .expect("seed calendar");
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+        });
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, config).await.expect("handle");
+        });
+
+        let auth = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:" xmlns:ical="http://apple.com/ns/ical/"><d:set><d:prop><d:displayname>Renamed</d:displayname><ical:calendar-color>#FF9500</ical:calendar-color></d:prop></d:set></d:propertyupdate>"#;
+        let request = format!(
+            "PROPPATCH /dav/uid-1/calendars/work/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(request.as_bytes()).await?;
+        let mut response = vec![0; 2048];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
+
+        let updated = store
+            .get_calendar("work", false)
+            .expect("lookup calendar")
+            .expect("calendar exists");
+        assert_eq!(updated.name, "Renamed");
+        assert_eq!(updated.color, "#FF9500");
 
         server.await.expect("server");
         Ok(())

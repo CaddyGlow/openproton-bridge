@@ -11,6 +11,20 @@ use super::{PimError, Result};
 
 const CALENDAR_LAST_HORIZON_SYNC_KEY: &str = "calendar.last_horizon_sync_ms";
 
+fn is_remote_calendar_id(calendar_id: &str) -> bool {
+    !looks_like_local_uuid(calendar_id)
+}
+
+fn looks_like_local_uuid(value: &str) -> bool {
+    if value.len() != 36 {
+        return false;
+    }
+
+    value.chars().enumerate().all(|(index, ch)| {
+        (matches!(index, 8 | 13 | 18 | 23) && ch == '-') || ch.is_ascii_hexdigit()
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BootstrapCalendarsSummary {
     pub calendars_seen: usize,
@@ -114,7 +128,11 @@ fn load_cached_calendar_ids(store: &PimStore) -> Result<HashSet<String>> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let mut stmt = conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let ids = rows.collect::<std::result::Result<HashSet<String>, _>>()?;
+    let ids = rows
+        .collect::<std::result::Result<HashSet<String>, _>>()?
+        .into_iter()
+        .filter(|calendar_id| is_remote_calendar_id(calendar_id))
+        .collect();
     Ok(ids)
 }
 
@@ -163,7 +181,11 @@ fn load_active_calendar_ids(store: &PimStore) -> Result<Vec<String>> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     let mut stmt = conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0 ORDER BY id")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    Ok(rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|calendar_id| is_remote_calendar_id(calendar_id))
+        .collect())
 }
 
 fn reconcile_removed_calendar_events(
@@ -844,5 +866,15 @@ mod tests {
         assert_eq!(keep_deleted, 0);
         assert_eq!(in_range_deleted, 1);
         assert_eq!(out_of_range_deleted, 0);
+    }
+
+    #[test]
+    fn uuid_calendar_ids_are_local_only() {
+        assert!(!is_remote_calendar_id(
+            "7A60F3B9-C6B7-429D-8AB6-8029FB968C50"
+        ));
+        assert!(is_remote_calendar_id(
+            "35HQnSLUjSZsGBFNsioWA79AyBUbGDJkH3eqjkjgN-QJZRbawPZMsZFHGJOO5cns43YKn_zMH6PWdFwmYkGPsg=="
+        ));
     }
 }

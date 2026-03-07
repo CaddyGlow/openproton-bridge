@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use regex::Regex;
+
 use crate::bridge::auth_router::AuthRoute;
 use crate::pim::dav::{
     CalDavRepository, CardDavRepository, DavSyncStateRepository, StoreBackedDavAdapter,
@@ -24,7 +26,6 @@ pub fn handle_report(
     let adapter = StoreBackedDavAdapter::new(store.clone());
 
     let card_collection = discovery::default_addressbook_path(&auth.account_id.0);
-    let cal_collection = discovery::default_calendar_path(&auth.account_id.0);
 
     if path == card_collection {
         if body_text.contains("addressbook-query") {
@@ -40,18 +41,31 @@ pub fn handle_report(
         return Ok(Some(not_implemented_report()));
     }
 
-    if path == cal_collection {
+    if let Some(calendar_id) = parse_calendar_collection_path(&path, &auth.account_id.0) {
         if body_text.contains("calendar-query") {
             return Ok(Some(calendar_query(
                 &adapter,
+                store,
                 &auth.account_id.0,
+                &calendar_id,
+                body_text,
+            )?));
+        }
+        if body_text.contains("calendar-multiget") {
+            return Ok(Some(calendar_multiget(
+                &adapter,
+                store,
+                &auth.account_id.0,
+                &calendar_id,
                 body_text,
             )?));
         }
         if body_text.contains("sync-collection") {
             return Ok(Some(caldav_sync_collection(
                 &adapter,
+                store,
                 &auth.account_id.0,
+                &calendar_id,
                 body_text,
             )?));
         }
@@ -76,20 +90,30 @@ fn addressbook_query(adapter: &StoreBackedDavAdapter, account_id: &str) -> Resul
         .map(|contact| ReportItem {
             href: format!("/dav/{account_id}/addressbooks/default/{}.vcf", contact.id),
             etag: etag::from_updated_ms(&contact.id, contact.updated_at_ms),
+            calendar_data: None,
+            not_found: false,
         })
         .collect::<Vec<_>>();
+    tracing::debug!(
+        report = "addressbook-query",
+        account_id,
+        item_count = items.len(),
+        "dav report assembled"
+    );
     Ok(multistatus_response(&items, None))
 }
 
 fn calendar_query(
     adapter: &StoreBackedDavAdapter,
+    store: &Arc<PimStore>,
     account_id: &str,
+    calendar_id: &str,
     body: &str,
 ) -> Result<DavResponse> {
     let range = parse_calendar_time_range(body);
     let events = adapter
         .list_calendar_events(
-            "default",
+            calendar_id,
             false,
             range,
             QueryPage {
@@ -101,10 +125,75 @@ fn calendar_query(
     let items = events
         .iter()
         .map(|event| ReportItem {
-            href: format!("/dav/{account_id}/calendars/default/{}.ics", event.id),
+            href: format!("/dav/{account_id}/calendars/{calendar_id}/{}.ics", event.id),
             etag: etag::from_updated_ms(&event.id, event.updated_at_ms),
+            calendar_data: load_calendar_data(store, &event.id, false),
+            not_found: false,
         })
         .collect::<Vec<_>>();
+    let item_count = items.len();
+    let payload_count = items
+        .iter()
+        .filter(|item| item.calendar_data.is_some())
+        .count();
+    tracing::debug!(
+        report = "calendar-query",
+        account_id,
+        calendar_id,
+        item_count,
+        payload_count,
+        "dav report assembled"
+    );
+    Ok(multistatus_response(&items, None))
+}
+
+fn calendar_multiget(
+    adapter: &StoreBackedDavAdapter,
+    store: &Arc<PimStore>,
+    account_id: &str,
+    calendar_id: &str,
+    body: &str,
+) -> Result<DavResponse> {
+    let hrefs = extract_report_hrefs(body);
+    let mut items = Vec::with_capacity(hrefs.len());
+    for href in hrefs {
+        let Some(event_id) = parse_event_id_from_href(&href, account_id, calendar_id) else {
+            continue;
+        };
+        let event = adapter
+            .get_calendar_event(&event_id, false)
+            .map_err(|err| DavError::Backend(err.to_string()))?;
+        let Some(event) = event else {
+            items.push(ReportItem {
+                href,
+                etag: String::new(),
+                calendar_data: None,
+                not_found: true,
+            });
+            continue;
+        };
+        items.push(ReportItem {
+            href,
+            etag: etag::from_updated_ms(&event.id, event.updated_at_ms),
+            calendar_data: load_calendar_data(store, &event.id, false),
+            not_found: false,
+        });
+    }
+    let item_count = items.len();
+    let payload_count = items
+        .iter()
+        .filter(|item| item.calendar_data.is_some())
+        .count();
+    let not_found_count = items.iter().filter(|item| item.not_found).count();
+    tracing::debug!(
+        report = "calendar-multiget",
+        account_id,
+        calendar_id,
+        item_count,
+        payload_count,
+        not_found_count,
+        "dav report assembled"
+    );
     Ok(multistatus_response(&items, None))
 }
 
@@ -137,8 +226,18 @@ fn carddav_sync_collection(
         .map(|contact| ReportItem {
             href: format!("/dav/{account_id}/addressbooks/default/{}.vcf", contact.id),
             etag: etag::from_updated_ms(&contact.id, contact.updated_at_ms),
+            calendar_data: None,
+            not_found: false,
         })
         .collect::<Vec<_>>();
+    tracing::debug!(
+        report = "sync-collection",
+        protocol = "carddav",
+        account_id,
+        item_count = items.len(),
+        sync_token = current_token,
+        "dav report assembled"
+    );
     Ok(multistatus_response(
         &items,
         Some(current_token.to_string()),
@@ -147,12 +246,14 @@ fn carddav_sync_collection(
 
 fn caldav_sync_collection(
     adapter: &StoreBackedDavAdapter,
+    store: &Arc<PimStore>,
     account_id: &str,
+    calendar_id: &str,
     body: &str,
 ) -> Result<DavResponse> {
     let events = adapter
         .list_calendar_events(
-            "default",
+            calendar_id,
             true,
             CalendarEventRange::default(),
             QueryPage {
@@ -166,21 +267,48 @@ fn caldav_sync_collection(
         .iter()
         .map(|item| item.updated_at_ms)
         .max()
-        .unwrap_or_else(epoch_millis);
+        .unwrap_or_default();
     adapter
-        .set_sync_state_int(&sync_scope("caldav", account_id), current_token)
+        .set_sync_state_int(&caldav_sync_scope(account_id, calendar_id), current_token)
         .map_err(|err| DavError::Backend(err.to_string()))?;
     let items = events
         .iter()
         .filter(|event| since.is_none_or(|token| event.updated_at_ms > token))
         .map(|event| ReportItem {
-            href: format!("/dav/{account_id}/calendars/default/{}.ics", event.id),
-            etag: etag::from_updated_ms(&event.id, event.updated_at_ms),
+            href: format!("/dav/{account_id}/calendars/{calendar_id}/{}.ics", event.id),
+            etag: if event.deleted {
+                String::new()
+            } else {
+                etag::from_updated_ms(&event.id, event.updated_at_ms)
+            },
+            calendar_data: if event.deleted {
+                None
+            } else {
+                load_calendar_data(store, &event.id, true)
+            },
+            not_found: event.deleted,
         })
         .collect::<Vec<_>>();
+    let item_count = items.len();
+    let payload_count = items
+        .iter()
+        .filter(|item| item.calendar_data.is_some())
+        .count();
+    let tombstone_count = items.iter().filter(|item| item.not_found).count();
+    tracing::debug!(
+        report = "sync-collection",
+        protocol = "caldav",
+        account_id,
+        calendar_id,
+        item_count,
+        payload_count,
+        tombstone_count,
+        sync_token = current_token,
+        "dav report assembled"
+    );
     Ok(multistatus_response(
         &items,
-        Some(current_token.to_string()),
+        Some(sync_token_uri(account_id, calendar_id, current_token)),
     ))
 }
 
@@ -267,19 +395,30 @@ fn days_in_month(year: i32, month: u32) -> u32 {
 struct ReportItem {
     href: String,
     etag: String,
+    calendar_data: Option<String>,
+    not_found: bool,
 }
 
 fn multistatus_response(items: &[ReportItem], sync_token: Option<String>) -> DavResponse {
-    let mut body =
-        String::from(r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:">"#);
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav">"#,
+    );
     for item in items {
         body.push_str("<d:response><d:href>");
         body.push_str(&escape_xml(&item.href));
+        if item.not_found {
+            body.push_str("</d:href><d:status>HTTP/1.1 404 Not Found</d:status></d:response>");
+            continue;
+        }
         body.push_str("</d:href><d:propstat><d:prop><d:getetag>");
         body.push_str(&escape_xml(&item.etag));
-        body.push_str(
-            "</d:getetag></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>",
-        );
+        body.push_str("</d:getetag>");
+        if let Some(calendar_data) = &item.calendar_data {
+            body.push_str("<cal:calendar-data>");
+            body.push_str(&escape_xml(calendar_data));
+            body.push_str("</cal:calendar-data>");
+        }
+        body.push_str("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>");
     }
     if let Some(token) = sync_token {
         body.push_str("<d:sync-token>");
@@ -297,6 +436,141 @@ fn multistatus_response(items: &[ReportItem], sync_token: Option<String>) -> Dav
 
 fn sync_scope(protocol: &str, account_id: &str) -> String {
     format!("dav:{protocol}:{account_id}:sync-token")
+}
+
+fn caldav_sync_scope(account_id: &str, calendar_id: &str) -> String {
+    format!("dav:caldav:{account_id}:{calendar_id}:sync-token")
+}
+
+fn sync_token_uri(account_id: &str, calendar_id: &str, version: i64) -> String {
+    format!(
+        "https://openproton.local/dav/{account_id}/calendars/{calendar_id}/sync/{}",
+        version.max(0)
+    )
+}
+
+fn load_calendar_data(store: &PimStore, event_id: &str, include_deleted: bool) -> Option<String> {
+    store
+        .get_calendar_event_payload(event_id, include_deleted)
+        .ok()
+        .flatten()
+        .map(|event| render_report_calendar_data(&event))
+}
+
+fn render_report_calendar_data(event: &crate::api::calendar::CalendarEvent) -> String {
+    extract_ics_payload(event).unwrap_or_else(|| {
+        format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+            event.uid,
+            format_ics_datetime(event.start_time),
+            format_ics_datetime(event.end_time)
+        )
+    })
+}
+
+fn extract_ics_payload(event: &crate::api::calendar::CalendarEvent) -> Option<String> {
+    event
+        .shared_events
+        .iter()
+        .chain(event.calendar_events.iter())
+        .chain(event.personal_events.iter())
+        .chain(event.attendees_events.iter())
+        .find(|part| part.data.contains("BEGIN:VCALENDAR"))
+        .map(|part| normalize_ics_newlines(&part.data))
+}
+
+fn extract_report_hrefs(body: &str) -> Vec<String> {
+    let href_re = Regex::new(
+        r"(?is)<(?:[A-Za-z0-9_-]+:)?href\b[^>]*>\s*(?P<href>.*?)\s*</(?:[A-Za-z0-9_-]+:)?href>",
+    )
+    .expect("href regex should compile");
+    href_re
+        .captures_iter(body)
+        .filter_map(|caps| {
+            let href = caps.name("href")?.as_str().trim();
+            (!href.is_empty()).then(|| href.to_string())
+        })
+        .collect()
+}
+
+fn parse_event_id_from_href(href: &str, account_id: &str, calendar_id: &str) -> Option<String> {
+    let href_path = normalize_report_href_path(href)?;
+    let prefix = format!("/dav/{account_id}/calendars/{calendar_id}/");
+    let remainder = href_path.strip_prefix(&prefix)?;
+    let event_id = remainder.strip_suffix(".ics")?;
+    if event_id.is_empty() || event_id.contains('/') {
+        return None;
+    }
+    Some(event_id.to_string())
+}
+
+fn normalize_report_href_path(href: &str) -> Option<String> {
+    if href.starts_with('/') {
+        return Some(href.to_string());
+    }
+    reqwest::Url::parse(href)
+        .ok()
+        .map(|url| url.path().to_string())
+}
+
+fn normalize_ics_newlines(raw: &str) -> String {
+    raw.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\r\n")
+}
+
+fn format_ics_datetime(unix_seconds: i64) -> String {
+    let (year, month, day, hour, minute, second) = from_unix_utc(unix_seconds);
+    format!("{year:04}{month:02}{day:02}T{hour:02}{minute:02}{second:02}Z")
+}
+
+fn from_unix_utc(unix_seconds: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let mut days = unix_seconds.div_euclid(86_400);
+    let mut seconds_of_day = unix_seconds.rem_euclid(86_400);
+    let mut year = 1970i32;
+    loop {
+        let diy = if is_leap(year) { 366 } else { 365 };
+        if days < diy {
+            break;
+        }
+        days -= diy;
+        year += 1;
+    }
+
+    let mut month = 1u32;
+    loop {
+        let dim = days_in_month(year, month) as i64;
+        if days < dim {
+            break;
+        }
+        days -= dim;
+        month += 1;
+    }
+
+    let day = (days + 1) as u32;
+    let hour = (seconds_of_day / 3_600) as u32;
+    seconds_of_day %= 3_600;
+    let minute = (seconds_of_day / 60) as u32;
+    let second = (seconds_of_day % 60) as u32;
+    (year, month, day, hour, minute, second)
+}
+
+fn parse_calendar_collection_path(path: &str, account_id: &str) -> Option<String> {
+    let mut segments = path.trim_matches('/').split('/').filter(|s| !s.is_empty());
+    if segments.next()? != "dav" {
+        return None;
+    }
+    if segments.next()? != account_id {
+        return None;
+    }
+    if segments.next()? != "calendars" {
+        return None;
+    }
+    let calendar_id = segments.next()?;
+    if calendar_id.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some(calendar_id.to_string())
 }
 
 fn not_implemented_report() -> DavResponse {
@@ -338,7 +612,10 @@ fn epoch_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_sync_token, parse_calendar_time_range};
+    use super::{
+        extract_report_hrefs, extract_sync_token, parse_calendar_collection_path,
+        parse_calendar_time_range, parse_event_id_from_href,
+    };
 
     #[test]
     fn parses_sync_token_from_report_body() {
@@ -355,5 +632,38 @@ mod tests {
         );
         assert!(range.start_time_from.is_some());
         assert!(range.start_time_to.is_some());
+    }
+
+    #[test]
+    fn parses_calendar_collection_path_for_account() {
+        let parsed = parse_calendar_collection_path("/dav/uid-1/calendars/work/", "uid-1");
+        assert_eq!(parsed.as_deref(), Some("work"));
+
+        assert!(parse_calendar_collection_path("/dav/uid-2/calendars/work/", "uid-1").is_none());
+        assert!(parse_calendar_collection_path("/dav/uid-1/calendars/", "uid-1").is_none());
+    }
+
+    #[test]
+    fn parses_event_id_from_absolute_multiget_href() {
+        let parsed = parse_event_id_from_href(
+            "https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics",
+            "uid-1",
+            "work",
+        );
+        assert_eq!(parsed.as_deref(), Some("event-1"));
+    }
+
+    #[test]
+    fn extracts_hrefs_with_arbitrary_namespace_prefixes() {
+        let hrefs = extract_report_hrefs(
+            r#"<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:D="DAV:"><D:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</D:href><href>/dav/uid-1/calendars/work/event-2.ics</href></c:calendar-multiget>"#,
+        );
+        assert_eq!(
+            hrefs,
+            vec![
+                "https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics".to_string(),
+                "/dav/uid-1/calendars/work/event-2.ics".to_string()
+            ]
+        );
     }
 }

@@ -1,11 +1,12 @@
 use super::http::DavResponse;
 
+pub const DAV_ROOT_PATH: &str = "/";
 pub const WELL_KNOWN_CARDDAV: &str = "/.well-known/carddav";
 pub const WELL_KNOWN_CALDAV: &str = "/.well-known/caldav";
 pub const PRINCIPAL_ME_PATH: &str = "/dav/principals/me/";
 
 pub fn discovery_redirect(path: &str) -> Option<DavResponse> {
-    if !matches!(path, WELL_KNOWN_CARDDAV | WELL_KNOWN_CALDAV) {
+    if !matches!(path, DAV_ROOT_PATH | WELL_KNOWN_CARDDAV | WELL_KNOWN_CALDAV) {
         return None;
     }
 
@@ -21,6 +22,18 @@ pub fn discovery_redirect(path: &str) -> Option<DavResponse> {
 
 pub fn principal_path(account_id: &str) -> String {
     format!("/dav/{account_id}/principal/")
+}
+
+pub fn principal_collection_set_path() -> String {
+    "/dav/".to_string()
+}
+
+pub fn schedule_inbox_path(account_id: &str) -> String {
+    format!("/dav/{account_id}/principal/inbox/")
+}
+
+pub fn schedule_outbox_path(account_id: &str) -> String {
+    format!("/dav/{account_id}/principal/outbox/")
 }
 
 pub fn addressbook_home_path(account_id: &str) -> String {
@@ -41,7 +54,9 @@ pub fn default_calendar_path(account_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{discovery_redirect, PRINCIPAL_ME_PATH, WELL_KNOWN_CALDAV, WELL_KNOWN_CARDDAV};
+    use super::{
+        discovery_redirect, DAV_ROOT_PATH, PRINCIPAL_ME_PATH, WELL_KNOWN_CALDAV, WELL_KNOWN_CARDDAV,
+    };
 
     #[test]
     fn well_known_paths_redirect_to_principal() {
@@ -54,5 +69,15 @@ mod tests {
 
         let caldav = discovery_redirect(WELL_KNOWN_CALDAV).expect("caldav should redirect");
         assert_eq!(caldav.status, "301 Moved Permanently");
+    }
+
+    #[test]
+    fn root_path_redirects_to_principal() {
+        let root = discovery_redirect(DAV_ROOT_PATH).expect("root should redirect");
+        assert_eq!(root.status, "301 Moved Permanently");
+        assert!(root
+            .headers
+            .iter()
+            .any(|(k, v)| *k == "Location" && v == PRINCIPAL_ME_PATH));
     }
 }

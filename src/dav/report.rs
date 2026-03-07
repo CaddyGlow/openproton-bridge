@@ -20,7 +20,6 @@ use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
 
-const CALDAV_EMPTY_SYNC_BACKFILL_SCOPE: &str = "calendar.dav_last_backfill_ms";
 const CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub async fn handle_report(
@@ -370,7 +369,12 @@ async fn maybe_backfill_empty_caldav_sync(
         return Ok(());
     }
 
-    if !backfill_cooldown_elapsed(adapter)? {
+    if !backfill_cooldown_elapsed(adapter, account_id, calendar_id)? {
+        tracing::debug!(
+            account_id,
+            calendar_id,
+            "skipping CalDAV backfill because cooldown is still active"
+        );
         return Ok(());
     }
 
@@ -403,20 +407,31 @@ async fn maybe_backfill_empty_caldav_sync(
     .await
     .map_err(|err| DavError::Backend(err.to_string()))?;
     adapter
-        .set_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE, epoch_millis())
+        .set_sync_state_int(
+            &caldav_backfill_scope(account_id, calendar_id),
+            epoch_millis(),
+        )
         .map_err(|err| DavError::Backend(err.to_string()))?;
     Ok(())
 }
 
-fn backfill_cooldown_elapsed(adapter: &StoreBackedDavAdapter) -> Result<bool> {
+fn backfill_cooldown_elapsed(
+    adapter: &StoreBackedDavAdapter,
+    account_id: &str,
+    calendar_id: &str,
+) -> Result<bool> {
     let Some(last_backfill_ms) = adapter
-        .get_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE)
+        .get_sync_state_int(&caldav_backfill_scope(account_id, calendar_id))
         .map_err(|err| DavError::Backend(err.to_string()))?
     else {
         return Ok(true);
     };
     Ok(epoch_millis().saturating_sub(last_backfill_ms)
         >= CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN.as_millis() as i64)
+}
+
+fn caldav_backfill_scope(account_id: &str, calendar_id: &str) -> String {
+    format!("calendar.dav_last_backfill_ms.{account_id}.{calendar_id}")
 }
 
 pub(crate) fn calendar_collection_sync_version(
@@ -861,10 +876,10 @@ fn epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        backfill_cooldown_elapsed, escape_xml, extract_report_hrefs, extract_sync_token,
-        extract_sync_token_version, multistatus_response, parse_calendar_collection_path,
-        parse_calendar_time_range, parse_event_id_from_href, ReportItem,
-        CALDAV_EMPTY_SYNC_BACKFILL_SCOPE,
+        backfill_cooldown_elapsed, caldav_backfill_scope, escape_xml, extract_report_hrefs,
+        extract_sync_token, extract_sync_token_version, multistatus_response,
+        parse_calendar_collection_path, parse_calendar_time_range, parse_event_id_from_href,
+        ReportItem,
     };
     use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
     use crate::pim::store::PimStore;
@@ -906,12 +921,16 @@ mod tests {
     #[test]
     fn backfill_cooldown_blocks_immediate_repeat_attempts() {
         let adapter = test_adapter();
-        assert!(backfill_cooldown_elapsed(&adapter).unwrap());
+        assert!(backfill_cooldown_elapsed(&adapter, "uid-1", "work").unwrap());
 
         adapter
-            .set_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE, super::epoch_millis())
+            .set_sync_state_int(
+                &caldav_backfill_scope("uid-1", "work"),
+                super::epoch_millis(),
+            )
             .unwrap();
-        assert!(!backfill_cooldown_elapsed(&adapter).unwrap());
+        assert!(!backfill_cooldown_elapsed(&adapter, "uid-1", "work").unwrap());
+        assert!(backfill_cooldown_elapsed(&adapter, "uid-1", "other").unwrap());
     }
 
     #[test]

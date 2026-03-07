@@ -1320,6 +1320,51 @@ async fn cached_message_count_for_generation(
     Ok(total)
 }
 
+async fn bootstrap_latest_event_cursor_for_generation(
+    config: &EventWorkerConfig,
+    expected_generation: u64,
+) -> Result<String, EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "startup_cursor_init").await?;
+    let mut session = config
+        .runtime_accounts
+        .with_valid_access_token(&config.account_id)
+        .await?;
+
+    let base_url = resolve_api_base_url_for_mode(&config.api_base_url, session.api_mode);
+    let mut client = ProtonClient::authenticated_with_mode(
+        &base_url,
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )?;
+
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        "bootstrapping baseline event cursor from cached message store"
+    );
+    let response = fetch_events_with_retry(config, &mut session, &mut client, "").await?;
+    let event_id = response.event_id.trim().to_string();
+    if event_id.is_empty() {
+        return Err(EventWorkerError::Payload(
+            "latest event cursor bootstrap returned empty event id".to_string(),
+        ));
+    }
+
+    ensure_account_generation(config, expected_generation, "startup_cursor_commit").await?;
+    let checkpoint = EventCheckpoint {
+        last_event_id: event_id.clone(),
+        last_event_ts: Some(unix_now()),
+        sync_state: Some("baseline_cursor".to_string()),
+    };
+    config
+        .checkpoint_store
+        .save_checkpoint(&config.account_id, &checkpoint)
+        .map_err(|_| EventWorkerError::Checkpoint)?;
+
+    Ok(event_id)
+}
+
 pub async fn poll_account_once(
     config: &EventWorkerConfig,
     last_event_id: &str,
@@ -1593,10 +1638,80 @@ async fn run_event_worker_with_shutdown(
                     }
                 };
                 if startup_resync_pending {
-                    if !last_event_id.trim().is_empty() {
-                        match cached_message_count_for_generation(&config, expected_generation).await
-                        {
-                            Ok(cached_count) if cached_count > 0 => {
+                    match cached_message_count_for_generation(&config, expected_generation).await {
+                        Ok(cached_count) if cached_count > 0 => {
+                            if last_event_id.trim().is_empty() {
+                                match bootstrap_latest_event_cursor_for_generation(
+                                    &config,
+                                    expected_generation,
+                                )
+                                .await
+                                {
+                                    Ok(event_id) => {
+                                        info!(
+                                            service = "user-events",
+                                            user = %config.account_id.0,
+                                            account_id = %config.account_id.0,
+                                            account_email = %config.account_email,
+                                            count = cached_count,
+                                            event_id = %event_id,
+                                            msg = "Bootstrapped latest event cursor from cached messages",
+                                            "Bootstrapped latest event cursor from cached messages"
+                                        );
+                                        last_event_id = event_id;
+                                        startup_resync_pending = false;
+                                        next_delay = Duration::ZERO;
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        let now = unix_now();
+                                        let failure_class = classify_worker_failure_class(&err);
+                                        stats.record_failure(failure_class, now);
+                                        consecutive_failures =
+                                            consecutive_failures.saturating_add(1);
+                                        if let Some(next_health) = classify_worker_health(&err) {
+                                            let _ = config
+                                                .runtime_accounts
+                                                .set_health(&config.account_id, next_health)
+                                                .await;
+                                        }
+                                        let jitter_ms = rand::thread_rng().gen_range(0..=500_u64);
+                                        next_delay = compute_failure_delay(
+                                            poll_interval,
+                                            consecutive_failures,
+                                            jitter_ms,
+                                        );
+                                        warn!(
+                                            account_id = %config.account_id.0,
+                                            account_email = %config.account_email,
+                                            error = %err,
+                                            failure_class = ?failure_class,
+                                            consecutive_failures,
+                                            retry_delay_ms = next_delay.as_millis() as u64,
+                                            poll_attempts = stats.poll_attempts,
+                                            failed_polls = stats.failed_polls,
+                                            auth_failures = stats.auth_failures,
+                                            transient_failures = stats.transient_failures,
+                                            permanent_failures = stats.permanent_failures,
+                                            "event worker startup cursor bootstrap failed"
+                                        );
+                                        if stats.poll_attempts % WORKER_STATS_LOG_EVERY_ATTEMPTS == 0 {
+                                            warn!(
+                                                account_id = %config.account_id.0,
+                                                account_email = %config.account_email,
+                                                poll_attempts = stats.poll_attempts,
+                                                successful_polls = stats.successful_polls,
+                                                failed_polls = stats.failed_polls,
+                                                auth_failures = stats.auth_failures,
+                                                transient_failures = stats.transient_failures,
+                                                permanent_failures = stats.permanent_failures,
+                                                "event worker stats"
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else {
                                 info!(
                                     service = "imap",
                                     user = %config.account_id.0,
@@ -1611,15 +1726,15 @@ async fn run_event_worker_with_shutdown(
                                 next_delay = Duration::ZERO;
                                 continue;
                             }
-                            Ok(_) => {}
-                            Err(err) => {
-                                warn!(
-                                    account_id = %config.account_id.0,
-                                    account_email = %config.account_email,
-                                    error = %err,
-                                    "failed to inspect cached message state before startup resync"
-                                );
-                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(
+                                account_id = %config.account_id.0,
+                                account_email = %config.account_email,
+                                error = %err,
+                                "failed to inspect cached message state before startup resync"
+                            );
                         }
                     }
                     let startup_result = match run_startup_resync_for_generation(

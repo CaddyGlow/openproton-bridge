@@ -296,7 +296,14 @@ async fn caldav_sync_collection(
             },
         )
         .map_err(|err| DavError::Backend(err.to_string()))?;
-    let since = extract_sync_token_version(body);
+    let prior_sync_token = adapter
+        .get_sync_state_int(&caldav_sync_scope(account_id, calendar_id))
+        .map_err(|err| DavError::Backend(err.to_string()))?;
+    let since = if prior_sync_token.is_some() {
+        extract_sync_token_version(body)
+    } else {
+        None
+    };
     let current_token = calendar_collection_sync_version(adapter, calendar_id, Some(&events))?;
     adapter
         .set_sync_state_int(&caldav_sync_scope(account_id, calendar_id), current_token)
@@ -335,6 +342,8 @@ async fn caldav_sync_collection(
         protocol = "caldav",
         account_id,
         calendar_id,
+        prior_sync_known = prior_sync_token.is_some(),
+        request_sync_token = extract_sync_token(body).as_deref().unwrap_or_default(),
         item_count,
         payload_count,
         tombstone_count,

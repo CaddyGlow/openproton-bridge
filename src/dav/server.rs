@@ -1174,7 +1174,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caldav_sync_collection_accepts_propfind_sync_tokens_without_replay() -> Result<()> {
+    async fn caldav_sync_collection_replays_on_first_report_after_propfind_token() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
         let mut pim_stores = HashMap::new();
@@ -1249,7 +1249,7 @@ mod tests {
         let n = client.read(&mut response).await?;
         let incremental_wire = String::from_utf8_lossy(&response[..n]);
         assert!(incremental_wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
-        assert!(!incremental_wire.contains("/dav/uid-1/calendars/work/e1.ics"));
+        assert!(incremental_wire.contains("/dav/uid-1/calendars/work/e1.ics"));
 
         server.await.expect("server");
         Ok(())

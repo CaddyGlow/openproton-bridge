@@ -9,6 +9,7 @@ use super::error::{ApiError, Result};
 use super::types::ApiMode;
 
 const DEFAULT_BRIDGE_APP_VERSION: &str = "3.22.0+git";
+const DEFAULT_BRIDGE_APP_NAMESPACE: &str = "mail";
 const DEFAULT_WEBMAIL_APP_VERSION: &str = "web-mail@5.0.103.3";
 const DEFAULT_WEBMAIL_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
@@ -16,14 +17,25 @@ const DEFAULT_TRANSIENT_RETRY_DELAY_MS: u64 = 200;
 
 fn bridge_app_version() -> String {
     let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
-        .unwrap_or_else(|_| DEFAULT_BRIDGE_APP_VERSION.to_string());
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| DEFAULT_BRIDGE_APP_VERSION.to_string());
+    if bridge_version.contains('@') {
+        return bridge_version;
+    }
+    let namespace = std::env::var("OPENPROTON_PM_APP_NAMESPACE")
+        .ok()
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .unwrap_or_else(|| DEFAULT_BRIDGE_APP_NAMESPACE.to_string());
     let os = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
         "windows" => "windows",
         _ => "linux",
     };
-    format!("{os}-bridge@{bridge_version}")
+    format!("{os}-{namespace}@{bridge_version}")
 }
 
 fn bridge_user_agent() -> String {
@@ -115,6 +127,12 @@ impl ProtonClient {
     pub fn with_base_url_and_mode(base_url: &str, api_mode: ApiMode) -> Result<Self> {
         let mut headers = HeaderMap::new();
         let app_version = mode_app_version(api_mode);
+        info!(
+            pkg = "gpa/client",
+            api_mode = api_mode.as_str(),
+            app_version = %app_version,
+            "configured proton client identity"
+        );
         let app_version_header = HeaderValue::from_str(&app_version)
             .map_err(|err| ApiError::Auth(format!("invalid app version header value: {err}")))?;
         headers.insert("x-pm-appversion", app_version_header);

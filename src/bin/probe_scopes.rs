@@ -304,11 +304,6 @@ fn apply_client_version_env(api_mode: api::types::ApiMode, client_version: &str)
             std::env::set_var("OPENPROTON_PM_WEBMAIL_APP_VERSION", client_version);
         }
         api::types::ApiMode::Bridge => {
-            if client_version.contains('@') {
-                anyhow::bail!(
-                    "bridge mode expects plain version (example 3.22.0), got `{client_version}`"
-                );
-            }
             std::env::remove_var("OPENPROTON_PM_WEBMAIL_APP_VERSION");
             std::env::set_var("OPENPROTON_PM_APP_VERSION", client_version);
         }
@@ -401,7 +396,20 @@ async fn run_single_attempt(
     };
 
     let second_factor_scopes =
-        complete_second_factor(&client, &auth, totp_config, totp_code_override).await?;
+        match complete_second_factor(&client, &auth, totp_config, totp_code_override).await {
+            Ok(scopes) => scopes,
+            Err(err) => {
+                return Ok(AttemptResult {
+                    client_version: client_version.to_string(),
+                    status: "FAIL".to_string(),
+                    granted_scopes: None,
+                    missing_requested_scopes: None,
+                    human_verification_required: false,
+                    human_verification_url: None,
+                    error: Some(format!("second-factor step failed: {err}")),
+                });
+            }
+        };
     let mut granted_scopes = if second_factor_scopes.is_empty() {
         api::auth::normalize_scope_string(auth.scope.as_deref())
     } else {

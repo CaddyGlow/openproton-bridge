@@ -1040,6 +1040,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn caldav_sync_collection_accepts_uri_sync_tokens() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+            runtime_accounts: None,
+        });
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.expect("accept");
+                handle_connection(stream, config.clone())
+                    .await
+                    .expect("handle");
+            }
+        });
+
+        let auth = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let body = "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:event-1\nDTSTART:20260305T120000Z\nDTEND:20260305T130000Z\nSUMMARY:Test\nEND:VEVENT\nEND:VCALENDAR\n";
+        let put = format!(
+            "PUT /dav/uid-1/calendars/default/e1.ics HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(put.as_bytes()).await?;
+        let mut response = vec![0; 1024];
+        let _ = client.read(&mut response).await?;
+
+        let initial_report_body = r#"<sync-collection xmlns="DAV:"><sync-token></sync-token><sync-level>1</sync-level><prop><getetag/></prop></sync-collection>"#;
+        let initial_report = format!(
+            "REPORT /dav/uid-1/calendars/default/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            initial_report_body.len(),
+            initial_report_body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(initial_report.as_bytes()).await?;
+        let mut response = vec![0; 4096];
+        let n = client.read(&mut response).await?;
+        let initial_wire = String::from_utf8_lossy(&response[..n]);
+        assert!(initial_wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
+        assert!(initial_wire.contains("/dav/uid-1/calendars/default/e1.ics"));
+        let (_, after_open) = initial_wire
+            .split_once("<d:sync-token>")
+            .expect("sync token should be present");
+        let (sync_token, _) = after_open
+            .split_once("</d:sync-token>")
+            .expect("sync token should close");
+
+        let incremental_report_body = format!(
+            r#"<sync-collection xmlns="DAV:"><sync-token>{sync_token}</sync-token><sync-level>1</sync-level><prop><getetag/></prop></sync-collection>"#
+        );
+        let incremental_report = format!(
+            "REPORT /dav/uid-1/calendars/default/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
+            incremental_report_body.len(),
+            incremental_report_body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(incremental_report.as_bytes()).await?;
+        let mut response = vec![0; 4096];
+        let n = client.read(&mut response).await?;
+        let incremental_wire = String::from_utf8_lossy(&response[..n]);
+        assert!(incremental_wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
+        assert!(!incremental_wire.contains("/dav/uid-1/calendars/default/e1.ics"));
+
+        server.await.expect("server");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mkcalendar_creates_named_calendar_collection() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));

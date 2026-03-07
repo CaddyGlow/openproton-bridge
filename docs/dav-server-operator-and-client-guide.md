@@ -134,3 +134,22 @@ Discovery endpoints:
 3. Verify authenticated `PROPFIND` returns `207 Multi-Status`.
 4. Verify one contact create/read/delete via CardDAV client.
 5. Verify one event create/read/delete via CalDAV client.
+
+## Compliance test stack
+
+Use these tools in addition to client smoke testing:
+
+- `litmus` for baseline WebDAV compliance, including common WebDAV method and precondition behavior.
+- `caldavtester` for CalDAV-specific protocol coverage; this is the reference suite commonly used by CalDAV server implementations.
+
+Example `litmus` invocation:
+
+```bash
+litmus https://your-server/dav/ user pass
+```
+
+Operational notes:
+
+- Point `litmus` at the DAV collection root or routed DAV base URL exposed by your deployment.
+- Run `caldavtester` against the CalDAV endpoint when validating calendar REPORT, sync, and recurrence behavior.
+- Keep both in the DAV rollout checklist before broad enablement, especially after changes to auth, XML serialization, sync-token handling, or write preconditions.

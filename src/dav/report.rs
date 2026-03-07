@@ -230,7 +230,7 @@ fn carddav_sync_collection(
             },
         )
         .map_err(|err| DavError::Backend(err.to_string()))?;
-    let since = extract_sync_token(body).and_then(|token| token.parse::<i64>().ok());
+    let since = extract_sync_token_version(body);
     let current_token = contacts
         .iter()
         .map(|item| item.updated_at_ms)
@@ -283,7 +283,7 @@ fn caldav_sync_collection(
             },
         )
         .map_err(|err| DavError::Backend(err.to_string()))?;
-    let since = extract_sync_token(body).and_then(|token| token.parse::<i64>().ok());
+    let since = extract_sync_token_version(body);
     let current_token = events
         .iter()
         .map(|item| item.updated_at_ms)
@@ -355,9 +355,39 @@ fn extract_attr(body: &str, name: &str) -> Option<String> {
 }
 
 fn extract_sync_token(body: &str) -> Option<String> {
-    let (_, rest) = body.split_once("<d:sync-token>")?;
-    let (token, _) = rest.split_once("</d:sync-token>")?;
-    Some(token.trim().to_string())
+    extract_xml_text(body, "sync-token")
+}
+
+fn extract_sync_token_version(body: &str) -> Option<i64> {
+    let token = extract_sync_token(body)?;
+    token
+        .parse::<i64>()
+        .ok()
+        .or_else(|| sync_token_version_from_uri(&token))
+}
+
+fn sync_token_version_from_uri(token: &str) -> Option<i64> {
+    token
+        .trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()?
+        .parse::<i64>()
+        .ok()
+}
+
+fn extract_xml_text(body: &str, local_name: &str) -> Option<String> {
+    let pattern = format!(
+        r"(?is)<(?:[A-Za-z0-9_-]+:)?{tag}\b[^>]*>\s*(?P<value>.*?)\s*</(?:[A-Za-z0-9_-]+:)?{tag}>",
+        tag = regex::escape(local_name)
+    );
+    let re = Regex::new(&pattern).ok()?;
+    let value = re
+        .captures(body)?
+        .name("value")?
+        .as_str()
+        .trim();
+    Some(value.to_string())
 }
 
 fn parse_ics_datetime(value: String) -> Option<i64> {
@@ -684,9 +714,9 @@ fn epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_xml, extract_report_hrefs, extract_sync_token, multistatus_response,
-        parse_calendar_collection_path, parse_calendar_time_range, parse_event_id_from_href,
-        ReportItem,
+        escape_xml, extract_report_hrefs, extract_sync_token, extract_sync_token_version,
+        multistatus_response, parse_calendar_collection_path, parse_calendar_time_range,
+        parse_event_id_from_href, ReportItem,
     };
 
     #[test]
@@ -695,6 +725,23 @@ mod tests {
             "<d:sync-collection><d:sync-token>123</d:sync-token></d:sync-collection>",
         );
         assert_eq!(token.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn parses_sync_token_with_default_namespace_and_uri_version() {
+        let token = extract_sync_token(
+            r#"<sync-collection xmlns="DAV:"><sync-token>https://openproton.local/dav/uid-1/calendars/work/sync/456</sync-token></sync-collection>"#,
+        );
+        assert_eq!(
+            token.as_deref(),
+            Some("https://openproton.local/dav/uid-1/calendars/work/sync/456")
+        );
+        assert_eq!(
+            extract_sync_token_version(
+                r#"<sync-collection xmlns="DAV:"><sync-token>https://openproton.local/dav/uid-1/calendars/work/sync/456</sync-token></sync-collection>"#,
+            ),
+            Some(456)
+        );
     }
 
     #[test]

@@ -130,9 +130,14 @@ impl HumanVerificationDetails {
     }
 
     pub fn challenge_url(&self) -> String {
+        let methods = self.methods_header_value();
+        let path = if self.normalized_methods() == ["captcha".to_string()] {
+            "captcha"
+        } else {
+            ""
+        };
         format!(
-            "https://verify.proton.me/?methods={}&token={}",
-            self.methods_header_value(),
+            "https://verify.proton.me/{path}?methods={methods}&token={}",
             self.human_verification_token
         )
     }
@@ -1024,7 +1029,7 @@ mod tests {
         assert_eq!(hv.methods_header_value(), "captcha");
         assert_eq!(
             hv.challenge_url(),
-            "https://verify.proton.me/?methods=captcha&token=token-123"
+            "https://verify.proton.me/captcha?methods=captcha&token=token-123"
         );
     }
 

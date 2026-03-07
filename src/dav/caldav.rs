@@ -287,7 +287,7 @@ fn parse_calendar_collection_id(calendars_root: &str, path: &str) -> Option<Stri
     if id.is_empty() || id.contains('/') {
         None
     } else {
-        Some(id.to_string())
+        decode_percent_component(id)
     }
 }
 
@@ -304,7 +304,44 @@ fn parse_event_resource_id(calendars_root: &str, path: &str) -> Option<(String, 
     if event_id.is_empty() {
         return None;
     }
-    Some((calendar_id.to_string(), event_id.to_string()))
+    Some((
+        decode_percent_component(calendar_id)?,
+        decode_percent_component(event_id)?,
+    ))
+}
+
+fn decode_percent_component(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            let high = hex_value(*bytes.get(idx + 1)?)?;
+            let low = hex_value(*bytes.get(idx + 2)?)?;
+            out.push((high << 4) | low);
+            idx += 3;
+            continue;
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+
+    let decoded = String::from_utf8(out).ok()?;
+    if decoded.is_empty() || decoded.contains('/') {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_ics(
@@ -539,11 +576,34 @@ fn epoch_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_ics_datetime, parse_ics_datetime};
+    use super::{
+        format_ics_datetime, parse_calendar_collection_id, parse_event_resource_id,
+        parse_ics_datetime,
+    };
 
     #[test]
     fn parses_and_formats_ics_timestamps() {
         let ts = parse_ics_datetime("20260305T123456Z").expect("parse timestamp");
         assert_eq!(format_ics_datetime(ts), "20260305T123456Z");
+    }
+
+    #[test]
+    fn parses_percent_encoded_calendar_collection_ids() {
+        let root = "/dav/uid-1/calendars/";
+        let parsed = parse_calendar_collection_id(root, "/dav/uid-1/calendars/35HQnSLUjSZs%3D%3D/");
+        assert_eq!(parsed.as_deref(), Some("35HQnSLUjSZs=="));
+    }
+
+    #[test]
+    fn parses_percent_encoded_event_resource_ids() {
+        let root = "/dav/uid-1/calendars/";
+        let parsed = parse_event_resource_id(
+            root,
+            "/dav/uid-1/calendars/35HQnSLUjSZs%3D%3D/event%3D1.ics",
+        );
+        assert_eq!(
+            parsed,
+            Some(("35HQnSLUjSZs==".to_string(), "event=1".to_string()))
+        );
     }
 }

@@ -284,15 +284,8 @@ async fn caldav_sync_collection(
     body: &str,
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
-    maybe_backfill_empty_caldav_sync(
-        adapter,
-        store,
-        runtime_accounts,
-        account_id,
-        calendar_id,
-        body,
-    )
-    .await?;
+    maybe_backfill_empty_caldav_sync(adapter, store, runtime_accounts, account_id, calendar_id)
+        .await?;
     let events = adapter
         .list_calendar_events(
             calendar_id,
@@ -361,12 +354,7 @@ async fn maybe_backfill_empty_caldav_sync(
     runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
     account_id: &str,
     calendar_id: &str,
-    body: &str,
 ) -> Result<()> {
-    if !should_backfill_empty_caldav_sync(body) {
-        return Ok(());
-    }
-
     let cached_events = adapter
         .list_calendar_events(
             calendar_id,
@@ -418,10 +406,6 @@ async fn maybe_backfill_empty_caldav_sync(
         .set_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE, epoch_millis())
         .map_err(|err| DavError::Backend(err.to_string()))?;
     Ok(())
-}
-
-fn should_backfill_empty_caldav_sync(body: &str) -> bool {
-    extract_sync_token(body).is_none_or(|token| token.trim().is_empty())
 }
 
 fn backfill_cooldown_elapsed(adapter: &StoreBackedDavAdapter) -> Result<bool> {
@@ -723,16 +707,16 @@ fn parse_event_id_from_href(href: &str, account_id: &str, calendar_id: &str) -> 
     if event_id.is_empty() || event_id.contains('/') {
         return None;
     }
-    Some(event_id.to_string())
+    decode_percent_component(event_id)
 }
 
 fn normalize_report_href_path(href: &str) -> Option<String> {
     if href.starts_with('/') {
-        return Some(href.to_string());
+        return decode_percent_path(href);
     }
     reqwest::Url::parse(href)
         .ok()
-        .map(|url| url.path().to_string())
+        .and_then(|url| decode_percent_path(url.path()))
 }
 
 fn format_ics_datetime(unix_seconds: i64) -> String {
@@ -786,7 +770,45 @@ fn parse_calendar_collection_path(path: &str, account_id: &str) -> Option<String
     if calendar_id.is_empty() || segments.next().is_some() {
         return None;
     }
-    Some(calendar_id.to_string())
+    decode_percent_component(calendar_id)
+}
+
+fn decode_percent_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            let high = hex_value(*bytes.get(idx + 1)?)?;
+            let low = hex_value(*bytes.get(idx + 2)?)?;
+            out.push((high << 4) | low);
+            idx += 3;
+            continue;
+        }
+        out.push(bytes[idx]);
+        idx += 1;
+    }
+
+    String::from_utf8(out).ok()
+}
+
+fn decode_percent_component(value: &str) -> Option<String> {
+    let decoded = decode_percent_path(value)?;
+    if decoded.is_empty() || decoded.contains('/') {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn not_implemented_report() -> DavResponse {
@@ -841,8 +863,8 @@ mod tests {
     use super::{
         backfill_cooldown_elapsed, escape_xml, extract_report_hrefs, extract_sync_token,
         extract_sync_token_version, multistatus_response, parse_calendar_collection_path,
-        parse_calendar_time_range, parse_event_id_from_href, should_backfill_empty_caldav_sync,
-        ReportItem, CALDAV_EMPTY_SYNC_BACKFILL_SCOPE,
+        parse_calendar_time_range, parse_event_id_from_href, ReportItem,
+        CALDAV_EMPTY_SYNC_BACKFILL_SCOPE,
     };
     use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
     use crate::pim::store::PimStore;
@@ -882,19 +904,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_sync_token_requests_trigger_backfill() {
-        assert!(should_backfill_empty_caldav_sync(
-            r#"<sync-collection xmlns="DAV:"><sync-token></sync-token></sync-collection>"#,
-        ));
-        assert!(should_backfill_empty_caldav_sync(
-            r#"<sync-collection xmlns="DAV:"></sync-collection>"#,
-        ));
-        assert!(!should_backfill_empty_caldav_sync(
-            r#"<sync-collection xmlns="DAV:"><sync-token>https://openproton.local/dav/uid-1/calendars/work/sync/456</sync-token></sync-collection>"#,
-        ));
-    }
-
-    #[test]
     fn backfill_cooldown_blocks_immediate_repeat_attempts() {
         let adapter = test_adapter();
         assert!(backfill_cooldown_elapsed(&adapter).unwrap());
@@ -918,6 +927,9 @@ mod tests {
     fn parses_calendar_collection_path_for_account() {
         let parsed = parse_calendar_collection_path("/dav/uid-1/calendars/work/", "uid-1");
         assert_eq!(parsed.as_deref(), Some("work"));
+        let encoded =
+            parse_calendar_collection_path("/dav/uid-1/calendars/35HQnSLUjSZs%3D%3D/", "uid-1");
+        assert_eq!(encoded.as_deref(), Some("35HQnSLUjSZs=="));
 
         assert!(parse_calendar_collection_path("/dav/uid-2/calendars/work/", "uid-1").is_none());
         assert!(parse_calendar_collection_path("/dav/uid-1/calendars/", "uid-1").is_none());
@@ -931,6 +943,12 @@ mod tests {
             "work",
         );
         assert_eq!(parsed.as_deref(), Some("event-1"));
+        let encoded = parse_event_id_from_href(
+            "https://127.0.0.1:8080/dav/uid-1/calendars/35HQnSLUjSZs%3D%3D/event%3D1.ics",
+            "uid-1",
+            "35HQnSLUjSZs==",
+        );
+        assert_eq!(encoded.as_deref(), Some("event=1"));
     }
 
     #[test]

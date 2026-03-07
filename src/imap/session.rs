@@ -850,6 +850,10 @@ where
             .unwrap_or_else(|| "unknown".to_string());
         let header_only_body_fetch = needs_body_sections && !needs_full_rfc822;
         let target_fetch_count = target_messages.len() as u32;
+        let include_uid_in_response = uid_mode
+            && !expanded
+                .iter()
+                .any(|item| matches!(item, FetchItem::Uid));
         let mut cache_hits = 0u32;
         let mut cache_misses = 0u32;
 
@@ -873,6 +877,10 @@ where
 
             let mut parts: Vec<String> = Vec::with_capacity(expanded.len());
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
+
+            if include_uid_in_response {
+                parts.push(format!("UID {}", uid));
+            }
 
             let mut rfc822_data = None;
             if needs_body_sections && !header_only_body_fetch {
@@ -1290,8 +1298,13 @@ where
                 let seq = store.uid_to_seq(&scoped_mailbox, uid).await?.unwrap_or(0);
                 let current_flags = store.get_flags(&scoped_mailbox, uid).await?;
                 let flag_str = current_flags.join(" ");
+                let fetch_items = if uid_mode {
+                    format!("UID {uid} FLAGS ({flag_str})")
+                } else {
+                    format!("FLAGS ({flag_str})")
+                };
                 self.writer
-                    .untagged(&format!("{} FETCH (FLAGS ({}))", seq, flag_str))
+                    .untagged(&format!("{seq} FETCH ({fetch_items})"))
                     .await?;
             }
         }
@@ -2253,6 +2266,67 @@ mod tests {
         assert!(flags.iter().any(|f| f == "\\Seen"));
 
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_uid_fetch_flags_always_includes_uid() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 UID FETCH 1:* (FLAGS)")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains(&format!("* 1 FETCH (UID {uid} FLAGS (")));
+        assert!(response.contains("a001 OK FETCH completed"));
+    }
+
+    #[tokio::test]
+    async fn test_uid_store_flags_response_includes_uid() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 UID STORE 1:* +FLAGS (\\Seen)")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains(&format!("* 1 FETCH (UID {uid} FLAGS (")));
+        assert!(response.contains("\\Seen"));
+        assert!(response.contains("a001 OK STORE completed"));
     }
 
     #[tokio::test]

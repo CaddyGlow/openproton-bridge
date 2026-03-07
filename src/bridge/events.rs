@@ -4051,6 +4051,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_with_cached_mail_and_missing_cursor_bootstraps_latest_event_id() {
+        let tmp = tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/latest"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-1"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let store_root = tmp.path().join("gluon");
+        let mut account_storage_ids = HashMap::new();
+        account_storage_ids.insert("uid-1".to_string(), "storage-uid-1".to_string());
+        let store = crate::imap::store::new_runtime_message_store(
+            store_root.clone(),
+            account_storage_ids.clone(),
+        )
+        .unwrap();
+        store
+            .store_metadata(
+                "uid-1::INBOX",
+                "msg-1",
+                MessageMetadata {
+                    id: "msg-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["0".to_string()],
+                    external_id: None,
+                    subject: "Cached message".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: vec![],
+                    cc_list: vec![],
+                    bcc_list: vec![],
+                    reply_tos: vec![],
+                    flags: 0,
+                    time: 1700000000,
+                    size: 100,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session.clone()]));
+        let auth_router = AuthRouter::new(AccountRegistry::from_single_session(session));
+        let store_after_restart =
+            crate::imap::store::new_runtime_message_store(store_root, account_storage_ids).unwrap();
+        let checkpoints: SharedCheckpointStore =
+            Arc::new(VaultCheckpointStore::new(tmp.path().to_path_buf()));
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store_after_restart.clone(),
+            checkpoints.clone(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_event_worker_with_shutdown(
+            config,
+            Duration::from_secs(3600),
+            shutdown_rx,
+        ));
+        let checkpoint = wait_for_checkpoint_event_id(
+            checkpoints.as_ref(),
+            &AccountId("uid-1".to_string()),
+            "event-1",
+            Duration::from_secs(8),
+        )
+        .await
+        .expect("cached restart should bootstrap a latest event cursor");
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("baseline_cursor"));
+        assert_eq!(
+            store_after_restart
+                .get_uid("uid-1::INBOX", "msg-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
     async fn vault_checkpoint_restart_recovers_from_stale_cursor() {
         let tmp = tempdir().unwrap();
         let server = MockServer::start().await;

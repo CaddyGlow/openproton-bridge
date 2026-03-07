@@ -166,6 +166,31 @@ impl PimStore {
         Ok(None)
     }
 
+    pub fn calendar_collection_version(&self, calendar_id: &str) -> Result<i64> {
+        if calendar_id.trim().is_empty() {
+            return Ok(0);
+        }
+        let conn = open_read_connection(self)?;
+        let calendar_version = conn
+            .query_row(
+                "SELECT updated_at_ms FROM pim_calendars WHERE id = ?1",
+                [calendar_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let event_version = conn
+            .query_row(
+                "SELECT MAX(updated_at_ms) FROM pim_calendar_events WHERE calendar_id = ?1",
+                [calendar_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or_default();
+        Ok(calendar_version.max(event_version))
+    }
+
     pub fn list_calendar_events(
         &self,
         calendar_id: &str,

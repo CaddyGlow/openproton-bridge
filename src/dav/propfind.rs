@@ -88,6 +88,7 @@ pub fn handle_propfind_with_store(
                 auth,
                 &calendar_id,
                 calendar.as_ref(),
+                store.map(Arc::as_ref),
             )]
         }
     };
@@ -137,6 +138,7 @@ fn calendar_home_resources(
                         auth,
                         &calendar.id,
                         Some(&calendar),
+                        Some(store.as_ref()),
                     ));
                 }
             }
@@ -343,16 +345,18 @@ fn calendar_home_resource(auth: &AuthRoute) -> DavPropResource {
 }
 
 fn default_calendar_resource(auth: &AuthRoute) -> DavPropResource {
-    calendar_collection_resource(auth, "default", None)
+    calendar_collection_resource(auth, "default", None, None)
 }
 
 fn calendar_collection_resource(
     auth: &AuthRoute,
     calendar_id: &str,
     calendar: Option<&StoredCalendar>,
+    store: Option<&PimStore>,
 ) -> DavPropResource {
     let display_name = calendar_display_name(calendar_id, calendar);
     let href = format!("/dav/{}/calendars/{calendar_id}/", auth.account_id.0);
+    let version = calendar_collection_version(calendar_id, calendar, store);
     DavPropResource {
         href: href.clone(),
         display_name,
@@ -380,20 +384,28 @@ fn calendar_collection_resource(
         calendar_ctag: Some(calendar_collection_tag(
             &auth.account_id.0,
             calendar_id,
-            calendar
-                .map(|calendar| calendar.updated_at_ms)
-                .unwrap_or_default(),
+            version,
         )),
         sync_token: Some(calendar_sync_token(
             &auth.account_id.0,
             calendar_id,
-            calendar
-                .map(|calendar| calendar.updated_at_ms)
-                .unwrap_or_default(),
+            version,
         )),
         supported_calendar_components: vec!["VEVENT"],
         supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
     }
+}
+
+fn calendar_collection_version(
+    calendar_id: &str,
+    calendar: Option<&StoredCalendar>,
+    store: Option<&PimStore>,
+) -> i64 {
+    let base_version = calendar.map(|calendar| calendar.updated_at_ms).unwrap_or_default();
+    let store_version = store
+        .and_then(|store| store.calendar_collection_version(calendar_id).ok())
+        .unwrap_or_default();
+    base_version.max(store_version)
 }
 
 fn calendar_display_name(calendar_id: &str, calendar: Option<&StoredCalendar>) -> String {
@@ -525,7 +537,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::api::calendar::Calendar;
+    use crate::api::calendar::{Calendar, CalendarEvent, CalendarEventPart};
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
     use crate::pim::store::PimStore;
@@ -660,5 +672,75 @@ mod tests {
 
         assert!(body.contains("/dav/uid-1/calendars/cal-1/"));
         assert!(!body.contains("/dav/uid-1/calendars/7A60F3B9-C6B7-429D-8AB6-8029FB968C50/"));
+    }
+
+    #[test]
+    fn propfind_calendar_collection_ctag_tracks_event_updates() {
+        let store = store();
+        store
+            .upsert_calendar(&Calendar {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                description: "".to_string(),
+                color: "#3A7AFE".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .expect("upsert calendar");
+
+        let initial = handle_propfind_with_store(
+            "/dav/uid-1/calendars/work/",
+            &HashMap::new(),
+            &auth(),
+            Some(&store),
+        )
+        .expect("response");
+        let initial_body = String::from_utf8(initial.body).expect("utf8");
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        store
+            .upsert_calendar_event(&CalendarEvent {
+                id: "evt-1".to_string(),
+                uid: "evt-1".to_string(),
+                calendar_id: "work".to_string(),
+                shared_event_id: "shared-evt-1".to_string(),
+                create_time: 1,
+                last_edit_time: 2,
+                start_time: 1_741_178_800,
+                end_time: 1_741_182_400,
+                start_timezone: "UTC".to_string(),
+                end_timezone: "UTC".to_string(),
+                full_day: 0,
+                author: String::new(),
+                permissions: 0,
+                attendees: vec![],
+                shared_key_packet: String::new(),
+                calendar_key_packet: String::new(),
+                shared_events: vec![],
+                calendar_events: vec![CalendarEventPart {
+                    member_id: String::new(),
+                    kind: 0,
+                    data: "BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n".to_string(),
+                    signature: None,
+                    author: None,
+                }],
+                attendees_events: vec![],
+                personal_events: vec![],
+            })
+            .expect("upsert event");
+
+        let updated = handle_propfind_with_store(
+            "/dav/uid-1/calendars/work/",
+            &HashMap::new(),
+            &auth(),
+            Some(&store),
+        )
+        .expect("response");
+        let updated_body = String::from_utf8(updated.body).expect("utf8");
+
+        assert!(initial_body.contains("<cs:getctag>uid-1-work-"));
+        assert!(updated_body.contains("<cs:getctag>uid-1-work-"));
+        assert_ne!(initial_body, updated_body);
     }
 }

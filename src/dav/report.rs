@@ -284,11 +284,7 @@ fn caldav_sync_collection(
         )
         .map_err(|err| DavError::Backend(err.to_string()))?;
     let since = extract_sync_token_version(body);
-    let current_token = events
-        .iter()
-        .map(|item| item.updated_at_ms)
-        .max()
-        .unwrap_or_default();
+    let current_token = calendar_collection_sync_version(adapter, calendar_id, Some(&events))?;
     adapter
         .set_sync_state_int(&caldav_sync_scope(account_id, calendar_id), current_token)
         .map_err(|err| DavError::Backend(err.to_string()))?;
@@ -336,6 +332,38 @@ fn caldav_sync_collection(
         &items,
         Some(sync_token_uri(account_id, calendar_id, current_token)),
     ))
+}
+
+pub(crate) fn calendar_collection_sync_version(
+    adapter: &StoreBackedDavAdapter,
+    calendar_id: &str,
+    cached_events: Option<&[crate::pim::types::StoredCalendarEvent]>,
+) -> Result<i64> {
+    let calendar_version = adapter
+        .get_calendar(calendar_id, true)
+        .map_err(|err| DavError::Backend(err.to_string()))?
+        .map(|calendar| calendar.updated_at_ms)
+        .unwrap_or_default();
+    let event_version = if let Some(events) = cached_events {
+        events.iter().map(|event| event.updated_at_ms).max()
+    } else {
+        adapter
+            .list_calendar_events(
+                calendar_id,
+                true,
+                CalendarEventRange::default(),
+                QueryPage {
+                    limit: 500,
+                    offset: 0,
+                },
+            )
+            .map_err(|err| DavError::Backend(err.to_string()))?
+            .iter()
+            .map(|event| event.updated_at_ms)
+            .max()
+    }
+    .unwrap_or_default();
+    Ok(calendar_version.max(event_version))
 }
 
 fn parse_calendar_time_range(body: &str) -> CalendarEventRange {

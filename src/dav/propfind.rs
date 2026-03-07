@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use regex::Regex;
+
 use crate::bridge::auth_router::AuthRoute;
 use crate::pim::dav::CalDavRepository;
 use crate::pim::query::QueryPage;
@@ -11,7 +13,7 @@ use crate::pim::types::StoredCalendar;
 use super::discovery;
 use super::error::{DavError, Result};
 use super::http::DavResponse;
-use super::xml::{multistatus_xml, DavPropResource, DavResourceKind};
+use super::xml::{multistatus_xml_for_propfind, DavPropResource, DavPropfindMode, DavResourceKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavDepth {
@@ -45,24 +47,27 @@ pub fn parse_depth(headers: &HashMap<String, String>) -> Result<DavDepth> {
 
 pub fn handle_propfind(
     raw_path: &str,
+    body: &[u8],
     headers: &HashMap<String, String>,
     auth: &AuthRoute,
 ) -> Result<DavResponse> {
-    handle_propfind_with_store(raw_path, headers, auth, None)
+    handle_propfind_with_store(raw_path, body, headers, auth, None)
 }
 
 pub fn handle_propfind_with_store(
     raw_path: &str,
+    body: &[u8],
     headers: &HashMap<String, String>,
     auth: &AuthRoute,
     store: Option<&Arc<PimStore>>,
 ) -> Result<DavResponse> {
     let depth = parse_depth(headers)?;
     let path = normalize_path(raw_path);
+    let mode = parse_propfind_mode(body)?;
 
     if path == discovery::PRINCIPAL_ME_PATH {
         let resources = principal_resources(auth, depth);
-        return Ok(multistatus_response(resources));
+        return Ok(multistatus_response(resources, &mode));
     }
 
     let Some((account_id, target)) = parse_account_resource_path(&path) else {
@@ -92,7 +97,7 @@ pub fn handle_propfind_with_store(
             )]
         }
     };
-    Ok(multistatus_response(resources))
+    Ok(multistatus_response(resources, &mode))
 }
 
 fn principal_resources(auth: &AuthRoute, depth: DavDepth) -> Vec<DavPropResource> {
@@ -488,11 +493,49 @@ fn parse_account_resource_path(path: &str) -> Option<(String, AccountResource)> 
     Some((account_id, target))
 }
 
-fn multistatus_response(resources: Vec<DavPropResource>) -> DavResponse {
+fn multistatus_response(resources: Vec<DavPropResource>, mode: &DavPropfindMode) -> DavResponse {
     DavResponse {
         status: "207 Multi-Status",
         headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
-        body: multistatus_xml(&resources),
+        body: multistatus_xml_for_propfind(&resources, mode),
+    }
+}
+
+fn parse_propfind_mode(body: &[u8]) -> Result<DavPropfindMode> {
+    if body.is_empty() {
+        return Ok(DavPropfindMode::AllProp);
+    }
+    let body = std::str::from_utf8(body)
+        .map_err(|_| DavError::InvalidRequest("PROPFIND body is not utf-8"))?;
+    if body.contains("propname") {
+        return Ok(DavPropfindMode::PropName);
+    }
+    if !body.contains("prop") {
+        return Ok(DavPropfindMode::AllProp);
+    }
+    let prop_re = Regex::new(
+        r"(?is)<(?:[A-Za-z0-9_-]+:)?prop\b[^>]*>(?P<body>.*?)</(?:[A-Za-z0-9_-]+:)?prop>",
+    )
+    .expect("prop regex should compile");
+    let tag_re = Regex::new(r"(?is)<(?:[A-Za-z0-9_-]+:)?(?P<name>[A-Za-z0-9_-]+)\b")
+        .expect("tag regex should compile");
+    let Some(prop_body) = prop_re
+        .captures(body)
+        .and_then(|caps| caps.name("body"))
+        .map(|m| m.as_str())
+    else {
+        return Ok(DavPropfindMode::AllProp);
+    };
+    let requested = tag_re
+        .captures_iter(prop_body)
+        .filter_map(|caps| caps.name("name"))
+        .map(|name| name.as_str().to_string())
+        .filter(|name| name != "prop")
+        .collect::<HashSet<_>>();
+    if requested.is_empty() {
+        Ok(DavPropfindMode::AllProp)
+    } else {
+        Ok(DavPropfindMode::Prop(requested))
     }
 }
 
@@ -568,7 +611,7 @@ mod tests {
     #[test]
     fn propfind_principal_me_returns_multistatus() {
         let response =
-            handle_propfind("/dav/principals/me/", &HashMap::new(), &auth()).expect("response");
+            handle_propfind("/dav/principals/me/", &[], &HashMap::new(), &auth()).expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
         assert_eq!(response.status, "207 Multi-Status");
         assert!(body.contains("<d:multistatus"));
@@ -578,7 +621,7 @@ mod tests {
     #[test]
     fn propfind_rejects_cross_account_paths() {
         let response =
-            handle_propfind("/dav/uid-2/principal/", &HashMap::new(), &auth()).expect("response");
+            handle_propfind("/dav/uid-2/principal/", &[], &HashMap::new(), &auth()).expect("response");
         assert_eq!(response.status, "403 Forbidden");
     }
 
@@ -600,7 +643,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("depth".to_string(), "1".to_string());
         let response =
-            handle_propfind_with_store("/dav/uid-1/calendars/", &headers, &auth(), Some(&store))
+            handle_propfind_with_store("/dav/uid-1/calendars/", &[], &headers, &auth(), Some(&store))
                 .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
 
@@ -626,6 +669,7 @@ mod tests {
 
         let response = handle_propfind_with_store(
             "/dav/uid-1/calendars/opaque-cal-id/",
+            &[],
             &HashMap::new(),
             &auth(),
             Some(&store),
@@ -666,7 +710,7 @@ mod tests {
         let mut headers = HashMap::new();
         headers.insert("depth".to_string(), "1".to_string());
         let response =
-            handle_propfind_with_store("/dav/uid-1/calendars/", &headers, &auth(), Some(&store))
+            handle_propfind_with_store("/dav/uid-1/calendars/", &[], &headers, &auth(), Some(&store))
                 .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
 
@@ -691,6 +735,7 @@ mod tests {
 
         let initial = handle_propfind_with_store(
             "/dav/uid-1/calendars/work/",
+            &[],
             &HashMap::new(),
             &auth(),
             Some(&store),
@@ -732,6 +777,7 @@ mod tests {
 
         let updated = handle_propfind_with_store(
             "/dav/uid-1/calendars/work/",
+            &[],
             &HashMap::new(),
             &auth(),
             Some(&store),
@@ -742,5 +788,39 @@ mod tests {
         assert!(initial_body.contains("<cs:getctag>uid-1-work-"));
         assert!(updated_body.contains("<cs:getctag>uid-1-work-"));
         assert_ne!(initial_body, updated_body);
+    }
+
+    #[test]
+    fn propfind_prop_request_filters_to_requested_properties() {
+        let store = store();
+        store
+            .upsert_calendar(&Calendar {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                description: "Team".to_string(),
+                color: "#00AAFF".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .expect("upsert calendar");
+
+        let mut headers = HashMap::new();
+        headers.insert("depth".to_string(), "0".to_string());
+        let body = br#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><d:displayname/><cs:getctag/></d:prop></d:propfind>"#;
+        let response = handle_propfind_with_store(
+            "/dav/uid-1/calendars/work/",
+            body,
+            &headers,
+            &auth(),
+            Some(&store),
+        )
+        .expect("response");
+        let wire = String::from_utf8(response.body).expect("utf8");
+
+        assert!(wire.contains("<d:displayname>Work</d:displayname>"));
+        assert!(wire.contains("<cs:getctag>"));
+        assert!(!wire.contains("<d:sync-token>"));
+        assert!(!wire.contains("<d:supported-report-set>"));
     }
 }

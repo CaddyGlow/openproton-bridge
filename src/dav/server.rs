@@ -459,6 +459,7 @@ async fn route_request(
                 let store = config.pim_stores.get(&auth.account_id.0);
                 return propfind::handle_propfind_with_store(
                     &request.path,
+                    body,
                     &request.headers,
                     &auth,
                     store,
@@ -859,6 +860,61 @@ mod tests {
         let wire = String::from_utf8_lossy(&response[..n]);
         assert!(wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
         assert!(wire.contains("<d:multistatus"));
+
+        server.await.expect("server task");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn propfind_with_prop_body_filters_response() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        store
+            .upsert_calendar(&crate::api::calendar::Calendar {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                description: "Team".to_string(),
+                color: "#00AAFF".to_string(),
+                display: 1,
+                calendar_type: 0,
+                flags: 0,
+            })
+            .expect("seed calendar");
+        let mut pim_stores = HashMap::new();
+        pim_stores.insert("uid-1".to_string(), store);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let config = Arc::new(DavServerConfig {
+            auth_router: auth_router(),
+            pim_stores,
+            runtime_accounts: None,
+        });
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            handle_connection(stream, config)
+                .await
+                .expect("handle request");
+        });
+
+        let authorization = BASE64_STANDARD.encode("alice@proton.me:secret");
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:prop><d:displayname/><cs:getctag/></d:prop></d:propfind>"#;
+        let request = format!(
+            "PROPFIND /dav/uid-1/calendars/work/ HTTP/1.1\r\nHost: localhost\r\nDepth: 0\r\nAuthorization: Basic {authorization}\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut client = tokio::net::TcpStream::connect(addr).await?;
+        client.write_all(request.as_bytes()).await?;
+
+        let mut response = vec![0_u8; 4096];
+        let n = client.read(&mut response).await?;
+        let wire = String::from_utf8_lossy(&response[..n]);
+        assert!(wire.starts_with("HTTP/1.1 207 Multi-Status\r\n"));
+        assert!(wire.contains("<d:displayname>Work</d:displayname>"));
+        assert!(wire.contains("<cs:getctag>"));
+        assert!(!wire.contains("<d:sync-token>"));
+        assert!(!wire.contains("<d:supported-report-set>"));
 
         server.await.expect("server task");
         Ok(())

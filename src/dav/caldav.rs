@@ -108,7 +108,7 @@ pub async fn handle_request(
                     })
                     .map_err(|err| DavError::Backend(err.to_string()))?;
 
-                Ok(Some(prop_patch_ok_response(raw_path)))
+                Ok(Some(prop_patch_ok_response(raw_path, body)))
             }
             "DELETE" => {
                 let exists = adapter
@@ -526,17 +526,41 @@ fn precondition_failed_response() -> DavResponse {
     }
 }
 
-fn prop_patch_ok_response(path: &str) -> DavResponse {
+fn prop_patch_ok_response(path: &str, body: &[u8]) -> DavResponse {
     let href = normalize_path(path);
+    let accepted_props = accepted_proppatch_props(body);
     DavResponse {
         status: "207 Multi-Status",
         headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
         body: format!(
-            r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:"><d:response><d:href>{}</d:href><d:propstat><d:prop/><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#,
-            href
+            r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:ical="http://apple.com/ns/ical/"><d:response><d:href>{}</d:href><d:propstat><d:prop>{}</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>"#,
+            href,
+            accepted_props
         )
         .into_bytes(),
     }
+}
+
+fn accepted_proppatch_props(body: &[u8]) -> String {
+    let body = match std::str::from_utf8(body) {
+        Ok(body) => body,
+        Err(_) => return String::new(),
+    };
+    let mut props = String::new();
+    for (needle, xml) in [
+        ("displayname", "<d:displayname/>"),
+        ("calendar-color", "<ical:calendar-color/>"),
+        ("calendar_color", "<ical:calendar-color/>"),
+        ("calendar-description", "<cal:calendar-description/>"),
+        ("calendar_description", "<cal:calendar-description/>"),
+    ] {
+        if body.contains(&format!("<{needle}>")) || body.contains(&format!(":{needle}>")) {
+            if !props.contains(xml) {
+                props.push_str(xml);
+            }
+        }
+    }
+    props
 }
 
 fn extract_prop_text(body: &[u8], tag: &str) -> Option<String> {
@@ -577,8 +601,8 @@ fn epoch_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_ics_datetime, parse_calendar_collection_id, parse_event_resource_id,
-        parse_ics_datetime,
+        accepted_proppatch_props, format_ics_datetime, parse_calendar_collection_id,
+        parse_event_resource_id, parse_ics_datetime, prop_patch_ok_response,
     };
 
     #[test]
@@ -605,5 +629,23 @@ mod tests {
             parsed,
             Some(("35HQnSLUjSZs==".to_string(), "event=1".to_string()))
         );
+    }
+
+    #[test]
+    fn accepted_proppatch_props_tracks_calendar_metadata_tags() {
+        let body = br#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:" xmlns:ical="http://apple.com/ns/ical/"><d:set><d:prop><d:displayname>Renamed</d:displayname><ical:calendar-color>#FF9500</ical:calendar-color></d:prop></d:set></d:propertyupdate>"#;
+        let props = accepted_proppatch_props(body);
+        assert!(props.contains("<d:displayname/>"));
+        assert!(props.contains("<ical:calendar-color/>"));
+    }
+
+    #[test]
+    fn prop_patch_ok_response_lists_accepted_properties() {
+        let body = br#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:" xmlns:ical="http://apple.com/ns/ical/"><d:set><d:prop><d:displayname>Renamed</d:displayname><ical:calendar-color>#FF9500</ical:calendar-color></d:prop></d:set></d:propertyupdate>"#;
+        let response = prop_patch_ok_response("/dav/uid-1/calendars/work/", body);
+        let wire = String::from_utf8(response.body).expect("utf8");
+        assert!(wire.contains("<d:displayname/>"));
+        assert!(wire.contains("<ical:calendar-color/>"));
+        assert!(wire.contains("<d:status>HTTP/1.1 200 OK</d:status>"));
     }
 }

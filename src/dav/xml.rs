@@ -59,125 +59,169 @@ pub fn multistatus_xml_for_propfind(
         r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">"#,
     );
     for resource in resources {
+        let mut ok_props = String::new();
+        let mut missing_props = String::new();
         xml.push_str("<d:response>");
         xml.push_str("<d:href>");
         xml.push_str(&escape_xml(&resource.href));
         xml.push_str("</d:href>");
-        xml.push_str("<d:propstat><d:prop>");
         write_named_or_valued_property(
-            &mut xml,
+            &mut ok_props,
+            &mut missing_props,
             mode,
             "displayname",
             "<d:displayname>",
             "</d:displayname>",
+            "<d:displayname/>",
             Some(&escape_xml(&resource.display_name)),
         );
         write_named_or_valued_property(
-            &mut xml,
+            &mut ok_props,
+            &mut missing_props,
             mode,
             "resourcetype",
             "<d:resourcetype>",
             "</d:resourcetype>",
+            "<d:resourcetype/>",
             Some(resource_type_xml(resource.kind)),
         );
 
-        if let Some(current) = &resource.current_user_principal {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "current-user-principal",
-                "<d:current-user-principal>",
-                "</d:current-user-principal>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(current))),
-            );
-        }
-        if let Some(principal_url) = &resource.principal_url {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "principal-URL",
-                "<d:principal-URL>",
-                "</d:principal-URL>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(principal_url))),
-            );
-        }
-        if let Some(collection_set) = &resource.principal_collection_set {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "principal-collection-set",
-                "<d:principal-collection-set>",
-                "</d:principal-collection-set>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(collection_set))),
-            );
-        }
-        if let Some(home) = &resource.addressbook_home_set {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "addressbook-home-set",
-                "<card:addressbook-home-set>",
-                "</card:addressbook-home-set>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(home))),
-            );
-        }
-        if let Some(home) = &resource.calendar_home_set {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "calendar-home-set",
-                "<cal:calendar-home-set>",
-                "</cal:calendar-home-set>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(home))),
-            );
-        }
-        if !resource.calendar_user_addresses.is_empty() {
+        let current_user_principal = resource
+            .current_user_principal
+            .as_ref()
+            .map(|current| format!("<d:href>{}</d:href>", escape_xml(current)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "current-user-principal",
+            "<d:current-user-principal>",
+            "</d:current-user-principal>",
+            "<d:current-user-principal/>",
+            current_user_principal.as_deref(),
+        );
+        let principal_url = resource
+            .principal_url
+            .as_ref()
+            .map(|principal_url| format!("<d:href>{}</d:href>", escape_xml(principal_url)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "principal-URL",
+            "<d:principal-URL>",
+            "</d:principal-URL>",
+            "<d:principal-URL/>",
+            principal_url.as_deref(),
+        );
+        let principal_collection_set = resource
+            .principal_collection_set
+            .as_ref()
+            .map(|collection_set| format!("<d:href>{}</d:href>", escape_xml(collection_set)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "principal-collection-set",
+            "<d:principal-collection-set>",
+            "</d:principal-collection-set>",
+            "<d:principal-collection-set/>",
+            principal_collection_set.as_deref(),
+        );
+        let addressbook_home_set = resource
+            .addressbook_home_set
+            .as_ref()
+            .map(|home| format!("<d:href>{}</d:href>", escape_xml(home)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "addressbook-home-set",
+            "<card:addressbook-home-set>",
+            "</card:addressbook-home-set>",
+            "<card:addressbook-home-set/>",
+            addressbook_home_set.as_deref(),
+        );
+        let calendar_home_set = resource
+            .calendar_home_set
+            .as_ref()
+            .map(|home| format!("<d:href>{}</d:href>", escape_xml(home)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "calendar-home-set",
+            "<cal:calendar-home-set>",
+            "</cal:calendar-home-set>",
+            "<cal:calendar-home-set/>",
+            calendar_home_set.as_deref(),
+        );
+        let calendar_user_addresses = if resource.calendar_user_addresses.is_empty() {
+            None
+        } else {
             let mut value = String::new();
             for address in &resource.calendar_user_addresses {
                 value.push_str("<d:href>");
                 value.push_str(&escape_xml(address));
                 value.push_str("</d:href>");
             }
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "calendar-user-address-set",
-                "<cal:calendar-user-address-set>",
-                "</cal:calendar-user-address-set>",
-                Some(&value),
-            );
-        }
-        if let Some(inbox) = &resource.schedule_inbox_url {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "schedule-inbox-URL",
-                "<cal:schedule-inbox-URL>",
-                "</cal:schedule-inbox-URL>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(inbox))),
-            );
-        }
-        if let Some(outbox) = &resource.schedule_outbox_url {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "schedule-outbox-URL",
-                "<cal:schedule-outbox-URL>",
-                "</cal:schedule-outbox-URL>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(outbox))),
-            );
-        }
-        if let Some(owner) = &resource.owner {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "owner",
-                "<d:owner>",
-                "</d:owner>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(owner))),
-            );
-        }
-        if !resource.current_user_privileges.is_empty() {
+            Some(value)
+        };
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "calendar-user-address-set",
+            "<cal:calendar-user-address-set>",
+            "</cal:calendar-user-address-set>",
+            "<cal:calendar-user-address-set/>",
+            calendar_user_addresses.as_deref(),
+        );
+        let schedule_inbox_url = resource
+            .schedule_inbox_url
+            .as_ref()
+            .map(|inbox| format!("<d:href>{}</d:href>", escape_xml(inbox)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "schedule-inbox-URL",
+            "<cal:schedule-inbox-URL>",
+            "</cal:schedule-inbox-URL>",
+            "<cal:schedule-inbox-URL/>",
+            schedule_inbox_url.as_deref(),
+        );
+        let schedule_outbox_url = resource
+            .schedule_outbox_url
+            .as_ref()
+            .map(|outbox| format!("<d:href>{}</d:href>", escape_xml(outbox)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "schedule-outbox-URL",
+            "<cal:schedule-outbox-URL>",
+            "</cal:schedule-outbox-URL>",
+            "<cal:schedule-outbox-URL/>",
+            schedule_outbox_url.as_deref(),
+        );
+        let owner = resource
+            .owner
+            .as_ref()
+            .map(|owner| format!("<d:href>{}</d:href>", escape_xml(owner)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "owner",
+            "<d:owner>",
+            "</d:owner>",
+            "<d:owner/>",
+            owner.as_deref(),
+        );
+        let current_user_privileges = if resource.current_user_privileges.is_empty() {
+            None
+        } else {
             let mut value = String::from("<d:current-user-privilege-set>");
             for privilege in &resource.current_user_privileges {
                 value.push_str("<d:privilege>");
@@ -192,148 +236,179 @@ pub fn multistatus_xml_for_propfind(
                 value.push_str("</d:privilege>");
             }
             value.push_str("</d:current-user-privilege-set>");
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "current-user-privilege-set",
-                "",
-                "",
-                Some(&value),
-            );
-        }
-        if let Some(content_length) = collection_content_length(resource.kind) {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "getcontentlength",
-                "<d:getcontentlength>",
-                "</d:getcontentlength>",
-                Some(content_length),
-            );
-        }
-        if let Some(quota_available_bytes) = resource.quota_available_bytes {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "quota-available-bytes",
-                "<d:quota-available-bytes>",
-                "</d:quota-available-bytes>",
-                Some(&quota_available_bytes.to_string()),
-            );
-        }
-        if let Some(quota_used_bytes) = resource.quota_used_bytes {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "quota-used-bytes",
-                "<d:quota-used-bytes>",
-                "</d:quota-used-bytes>",
-                Some(&quota_used_bytes.to_string()),
-            );
-        }
-        if let Some(resource_id) = &resource.resource_id {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "resource-id",
-                "<d:resource-id>",
-                "</d:resource-id>",
-                Some(&format!("<d:href>urn:uuid:{}</d:href>", escape_xml(resource_id))),
-            );
-        }
-        if !resource.calendar_free_busy_set.is_empty() {
+            Some(value)
+        };
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "current-user-privilege-set",
+            "",
+            "",
+            "<d:current-user-privilege-set/>",
+            current_user_privileges.as_deref(),
+        );
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "getcontentlength",
+            "<d:getcontentlength>",
+            "</d:getcontentlength>",
+            "<d:getcontentlength/>",
+            collection_content_length(resource.kind),
+        );
+        let quota_available_bytes = resource
+            .quota_available_bytes
+            .map(|value| value.to_string());
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "quota-available-bytes",
+            "<d:quota-available-bytes>",
+            "</d:quota-available-bytes>",
+            "<d:quota-available-bytes/>",
+            quota_available_bytes.as_deref(),
+        );
+        let quota_used_bytes = resource.quota_used_bytes.map(|value| value.to_string());
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "quota-used-bytes",
+            "<d:quota-used-bytes>",
+            "</d:quota-used-bytes>",
+            "<d:quota-used-bytes/>",
+            quota_used_bytes.as_deref(),
+        );
+        let resource_id = resource
+            .resource_id
+            .as_ref()
+            .map(|resource_id| format!("<d:href>urn:uuid:{}</d:href>", escape_xml(resource_id)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "resource-id",
+            "<d:resource-id>",
+            "</d:resource-id>",
+            "<d:resource-id/>",
+            resource_id.as_deref(),
+        );
+        let calendar_free_busy_set = if resource.calendar_free_busy_set.is_empty() {
+            None
+        } else {
             let mut value = String::new();
             for href in &resource.calendar_free_busy_set {
                 value.push_str("<d:href>");
                 value.push_str(&escape_xml(href));
                 value.push_str("</d:href>");
             }
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "calendar-free-busy-set",
-                "<cal:calendar-free-busy-set>",
-                "</cal:calendar-free-busy-set>",
-                Some(&value),
-            );
-        }
-        if let Some(transp) = &resource.schedule_calendar_transp {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "schedule-calendar-transp",
-                "<cal:schedule-calendar-transp>",
-                "</cal:schedule-calendar-transp>",
-                Some(&format!("<cal:{transp}/>")),
-            );
-        }
-        if let Some(url) = &resource.schedule_default_calendar_url {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "schedule-default-calendar-URL",
-                "<cal:schedule-default-calendar-URL>",
-                "</cal:schedule-default-calendar-URL>",
-                Some(&format!("<d:href>{}</d:href>", escape_xml(url))),
-            );
-        }
-        if let Some(color) = &resource.calendar_color {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "calendar-color",
-                "<ical:calendar-color>",
-                "</ical:calendar-color>",
-                Some(&escape_xml(color)),
-            );
-        }
-        if let Some(description) = &resource.calendar_description {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "calendar-description",
-                "<cal:calendar-description>",
-                "</cal:calendar-description>",
-                Some(&escape_xml(description)),
-            );
-        }
-        if let Some(ctag) = &resource.calendar_ctag {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "getctag",
-                "<cs:getctag>",
-                "</cs:getctag>",
-                Some(&escape_xml(ctag)),
-            );
-        }
-        if let Some(sync_token) = &resource.sync_token {
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "sync-token",
-                "<d:sync-token>",
-                "</d:sync-token>",
-                Some(&escape_xml(sync_token)),
-            );
-        }
-        if !resource.supported_calendar_components.is_empty() {
+            Some(value)
+        };
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "calendar-free-busy-set",
+            "<cal:calendar-free-busy-set>",
+            "</cal:calendar-free-busy-set>",
+            "<cal:calendar-free-busy-set/>",
+            calendar_free_busy_set.as_deref(),
+        );
+        let schedule_calendar_transp = resource
+            .schedule_calendar_transp
+            .as_ref()
+            .map(|transp| format!("<cal:{transp}/>"));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "schedule-calendar-transp",
+            "<cal:schedule-calendar-transp>",
+            "</cal:schedule-calendar-transp>",
+            "<cal:schedule-calendar-transp/>",
+            schedule_calendar_transp.as_deref(),
+        );
+        let schedule_default_calendar_url = resource
+            .schedule_default_calendar_url
+            .as_ref()
+            .map(|url| format!("<d:href>{}</d:href>", escape_xml(url)));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "schedule-default-calendar-URL",
+            "<cal:schedule-default-calendar-URL>",
+            "</cal:schedule-default-calendar-URL>",
+            "<cal:schedule-default-calendar-URL/>",
+            schedule_default_calendar_url.as_deref(),
+        );
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "calendar-color",
+            "<ical:calendar-color>",
+            "</ical:calendar-color>",
+            "<ical:calendar-color/>",
+            resource.calendar_color.as_deref(),
+        );
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "calendar-description",
+            "<cal:calendar-description>",
+            "</cal:calendar-description>",
+            "<cal:calendar-description/>",
+            resource.calendar_description.as_deref(),
+        );
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "getctag",
+            "<cs:getctag>",
+            "</cs:getctag>",
+            "<cs:getctag/>",
+            resource.calendar_ctag.as_deref(),
+        );
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "sync-token",
+            "<d:sync-token>",
+            "</d:sync-token>",
+            "<d:sync-token/>",
+            resource.sync_token.as_deref(),
+        );
+        let supported_calendar_components = if resource.supported_calendar_components.is_empty() {
+            None
+        } else {
             let mut value = String::new();
             for component in &resource.supported_calendar_components {
                 value.push_str(r#"<cal:comp name=""#);
                 value.push_str(component);
                 value.push_str(r#""/>"#);
             }
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "supported-calendar-component-set",
-                "<cal:supported-calendar-component-set>",
-                "</cal:supported-calendar-component-set>",
-                Some(&value),
-            );
-        }
-        if !resource.supported_reports.is_empty() {
+            Some(value)
+        };
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "supported-calendar-component-set",
+            "<cal:supported-calendar-component-set>",
+            "</cal:supported-calendar-component-set>",
+            "<cal:supported-calendar-component-set/>",
+            supported_calendar_components.as_deref(),
+        );
+        let supported_reports = if resource.supported_reports.is_empty() {
+            None
+        } else {
             let mut value = String::new();
             for report in &resource.supported_reports {
                 value.push_str("<d:supported-report><d:report>");
@@ -350,17 +425,29 @@ pub fn multistatus_xml_for_propfind(
                 }
                 value.push_str("</d:report></d:supported-report>");
             }
-            write_named_or_valued_property(
-                &mut xml,
-                mode,
-                "supported-report-set",
-                "<d:supported-report-set>",
-                "</d:supported-report-set>",
-                Some(&value),
-            );
-        }
+            Some(value)
+        };
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "supported-report-set",
+            "<d:supported-report-set>",
+            "</d:supported-report-set>",
+            "<d:supported-report-set/>",
+            supported_reports.as_deref(),
+        );
 
-        xml.push_str("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>");
+        if !ok_props.is_empty() {
+            xml.push_str("<d:propstat><d:prop>");
+            xml.push_str(&ok_props);
+            xml.push_str("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>");
+        }
+        if !missing_props.is_empty() {
+            xml.push_str("<d:propstat><d:prop>");
+            xml.push_str(&missing_props);
+            xml.push_str("</d:prop><d:status>HTTP/1.1 404 Not Found</d:status></d:propstat>");
+        }
         xml.push_str("</d:response>");
     }
     xml.push_str("</d:multistatus>");
@@ -368,11 +455,13 @@ pub fn multistatus_xml_for_propfind(
 }
 
 fn write_named_or_valued_property(
-    xml: &mut String,
+    ok_props: &mut String,
+    missing_props: &mut String,
     mode: &DavPropfindMode,
     local_name: &str,
     open_tag: &str,
     close_tag: &str,
+    empty_tag: &str,
     value: Option<&str>,
 ) {
     if !should_emit_property(mode, local_name) {
@@ -381,18 +470,20 @@ fn write_named_or_valued_property(
     match mode {
         DavPropfindMode::PropName => {
             if let Some(self_closing) = self_closing_tag(open_tag, close_tag) {
-                xml.push_str(&self_closing);
+                ok_props.push_str(&self_closing);
             }
         }
         DavPropfindMode::AllProp | DavPropfindMode::Prop(_) => {
             if let Some(value) = value {
                 if open_tag.is_empty() && close_tag.is_empty() {
-                    xml.push_str(value);
+                    ok_props.push_str(value);
                     return;
                 }
-                xml.push_str(open_tag);
-                xml.push_str(value);
-                xml.push_str(close_tag);
+                ok_props.push_str(open_tag);
+                ok_props.push_str(value);
+                ok_props.push_str(close_tag);
+            } else if matches!(mode, DavPropfindMode::Prop(_)) && !empty_tag.is_empty() {
+                missing_props.push_str(empty_tag);
             }
         }
     }
@@ -462,7 +553,10 @@ fn escape_xml(input: &str) -> String {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{multistatus_xml, multistatus_xml_for_propfind, DavPropResource, DavPropfindMode, DavResourceKind};
+    use super::{
+        multistatus_xml, multistatus_xml_for_propfind, DavPropResource, DavPropfindMode,
+        DavResourceKind,
+    };
 
     #[test]
     fn multistatus_contains_expected_namespaces_and_fields() {
@@ -595,6 +689,50 @@ mod tests {
         assert!(xml.contains("<cs:getctag>work-10</cs:getctag>"));
         assert!(!xml.contains("<d:sync-token>"));
         assert!(!xml.contains("<d:supported-report-set>"));
+    }
+
+    #[test]
+    fn propfind_prop_mode_returns_404_for_requested_missing_properties() {
+        let mut requested = HashSet::new();
+        requested.insert("displayname".to_string());
+        requested.insert("calendar-color".to_string());
+        requested.insert("calendar-description".to_string());
+        let payload = multistatus_xml_for_propfind(
+            &[DavPropResource {
+                href: "/dav/uid-1/calendars/work/".to_string(),
+                display_name: "Work".to_string(),
+                kind: DavResourceKind::Calendar,
+                current_user_principal: None,
+                principal_url: None,
+                principal_collection_set: None,
+                addressbook_home_set: None,
+                calendar_home_set: None,
+                calendar_user_addresses: Vec::new(),
+                schedule_inbox_url: None,
+                schedule_outbox_url: None,
+                owner: None,
+                current_user_privileges: Vec::new(),
+                quota_available_bytes: None,
+                quota_used_bytes: None,
+                resource_id: None,
+                calendar_free_busy_set: Vec::new(),
+                schedule_calendar_transp: None,
+                schedule_default_calendar_url: None,
+                calendar_color: None,
+                calendar_description: None,
+                calendar_ctag: None,
+                sync_token: None,
+                supported_calendar_components: Vec::new(),
+                supported_reports: Vec::new(),
+            }],
+            &DavPropfindMode::Prop(requested),
+        );
+        let xml = String::from_utf8(payload).expect("xml is utf8");
+        assert!(xml.contains("<d:status>HTTP/1.1 200 OK</d:status>"));
+        assert!(xml.contains("<d:displayname>Work</d:displayname>"));
+        assert!(xml.contains("<d:status>HTTP/1.1 404 Not Found</d:status>"));
+        assert!(xml.contains("<ical:calendar-color/>"));
+        assert!(xml.contains("<cal:calendar-description/>"));
     }
 
     #[test]

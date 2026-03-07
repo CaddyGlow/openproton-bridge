@@ -409,7 +409,9 @@ fn calendar_collection_version(
     calendar: Option<&StoredCalendar>,
     store: Option<&PimStore>,
 ) -> i64 {
-    let base_version = calendar.map(|calendar| calendar.updated_at_ms).unwrap_or_default();
+    let base_version = calendar
+        .map(|calendar| calendar.updated_at_ms)
+        .unwrap_or_default();
     let store_version = store
         .and_then(|store| store.calendar_collection_version(calendar_id).ok())
         .unwrap_or_default();
@@ -621,8 +623,8 @@ mod tests {
 
     #[test]
     fn propfind_principal_me_returns_multistatus() {
-        let response =
-            handle_propfind("/dav/principals/me/", &[], &HashMap::new(), &auth()).expect("response");
+        let response = handle_propfind("/dav/principals/me/", &[], &HashMap::new(), &auth())
+            .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
         assert_eq!(response.status, "207 Multi-Status");
         assert!(body.contains("<d:multistatus"));
@@ -631,8 +633,8 @@ mod tests {
 
     #[test]
     fn propfind_rejects_cross_account_paths() {
-        let response =
-            handle_propfind("/dav/uid-2/principal/", &[], &HashMap::new(), &auth()).expect("response");
+        let response = handle_propfind("/dav/uid-2/principal/", &[], &HashMap::new(), &auth())
+            .expect("response");
         assert_eq!(response.status, "403 Forbidden");
     }
 
@@ -640,13 +642,8 @@ mod tests {
     fn propfind_depth_infinity_is_rejected_for_calendar_collection() {
         let mut headers = HashMap::new();
         headers.insert("depth".to_string(), "infinity".to_string());
-        let response = handle_propfind(
-            "/dav/uid-1/calendars/work/",
-            &[],
-            &headers,
-            &auth(),
-        )
-        .expect("response");
+        let response = handle_propfind("/dav/uid-1/calendars/work/", &[], &headers, &auth())
+            .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
         assert_eq!(response.status, "403 Forbidden");
         assert!(body.contains("<d:propfind-finite-depth/>"));
@@ -669,9 +666,14 @@ mod tests {
 
         let mut headers = HashMap::new();
         headers.insert("depth".to_string(), "1".to_string());
-        let response =
-            handle_propfind_with_store("/dav/uid-1/calendars/", &[], &headers, &auth(), Some(&store))
-                .expect("response");
+        let response = handle_propfind_with_store(
+            "/dav/uid-1/calendars/",
+            &[],
+            &headers,
+            &auth(),
+            Some(&store),
+        )
+        .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
 
         assert!(body.contains("/dav/uid-1/calendars/cal-1/"));
@@ -682,6 +684,8 @@ mod tests {
     #[test]
     fn propfind_primary_calendar_uses_readable_fallback_name() {
         let store = store();
+        let mut headers = HashMap::new();
+        headers.insert("depth".to_string(), "0".to_string());
         store
             .upsert_calendar(&Calendar {
                 id: "opaque-cal-id".to_string(),
@@ -697,7 +701,7 @@ mod tests {
         let response = handle_propfind_with_store(
             "/dav/uid-1/calendars/opaque-cal-id/",
             &[],
-            &HashMap::new(),
+            &headers,
             &auth(),
             Some(&store),
         )
@@ -736,9 +740,14 @@ mod tests {
 
         let mut headers = HashMap::new();
         headers.insert("depth".to_string(), "1".to_string());
-        let response =
-            handle_propfind_with_store("/dav/uid-1/calendars/", &[], &headers, &auth(), Some(&store))
-                .expect("response");
+        let response = handle_propfind_with_store(
+            "/dav/uid-1/calendars/",
+            &[],
+            &headers,
+            &auth(),
+            Some(&store),
+        )
+        .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
 
         assert!(body.contains("/dav/uid-1/calendars/cal-1/"));
@@ -748,6 +757,8 @@ mod tests {
     #[test]
     fn propfind_calendar_collection_ctag_tracks_event_updates() {
         let store = store();
+        let mut headers = HashMap::new();
+        headers.insert("depth".to_string(), "0".to_string());
         store
             .upsert_calendar(&Calendar {
                 id: "work".to_string(),
@@ -763,7 +774,7 @@ mod tests {
         let initial = handle_propfind_with_store(
             "/dav/uid-1/calendars/work/",
             &[],
-            &HashMap::new(),
+            &headers,
             &auth(),
             Some(&store),
         )
@@ -805,7 +816,7 @@ mod tests {
         let updated = handle_propfind_with_store(
             "/dav/uid-1/calendars/work/",
             &[],
-            &HashMap::new(),
+            &headers,
             &auth(),
             Some(&store),
         )

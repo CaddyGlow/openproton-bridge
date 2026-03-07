@@ -377,8 +377,14 @@ impl DecryptionHelper for KeyringHelper<'_> {
         D: FnMut(SymmetricAlgorithm, &SessionKey) -> bool,
     {
         let policy = StandardPolicy::new();
+        let mut attempts = 0usize;
+        let mut failures = 0usize;
 
         for pkesk in pkesks {
+            tracing::trace!(
+                keys_available = self.keyring.keys.len(),
+                "starting pkesk decryption attempt"
+            );
             for unlocked_key in &self.keyring.keys {
                 for ka in unlocked_key
                     .cert
@@ -387,11 +393,13 @@ impl DecryptionHelper for KeyringHelper<'_> {
                     .supported()
                     .secret()
                 {
-                    tracing::debug!(keyid = %ka.keyid(), "trying secret key for message decryption");
+                    attempts += 1;
+                    tracing::trace!(keyid = %ka.keyid(), "trying secret key for message decryption");
                     let secret = match ka.key().clone().parts_into_secret() {
                         Ok(secret) => secret,
                         Err(e) => {
-                            tracing::debug!(keyid = %ka.keyid(), error = %e, "parts_into_secret failed");
+                            failures += 1;
+                            tracing::trace!(keyid = %ka.keyid(), error = %e, "parts_into_secret failed");
                             continue;
                         }
                     };
@@ -400,7 +408,8 @@ impl DecryptionHelper for KeyringHelper<'_> {
                     let decrypted = match secret.decrypt_secret(&unlocked_key.password) {
                         Ok(d) => d,
                         Err(e) => {
-                            tracing::debug!(keyid = %ka.keyid(), error = %e, "decrypt_secret failed");
+                            failures += 1;
+                            tracing::trace!(keyid = %ka.keyid(), error = %e, "decrypt_secret failed");
                             continue;
                         }
                     };
@@ -408,22 +417,35 @@ impl DecryptionHelper for KeyringHelper<'_> {
                     let mut keypair = match decrypted.into_keypair() {
                         Ok(keypair) => keypair,
                         Err(e) => {
-                            tracing::debug!(keyid = %ka.keyid(), error = %e, "into_keypair failed");
+                            failures += 1;
+                            tracing::trace!(keyid = %ka.keyid(), error = %e, "into_keypair failed");
                             continue;
                         }
                     };
 
                     if let Some((algo, sk)) = pkesk.decrypt(&mut keypair, sym_algo) {
-                        tracing::debug!(keyid = %ka.keyid(), sym_algo = ?algo, "pkesk decrypted, testing session key");
+                        tracing::trace!(keyid = %ka.keyid(), sym_algo = ?algo, "pkesk decrypted, testing session key");
                         if decrypt(algo, &sk) {
-                            tracing::debug!(keyid = %ka.keyid(), "session key accepted");
+                            tracing::debug!(
+                                keyid = %ka.keyid(),
+                                attempts,
+                                failures,
+                                "message decryption succeeded"
+                            );
                             return Ok(Some(ka.fingerprint()));
                         }
-                        tracing::debug!(keyid = %ka.keyid(), "session key rejected");
+                        failures += 1;
+                        tracing::trace!(keyid = %ka.keyid(), "session key rejected");
                     }
                 }
             }
         }
+
+        tracing::debug!(
+            attempts,
+            failures,
+            "message decryption failed for all available keys"
+        );
 
         Err(anyhow::anyhow!("no key could decrypt the message"))
     }

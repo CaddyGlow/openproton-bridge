@@ -266,11 +266,11 @@ fn collect_plaintext_candidates(
     parts: &[CalendarEventPart],
     source: IcsCandidateSource,
 ) {
-    out.extend(parts.iter().filter_map(|part| {
-        part.data
-            .contains("BEGIN:VCALENDAR")
-            .then(|| (source, normalize_ics_payload(&part.data)))
-    }));
+    out.extend(
+        parts
+            .iter()
+            .filter_map(|part| extract_inline_ics_payload(&part.data).map(|ics| (source, ics))),
+    );
 }
 
 fn decrypted_candidates(
@@ -313,8 +313,48 @@ fn decrypt_part(part: &CalendarEventPart, key_packet: &str, keyring: &Keyring) -
     let data_packets = BASE64.decode(part.data.trim()).ok()?;
     let decrypted = decrypt::decrypt_attachment(keyring, key_packet, &data_packets).ok()?;
     let text = String::from_utf8(decrypted).ok()?;
-    text.contains("BEGIN:VCALENDAR")
-        .then(|| normalize_ics_payload(&text))
+    extract_inline_ics_payload(&text)
+}
+
+fn extract_inline_ics_payload(raw: &str) -> Option<String> {
+    let payload = if raw
+        .trim_start()
+        .starts_with("-----BEGIN PGP SIGNED MESSAGE-----")
+    {
+        extract_clearsigned_body(raw)?
+    } else {
+        raw.to_string()
+    };
+    let start = payload.find("BEGIN:VCALENDAR")?;
+    let end = payload.rfind("END:VCALENDAR")? + "END:VCALENDAR".len();
+    (end > start).then(|| normalize_ics_payload(&payload[start..end]))
+}
+
+fn extract_clearsigned_body(raw: &str) -> Option<String> {
+    let mut body = Vec::new();
+    let mut in_body = false;
+
+    for line in raw.lines() {
+        let trimmed = line.trim_end_matches('\r');
+        if trimmed.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") {
+            continue;
+        }
+        if trimmed.starts_with("Hash:") {
+            continue;
+        }
+        if trimmed.starts_with("-----BEGIN PGP SIGNATURE-----") {
+            break;
+        }
+        if !in_body {
+            if trimmed.is_empty() {
+                in_body = true;
+            }
+            continue;
+        }
+        body.push(trimmed.strip_prefix("- ").unwrap_or(trimmed).to_string());
+    }
+
+    (!body.is_empty()).then(|| body.join("\n"))
 }
 
 fn ics_score(ics: &str, source: IcsCandidateSource) -> i32 {
@@ -517,7 +557,10 @@ fn first_property_value(ics: &str, property: &str) -> Option<String> {
 mod tests {
     use crate::api::calendar::{CalendarEvent, CalendarEventPart};
 
-    use super::{best_event_ics, first_property_value, normalize_ics_payload};
+    use super::{
+        best_event_ics, extract_clearsigned_body, extract_inline_ics_payload, first_property_value,
+        normalize_ics_payload,
+    };
 
     #[test]
     fn prefers_richer_plaintext_ics_payload() {
@@ -560,6 +603,27 @@ mod tests {
 
         let ics = best_event_ics(&event, None).unwrap();
         assert!(ics.contains("SUMMARY:Sparse"));
+    }
+
+    #[test]
+    fn extracts_ics_from_clearsigned_payload() {
+        let payload = "-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nBEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:a\r\nSUMMARY:Meeting\r\nLOCATION:Office\r\nDESCRIPTION:Notes\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n-----BEGIN PGP SIGNATURE-----\r\nsig\r\n-----END PGP SIGNATURE-----\r\n";
+        let ics = extract_inline_ics_payload(payload).unwrap();
+        assert!(ics.starts_with("BEGIN:VCALENDAR\r\n"));
+        assert!(ics.contains("SUMMARY:Meeting\r\n"));
+        assert!(ics.contains("LOCATION:Office\r\n"));
+        assert!(ics.contains("DESCRIPTION:Notes\r\n"));
+        assert!(!ics.contains("BEGIN PGP SIGNED MESSAGE"));
+        assert!(!ics.contains("BEGIN PGP SIGNATURE"));
+    }
+
+    #[test]
+    fn extracts_clearsigned_body_without_signature_block() {
+        let payload = "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nBEGIN:VCALENDAR\nBEGIN:VEVENT\nSUMMARY:Meeting\nEND:VEVENT\nEND:VCALENDAR\n-----BEGIN PGP SIGNATURE-----\nsig\n-----END PGP SIGNATURE-----\n";
+        let body = extract_clearsigned_body(payload).unwrap();
+        assert!(body.starts_with("BEGIN:VCALENDAR\n"));
+        assert!(body.contains("SUMMARY:Meeting\n"));
+        assert!(!body.contains("BEGIN PGP SIGNATURE"));
     }
 
     #[test]

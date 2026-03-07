@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,6 +10,37 @@ async fn decode_api_json<T: DeserializeOwned>(resp: reqwest::Response) -> Result
     let json: serde_json::Value = resp.json().await?;
     check_api_response(&json)?;
     serde_json::from_value(json).map_err(ApiError::Json)
+}
+
+fn deserialize_string_or_default<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_i32_or_default<'de, D>(deserializer: D) -> std::result::Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<i32>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_i64_or_default<'de, D>(deserializer: D) -> std::result::Result<i64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<i64>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_vec_or_default<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -101,20 +132,36 @@ pub struct CalendarSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct CalendarAttendee {
-    #[serde(rename = "ID")]
+    #[serde(
+        rename = "ID",
+        default,
+        deserialize_with = "deserialize_string_or_default"
+    )]
     pub id: String,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub token: String,
+    #[serde(default, deserialize_with = "deserialize_i32_or_default")]
     pub status: i32,
+    #[serde(default, deserialize_with = "deserialize_i32_or_default")]
     pub permissions: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct CalendarEventPart {
-    #[serde(rename = "MemberID", default)]
+    #[serde(
+        rename = "MemberID",
+        default,
+        deserialize_with = "deserialize_string_or_default"
+    )]
     pub member_id: String,
-    #[serde(rename = "Type")]
+    #[serde(
+        rename = "Type",
+        default,
+        deserialize_with = "deserialize_i32_or_default"
+    )]
     pub kind: i32,
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub data: String,
     pub signature: Option<String>,
     pub author: Option<String>,
@@ -123,44 +170,61 @@ pub struct CalendarEventPart {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct CalendarEvent {
-    #[serde(rename = "ID")]
+    #[serde(
+        rename = "ID",
+        default,
+        deserialize_with = "deserialize_string_or_default"
+    )]
     pub id: String,
-    #[serde(rename = "UID")]
+    #[serde(
+        rename = "UID",
+        default,
+        deserialize_with = "deserialize_string_or_default"
+    )]
     pub uid: String,
-    #[serde(rename = "CalendarID")]
+    #[serde(
+        rename = "CalendarID",
+        default,
+        deserialize_with = "deserialize_string_or_default"
+    )]
     pub calendar_id: String,
-    #[serde(rename = "SharedEventID", default)]
+    #[serde(
+        rename = "SharedEventID",
+        default,
+        deserialize_with = "deserialize_string_or_default"
+    )]
     pub shared_event_id: String,
+    #[serde(default, deserialize_with = "deserialize_i64_or_default")]
     pub create_time: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i64_or_default")]
     pub last_edit_time: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i64_or_default")]
     pub start_time: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub start_timezone: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i64_or_default")]
     pub end_time: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub end_timezone: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i32_or_default")]
     pub full_day: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub author: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_i32_or_default")]
     pub permissions: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub attendees: Vec<CalendarAttendee>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub shared_key_packet: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_default")]
     pub calendar_key_packet: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub shared_events: Vec<CalendarEventPart>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub calendar_events: Vec<CalendarEventPart>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub attendees_events: Vec<CalendarEventPart>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_vec_or_default")]
     pub personal_events: Vec<CalendarEventPart>,
 }
 
@@ -1116,6 +1180,69 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "evt-1");
+    }
+
+    #[tokio::test]
+    async fn test_get_calendar_events_tolerates_null_scalar_and_array_fields() {
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        Mock::given(method("GET"))
+            .and(path("/calendar/v1/cal-1/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Events": [{
+                    "ID": "evt-null-1",
+                    "UID": "uid-null-1",
+                    "CalendarID": "cal-1",
+                    "SharedEventID": null,
+                    "CreateTime": null,
+                    "LastEditTime": null,
+                    "StartTime": null,
+                    "StartTimezone": null,
+                    "EndTime": null,
+                    "EndTimezone": null,
+                    "FullDay": null,
+                    "Author": null,
+                    "Permissions": null,
+                    "Attendees": null,
+                    "SharedKeyPacket": null,
+                    "CalendarKeyPacket": null,
+                    "SharedEvents": null,
+                    "CalendarEvents": null,
+                    "AttendeesEvents": null,
+                    "PersonalEvents": null
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let events = get_calendar_events(&client, "cal-1", &CalendarEventsQuery::default())
+            .await
+            .unwrap();
+
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.id, "evt-null-1");
+        assert_eq!(event.uid, "uid-null-1");
+        assert_eq!(event.calendar_id, "cal-1");
+        assert_eq!(event.shared_event_id, "");
+        assert_eq!(event.create_time, 0);
+        assert_eq!(event.last_edit_time, 0);
+        assert_eq!(event.start_time, 0);
+        assert_eq!(event.start_timezone, "");
+        assert_eq!(event.end_time, 0);
+        assert_eq!(event.end_timezone, "");
+        assert_eq!(event.full_day, 0);
+        assert_eq!(event.author, "");
+        assert_eq!(event.permissions, 0);
+        assert!(event.attendees.is_empty());
+        assert_eq!(event.shared_key_packet, "");
+        assert_eq!(event.calendar_key_packet, "");
+        assert!(event.shared_events.is_empty());
+        assert!(event.calendar_events.is_empty());
+        assert!(event.attendees_events.is_empty());
+        assert!(event.personal_events.is_empty());
     }
 
     #[test]

@@ -684,13 +684,9 @@ where
 
             // Populate store with message metadata
             for meta in &meta_resp.messages {
-                let uid = store
+                store
                     .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
                     .await?;
-                // Initialize flags from metadata
-                let flags = mailbox::message_flags(meta);
-                let flag_strings: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-                store.set_flags(&scoped_mailbox, uid, flag_strings).await?;
             }
         } else {
             info!(

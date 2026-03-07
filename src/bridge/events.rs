@@ -912,18 +912,9 @@ async fn apply_metadata_to_store(
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         let in_mailbox = metadata.label_ids.iter().any(|label| label == mb.label_id);
         if in_mailbox {
-            let uid = config
-                .store
-                .store_metadata(&scoped, &metadata.id, metadata.clone())
-                .await
-                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-            let flags = mailbox::message_flags(metadata)
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>();
             config
                 .store
-                .set_flags(&scoped, uid, flags)
+                .store_metadata(&scoped, &metadata.id, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         } else if let Some(uid) = config
@@ -1414,7 +1405,6 @@ async fn poll_account_once_for_generation(
         ensure_account_generation(config, expected_generation, "poll_after_fetch").await?;
 
         let mut address_changed = response.refresh != 0;
-        let mut labels_changed = false;
         let mut resync_state: Option<&str> = None;
         if response.refresh != 0 && forced_sync_state.is_none() {
             info!(
@@ -1452,9 +1442,7 @@ async fn poll_account_once_for_generation(
                     EventDelta::MessageDelete(id) => {
                         apply_message_delete(config, &id, expected_generation).await?;
                     }
-                    EventDelta::LabelsChanged => {
-                        labels_changed = true;
-                    }
+                    EventDelta::LabelsChanged => {}
                     EventDelta::AddressesChanged => {
                         address_changed = true;
                     }
@@ -1486,17 +1474,6 @@ async fn poll_account_once_for_generation(
                     );
                 }
             }
-        }
-
-        if labels_changed && resync_state.is_none() {
-            bounded_resync_account_for_generation(
-                config,
-                &mut session,
-                &mut client,
-                expected_generation,
-            )
-            .await?;
-            resync_state = Some("label_resync");
         }
 
         if address_changed {
@@ -3179,7 +3156,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_account_once_label_event_uses_bounded_resync() {
+    async fn poll_account_once_label_event_does_not_trigger_resync() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/core/v4/events/event-0"))
@@ -3197,29 +3174,6 @@ mod tests {
                             "Name": "Projects"
                         }
                     }]
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/mail/v4/messages"))
-            .and(header("x-http-method-override", "GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "Total": 1,
-                "Messages": [{
-                    "ID": "msg-label-resync-1",
-                    "AddressID": "addr-1",
-                    "LabelIDs": ["0"],
-                    "Subject": "Resynced from label event",
-                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
-                    "ToList": [],
-                    "CCList": [],
-                    "BCCList": [],
-                    "Time": 1700000000,
-                    "Size": 100,
-                    "Unread": 1,
-                    "NumAttachments": 0
                 }]
             })))
             .mount(&server)
@@ -3247,18 +3201,15 @@ mod tests {
         let next = poll_account_once(&config, "event-0").await.unwrap();
         assert_eq!(next, "event-1");
         assert_eq!(
-            store
-                .get_uid("uid-1::INBOX", "msg-label-resync-1")
-                .await
-                .unwrap(),
-            Some(1)
+            store.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
         );
 
         let checkpoint = checkpoints
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("label_resync"));
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
     }
 
     #[tokio::test]
@@ -3364,7 +3315,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_account_once_message_and_label_batch_sets_label_resync_state() {
+    async fn poll_account_once_message_and_label_batch_stays_incremental() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/core/v4/events/event-0"))
@@ -3387,29 +3338,6 @@ mod tests {
                 &["0"],
                 1,
             )))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/mail/v4/messages"))
-            .and(header("x-http-method-override", "GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "Total": 1,
-                "Messages": [{
-                    "ID": "msg-1",
-                    "AddressID": "addr-1",
-                    "LabelIDs": ["0"],
-                    "Subject": "Event Subject",
-                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
-                    "ToList": [],
-                    "CCList": [],
-                    "BCCList": [],
-                    "Time": 1700000000,
-                    "Size": 100,
-                    "Unread": 1,
-                    "NumAttachments": 0
-                }]
-            })))
             .mount(&server)
             .await;
 
@@ -3442,7 +3370,7 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("label_resync"));
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
     }
 
     #[tokio::test]

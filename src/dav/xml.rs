@@ -201,6 +201,16 @@ pub fn multistatus_xml_for_propfind(
                 Some(&value),
             );
         }
+        if let Some(content_length) = collection_content_length(resource.kind) {
+            write_named_or_valued_property(
+                &mut xml,
+                mode,
+                "getcontentlength",
+                "<d:getcontentlength>",
+                "</d:getcontentlength>",
+                Some(content_length),
+            );
+        }
         if let Some(quota_available_bytes) = resource.quota_available_bytes {
             write_named_or_valued_property(
                 &mut xml,
@@ -421,6 +431,18 @@ fn resource_type_xml(kind: DavResourceKind) -> &'static str {
     }
 }
 
+fn collection_content_length(kind: DavResourceKind) -> Option<&'static str> {
+    match kind {
+        DavResourceKind::Principal => None,
+        DavResourceKind::ScheduleInbox
+        | DavResourceKind::ScheduleOutbox
+        | DavResourceKind::AddressbookHome
+        | DavResourceKind::Addressbook
+        | DavResourceKind::CalendarHome
+        | DavResourceKind::Calendar => Some("0"),
+    }
+}
+
 fn escape_xml(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
@@ -573,5 +595,41 @@ mod tests {
         assert!(xml.contains("<cs:getctag>work-10</cs:getctag>"));
         assert!(!xml.contains("<d:sync-token>"));
         assert!(!xml.contains("<d:supported-report-set>"));
+    }
+
+    #[test]
+    fn calendar_resource_reports_zero_content_length() {
+        let payload = multistatus_xml_for_propfind(
+            &[DavPropResource {
+                href: "/dav/uid-1/calendars/work/".to_string(),
+                display_name: "Work".to_string(),
+                kind: DavResourceKind::Calendar,
+                current_user_principal: None,
+                principal_url: None,
+                principal_collection_set: None,
+                addressbook_home_set: None,
+                calendar_home_set: None,
+                calendar_user_addresses: Vec::new(),
+                schedule_inbox_url: None,
+                schedule_outbox_url: None,
+                owner: None,
+                current_user_privileges: Vec::new(),
+                quota_available_bytes: None,
+                quota_used_bytes: None,
+                resource_id: None,
+                calendar_free_busy_set: Vec::new(),
+                schedule_calendar_transp: None,
+                schedule_default_calendar_url: None,
+                calendar_color: None,
+                calendar_description: None,
+                calendar_ctag: None,
+                sync_token: None,
+                supported_calendar_components: Vec::new(),
+                supported_reports: Vec::new(),
+            }],
+            &DavPropfindMode::AllProp,
+        );
+        let xml = String::from_utf8(payload).expect("xml is utf8");
+        assert!(xml.contains("<d:getcontentlength>0</d:getcontentlength>"));
     }
 }

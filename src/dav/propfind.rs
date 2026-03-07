@@ -76,6 +76,9 @@ pub fn handle_propfind_with_store(
     if account_id != auth.account_id.0 {
         return Ok(forbidden_response());
     }
+    if depth == DavDepth::Infinity {
+        return Ok(finite_depth_required_response());
+    }
 
     let resources = match target {
         AccountResource::Principal => principal_resources(auth, depth),
@@ -547,6 +550,14 @@ fn forbidden_response() -> DavResponse {
     }
 }
 
+fn finite_depth_required_response() -> DavResponse {
+    DavResponse {
+        status: "403 Forbidden",
+        headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
+        body: br#"<?xml version="1.0" encoding="utf-8"?><d:error xmlns:d="DAV:"><d:propfind-finite-depth/></d:error>"#.to_vec(),
+    }
+}
+
 fn not_found_response() -> DavResponse {
     DavResponse {
         status: "404 Not Found",
@@ -623,6 +634,22 @@ mod tests {
         let response =
             handle_propfind("/dav/uid-2/principal/", &[], &HashMap::new(), &auth()).expect("response");
         assert_eq!(response.status, "403 Forbidden");
+    }
+
+    #[test]
+    fn propfind_depth_infinity_is_rejected_for_calendar_collection() {
+        let mut headers = HashMap::new();
+        headers.insert("depth".to_string(), "infinity".to_string());
+        let response = handle_propfind(
+            "/dav/uid-1/calendars/work/",
+            &[],
+            &headers,
+            &auth(),
+        )
+        .expect("response");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert_eq!(response.status, "403 Forbidden");
+        assert!(body.contains("<d:propfind-finite-depth/>"));
     }
 
     #[test]

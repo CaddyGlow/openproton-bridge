@@ -253,8 +253,8 @@ mod tests {
             addressbook_home_set: Some("/dav/uid-1/addressbooks/".to_string()),
             calendar_home_set: Some("/dav/uid-1/calendars/".to_string()),
             calendar_user_addresses: vec!["mailto:alice@proton.me".to_string()],
-            schedule_inbox_url: Some("/dav/uid-1/principal/inbox/".to_string()),
-            schedule_outbox_url: Some("/dav/uid-1/principal/outbox/".to_string()),
+            schedule_inbox_url: None,
+            schedule_outbox_url: None,
             owner: Some("/dav/uid-1/principal/".to_string()),
             current_user_privileges: vec!["read", "write"],
             quota_available_bytes: None,
@@ -281,8 +281,8 @@ mod tests {
         assert!(xml.contains("<d:principal-URL>"));
         assert!(xml.contains("<d:principal-collection-set>"));
         assert!(xml.contains("<cal:calendar-user-address-set>"));
-        assert!(xml.contains("<cal:schedule-inbox-URL>"));
-        assert!(xml.contains("<cal:schedule-outbox-URL>"));
+        assert!(!xml.contains("<cal:schedule-inbox-URL>"));
+        assert!(!xml.contains("<cal:schedule-outbox-URL>"));
         assert!(xml.contains("<card:addressbook-home-set>"));
         assert!(xml.contains("<cal:calendar-home-set>"));
     }
@@ -307,8 +307,8 @@ mod tests {
             quota_used_bytes: Some(0),
             resource_id: Some("work".to_string()),
             calendar_free_busy_set: vec!["/dav/uid-1/calendars/work/".to_string()],
-            schedule_calendar_transp: Some("opaque"),
-            schedule_default_calendar_url: Some("/dav/uid-1/calendars/work/".to_string()),
+            schedule_calendar_transp: None,
+            schedule_default_calendar_url: None,
             calendar_color: Some("#00AAFF".to_string()),
             calendar_description: Some("Team calendar".to_string()),
             calendar_ctag: Some("work-10".to_string()),
@@ -328,9 +328,7 @@ mod tests {
         assert!(xml.contains("<d:quota-available-bytes>1000000000</d:quota-available-bytes>"));
         assert!(xml.contains("<d:resource-id><d:href>urn:uuid:work</d:href></d:resource-id>"));
         assert!(xml.contains("<cal:calendar-free-busy-set>"));
-        assert!(xml.contains(
-            "<cal:schedule-calendar-transp><cal:opaque/></cal:schedule-calendar-transp>"
-        ));
-        assert!(xml.contains("<cal:schedule-default-calendar-URL><d:href>/dav/uid-1/calendars/work/</d:href></cal:schedule-default-calendar-URL>"));
+        assert!(!xml.contains("<cal:schedule-calendar-transp>"));
+        assert!(!xml.contains("<cal:schedule-default-calendar-URL>"));
     }
 }

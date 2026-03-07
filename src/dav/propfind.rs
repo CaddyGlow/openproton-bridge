@@ -171,8 +171,8 @@ fn principal_resource(auth: &AuthRoute) -> DavPropResource {
         addressbook_home_set: Some(discovery::addressbook_home_path(&auth.account_id.0)),
         calendar_home_set: Some(discovery::calendar_home_path(&auth.account_id.0)),
         calendar_user_addresses: vec![format!("mailto:{}", auth.primary_email)],
-        schedule_inbox_url: Some(discovery::schedule_inbox_path(&auth.account_id.0)),
-        schedule_outbox_url: Some(discovery::schedule_outbox_path(&auth.account_id.0)),
+        schedule_inbox_url: None,
+        schedule_outbox_url: None,
         owner: Some(discovery::principal_path(&auth.account_id.0)),
         current_user_privileges: vec!["read", "write", "write-properties", "bind", "unbind"],
         quota_available_bytes: None,
@@ -375,8 +375,8 @@ fn calendar_collection_resource(
         quota_used_bytes: Some(0),
         resource_id: Some(calendar_id.to_string()),
         calendar_free_busy_set: vec![href.clone()],
-        schedule_calendar_transp: Some("opaque"),
-        schedule_default_calendar_url: Some(href.clone()),
+        schedule_calendar_transp: None,
+        schedule_default_calendar_url: None,
         calendar_color: calendar
             .and_then(|calendar| non_empty_display_name(calendar.color.clone())),
         calendar_description: calendar

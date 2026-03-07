@@ -600,6 +600,7 @@ async fn run_runtime(
         pim_contacts_reconcile_interval,
         pim_calendar_reconcile_interval,
         pim_calendar_horizon_reconcile_interval,
+        config.dav_enable,
         notify_tx.clone(),
         pim_reconcile_metrics,
     ));
@@ -948,6 +949,7 @@ async fn run_pim_reconcile_periodically(
     contacts_reconcile_interval: Duration,
     calendar_reconcile_interval: Duration,
     calendar_horizon_reconcile_interval: Duration,
+    eager_calendar_warmup: bool,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
     metrics_snapshot: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
 ) {
@@ -955,6 +957,7 @@ async fn run_pim_reconcile_periodically(
 
     let mut ticker = interval(reconcile_tick_interval);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut first_sweep = true;
 
     loop {
         ticker.tick().await;
@@ -1006,6 +1009,16 @@ async fn run_pim_reconcile_periodically(
                         true
                     }
                 };
+            let force_calendar_full_due =
+                should_force_startup_calendar_warmup(first_sweep, eager_calendar_warmup);
+            let raw_calendar_full_due = raw_calendar_full_due || force_calendar_full_due;
+            if force_calendar_full_due {
+                tracing::info!(
+                    account_id = %account.account_id.0,
+                    email = %account.email,
+                    "forcing startup calendar warmup because DAV is enabled"
+                );
+            }
             if !raw_contacts_due && !raw_calendar_full_due && !raw_calendar_horizon_due {
                 continue;
             }
@@ -1310,7 +1323,12 @@ async fn run_pim_reconcile_periodically(
                 .calendar_rows_soft_deleted_total
                 .saturating_add(metrics.calendar_rows_soft_deleted as u64);
         }
+        first_sweep = false;
     }
+}
+
+fn should_force_startup_calendar_warmup(first_sweep: bool, eager_calendar_warmup: bool) -> bool {
+    first_sweep && eager_calendar_warmup
 }
 
 #[derive(Debug, Default)]
@@ -1608,6 +1626,7 @@ mod tests {
             Duration::from_secs(24 * 60 * 60),
             Duration::from_secs(24 * 60 * 60),
             Duration::from_secs(12 * 60 * 60),
+            false,
             None,
             metrics.clone(),
         ));
@@ -1650,6 +1669,7 @@ mod tests {
             Duration::from_secs(24 * 60 * 60),
             Duration::from_secs(24 * 60 * 60),
             Duration::from_secs(12 * 60 * 60),
+            false,
             None,
             metrics.clone(),
         ));
@@ -1669,5 +1689,12 @@ mod tests {
         assert_eq!(snapshot.contacts_runs_due_total, 0);
         assert_eq!(snapshot.calendar_full_runs_due_total, 0);
         assert_eq!(snapshot.calendar_horizon_runs_due_total, 0);
+    }
+
+    #[test]
+    fn startup_calendar_warmup_is_forced_only_on_first_sweep_when_enabled() {
+        assert!(super::should_force_startup_calendar_warmup(true, true));
+        assert!(!super::should_force_startup_calendar_warmup(false, true));
+        assert!(!super::should_force_startup_calendar_warmup(true, false));
     }
 }

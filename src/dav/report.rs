@@ -1,20 +1,27 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use regex::Regex;
 
+use crate::api::{calendar, client::ProtonClient};
 use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRoute;
+use crate::bridge::types::AccountId;
 use crate::pim::dav::{
     CalDavRepository, CardDavRepository, DavSyncStateRepository, StoreBackedDavAdapter,
 };
 use crate::pim::query::{CalendarEventRange, QueryPage};
 use crate::pim::store::PimStore;
+use crate::pim::sync_calendar;
 
 use super::calendar_crypto::{self, CalendarDecryptContext};
 use super::discovery;
 use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
+
+const CALDAV_EMPTY_SYNC_BACKFILL_SCOPE: &str = "calendar.dav_last_backfill_ms";
+const CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN: Duration = Duration::from_secs(300);
 
 pub async fn handle_report(
     raw_path: &str,
@@ -72,14 +79,18 @@ pub async fn handle_report(
         if body_text.contains("sync-collection") {
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
-            return Ok(Some(caldav_sync_collection(
-                &adapter,
-                store,
-                &auth.account_id.0,
-                &calendar_id,
-                body_text,
-                decrypt_context.as_ref(),
-            )?));
+            return Ok(Some(
+                caldav_sync_collection(
+                    &adapter,
+                    store,
+                    runtime_accounts,
+                    &auth.account_id.0,
+                    &calendar_id,
+                    body_text,
+                    decrypt_context.as_ref(),
+                )
+                .await?,
+            ));
         }
         return Ok(Some(not_implemented_report()));
     }
@@ -264,14 +275,24 @@ fn carddav_sync_collection(
     ))
 }
 
-fn caldav_sync_collection(
+async fn caldav_sync_collection(
     adapter: &StoreBackedDavAdapter,
     store: &Arc<PimStore>,
+    runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
     account_id: &str,
     calendar_id: &str,
     body: &str,
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
+    maybe_backfill_empty_caldav_sync(
+        adapter,
+        store,
+        runtime_accounts,
+        account_id,
+        calendar_id,
+        body,
+    )
+    .await?;
     let events = adapter
         .list_calendar_events(
             calendar_id,
@@ -332,6 +353,86 @@ fn caldav_sync_collection(
         &items,
         Some(sync_token_uri(account_id, calendar_id, current_token)),
     ))
+}
+
+async fn maybe_backfill_empty_caldav_sync(
+    adapter: &StoreBackedDavAdapter,
+    store: &Arc<PimStore>,
+    runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
+    account_id: &str,
+    calendar_id: &str,
+    body: &str,
+) -> Result<()> {
+    if !should_backfill_empty_caldav_sync(body) {
+        return Ok(());
+    }
+
+    let cached_events = adapter
+        .list_calendar_events(
+            calendar_id,
+            false,
+            CalendarEventRange::default(),
+            QueryPage {
+                limit: 1,
+                offset: 0,
+            },
+        )
+        .map_err(|err| DavError::Backend(err.to_string()))?;
+    if !cached_events.is_empty() {
+        return Ok(());
+    }
+
+    if !backfill_cooldown_elapsed(adapter)? {
+        return Ok(());
+    }
+
+    let Some(runtime_accounts) = runtime_accounts else {
+        return Ok(());
+    };
+
+    let session = runtime_accounts
+        .with_valid_access_token(&AccountId(account_id.to_string()))
+        .await
+        .map_err(|err| DavError::Backend(err.to_string()))?;
+    let client = ProtonClient::authenticated_with_mode(
+        session.api_mode.base_url(),
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )
+    .map_err(|err| DavError::Backend(err.to_string()))?;
+
+    tracing::info!(
+        account_id,
+        calendar_id,
+        "backfilling calendar cache before initial CalDAV sync"
+    );
+    sync_calendar::bootstrap_calendars(
+        &client,
+        store.as_ref(),
+        &calendar::CalendarEventsQuery::default(),
+    )
+    .await
+    .map_err(|err| DavError::Backend(err.to_string()))?;
+    adapter
+        .set_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE, epoch_millis())
+        .map_err(|err| DavError::Backend(err.to_string()))?;
+    Ok(())
+}
+
+fn should_backfill_empty_caldav_sync(body: &str) -> bool {
+    extract_sync_token(body).is_none_or(|token| token.trim().is_empty())
+}
+
+fn backfill_cooldown_elapsed(adapter: &StoreBackedDavAdapter) -> Result<bool> {
+    let Some(last_backfill_ms) = adapter
+        .get_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE)
+        .map_err(|err| DavError::Backend(err.to_string()))?
+    else {
+        return Ok(true);
+    };
+    Ok(epoch_millis().saturating_sub(last_backfill_ms)
+        >= CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN.as_millis() as i64)
 }
 
 pub(crate) fn calendar_collection_sync_version(
@@ -410,11 +511,7 @@ fn extract_xml_text(body: &str, local_name: &str) -> Option<String> {
         tag = regex::escape(local_name)
     );
     let re = Regex::new(&pattern).ok()?;
-    let value = re
-        .captures(body)?
-        .name("value")?
-        .as_str()
-        .trim();
+    let value = re.captures(body)?.name("value")?.as_str().trim();
     Some(value.to_string())
 }
 
@@ -742,10 +839,22 @@ fn epoch_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        escape_xml, extract_report_hrefs, extract_sync_token, extract_sync_token_version,
-        multistatus_response, parse_calendar_collection_path, parse_calendar_time_range,
-        parse_event_id_from_href, ReportItem,
+        backfill_cooldown_elapsed, escape_xml, extract_report_hrefs, extract_sync_token,
+        extract_sync_token_version, multistatus_response, parse_calendar_collection_path,
+        parse_calendar_time_range, parse_event_id_from_href, should_backfill_empty_caldav_sync,
+        ReportItem, CALDAV_EMPTY_SYNC_BACKFILL_SCOPE,
     };
+    use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
+    use crate::pim::store::PimStore;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    fn test_adapter() -> StoreBackedDavAdapter {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("account.db");
+        Box::leak(Box::new(tmp));
+        StoreBackedDavAdapter::new(Arc::new(PimStore::new(db_path).unwrap()))
+    }
 
     #[test]
     fn parses_sync_token_from_report_body() {
@@ -770,6 +879,30 @@ mod tests {
             ),
             Some(456)
         );
+    }
+
+    #[test]
+    fn empty_sync_token_requests_trigger_backfill() {
+        assert!(should_backfill_empty_caldav_sync(
+            r#"<sync-collection xmlns="DAV:"><sync-token></sync-token></sync-collection>"#,
+        ));
+        assert!(should_backfill_empty_caldav_sync(
+            r#"<sync-collection xmlns="DAV:"></sync-collection>"#,
+        ));
+        assert!(!should_backfill_empty_caldav_sync(
+            r#"<sync-collection xmlns="DAV:"><sync-token>https://openproton.local/dav/uid-1/calendars/work/sync/456</sync-token></sync-collection>"#,
+        ));
+    }
+
+    #[test]
+    fn backfill_cooldown_blocks_immediate_repeat_attempts() {
+        let adapter = test_adapter();
+        assert!(backfill_cooldown_elapsed(&adapter).unwrap());
+
+        adapter
+            .set_sync_state_int(CALDAV_EMPTY_SYNC_BACKFILL_SCOPE, super::epoch_millis())
+            .unwrap();
+        assert!(!backfill_cooldown_elapsed(&adapter).unwrap());
     }
 
     #[test]

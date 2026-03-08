@@ -845,6 +845,7 @@ where
 
         self.selected_mailbox = Some(mb.name.to_string());
         self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        self.selected_read_only = false;
         self.state = State::Selected;
 
         info!(
@@ -1550,8 +1551,9 @@ where
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let store = &self.config.store;
+        let store = self.config.store.clone();
         let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let needs_rfc822 = criteria.iter().any(search_key_needs_rfc822);
 
         let mut results = Vec::new();
         let max_uid = all_uids.last().copied().unwrap_or(0);
@@ -1561,12 +1563,22 @@ where
             let meta = store.get_metadata(&scoped_mailbox, uid).await?;
             let flags = store.get_flags(&scoped_mailbox, uid).await?;
 
-            // For content-based search (BODY/TEXT/HEADER), we would need to fetch RFC822 data
-            // This is expensive so we pass None for now - those searches will return no matches
-            let rfc822_data: Option<&[u8]> = None;
-            let matches = criteria
-                .iter()
-                .all(|c| evaluate_search_key(c, uid, &meta, &flags, max_uid, rfc822_data));
+            let mut rfc822_data = if needs_rfc822 {
+                store.get_rfc822(&scoped_mailbox, uid).await?
+            } else {
+                None
+            };
+            if needs_rfc822 && rfc822_data.is_none() {
+                if let Some(meta) = meta.as_ref() {
+                    rfc822_data = self
+                        .fetch_and_cache_rfc822(&scoped_mailbox, uid, &meta.id)
+                        .await?;
+                }
+            }
+
+            let matches = criteria.iter().all(|c| {
+                evaluate_search_key(c, uid, &meta, &flags, max_uid, rfc822_data.as_deref())
+            });
 
             if matches {
                 if uid_mode {
@@ -1940,6 +1952,17 @@ fn evaluate_search_key(
             evaluate_search_key(a, uid, meta, flags, max_uid, rfc822_data)
                 || evaluate_search_key(b, uid, meta, flags, max_uid, rfc822_data)
         }
+    }
+}
+
+fn search_key_needs_rfc822(key: &SearchKey) -> bool {
+    match key {
+        SearchKey::Header(_, _) | SearchKey::Body(_) | SearchKey::Text(_) => true,
+        SearchKey::Not(inner) => search_key_needs_rfc822(inner),
+        SearchKey::Or(left, right) => {
+            search_key_needs_rfc822(left) || search_key_needs_rfc822(right)
+        }
+        _ => false,
     }
 }
 
@@ -2649,6 +2672,92 @@ mod tests {
         assert!(flags.iter().any(|f| f == "\\Seen"));
 
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_select_after_examine_resets_read_only_mode() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_metadata("test-uid::Drafts", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(session.selected_read_only);
+
+        session.handle_line("a002 SELECT Drafts").await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a002 OK [READ-WRITE] SELECT completed"));
+        assert!(!session.selected_read_only);
+    }
+
+    #[tokio::test]
+    async fn test_search_text_and_header_use_cached_rfc822() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_rfc822(
+                "test-uid::INBOX",
+                uid,
+                b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nsearch-hit-body"
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 SEARCH TEXT \"search-hit-body\"")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(response.contains("a001 OK SEARCH completed"), "response={response}");
+
+        session
+            .handle_line("a002 SEARCH HEADER Subject \"Subject msg-1\"")
+            .await
+            .unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(response.contains("a002 OK SEARCH completed"), "response={response}");
     }
 
     #[tokio::test]

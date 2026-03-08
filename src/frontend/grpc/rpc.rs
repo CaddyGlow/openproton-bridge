@@ -31,7 +31,9 @@ fn looks_like_padded_base64(input: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
 }
 
-fn decode_login_password_bytes(raw: Vec<u8>) -> Result<DecodedLoginPassword, LoginPasswordDecodeError> {
+fn decode_login_password_bytes(
+    raw: Vec<u8>,
+) -> Result<DecodedLoginPassword, LoginPasswordDecodeError> {
     let utf8 = String::from_utf8(raw).map_err(|_| LoginPasswordDecodeError::InvalidUtf8)?;
     if utf8.is_empty() {
         return Err(LoginPasswordDecodeError::Missing);
@@ -281,7 +283,8 @@ impl BridgeService {
             return Err(Status::invalid_argument("accountID is required"));
         }
 
-        let sessions = vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions =
+            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
         let Some(session) = sessions.into_iter().find(|session| {
             session.uid == selector || session.email.eq_ignore_ascii_case(selector)
         }) else {
@@ -292,9 +295,9 @@ impl BridgeService {
 
         let bootstrap = vault::load_gluon_store_bootstrap(self.settings_dir(), &[session.uid])
             .map_err(|err| match err {
-                vault::VaultError::AccountNotFound(_) => {
-                    Status::not_found(format!("no gluon bootstrap account for selector: {selector}"))
-                }
+                vault::VaultError::AccountNotFound(_) => Status::not_found(format!(
+                    "no gluon bootstrap account for selector: {selector}"
+                )),
                 other => status_from_vault_error(other),
             })?;
         let Some(account) = bootstrap.accounts.first() else {
@@ -322,9 +325,9 @@ impl BridgeService {
         let Some(expected) = expected_updated_at_ms else {
             return Ok(());
         };
-        let current = store
-            .get_contact(contact_id, true)
-            .map_err(|err| Status::internal(format!("failed to read current contact state: {err}")))?;
+        let current = store.get_contact(contact_id, true).map_err(|err| {
+            Status::internal(format!("failed to read current contact state: {err}"))
+        })?;
         let Some(current) = current else {
             return Err(Status::aborted(format!(
                 "stale write rejected for contact {}; current row missing",
@@ -350,9 +353,9 @@ impl BridgeService {
         let Some(expected) = expected_updated_at_ms else {
             return Ok(());
         };
-        let current = store
-            .get_calendar(calendar_id, true)
-            .map_err(|err| Status::internal(format!("failed to read current calendar state: {err}")))?;
+        let current = store.get_calendar(calendar_id, true).map_err(|err| {
+            Status::internal(format!("failed to read current calendar state: {err}"))
+        })?;
         let Some(current) = current else {
             return Err(Status::aborted(format!(
                 "stale write rejected for calendar {}; current row missing",
@@ -378,9 +381,11 @@ impl BridgeService {
         let Some(expected) = expected_updated_at_ms else {
             return Ok(());
         };
-        let current = store
-            .get_calendar_event(event_id, true)
-            .map_err(|err| Status::internal(format!("failed to read current calendar event state: {err}")))?;
+        let current = store.get_calendar_event(event_id, true).map_err(|err| {
+            Status::internal(format!(
+                "failed to read current calendar event state: {err}"
+            ))
+        })?;
         let Some(current) = current else {
             return Err(Status::aborted(format!(
                 "stale write rejected for calendar event {}; current row missing",
@@ -406,6 +411,588 @@ impl BridgeService {
         );
         *self.state.pending_login.lock().await = Some(pending);
         self.emit_login_two_password_requested(&username);
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_optimize_cache_accounts(
+    sessions: &[Session],
+    selector: &str,
+) -> Result<Vec<Session>, Status> {
+    if sessions.is_empty() {
+        return Err(Status::failed_precondition("no accounts are configured"));
+    }
+
+    let selector = selector.trim();
+    if selector.is_empty() {
+        return Ok(sessions.to_vec());
+    }
+
+    if let Ok(index) = selector.parse::<usize>() {
+        let Some(session) = sessions.get(index) else {
+            return Err(Status::invalid_argument(format!(
+                "account index {index} is out of range (max {})",
+                sessions.len().saturating_sub(1)
+            )));
+        };
+        return Ok(vec![session.clone()]);
+    }
+
+    let session = sessions.iter().find(|session| {
+        session.uid == selector
+            || session.email.eq_ignore_ascii_case(selector)
+            || session.display_name.eq_ignore_ascii_case(selector)
+    });
+
+    match session {
+        Some(session) => Ok(vec![session.clone()]),
+        None => Err(Status::not_found(format!(
+            "unknown account selector: {selector}"
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn resolve_optimize_cache_mailboxes(mailboxes: &[String]) -> Result<Vec<String>, Status> {
+    if mailboxes.is_empty() {
+        return Ok(crate::imap::mailbox::system_mailboxes()
+            .iter()
+            .filter(|mailbox| mailbox.selectable)
+            .map(|mailbox| mailbox.name.to_string())
+            .collect());
+    }
+
+    let mut out = Vec::with_capacity(mailboxes.len());
+    let mut seen = HashSet::new();
+    for raw_mailbox in mailboxes {
+        let name = raw_mailbox.trim();
+        if name.is_empty() {
+            return Err(Status::invalid_argument("mailbox name is empty"));
+        }
+
+        let Some(mailbox) = crate::imap::mailbox::find_mailbox(name) else {
+            return Err(Status::invalid_argument(format!("unknown mailbox: {name}")));
+        };
+        if !mailbox.selectable {
+            return Err(Status::invalid_argument(format!(
+                "mailbox is not selectable: {name}"
+            )));
+        }
+
+        let name = mailbox.name.to_string();
+        if seen.insert(name.clone()) {
+            out.push(name);
+        }
+    }
+
+    if out.is_empty() {
+        return Err(Status::invalid_argument("no valid mailbox names provided"));
+    }
+    Ok(out)
+}
+
+fn resolve_optimize_cache_concurrency(raw_concurrency: u32) -> usize {
+    if raw_concurrency == 0 {
+        return OPTIMIZE_CACHE_CONCURRENCY;
+    }
+
+    let requested = raw_concurrency as usize;
+    requested.clamp(1, OPTIMIZE_CACHE_CONCURRENCY_MAX)
+}
+
+fn scoped_cache_mailbox(account_id: &str, mailbox: &str) -> String {
+    format!("{account_id}::{mailbox}")
+}
+
+#[allow(clippy::result_large_err)]
+async fn load_cache_auth_material(
+    runtime_accounts: &Arc<bridge::accounts::RuntimeAccountRegistry>,
+    account_id: &bridge::types::AccountId,
+    account_session: &mut Session,
+    client: &mut ProtonClient,
+) -> Option<Arc<bridge::accounts::RuntimeAuthMaterial>> {
+    if let Some(material) = runtime_accounts.get_auth_material(account_id).await {
+        return Some(material);
+    }
+
+    let mut cached_session = account_session.clone();
+    let load_user = async {
+        loop {
+            match api::users::get_user(client).await {
+                Ok(response) => break Ok(response),
+                Err(err) if api::error::is_auth_error(&err) => {
+                    let refreshed = runtime_accounts
+                        .refresh_session_if_stale(&account_id, Some(&cached_session.access_token))
+                        .await
+                        .map_err(|refresh_err| {
+                            format!("failed to refresh session: {refresh_err}")
+                        })?;
+                    *account_session = refreshed.clone();
+                    cached_session = refreshed;
+                    *client = ProtonClient::authenticated_with_mode(
+                        cached_session.api_mode.base_url(),
+                        cached_session.api_mode,
+                        &cached_session.uid,
+                        &cached_session.access_token,
+                    )
+                    .map_err(|err| format!("failed to create authenticated client: {err}"))?;
+                    continue;
+                }
+                Err(err) => {
+                    return Err(format!("failed to fetch user metadata: {err}"));
+                }
+            }
+        }
+    };
+    let user_response = match load_user.await {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(account_id = %account_id.0, error = %err, "failed to load auth material");
+            return None;
+        }
+    };
+
+    let mut refreshed_session = account_session.clone();
+    let load_addresses = async {
+        loop {
+            match api::users::get_addresses(client).await {
+                Ok(response) => break Ok(response),
+                Err(err) if api::error::is_auth_error(&err) => {
+                    let refreshed = runtime_accounts
+                        .refresh_session_if_stale(
+                            &account_id,
+                            Some(&refreshed_session.access_token),
+                        )
+                        .await
+                        .map_err(|refresh_err| {
+                            format!(
+                                "failed to refresh session before addresses fetch: {refresh_err}"
+                            )
+                        })?;
+                    *account_session = refreshed.clone();
+                    refreshed_session = refreshed;
+                    *client = ProtonClient::authenticated_with_mode(
+                        refreshed_session.api_mode.base_url(),
+                        refreshed_session.api_mode,
+                        &refreshed_session.uid,
+                        &refreshed_session.access_token,
+                    )
+                    .map_err(|err| format!("failed to create authenticated client: {err}"))?;
+                    continue;
+                }
+                Err(err) => {
+                    return Err(format!("failed to fetch addresses: {err}"));
+                }
+            }
+        }
+    };
+    let addresses_response = match load_addresses.await {
+        Ok(response) => response,
+        Err(err) => {
+            warn!(account_id = %account_id.0, error = %err, "failed to load account addresses");
+            return None;
+        }
+    };
+
+    let material = Arc::new(bridge::accounts::RuntimeAuthMaterial {
+        user_keys: user_response.user.keys,
+        addresses: addresses_response.addresses,
+    });
+    if let Err(err) = runtime_accounts
+        .set_auth_material(account_id, material.clone())
+        .await
+    {
+        warn!(
+            account_id = %account_id.0,
+            error = %err,
+            "failed to cache account auth material"
+        );
+    }
+    Some(material)
+}
+
+#[allow(clippy::result_large_err)]
+async fn optimize_cache_message(
+    mailbox: String,
+    uid: u32,
+    proton_id: String,
+    mut client: ProtonClient,
+    access_token: String,
+    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
+    account_id: crate::bridge::types::AccountId,
+    addr_keyrings: Arc<HashMap<String, Arc<crate::crypto::keys::Keyring>>>,
+    store: Arc<dyn crate::imap::store::MessageStore>,
+) -> bool {
+    let msg_resp = match crate::api::messages::get_message(&client, &proton_id).await {
+        Ok(msg) => msg,
+        Err(err) if api::error::is_auth_error(&err) => {
+            let refreshed_session = match runtime_accounts
+                .refresh_session_if_stale(&account_id, Some(&access_token))
+                .await
+            {
+                Ok(session) => session,
+                Err(refresh_err) => {
+                    warn!(
+                        account_id = %account_id.0,
+                        proton_id = %proton_id,
+                        error = %refresh_err,
+                        "failed to refresh token while optimizing cache"
+                    );
+                    return false;
+                }
+            };
+            client = match ProtonClient::authenticated_with_mode(
+                refreshed_session.api_mode.base_url(),
+                refreshed_session.api_mode,
+                &refreshed_session.uid,
+                &refreshed_session.access_token,
+            ) {
+                Ok(authenticated) => authenticated,
+                Err(err) => {
+                    warn!(
+                        account_id = %account_id.0,
+                        proton_id = %proton_id,
+                        error = %err,
+                        "failed to recreate authenticated client while optimizing cache"
+                    );
+                    return false;
+                }
+            };
+            match crate::api::messages::get_message(&client, &proton_id).await {
+                Ok(msg) => msg,
+                Err(err) => {
+                    warn!(
+                        account_id = %account_id.0,
+                        proton_id = %proton_id,
+                        error = %err,
+                        "failed to fetch message while optimizing cache"
+                    );
+                    return false;
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                account_id = %account_id.0,
+                proton_id = %proton_id,
+                error = %err,
+                "failed to fetch message while optimizing cache"
+            );
+            return false;
+        }
+    };
+
+    let msg = &msg_resp.message;
+    let Some(keyring) = addr_keyrings.get(&msg.metadata.address_id) else {
+        warn!(
+            account_id = %account_id.0,
+            proton_id = %proton_id,
+            address_id = %msg.metadata.address_id,
+            "no address keyring for message; skipping cache optimization"
+        );
+        return false;
+    };
+
+    let data = match crate::imap::rfc822::build_rfc822(&client, keyring, msg).await {
+        Ok(data) => data,
+        Err(err) => {
+            warn!(
+                account_id = %account_id.0,
+                proton_id = %proton_id,
+                error = %err,
+                "failed to build RFC822 while optimizing cache"
+            );
+            return false;
+        }
+    };
+
+    if let Err(err) = store.store_rfc822(&mailbox, uid, data).await {
+        warn!(
+            account_id = %account_id.0,
+            mailbox = %mailbox,
+            uid,
+            error = %err,
+            "failed to store optimized RFC822 cache entry"
+        );
+        return false;
+    }
+
+    true
+}
+
+#[allow(clippy::result_large_err)]
+async fn run_cache_optimization_for_account(
+    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
+    store: Arc<dyn crate::imap::store::MessageStore>,
+    account: Session,
+    mailboxes: Vec<String>,
+    semaphore: Arc<Semaphore>,
+) {
+    let account_id = crate::bridge::types::AccountId(account.uid.clone());
+    let mut account_session = match runtime_accounts.with_valid_access_token(&account_id).await {
+        Ok(session) => session,
+        Err(err) => {
+            warn!(
+                account_id = %account.uid,
+                error = %err,
+                "optimizing cache failed while loading account session"
+            );
+            return;
+        }
+    };
+
+    let mut client = match ProtonClient::authenticated_with_mode(
+        account_session.api_mode.base_url(),
+        account_session.api_mode,
+        &account_session.uid,
+        &account_session.access_token,
+    ) {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(
+                account_id = %account.uid,
+                error = %err,
+                "failed to create authenticated client for cache optimization"
+            );
+            return;
+        }
+    };
+
+    let mut passphrase = match account_session.key_passphrase.as_deref() {
+        Some(raw) => match BASE64.decode(raw) {
+            Ok(passphrase) => passphrase,
+            Err(err) => {
+                warn!(
+                    account_id = %account.uid,
+                    error = %err,
+                    "invalid key passphrase encoding for cache optimization"
+                );
+                return;
+            }
+        },
+        None => {
+            warn!(
+                account_id = %account.uid,
+                "no key passphrase in session; skipping cache optimization"
+            );
+            return;
+        }
+    };
+
+    let auth_material = match load_cache_auth_material(
+        &runtime_accounts,
+        &account_id,
+        &mut account_session,
+        &mut client,
+    )
+    .await
+    {
+        Some(material) => material,
+        None => {
+            warn!(
+                account_id = %account.uid,
+                "failed to load auth material for cache optimization"
+            );
+            passphrase.zeroize();
+            return;
+        }
+    };
+
+    let user_keyring =
+        match crate::crypto::keys::unlock_user_keys(&auth_material.user_keys, &passphrase) {
+            Ok(kr) => kr,
+            Err(err) => {
+                passphrase.zeroize();
+                warn!(
+                    account_id = %account.uid,
+                    error = %err,
+                    "failed to unlock user keys for cache optimization"
+                );
+                return;
+            }
+        };
+
+    let mut addr_keyrings = HashMap::new();
+    for addr in &auth_material.addresses {
+        if addr.status != 1 || addr.keys.is_empty() {
+            continue;
+        }
+
+        match crate::crypto::keys::unlock_address_keys(&addr.keys, &passphrase, &user_keyring) {
+            Ok(address_keyring) => {
+                addr_keyrings.insert(addr.id.clone(), Arc::new(address_keyring));
+            }
+            Err(err) => {
+                warn!(
+                    account_id = %account.uid,
+                    address_id = %addr.id,
+                    error = %err,
+                    "failed to unlock address keyring for cache optimization"
+                );
+            }
+        }
+    }
+
+    passphrase.zeroize();
+
+    let addr_keyrings = Arc::new(addr_keyrings);
+    if addr_keyrings.is_empty() {
+        warn!(
+            account_id = %account.uid,
+            "cache optimization skipped: no unlocked address keyrings"
+        );
+        return;
+    }
+
+    let access_token = account_session.access_token;
+    let mut handles = Vec::new();
+    let mut pending_jobs = 0usize;
+
+    for mailbox in mailboxes.iter() {
+        let scoped = scoped_cache_mailbox(&account.uid, mailbox);
+        let uids = match store.list_uids(&scoped).await {
+            Ok(uids) => uids,
+            Err(err) => {
+                warn!(
+                    account_id = %account.uid,
+                    mailbox = %mailbox,
+                    error = %err,
+                    "failed to list mailbox uids while optimizing cache"
+                );
+                continue;
+            }
+        };
+
+        for uid in uids {
+            match store.get_rfc822(&scoped, uid).await {
+                Ok(Some(_)) => continue,
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(
+                        account_id = %account.uid,
+                        mailbox = %scoped,
+                        uid,
+                        error = %err,
+                        "failed to check RFC822 cache while optimizing"
+                    );
+                    continue;
+                }
+            }
+
+            let proton_id = match store.get_proton_id(&scoped, uid).await {
+                Ok(Some(proton_id)) => proton_id,
+                Ok(None) => continue,
+                Err(err) => {
+                    warn!(
+                        account_id = %account.uid,
+                        mailbox = %scoped,
+                        uid,
+                        error = %err,
+                        "missing proton id while optimizing cache"
+                    );
+                    continue;
+                }
+            };
+
+            let handle = {
+                let runtime_accounts = runtime_accounts.clone();
+                let store = store.clone();
+                let client = client.clone();
+                let account_id = account_id.clone();
+                let mailbox = scoped.clone();
+                let proton_id = proton_id.clone();
+                let addr_keyrings = addr_keyrings.clone();
+                let access_token = access_token.clone();
+                let semaphore = semaphore.clone();
+
+                tokio::spawn(async move {
+                    let permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(err) => {
+                            warn!(
+                                error = %err,
+                                account_id = %account_id.0,
+                                "cache optimization semaphore closed"
+                            );
+                            return false;
+                        }
+                    };
+                    let _permit = permit;
+                    optimize_cache_message(
+                        mailbox,
+                        uid,
+                        proton_id,
+                        client,
+                        access_token,
+                        runtime_accounts,
+                        account_id,
+                        addr_keyrings,
+                        store,
+                    )
+                    .await
+                })
+            };
+            handles.push(handle);
+            pending_jobs += 1;
+        }
+    }
+
+    let mut optimized = 0usize;
+    for handle in handles {
+        match handle.await {
+            Ok(true) => optimized += 1,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    account_id = %account.uid,
+                    error = %err,
+                    "cache optimization task join failed"
+                );
+            }
+        }
+    }
+
+    if pending_jobs > 0 {
+        info!(
+            account_id = %account.uid,
+            pending_jobs,
+            optimized,
+            "cache optimization finished for account"
+        );
+    }
+}
+
+#[allow(clippy::result_large_err)]
+async fn run_cache_optimization(
+    runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
+    store: Arc<dyn crate::imap::store::MessageStore>,
+    accounts: Vec<Session>,
+    mailboxes: Vec<String>,
+    concurrency: usize,
+) {
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let mut handles = Vec::new();
+    for account in accounts {
+        let runtime_accounts = runtime_accounts.clone();
+        let store = store.clone();
+        let mailboxes = mailboxes.clone();
+        let semaphore = semaphore.clone();
+        handles.push(tokio::spawn(async move {
+            run_cache_optimization_for_account(
+                runtime_accounts,
+                store,
+                account,
+                mailboxes,
+                semaphore,
+            )
+            .await;
+        }));
+    }
+
+    for handle in handles {
+        if let Err(err) = handle.await {
+            warn!(error = %err, "cache optimization account worker failed");
+        }
     }
 }
 
@@ -520,6 +1107,65 @@ impl pb::bridge_server::Bridge for BridgeService {
             service.emit_show_main_window();
         });
         Ok(Response::new(()))
+    }
+
+    async fn optimize_cache(
+        &self,
+        request: Request<pb::OptimizeCacheRequest>,
+    ) -> Result<Response<pb::OptimizeCacheResponse>, Status> {
+        let req = request.into_inner();
+        let selector = req.account_selector.trim();
+        let concurrency = resolve_optimize_cache_concurrency(req.concurrency);
+        debug!(
+            pkg = "grpc",
+            account_selector = %selector,
+            mailboxes = req.mailboxes.len(),
+            concurrency,
+            "OptimizeCache"
+        );
+
+        let sessions = vault::list_sessions(self.settings_dir())
+            .map_err(|err| status_from_vault_error(err))?;
+        let accounts = resolve_optimize_cache_accounts(&sessions, selector)?;
+        let mailboxes = resolve_optimize_cache_mailboxes(&req.mailboxes)?;
+
+        let runtime_accounts = Arc::new(bridge::accounts::RuntimeAccountRegistry::new(
+            accounts.clone(),
+            self.settings_dir().to_path_buf(),
+        ));
+
+        let account_ids = accounts
+            .iter()
+            .map(|session| session.uid.clone())
+            .collect::<Vec<_>>();
+        let bootstrap = vault::load_gluon_store_bootstrap(self.settings_dir(), &account_ids)
+            .map_err(|err| match err {
+                vault::VaultError::AccountNotFound(account_id) => {
+                    Status::not_found(format!("no gluon bootstrap account for {account_id}"))
+                }
+                other => status_from_vault_error(other),
+            })?;
+
+        let account_storage_ids = bootstrap
+            .accounts
+            .into_iter()
+            .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
+            .collect::<HashMap<_, _>>();
+        let gluon_paths = self
+            .state
+            .runtime_paths
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()));
+        let store = crate::imap::store::new_runtime_message_store(
+            gluon_paths.root().to_path_buf(),
+            account_storage_ids,
+        )
+        .map_err(|err| Status::internal(format!("failed to open runtime message store: {err}")))?;
+
+        tokio::spawn(async move {
+            run_cache_optimization(runtime_accounts, store, accounts, mailboxes, concurrency).await;
+        });
+
+        Ok(Response::new(pb::OptimizeCacheResponse { started: true }))
     }
 
     async fn trigger_reset(&self, _request: Request<()>) -> Result<Response<()>, Status> {
@@ -1007,17 +1653,17 @@ impl pb::bridge_server::Bridge for BridgeService {
                     "Requesting TOTP"
                 );
             }
-                let pending = PendingLogin {
-                    username: username.clone(),
-                    password,
-                    api_mode: effective_api_mode,
-                    required_scopes: required_scopes.clone(),
-                    auth_granted_scopes: auth_granted_scopes.clone(),
-                    uid: auth.uid,
-                    access_token: auth.access_token,
-                    refresh_token: auth.refresh_token,
-                    client,
-                    fido_authentication_options: auth.two_factor.fido_authentication_options(),
+            let pending = PendingLogin {
+                username: username.clone(),
+                password,
+                api_mode: effective_api_mode,
+                required_scopes: required_scopes.clone(),
+                auth_granted_scopes: auth_granted_scopes.clone(),
+                uid: auth.uid,
+                access_token: auth.access_token,
+                refresh_token: auth.refresh_token,
+                client,
+                fido_authentication_options: auth.two_factor.fido_authentication_options(),
             };
             *self.state.pending_login.lock().await = Some(pending);
             if auth.two_factor.totp_required() {
@@ -1486,7 +2132,9 @@ impl pb::bridge_server::Bridge for BridgeService {
             },
             req.include_password,
         );
-        Ok(Response::new(pb::RenderMuttConfigResponse { rendered_config }))
+        Ok(Response::new(pb::RenderMuttConfigResponse {
+            rendered_config,
+        }))
     }
 
     async fn configure_user_apple_mail(
@@ -1939,7 +2587,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         } else {
             store.soft_delete_calendar_event(req.event_id.as_str())
         };
-        result.map_err(|err| Status::internal(format!("failed to delete calendar event: {err}")))?;
+        result
+            .map_err(|err| Status::internal(format!("failed to delete calendar event: {err}")))?;
         Ok(Response::new(()))
     }
 
@@ -1983,9 +2632,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<bool>, Status> {
-        let installed = is_mail_tls_certificate_installed(self.settings_dir()).await.map_err(
-            |e| Status::internal(format!("failed to check TLS certificate status: {e}")),
-        )?;
+        let installed = is_mail_tls_certificate_installed(self.settings_dir())
+            .await
+            .map_err(|e| {
+                Status::internal(format!("failed to check TLS certificate status: {e}"))
+            })?;
         Ok(Response::new(installed))
     }
 

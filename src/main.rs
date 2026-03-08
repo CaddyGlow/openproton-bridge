@@ -207,6 +207,18 @@ enum Command {
         #[arg(long, default_value_t = false)]
         include_password: bool,
     },
+    /// Preload IMAP RFC822 cache for account mailboxes (requires `--mode grpc`).
+    OptimizeCache {
+        /// Account selector (email, display name, or index). Defaults to all accounts.
+        #[arg(long)]
+        account: Option<String>,
+        /// Mailbox names to optimize. Repeatable; defaults to all selectable mailboxes.
+        #[arg(long = "mailbox")]
+        mailboxes: Vec<String>,
+        /// Maximum number of concurrent cache fetch workers. 0 uses server default.
+        #[arg(long, default_value = "0")]
+        concurrency: u32,
+    },
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq, Eq)]
@@ -374,6 +386,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Cli => "cli",
         Command::VaultDump => "vault-dump",
         Command::MuttConfig { .. } => "mutt-config",
+        Command::OptimizeCache { .. } => "optimize-cache",
     }
 }
 
@@ -497,6 +510,9 @@ async fn execute_non_interactive_command_direct(
             )
             .await
         }
+        Command::OptimizeCache { .. } => anyhow::bail!(
+            "command `optimize-cache` is unsupported in direct mode; use `--mode grpc`"
+        ),
         Command::Cli => anyhow::bail!("cannot execute nested cli command"),
     }
 }
@@ -537,6 +553,11 @@ async fn execute_non_interactive_command_grpc(
             )
             .await
         }
+        Command::OptimizeCache {
+            account,
+            mailboxes,
+            concurrency,
+        } => cmd_optimize_cache_grpc(&mut client, account.as_deref(), mailboxes, concurrency).await,
         Command::Cli => anyhow::bail!("cannot execute nested cli command"),
         other => {
             let name = command_name(&other);
@@ -2051,6 +2072,9 @@ fn rewrite_repl_aliases(mut tokens: Vec<String>) -> Vec<String> {
         "configure-mutt" => {
             tokens[0] = "mutt-config".to_string();
         }
+        "optimize" => {
+            tokens[0] = "optimize-cache".to_string();
+        }
         "man" => {
             tokens[0] = "help".to_string();
         }
@@ -2425,6 +2449,9 @@ fn print_interactive_help() {
     );
     println!("  stop                             Stop all background runtimes");
     println!("  mutt-config [flags]              Generate mutt/neomutt config snippet");
+    println!(
+        "  optimize-cache [flags]           Preload IMAP RFC822 cache in background (grpc mode)"
+    );
     println!();
     print_interactive_serve_help();
     print_interactive_grpc_help();
@@ -4339,6 +4366,31 @@ async fn cmd_mutt_config_grpc(
     Ok(())
 }
 
+async fn cmd_optimize_cache_grpc(
+    client: &mut frontend::grpc::client::CliGrpcClient,
+    account_selector: Option<&str>,
+    mailboxes: Vec<String>,
+    concurrency: u32,
+) -> anyhow::Result<()> {
+    client
+        .optimize_cache(account_selector, &mailboxes, concurrency)
+        .await?;
+
+    let account_label = account_selector.unwrap_or("all accounts");
+    if mailboxes.is_empty() {
+        println!(
+            "Started RFC822 cache warm-up for account '{account_label}' across all selectable mailboxes (concurrency={concurrency})."
+        );
+    } else {
+        println!(
+            "Started RFC822 cache warm-up for account '{account_label}' across {} mailbox(es) (concurrency={concurrency}).",
+            mailboxes.len()
+        );
+    }
+
+    Ok(())
+}
+
 fn cmd_logout(email: Option<&str>, all: bool, dir: &std::path::Path) -> anyhow::Result<()> {
     if !vault::session_exists(dir) {
         tracing::info!(
@@ -5260,6 +5312,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_optimize_cache_subcommand() {
+        let cli = Cli::try_parse_from([
+            "openproton-bridge",
+            "optimize-cache",
+            "--account",
+            "alice@proton.me",
+            "--mailbox",
+            "INBOX",
+            "--mailbox",
+            "Archive",
+            "--concurrency",
+            "12",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::OptimizeCache {
+                account,
+                mailboxes,
+                concurrency,
+            } => {
+                assert_eq!(account.as_deref(), Some("alice@proton.me"));
+                assert_eq!(mailboxes, vec!["INBOX".to_string(), "Archive".to_string()]);
+                assert_eq!(concurrency, 12);
+            }
+            _ => panic!("expected optimize-cache command"),
+        }
+    }
+
+    #[test]
     fn parse_login_scopes_flags() {
         let cli = Cli::try_parse_from([
             "openproton-bridge",
@@ -5365,6 +5447,10 @@ mod tests {
                 "--account".to_string(),
                 "0".to_string()
             ]
+        );
+        assert_eq!(
+            rewrite_repl_aliases(vec!["optimize".into()]),
+            vec!["optimize-cache".to_string()]
         );
     }
 

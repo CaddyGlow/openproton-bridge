@@ -109,6 +109,24 @@ impl CliGrpcClient {
         Ok(response.into_inner().rendered_config)
     }
 
+    pub async fn optimize_cache(
+        &mut self,
+        account_selector: Option<&str>,
+        mailboxes: &[String],
+        concurrency: u32,
+    ) -> anyhow::Result<()> {
+        let request = self.request_with_token(pb::OptimizeCacheRequest {
+            account_selector: account_selector.unwrap_or_default().to_string(),
+            mailboxes: mailboxes.to_vec(),
+            concurrency,
+        })?;
+        self.inner
+            .optimize_cache(request)
+            .await
+            .map_err(|status| anyhow::anyhow!("grpc optimize_cache failed: {status}"))?;
+        Ok(())
+    }
+
     pub async fn pim_list_contacts(
         &mut self,
         account_id: &str,

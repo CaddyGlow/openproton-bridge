@@ -125,6 +125,7 @@ service Bridge {
 
   // Repair
   rpc TriggerRepair(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc OptimizeCache(OptimizeCacheRequest) returns (OptimizeCacheResponse);
 }
 
 //**********************************************************************************************************************
@@ -157,6 +158,17 @@ message AddLogEntryRequest {
 //**********************************************************
 message GuiReadyResponse {
   bool showSplashScreen = 1;
+}
+
+message OptimizeCacheRequest {
+  string account_selector = 1;
+  repeated string mailboxes = 2;
+  // 0 means server default.
+  uint32 concurrency = 3;
+}
+
+message OptimizeCacheResponse {
+  bool started = 1;
 }
 
 

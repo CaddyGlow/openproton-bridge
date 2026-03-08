@@ -520,9 +520,16 @@ fn upstream_url_for_target(
         return Ok(challenge_url.to_string());
     }
 
-    if matches!(target_path.path(), "/" | "/captcha") {
+    if target_path.path() == "/" {
         let mut upstream = challenge.clone();
         upstream.set_path(&challenge_path);
+        upstream.set_query(target_path.query().or_else(|| challenge.query()));
+        return Ok(upstream.to_string());
+    }
+
+    if target_path.path() == "/captcha" {
+        let mut upstream = challenge.clone();
+        upstream.set_path("/captcha");
         upstream.set_query(target_path.query().or_else(|| challenge.query()));
         return Ok(upstream.to_string());
     }

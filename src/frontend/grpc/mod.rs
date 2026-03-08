@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, Semaphore};
 #[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
@@ -22,6 +22,7 @@ use tonic::metadata::MetadataMap;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 use crate::api;
 use crate::api::client::ProtonClient;
@@ -44,6 +45,8 @@ const KEYCHAIN_HELPER_WINDOWS: &str = "windows-credentials";
 const KEYCHAIN_HELPER_SECRET_SERVICE_DBUS: &str = "secret-service-dbus";
 const KEYCHAIN_HELPER_SECRET_SERVICE: &str = "secret-service";
 const KEYCHAIN_HELPER_PASS_APP: &str = "pass-app";
+const OPTIMIZE_CACHE_CONCURRENCY: usize = 4;
+const OPTIMIZE_CACHE_CONCURRENCY_MAX: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InterruptAction {
@@ -1342,7 +1345,7 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(status
             .message()
-            .contains("https://verify.proton.me/?methods=captcha&token=token-123"));
+            .contains("https://verify.proton.me/captcha?methods=captcha&token=token-123"));
     }
 
     #[test]

@@ -195,3 +195,46 @@ async fn be025_flag_mutations_are_persisted_and_ordered() {
         .expect("snapshot after");
     assert!(snapshot_after.mod_seq >= snapshot_before.mod_seq);
 }
+
+#[tokio::test]
+async fn be026_metadata_refresh_preserves_local_deleted_flag() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mailbox = "account-3::INBOX";
+
+    let store = GluonStore::new(
+        temp.path().to_path_buf(),
+        make_account_map("account-3", "user-3"),
+    )
+    .expect("create store");
+
+    let uid = store
+        .store_metadata(mailbox, "msg-1", make_meta("msg-1", 1, "initial"))
+        .await
+        .expect("insert msg-1");
+
+    store
+        .add_flags(mailbox, uid, &["\\Deleted".to_string()])
+        .await
+        .expect("set deleted");
+
+    store
+        .store_metadata(mailbox, "msg-1", make_meta("msg-1", 0, "updated"))
+        .await
+        .expect("refresh metadata");
+
+    let flags = store.get_flags(mailbox, uid).await.expect("get flags");
+    assert!(flags.contains(&"\\Deleted".to_string()));
+    assert!(flags.contains(&"\\Seen".to_string()));
+
+    let reloaded = GluonStore::new(
+        temp.path().to_path_buf(),
+        make_account_map("account-3", "user-3"),
+    )
+    .expect("reload store");
+    let reloaded_flags = reloaded
+        .get_flags(mailbox, uid)
+        .await
+        .expect("reload flags");
+    assert!(reloaded_flags.contains(&"\\Deleted".to_string()));
+    assert!(reloaded_flags.contains(&"\\Seen".to_string()));
+}

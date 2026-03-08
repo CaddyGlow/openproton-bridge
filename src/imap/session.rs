@@ -226,7 +226,6 @@ where
                 ref mailbox,
                 uid,
             } => self.cmd_copy(tag, sequence, mailbox, uid).await?,
-            Command::Check { ref tag } => self.cmd_check(tag).await?,
             Command::Examine {
                 ref tag,
                 ref mailbox,
@@ -937,9 +936,7 @@ where
         if self.state != State::Selected {
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
-<<<<<<< HEAD
-        // Per RFC 3501, CHECK requests a checkpoint of the mailbox.
-        // Implementation-dependent; we treat it as a successful no-op.
+        self.emit_selected_mailbox_exists_update().await?;
         self.writer.tagged_ok(tag, None, "CHECK completed").await
     }
 
@@ -1032,12 +1029,6 @@ where
         self.writer
             .tagged_ok(tag, Some("READ-ONLY"), "EXAMINE completed")
             .await
-||||||| 56b9eac
-=======
-
-        self.emit_selected_mailbox_exists_update().await?;
-        self.writer.tagged_ok(tag, None, "CHECK completed").await
->>>>>>> refs/remotes/origin/main
     }
 
     async fn cmd_fetch(
@@ -1101,10 +1092,8 @@ where
             .unwrap_or_else(|| "unknown".to_string());
         let header_only_body_fetch = needs_body_sections && !needs_full_rfc822;
         let target_fetch_count = target_messages.len() as u32;
-        let include_uid_in_response = uid_mode
-            && !expanded
-                .iter()
-                .any(|item| matches!(item, FetchItem::Uid));
+        let include_uid_in_response =
+            uid_mode && !expanded.iter().any(|item| matches!(item, FetchItem::Uid));
         let mut cache_hits = 0u32;
         let mut cache_misses = 0u32;
 
@@ -2727,7 +2716,6 @@ mod tests {
     }
 
     #[tokio::test]
-<<<<<<< HEAD
     async fn test_select_after_examine_resets_read_only_mode() {
         let config = test_config();
         let (mut session, mut client_read, _client_write) =
@@ -2791,7 +2779,10 @@ mod tests {
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("a002 OK CLOSE completed"), "response={response}");
+        assert!(
+            response.contains("a002 OK CLOSE completed"),
+            "response={response}"
+        );
         assert_eq!(session.state, State::Authenticated);
         assert!(session.selected_mailbox.is_none());
         assert!(!session.selected_read_only);
@@ -2854,7 +2845,10 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("BODY[]"), "response={response}");
-        assert!(response.contains("a002 OK FETCH completed"), "response={response}");
+        assert!(
+            response.contains("a002 OK FETCH completed"),
+            "response={response}"
+        );
 
         let flags = config
             .store
@@ -2870,55 +2864,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_search_text_and_header_use_cached_rfc822() {
-        let config = test_config();
-        let (mut session, mut client_read, _client_write) =
-            create_session_pair(config.clone()).await;
-
-        session.state = State::Selected;
-        session.selected_mailbox = Some("INBOX".to_string());
-        session.authenticated_account_id = Some("test-uid".to_string());
-
-        let uid = config
-            .store
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
-            .await
-            .unwrap();
-        config
-            .store
-            .store_rfc822(
-                "test-uid::INBOX",
-                uid,
-                b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nsearch-hit-body"
-                    .to_vec(),
-            )
-            .await
-            .unwrap();
-
-        session
-            .handle_line("a001 SEARCH TEXT \"search-hit-body\"")
-            .await
-            .unwrap();
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
-            .await
-            .unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("* SEARCH 1"), "response={response}");
-        assert!(response.contains("a001 OK SEARCH completed"), "response={response}");
-
-        session
-            .handle_line("a002 SEARCH HEADER Subject \"Subject msg-1\"")
-            .await
-            .unwrap();
-        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
-            .await
-            .unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("* SEARCH 1"), "response={response}");
-        assert!(response.contains("a002 OK SEARCH completed"), "response={response}");
-||||||| 56b9eac
-=======
     async fn test_uid_fetch_flags_always_includes_uid() {
         let config = test_config();
         let (mut session, mut client_read, _client_write) =
@@ -2977,7 +2922,62 @@ mod tests {
         assert!(response.contains(&format!("* 1 FETCH (UID {uid} FLAGS (")));
         assert!(response.contains("\\Seen"));
         assert!(response.contains("a001 OK STORE completed"));
->>>>>>> refs/remotes/origin/main
+    }
+
+    #[tokio::test]
+    async fn test_search_text_and_header_use_cached_rfc822() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_rfc822(
+                "test-uid::INBOX",
+                uid,
+                b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nsearch-hit-body"
+                    .to_vec(),
+            )
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 SEARCH TEXT \"search-hit-body\"")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(
+            response.contains("a001 OK SEARCH completed"),
+            "response={response}"
+        );
+
+        session
+            .handle_line("a002 SEARCH HEADER Subject \"Subject msg-1\"")
+            .await
+            .unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(
+            response.contains("a002 OK SEARCH completed"),
+            "response={response}"
+        );
     }
 
     #[tokio::test]
@@ -3054,7 +3054,8 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("2 EXISTS"));
-        assert!(response.contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"));
+        assert!(response
+            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"));
         assert!(response.contains("OK [UNSEEN 2]"));
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
     }

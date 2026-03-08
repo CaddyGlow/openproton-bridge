@@ -849,6 +849,37 @@ fn derived_flag_strings(meta: &MessageMetadata) -> Vec<String> {
         .collect()
 }
 
+fn is_metadata_derived_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "\\Seen" | "\\Flagged" | "\\Draft" | "\\Answered" | "$Forwarded"
+    )
+}
+
+fn merge_metadata_flags(
+    existing_flags: Option<&Vec<String>>,
+    meta: &MessageMetadata,
+) -> Vec<String> {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(existing_flags) = existing_flags {
+        for flag in existing_flags {
+            if !is_metadata_derived_flag(flag) && seen.insert(flag.clone()) {
+                merged.push(flag.clone());
+            }
+        }
+    }
+
+    for flag in derived_flag_strings(meta) {
+        if seen.insert(flag.clone()) {
+            merged.push(flag);
+        }
+    }
+
+    merged
+}
+
 #[async_trait]
 impl MessageStore for InMemoryStore {
     async fn store_metadata(
@@ -861,11 +892,11 @@ impl MessageStore for InMemoryStore {
         let mb = mailboxes
             .entry(mailbox.to_string())
             .or_insert_with(MailboxData::new);
-        let derived_flags = derived_flag_strings(&meta);
 
         if let Some(&uid) = mb.proton_to_uid.get(proton_id) {
+            let merged_flags = merge_metadata_flags(mb.flags.get(&uid), &meta);
             mb.metadata.insert(uid, meta);
-            mb.flags.insert(uid, derived_flags);
+            mb.flags.insert(uid, merged_flags);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
             return Ok(uid);
         }
@@ -876,7 +907,10 @@ impl MessageStore for InMemoryStore {
         mb.uid_to_proton.insert(uid, proton_id.to_string());
         mb.uid_order.push(uid);
         mb.metadata.insert(uid, meta);
-        mb.flags.insert(uid, derived_flags);
+        mb.flags.insert(
+            uid,
+            merge_metadata_flags(None, mb.metadata.get(&uid).unwrap()),
+        );
         mb.mod_seq = mb.mod_seq.saturating_add(1);
         Ok(uid)
     }
@@ -1158,7 +1192,6 @@ impl MessageStore for GluonStore {
         let mut next_state = self.load_account_from_disk(&storage_user_id)?;
         let mut accounts = self.accounts.write().await;
         let mailbox_was_missing = !next_state.mailboxes.contains_key(&mailbox_name);
-        let derived_flags = derived_flag_strings(&meta);
 
         let mailbox = next_state
             .mailboxes
@@ -1184,8 +1217,9 @@ impl MessageStore for GluonStore {
         }
 
         let uid = if let Some(existing_uid) = mailbox.proton_to_uid.get(proton_id).copied() {
+            let merged_flags = merge_metadata_flags(mailbox.flags.get(&existing_uid), &meta);
             mailbox.metadata.insert(existing_uid, meta);
-            mailbox.flags.insert(existing_uid, derived_flags);
+            mailbox.flags.insert(existing_uid, merged_flags);
             mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
             existing_uid
         } else {
@@ -1199,7 +1233,10 @@ impl MessageStore for GluonStore {
                 .insert(assigned_uid, proton_id.to_string());
             mailbox.uid_order.push(assigned_uid);
             mailbox.metadata.insert(assigned_uid, meta);
-            mailbox.flags.insert(assigned_uid, derived_flags);
+            mailbox.flags.insert(
+                assigned_uid,
+                merge_metadata_flags(None, mailbox.metadata.get(&assigned_uid).unwrap()),
+            );
             mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
             assigned_uid
         };
@@ -1587,6 +1624,29 @@ mod tests {
             .unwrap();
         assert_eq!(uid1, uid2);
         let flags = store.get_flags("INBOX", uid1).await.unwrap();
+        assert!(flags.contains(&"\\Seen".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_metadata_refresh_preserves_local_only_flags() {
+        let store = InMemoryStore::new();
+        let uid = store
+            .store_metadata("INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        store
+            .add_flags("INBOX", uid, &["\\Deleted".to_string()])
+            .await
+            .unwrap();
+
+        store
+            .store_metadata("INBOX", "msg-1", make_meta("msg-1", 0))
+            .await
+            .unwrap();
+
+        let flags = store.get_flags("INBOX", uid).await.unwrap();
+        assert!(flags.contains(&"\\Deleted".to_string()));
         assert!(flags.contains(&"\\Seen".to_string()));
     }
 

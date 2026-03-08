@@ -86,9 +86,6 @@ pub enum Command {
         mailbox: String,
         uid: bool,
     },
-    Check {
-        tag: String,
-    },
     Examine {
         tag: String,
         mailbox: String,
@@ -286,7 +283,6 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "SEARCH" => parse_search(&tag, args, false),
         "EXPUNGE" => Ok(Command::Expunge { tag }),
         "COPY" => parse_copy(&tag, args, false),
-        "CHECK" => Ok(Command::Check { tag }),
         "EXAMINE" => parse_examine(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
@@ -1286,17 +1282,6 @@ mod tests {
             }
             _ => panic!("expected Fetch"),
         }
-    }
-
-    #[test]
-    fn test_parse_check() {
-        let cmd = parse_command("a005 CHECK").unwrap();
-        assert_eq!(
-            cmd,
-            Command::Check {
-                tag: "a005".to_string()
-            }
-        );
     }
 
     #[test]

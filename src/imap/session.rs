@@ -62,6 +62,7 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     addr_keyrings: Option<HashMap<String, Keyring>>,
     selected_mailbox: Option<String>,
     selected_mailbox_mod_seq: Option<u64>,
+    selected_read_only: bool,
     authenticated_account_id: Option<String>,
     starttls_available: bool,
     connection_id: u64,
@@ -92,6 +93,7 @@ where
             addr_keyrings: None,
             selected_mailbox: None,
             selected_mailbox_mod_seq: None,
+            selected_read_only: false,
             authenticated_account_id: None,
             starttls_available,
             connection_id: NEXT_IMAP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
@@ -223,6 +225,15 @@ where
                 ref mailbox,
                 uid,
             } => self.cmd_copy(tag, sequence, mailbox, uid).await?,
+            Command::Check { ref tag } => self.cmd_check(tag).await?,
+            Command::Examine {
+                ref tag,
+                ref mailbox,
+            } => self.cmd_examine(tag, mailbox).await?,
+            Command::UidExpunge {
+                ref tag,
+                ref sequence,
+            } => self.cmd_uid_expunge(tag, sequence).await?,
         }
 
         Ok(SessionAction::Continue)
@@ -901,8 +912,109 @@ where
 
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
+        self.selected_read_only = false;
         self.state = State::Authenticated;
         self.writer.tagged_ok(tag, None, "CLOSE completed").await
+    }
+
+    async fn cmd_check(&mut self, tag: &str) -> Result<()> {
+        if self.state != State::Selected {
+            return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+        // Per RFC 3501, CHECK requests a checkpoint of the mailbox.
+        // Implementation-dependent; we treat it as a successful no-op.
+        self.writer.tagged_ok(tag, None, "CHECK completed").await
+    }
+
+    async fn cmd_examine(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        let mb = match mailbox::find_mailbox(mailbox_name) {
+            Some(m) => m,
+            None => {
+                return self
+                    .writer
+                    .tagged_no(tag, &format!("mailbox not found: {}", mailbox_name))
+                    .await;
+            }
+        };
+
+        if !mb.selectable {
+            return self
+                .writer
+                .tagged_no(tag, &format!("mailbox not selectable: {}", mailbox_name))
+                .await;
+        }
+
+        let store = self.config.store.clone();
+        let scoped_mailbox = self.scoped_mailbox_name(mb.name);
+        let cached_uids = store.list_uids(&scoped_mailbox).await?;
+
+        if cached_uids.is_empty() {
+            let client = self.client.as_ref().unwrap();
+
+            let filter = MessageFilter {
+                label_id: Some(mb.label_id.to_string()),
+                desc: 1,
+                ..Default::default()
+            };
+
+            let meta_resp = match messages::get_message_metadata(client, &filter, 0, 150).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(error = %e, "failed to fetch message metadata");
+                    return self.writer.tagged_no(tag, "failed to fetch messages").await;
+                }
+            };
+
+            for meta in &meta_resp.messages {
+                let uid = store
+                    .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
+                    .await?;
+                let flags = mailbox::message_flags(meta);
+                let flag_strings: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
+                store.set_flags(&scoped_mailbox, uid, flag_strings).await?;
+            }
+        }
+
+        let status = store.mailbox_status(&scoped_mailbox).await?;
+        let snapshot = store.mailbox_snapshot(&scoped_mailbox).await?;
+
+        self.writer
+            .untagged(&format!("{} EXISTS", status.exists))
+            .await?;
+        self.writer.untagged("0 RECENT").await?;
+        self.writer
+            .untagged("FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
+            .await?;
+        self.writer
+            .untagged(&format!("OK [UIDVALIDITY {}]", status.uid_validity))
+            .await?;
+        self.writer
+            .untagged(&format!("OK [UIDNEXT {}]", status.next_uid))
+            .await?;
+        if status.unseen > 0 {
+            self.writer.untagged("OK [UNSEEN 1]").await?;
+        }
+
+        self.selected_mailbox = Some(mb.name.to_string());
+        self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        self.selected_read_only = true;
+        self.state = State::Selected;
+
+        info!(
+            service = "imap",
+            msg = "mailbox examined (read-only)",
+            mailbox = %mb.name,
+            messages = status.exists,
+            "mailbox examined (read-only)"
+        );
+
+        self.writer
+            .tagged_ok(tag, Some("READ-ONLY"), "EXAMINE completed")
+            .await
     }
 
     async fn cmd_fetch(
@@ -1045,11 +1157,15 @@ where
                         }
                     }
                     FetchItem::BodyStructure | FetchItem::Body => {
-                        // Minimal BODYSTRUCTURE for compatibility
-                        parts.push(
-                            "BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" 0 0)"
-                                .to_string(),
-                        );
+                        // Build BODYSTRUCTURE from RFC822 data if available
+                        let structure = if let Some(ref data) = rfc822_data {
+                            rfc822::build_bodystructure(data)
+                        } else if let Some(ref m) = meta {
+                            rfc822::simple_text_structure(m.size as usize)
+                        } else {
+                            rfc822::simple_text_structure(0)
+                        };
+                        parts.push(format!("BODYSTRUCTURE {}", structure));
                     }
                     FetchItem::BodySection { section, peek } => {
                         let section_tag = match section {
@@ -1307,6 +1423,10 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
+        if self.selected_read_only {
+            return self.writer.tagged_no(tag, "mailbox is read-only").await;
+        }
+
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
@@ -1438,9 +1558,12 @@ where
             let meta = store.get_metadata(&scoped_mailbox, uid).await?;
             let flags = store.get_flags(&scoped_mailbox, uid).await?;
 
+            // For content-based search (BODY/TEXT/HEADER), we would need to fetch RFC822 data
+            // This is expensive so we pass None for now - those searches will return no matches
+            let rfc822_data: Option<&[u8]> = None;
             let matches = criteria
                 .iter()
-                .all(|c| evaluate_search_key(c, uid, &meta, &flags, max_uid));
+                .all(|c| evaluate_search_key(c, uid, &meta, &flags, max_uid, rfc822_data));
 
             if matches {
                 if uid_mode {
@@ -1465,6 +1588,10 @@ where
     async fn cmd_expunge(&mut self, tag: &str) -> Result<()> {
         if self.state != State::Selected {
             return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+
+        if self.selected_read_only {
+            return self.writer.tagged_no(tag, "mailbox is read-only").await;
         }
 
         self.do_expunge(false).await?;
@@ -1513,6 +1640,71 @@ where
         }
 
         Ok(())
+    }
+
+    async fn cmd_uid_expunge(&mut self, tag: &str, sequence: &SequenceSet) -> Result<()> {
+        if self.state != State::Selected {
+            return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+
+        if self.selected_read_only {
+            return self.writer.tagged_no(tag, "mailbox is read-only").await;
+        }
+
+        let mailbox = match &self.selected_mailbox {
+            Some(m) => m.clone(),
+            None => return self.writer.tagged_no(tag, "no mailbox selected").await,
+        };
+        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
+        let store = &self.config.store;
+        let all_uids = store.list_uids(&scoped_mailbox).await?;
+
+        if all_uids.is_empty() {
+            return self
+                .writer
+                .tagged_ok(tag, None, "UID EXPUNGE completed")
+                .await;
+        }
+
+        let max_uid = *all_uids.last().unwrap();
+        let mut expunged_seqs = Vec::new();
+        let mut offset = 0u32;
+
+        for (i, &uid) in all_uids.iter().enumerate() {
+            // Only expunge if UID is in the sequence set AND has \Deleted flag
+            if !sequence.contains(uid, max_uid) {
+                continue;
+            }
+
+            let flags = store.get_flags(&scoped_mailbox, uid).await?;
+            if flags.iter().any(|f| f == "\\Deleted") {
+                let seq = i as u32 + 1 - offset;
+
+                // Move to trash via API
+                if let Some(ref client) = self.client {
+                    if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
+                        let _ = messages::label_messages(
+                            client,
+                            &[proton_id.as_str()],
+                            types::TRASH_LABEL,
+                        )
+                        .await;
+                    }
+                }
+
+                store.remove_message(&scoped_mailbox, uid).await?;
+                expunged_seqs.push(seq);
+                offset += 1;
+            }
+        }
+
+        for seq in &expunged_seqs {
+            self.writer.untagged(&format!("{} EXPUNGE", seq)).await?;
+        }
+
+        self.writer
+            .tagged_ok(tag, None, "UID EXPUNGE completed")
+            .await
     }
 
     async fn cmd_copy(
@@ -1625,6 +1817,7 @@ fn evaluate_search_key(
     meta: &Option<types::MessageMetadata>,
     flags: &[String],
     max_uid: u32,
+    rfc822_data: Option<&[u8]>,
 ) -> bool {
     match key {
         SearchKey::All => true,
@@ -1634,6 +1827,13 @@ fn evaluate_search_key(
         SearchKey::Deleted => flags.iter().any(|f| f == "\\Deleted"),
         SearchKey::Answered => flags.iter().any(|f| f == "\\Answered"),
         SearchKey::Draft => flags.iter().any(|f| f == "\\Draft"),
+        SearchKey::Recent => flags.iter().any(|f| f == "\\Recent"),
+        SearchKey::New => {
+            flags.iter().any(|f| f == "\\Recent") && !flags.iter().any(|f| f == "\\Seen")
+        }
+        SearchKey::Old => !flags.iter().any(|f| f == "\\Recent"),
+        SearchKey::Keyword(kw) => flags.iter().any(|f| f.eq_ignore_ascii_case(kw)),
+        SearchKey::Unkeyword(kw) => !flags.iter().any(|f| f.eq_ignore_ascii_case(kw)),
         SearchKey::Subject(s) => meta
             .as_ref()
             .map(|m| m.subject.to_lowercase().contains(&s.to_lowercase()))
@@ -1654,11 +1854,90 @@ fn evaluate_search_key(
                 })
             })
             .unwrap_or(false),
+        SearchKey::Cc(s) => meta
+            .as_ref()
+            .map(|m| {
+                m.cc_list.iter().any(|a| {
+                    a.address.to_lowercase().contains(&s.to_lowercase())
+                        || a.name.to_lowercase().contains(&s.to_lowercase())
+                })
+            })
+            .unwrap_or(false),
+        SearchKey::Bcc(s) => meta
+            .as_ref()
+            .map(|m| {
+                m.bcc_list.iter().any(|a| {
+                    a.address.to_lowercase().contains(&s.to_lowercase())
+                        || a.name.to_lowercase().contains(&s.to_lowercase())
+                })
+            })
+            .unwrap_or(false),
+        SearchKey::Header(field, value) => {
+            if let Some(data) = rfc822_data {
+                let header_section = extract_header_section(data);
+                let field_lower = field.to_lowercase();
+                let value_lower = value.to_lowercase();
+                header_section.lines().any(|line| {
+                    if let Some(colon_pos) = line.find(':') {
+                        let line_field = line[..colon_pos].trim().to_lowercase();
+                        if line_field == field_lower {
+                            let line_value = line[colon_pos + 1..].trim().to_lowercase();
+                            return line_value.contains(&value_lower);
+                        }
+                    }
+                    false
+                })
+            } else {
+                false
+            }
+        }
+        SearchKey::Body(s) => {
+            if let Some(data) = rfc822_data {
+                let body = extract_text_section(data);
+                String::from_utf8_lossy(&body)
+                    .to_lowercase()
+                    .contains(&s.to_lowercase())
+            } else {
+                false
+            }
+        }
+        SearchKey::Text(s) => {
+            if let Some(data) = rfc822_data {
+                String::from_utf8_lossy(data)
+                    .to_lowercase()
+                    .contains(&s.to_lowercase())
+            } else {
+                meta.as_ref()
+                    .map(|m| m.subject.to_lowercase().contains(&s.to_lowercase()))
+                    .unwrap_or(false)
+            }
+        }
+        SearchKey::Before(ts) => meta.as_ref().map(|m| m.time < *ts).unwrap_or(false),
+        SearchKey::Since(ts) => meta.as_ref().map(|m| m.time >= *ts).unwrap_or(false),
+        SearchKey::On(ts) => {
+            // Match if message time is on the same day (within 24 hours starting at ts)
+            meta.as_ref()
+                .map(|m| m.time >= *ts && m.time < *ts + 86400)
+                .unwrap_or(false)
+        }
+        SearchKey::SentBefore(ts) => {
+            // Use message time as approximation for sent date
+            meta.as_ref().map(|m| m.time < *ts).unwrap_or(false)
+        }
+        SearchKey::SentSince(ts) => meta.as_ref().map(|m| m.time >= *ts).unwrap_or(false),
+        SearchKey::SentOn(ts) => meta
+            .as_ref()
+            .map(|m| m.time >= *ts && m.time < *ts + 86400)
+            .unwrap_or(false),
+        SearchKey::Larger(size) => meta.as_ref().map(|m| m.size > *size).unwrap_or(false),
+        SearchKey::Smaller(size) => meta.as_ref().map(|m| m.size < *size).unwrap_or(false),
         SearchKey::Uid(seq) => seq.contains(uid, max_uid),
-        SearchKey::Not(inner) => !evaluate_search_key(inner, uid, meta, flags, max_uid),
+        SearchKey::Not(inner) => {
+            !evaluate_search_key(inner, uid, meta, flags, max_uid, rfc822_data)
+        }
         SearchKey::Or(a, b) => {
-            evaluate_search_key(a, uid, meta, flags, max_uid)
-                || evaluate_search_key(b, uid, meta, flags, max_uid)
+            evaluate_search_key(a, uid, meta, flags, max_uid, rfc822_data)
+                || evaluate_search_key(b, uid, meta, flags, max_uid, rfc822_data)
         }
     }
 }
@@ -2421,20 +2700,35 @@ mod tests {
     fn test_evaluate_search_all() {
         let meta = Some(make_meta("msg-1", 1));
         let flags = vec![];
-        assert!(evaluate_search_key(&SearchKey::All, 1, &meta, &flags, 1));
+        assert!(evaluate_search_key(
+            &SearchKey::All,
+            1,
+            &meta,
+            &flags,
+            1,
+            None
+        ));
     }
 
     #[test]
     fn test_evaluate_search_seen() {
         let meta = Some(make_meta("msg-1", 0));
         let flags = vec!["\\Seen".to_string()];
-        assert!(evaluate_search_key(&SearchKey::Seen, 1, &meta, &flags, 1));
+        assert!(evaluate_search_key(
+            &SearchKey::Seen,
+            1,
+            &meta,
+            &flags,
+            1,
+            None
+        ));
         assert!(!evaluate_search_key(
             &SearchKey::Unseen,
             1,
             &meta,
             &flags,
-            1
+            1,
+            None
         ));
     }
 
@@ -2447,14 +2741,16 @@ mod tests {
             1,
             &meta,
             &flags,
-            1
+            1,
+            None
         ));
         assert!(!evaluate_search_key(
             &SearchKey::Subject("NotFound".to_string()),
             1,
             &meta,
             &flags,
-            1
+            1,
+            None
         ));
     }
 
@@ -2467,7 +2763,8 @@ mod tests {
             1,
             &meta,
             &flags,
-            1
+            1,
+            None
         ));
     }
 
@@ -2480,7 +2777,8 @@ mod tests {
             1,
             &meta,
             &flags,
-            1
+            1,
+            None
         ));
     }
 }

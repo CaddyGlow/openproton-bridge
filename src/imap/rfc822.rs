@@ -150,6 +150,219 @@ fn filter_headers(header: &str) -> String {
     result
 }
 
+/// Build an IMAP BODYSTRUCTURE response from RFC822 data.
+///
+/// Format per RFC 3501 section 7.4.2:
+/// Non-multipart: (type subtype (params) id desc encoding size [lines] [md5] [disposition] [language] [location])
+/// Multipart: ((part1)(part2)... "subtype" (params) [disposition] [language] [location])
+pub fn build_bodystructure(data: &[u8]) -> String {
+    let text = String::from_utf8_lossy(data);
+    let (header_section, body_section) = split_header_body(&text);
+
+    // Parse Content-Type header
+    let content_type = extract_content_type(&header_section);
+
+    match &content_type {
+        ContentType::Multipart { subtype, boundary } => {
+            // Parse multipart parts
+            let parts = parse_multipart_parts(&body_section, boundary);
+            let part_structures: Vec<String> =
+                parts.iter().map(|p| build_part_structure(p)).collect();
+
+            if part_structures.is_empty() {
+                // Fallback to simple text if no parts found
+                simple_text_structure(data.len())
+            } else {
+                format!(
+                    "({} \"{}\" (\"BOUNDARY\" \"{}\") NIL NIL)",
+                    part_structures.join(""),
+                    subtype.to_uppercase(),
+                    boundary
+                )
+            }
+        }
+        ContentType::Simple {
+            type_main,
+            subtype,
+            charset,
+        } => {
+            let encoding = extract_content_transfer_encoding(&header_section);
+            let size = data.len();
+            let lines = text.lines().count();
+
+            format!(
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {} NIL NIL NIL)",
+                type_main.to_uppercase(),
+                subtype.to_uppercase(),
+                charset,
+                encoding.to_uppercase(),
+                size,
+                lines
+            )
+        }
+    }
+}
+
+/// Build a simple text/plain BODYSTRUCTURE (fallback)
+pub fn simple_text_structure(size: usize) -> String {
+    format!(
+        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {} 0 NIL NIL NIL)",
+        size
+    )
+}
+
+#[derive(Debug)]
+enum ContentType {
+    Simple {
+        type_main: String,
+        subtype: String,
+        charset: String,
+    },
+    Multipart {
+        subtype: String,
+        boundary: String,
+    },
+}
+
+fn extract_content_type(header: &str) -> ContentType {
+    let ct_line = header
+        .lines()
+        .find(|line| line.to_lowercase().starts_with("content-type:"))
+        .unwrap_or("Content-Type: text/plain; charset=UTF-8");
+
+    let value = ct_line
+        .split_once(':')
+        .map(|(_, v)| v.trim())
+        .unwrap_or("text/plain");
+
+    // Handle multipart
+    if value.to_lowercase().starts_with("multipart/") {
+        let subtype = value
+            .split('/')
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap_or("mixed")
+            .trim()
+            .to_string();
+
+        let boundary = extract_param(value, "boundary").unwrap_or_default();
+
+        return ContentType::Multipart { subtype, boundary };
+    }
+
+    // Parse type/subtype
+    let (type_main, subtype) = value
+        .split(';')
+        .next()
+        .and_then(|s| s.split_once('/'))
+        .map(|(t, s)| (t.trim().to_string(), s.trim().to_string()))
+        .unwrap_or_else(|| ("text".to_string(), "plain".to_string()));
+
+    let charset = extract_param(value, "charset").unwrap_or_else(|| "UTF-8".to_string());
+
+    ContentType::Simple {
+        type_main,
+        subtype,
+        charset,
+    }
+}
+
+fn extract_param(value: &str, param_name: &str) -> Option<String> {
+    let search = format!("{}=", param_name.to_lowercase());
+    for part in value.split(';') {
+        let part = part.trim();
+        if part.to_lowercase().starts_with(&search) {
+            let val = &part[search.len()..];
+            // Remove surrounding quotes
+            let val = val.trim_matches('"').trim_matches('\'');
+            return Some(val.to_string());
+        }
+    }
+    None
+}
+
+fn extract_content_transfer_encoding(header: &str) -> String {
+    header
+        .lines()
+        .find(|line| {
+            line.to_lowercase()
+                .starts_with("content-transfer-encoding:")
+        })
+        .and_then(|line| line.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
+        .unwrap_or_else(|| "8BIT".to_string())
+}
+
+fn split_header_body(text: &str) -> (String, String) {
+    if let Some(pos) = text.find("\r\n\r\n") {
+        (text[..pos].to_string(), text[pos + 4..].to_string())
+    } else if let Some(pos) = text.find("\n\n") {
+        (text[..pos].to_string(), text[pos + 2..].to_string())
+    } else {
+        (text.to_string(), String::new())
+    }
+}
+
+fn parse_multipart_parts(body: &str, boundary: &str) -> Vec<String> {
+    let delimiter = format!("--{}", boundary);
+    let end_delimiter = format!("--{}--", boundary);
+
+    let mut parts = Vec::new();
+
+    for section in body.split(&delimiter) {
+        let section = section.trim();
+        if section.is_empty() || section.starts_with("--") {
+            continue;
+        }
+        if section.starts_with(&end_delimiter) {
+            break;
+        }
+        parts.push(section.to_string());
+    }
+
+    parts
+}
+
+fn build_part_structure(part: &str) -> String {
+    let (header, body) = split_header_body(part);
+    let content_type = extract_content_type(&header);
+
+    match content_type {
+        ContentType::Simple {
+            type_main,
+            subtype,
+            charset,
+        } => {
+            let encoding = extract_content_transfer_encoding(&header);
+            let size = part.len();
+            let lines = body.lines().count();
+
+            format!(
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {} NIL NIL NIL)",
+                type_main.to_uppercase(),
+                subtype.to_uppercase(),
+                charset,
+                encoding.to_uppercase(),
+                size,
+                lines
+            )
+        }
+        ContentType::Multipart { subtype, boundary } => {
+            // Nested multipart
+            let parts = parse_multipart_parts(&body, &boundary);
+            let part_structures: Vec<String> =
+                parts.iter().map(|p| build_part_structure(p)).collect();
+
+            format!(
+                "({} \"{}\" (\"BOUNDARY\" \"{}\") NIL NIL)",
+                part_structures.join(""),
+                subtype.to_uppercase(),
+                boundary
+            )
+        }
+    }
+}
+
 /// Build an IMAP ENVELOPE response string from metadata and parsed headers.
 ///
 /// Format per RFC 3501 section 7.4.2:
@@ -453,5 +666,69 @@ mod tests {
     #[test]
     fn test_format_address_list_empty() {
         assert_eq!(format_address_list(&[]), "NIL");
+    }
+
+    #[test]
+    fn test_build_bodystructure_simple_text() {
+        let msg = b"Content-Type: text/plain; charset=UTF-8\r\n\r\nHello World";
+        let structure = build_bodystructure(msg);
+        assert!(structure.contains("\"TEXT\""));
+        assert!(structure.contains("\"PLAIN\""));
+        assert!(structure.contains("\"UTF-8\""));
+    }
+
+    #[test]
+    fn test_build_bodystructure_html() {
+        let msg = b"Content-Type: text/html; charset=UTF-8\r\n\r\n<html><body>Hello</body></html>";
+        let structure = build_bodystructure(msg);
+        assert!(structure.contains("\"TEXT\""));
+        assert!(structure.contains("\"HTML\""));
+    }
+
+    #[test]
+    fn test_build_bodystructure_multipart() {
+        let msg = b"Content-Type: multipart/mixed; boundary=\"abc123\"\r\n\r\n--abc123\r\nContent-Type: text/plain\r\n\r\nHello\r\n--abc123\r\nContent-Type: application/pdf; name=\"doc.pdf\"\r\n\r\nPDFDATA\r\n--abc123--";
+        let structure = build_bodystructure(msg);
+        assert!(structure.contains("\"MIXED\""));
+        assert!(structure.contains("\"abc123\""));
+    }
+
+    #[test]
+    fn test_simple_text_structure() {
+        let structure = simple_text_structure(1024);
+        assert!(structure.contains("\"TEXT\""));
+        assert!(structure.contains("\"PLAIN\""));
+        assert!(structure.contains("1024"));
+    }
+
+    #[test]
+    fn test_extract_content_type_simple() {
+        let header = "Content-Type: text/html; charset=iso-8859-1";
+        let ct = extract_content_type(header);
+        match ct {
+            ContentType::Simple {
+                type_main,
+                subtype,
+                charset,
+            } => {
+                assert_eq!(type_main, "text");
+                assert_eq!(subtype, "html");
+                assert_eq!(charset, "iso-8859-1");
+            }
+            _ => panic!("expected Simple"),
+        }
+    }
+
+    #[test]
+    fn test_extract_content_type_multipart() {
+        let header = "Content-Type: multipart/alternative; boundary=\"boundary123\"";
+        let ct = extract_content_type(header);
+        match ct {
+            ContentType::Multipart { subtype, boundary } => {
+                assert_eq!(subtype, "alternative");
+                assert_eq!(boundary, "boundary123");
+            }
+            _ => panic!("expected Multipart"),
+        }
     }
 }

@@ -83,6 +83,17 @@ pub enum Command {
         mailbox: String,
         uid: bool,
     },
+    Check {
+        tag: String,
+    },
+    Examine {
+        tag: String,
+        mailbox: String,
+    },
+    UidExpunge {
+        tag: String,
+        sequence: SequenceSet,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +190,29 @@ pub enum SearchKey {
     Uid(SequenceSet),
     Not(Box<SearchKey>),
     Or(Box<SearchKey>, Box<SearchKey>),
+    // Date criteria (unix timestamps)
+    Before(i64),
+    Since(i64),
+    On(i64),
+    SentBefore(i64),
+    SentSince(i64),
+    SentOn(i64),
+    // Size criteria
+    Larger(i64),
+    Smaller(i64),
+    // Header criteria
+    Cc(String),
+    Bcc(String),
+    Header(String, String),
+    // Content criteria
+    Body(String),
+    Text(String),
+    // Flag criteria
+    Keyword(String),
+    Unkeyword(String),
+    New,
+    Old,
+    Recent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -248,6 +282,8 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "SEARCH" => parse_search(&tag, args, false),
         "EXPUNGE" => Ok(Command::Expunge { tag }),
         "COPY" => parse_copy(&tag, args, false),
+        "CHECK" => Ok(Command::Check { tag }),
+        "EXAMINE" => parse_examine(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
             cmd_word
@@ -264,11 +300,21 @@ fn parse_uid_command(tag: &str, args: &str) -> Result<Command> {
         "STORE" => parse_store(tag, rest, true),
         "SEARCH" => parse_search(tag, rest, true),
         "COPY" => parse_copy(tag, rest, true),
+        "EXPUNGE" => parse_uid_expunge(tag, rest),
         _ => Err(ImapError::Protocol(format!(
             "unknown UID subcommand: {}",
             cmd_word
         ))),
     }
+}
+
+fn parse_uid_expunge(tag: &str, args: &str) -> Result<Command> {
+    let (seq_str, _) = split_first_word(args)?;
+    let sequence = parse_sequence_set(&seq_str)?;
+    Ok(Command::UidExpunge {
+        tag: tag.to_string(),
+        sequence,
+    })
 }
 
 fn split_first_word(s: &str) -> Result<(String, &str)> {
@@ -385,6 +431,14 @@ fn parse_unsubscribe(tag: &str, args: &str) -> Result<Command> {
 fn parse_select(tag: &str, args: &str) -> Result<Command> {
     let (mailbox, _) = parse_astring(args.trim_start())?;
     Ok(Command::Select {
+        tag: tag.to_string(),
+        mailbox,
+    })
+}
+
+fn parse_examine(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, _) = parse_astring(args.trim_start())?;
+    Ok(Command::Examine {
         tag: tag.to_string(),
         mailbox,
     })
@@ -633,6 +687,45 @@ fn parse_search(tag: &str, args: &str, uid: bool) -> Result<Command> {
     })
 }
 
+/// Parse IMAP date format "DD-Mon-YYYY" to unix timestamp (start of day UTC).
+fn parse_imap_date(s: &str) -> Result<i64> {
+    let months = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return Err(ImapError::Protocol(format!("invalid date: {}", s)));
+    }
+    let day: u32 = parts[0]
+        .parse()
+        .map_err(|_| ImapError::Protocol(format!("invalid day: {}", parts[0])))?;
+    let month_str = parts[1].to_uppercase();
+    let month = months
+        .iter()
+        .position(|&m| m == month_str)
+        .ok_or_else(|| ImapError::Protocol(format!("invalid month: {}", parts[1])))?
+        as u32
+        + 1;
+    let year: i32 = parts[2]
+        .parse()
+        .map_err(|_| ImapError::Protocol(format!("invalid year: {}", parts[2])))?;
+    // Simple calculation: days since epoch (1970-01-01)
+    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = |y: i32| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mut total_days: i64 = 0;
+    for y in 1970..year {
+        total_days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        total_days += days_in_month[(m - 1) as usize] as i64;
+        if m == 2 && is_leap(year) {
+            total_days += 1;
+        }
+    }
+    total_days += (day - 1) as i64;
+    Ok(total_days * 86400)
+}
+
 fn parse_search_criteria(s: &str) -> Result<Vec<SearchKey>> {
     let mut criteria = Vec::new();
     let mut remaining = s;
@@ -660,6 +753,15 @@ fn parse_search_criteria(s: &str) -> Result<Vec<SearchKey>> {
         } else if upper.starts_with("DRAFT") {
             criteria.push(SearchKey::Draft);
             remaining = remaining[5..].trim_start();
+        } else if upper.starts_with("NEW") {
+            criteria.push(SearchKey::New);
+            remaining = remaining[3..].trim_start();
+        } else if upper.starts_with("OLD") {
+            criteria.push(SearchKey::Old);
+            remaining = remaining[3..].trim_start();
+        } else if upper.starts_with("RECENT") && !upper.starts_with("RECENT ") {
+            criteria.push(SearchKey::Recent);
+            remaining = remaining[6..].trim_start();
         } else if upper.starts_with("SUBJECT ") {
             remaining = &remaining[8..];
             let (val, rest) = parse_astring(remaining)?;
@@ -675,12 +777,113 @@ fn parse_search_criteria(s: &str) -> Result<Vec<SearchKey>> {
             let (val, rest) = parse_astring(remaining)?;
             criteria.push(SearchKey::To(val));
             remaining = rest.trim_start();
+        } else if upper.starts_with("CC ") {
+            remaining = &remaining[3..];
+            let (val, rest) = parse_astring(remaining)?;
+            criteria.push(SearchKey::Cc(val));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("BCC ") {
+            remaining = &remaining[4..];
+            let (val, rest) = parse_astring(remaining)?;
+            criteria.push(SearchKey::Bcc(val));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("BODY ") {
+            remaining = &remaining[5..];
+            let (val, rest) = parse_astring(remaining)?;
+            criteria.push(SearchKey::Body(val));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("TEXT ") {
+            remaining = &remaining[5..];
+            let (val, rest) = parse_astring(remaining)?;
+            criteria.push(SearchKey::Text(val));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("KEYWORD ") {
+            remaining = &remaining[8..];
+            let (val, rest) = parse_astring(remaining)?;
+            criteria.push(SearchKey::Keyword(val));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("UNKEYWORD ") {
+            remaining = &remaining[10..];
+            let (val, rest) = parse_astring(remaining)?;
+            criteria.push(SearchKey::Unkeyword(val));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("HEADER ") {
+            remaining = &remaining[7..];
+            let (field, rest) = parse_astring(remaining)?;
+            let (value, rest2) = parse_astring(rest.trim_start())?;
+            criteria.push(SearchKey::Header(field, value));
+            remaining = rest2.trim_start();
+        } else if upper.starts_with("BEFORE ") {
+            remaining = &remaining[7..];
+            let (date_str, rest) = parse_astring(remaining)?;
+            let ts = parse_imap_date(&date_str)?;
+            criteria.push(SearchKey::Before(ts));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("SINCE ") {
+            remaining = &remaining[6..];
+            let (date_str, rest) = parse_astring(remaining)?;
+            let ts = parse_imap_date(&date_str)?;
+            criteria.push(SearchKey::Since(ts));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("ON ") {
+            remaining = &remaining[3..];
+            let (date_str, rest) = parse_astring(remaining)?;
+            let ts = parse_imap_date(&date_str)?;
+            criteria.push(SearchKey::On(ts));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("SENTBEFORE ") {
+            remaining = &remaining[11..];
+            let (date_str, rest) = parse_astring(remaining)?;
+            let ts = parse_imap_date(&date_str)?;
+            criteria.push(SearchKey::SentBefore(ts));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("SENTSINCE ") {
+            remaining = &remaining[10..];
+            let (date_str, rest) = parse_astring(remaining)?;
+            let ts = parse_imap_date(&date_str)?;
+            criteria.push(SearchKey::SentSince(ts));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("SENTON ") {
+            remaining = &remaining[7..];
+            let (date_str, rest) = parse_astring(remaining)?;
+            let ts = parse_imap_date(&date_str)?;
+            criteria.push(SearchKey::SentOn(ts));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("LARGER ") {
+            remaining = &remaining[7..];
+            let (size_str, rest) = split_first_word(remaining)?;
+            let size: i64 = size_str
+                .parse()
+                .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
+            criteria.push(SearchKey::Larger(size));
+            remaining = rest.trim_start();
+        } else if upper.starts_with("SMALLER ") {
+            remaining = &remaining[8..];
+            let (size_str, rest) = split_first_word(remaining)?;
+            let size: i64 = size_str
+                .parse()
+                .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
+            criteria.push(SearchKey::Smaller(size));
+            remaining = rest.trim_start();
         } else if upper.starts_with("UID ") {
             remaining = &remaining[4..];
             let (seq_str, rest) = split_first_word(remaining)?;
             let seq = parse_sequence_set(&seq_str)?;
             criteria.push(SearchKey::Uid(seq));
             remaining = rest.trim_start();
+        } else if upper.starts_with("OR ") {
+            remaining = remaining[3..].trim_start();
+            // OR requires exactly two search keys
+            let sub1 = parse_search_criteria(remaining)?;
+            if sub1.len() >= 2 {
+                criteria.push(SearchKey::Or(
+                    Box::new(sub1[0].clone()),
+                    Box::new(sub1[1].clone()),
+                ));
+            } else if sub1.len() == 1 {
+                criteria.push(sub1[0].clone());
+            }
+            break;
         } else if upper.starts_with("NOT ") {
             remaining = remaining[4..].trim_start();
             // Parse the next single criterion
@@ -1063,6 +1266,126 @@ mod tests {
                 assert!(items.contains(&FetchItem::InternalDate));
             }
             _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn test_parse_check() {
+        let cmd = parse_command("a005 CHECK").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Check {
+                tag: "a005".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_examine() {
+        let cmd = parse_command("a006 EXAMINE INBOX").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Examine {
+                tag: "a006".to_string(),
+                mailbox: "INBOX".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_examine_quoted() {
+        let cmd = parse_command("a007 EXAMINE \"Sent Items\"").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Examine {
+                tag: "a007".to_string(),
+                mailbox: "Sent Items".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_imap_date() {
+        // 1-Jan-2000 = 946684800 unix timestamp
+        let ts = parse_imap_date("1-Jan-2000").unwrap();
+        assert_eq!(ts, 946684800);
+    }
+
+    #[test]
+    fn test_parse_search_before() {
+        let cmd = parse_command("a001 SEARCH BEFORE 1-Jan-2020").unwrap();
+        match cmd {
+            Command::Search { criteria, .. } => {
+                assert_eq!(criteria.len(), 1);
+                match &criteria[0] {
+                    SearchKey::Before(ts) => {
+                        // 1-Jan-2020 = 1577836800 unix timestamp
+                        assert_eq!(*ts, 1577836800);
+                    }
+                    _ => panic!("expected Before"),
+                }
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_larger() {
+        let cmd = parse_command("a001 SEARCH LARGER 10000").unwrap();
+        match cmd {
+            Command::Search { criteria, .. } => {
+                assert_eq!(criteria.len(), 1);
+                match &criteria[0] {
+                    SearchKey::Larger(size) => {
+                        assert_eq!(*size, 10000_i64);
+                    }
+                    _ => panic!("expected Larger"),
+                }
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_cc() {
+        let cmd = parse_command("a001 SEARCH CC \"bob@example.com\"").unwrap();
+        match cmd {
+            Command::Search { criteria, .. } => {
+                assert_eq!(criteria.len(), 1);
+                match &criteria[0] {
+                    SearchKey::Cc(s) => {
+                        assert_eq!(s, "bob@example.com");
+                    }
+                    _ => panic!("expected Cc"),
+                }
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_search_new() {
+        let cmd = parse_command("a001 SEARCH NEW").unwrap();
+        match cmd {
+            Command::Search { criteria, .. } => {
+                assert_eq!(criteria.len(), 1);
+                assert_eq!(criteria[0], SearchKey::New);
+            }
+            _ => panic!("expected Search"),
+        }
+    }
+
+    #[test]
+    fn test_parse_uid_expunge() {
+        let cmd = parse_command("a001 UID EXPUNGE 1:5,10").unwrap();
+        match cmd {
+            Command::UidExpunge { tag, sequence } => {
+                assert_eq!(tag, "a001");
+                assert!(sequence.contains(3, 10));
+                assert!(sequence.contains(10, 10));
+                assert!(!sequence.contains(7, 10));
+            }
+            _ => panic!("expected UidExpunge"),
         }
     }
 }

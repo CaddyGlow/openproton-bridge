@@ -5705,6 +5705,8 @@ mod tests {
         assert!(rendered.contains("set from = \"alias@proton.me\""));
         assert!(rendered.contains("set imap_user = \"alias@proton.me\""));
         assert!(rendered.contains("set folder = \"imap://127.0.0.1:1143/\""));
+        assert!(rendered.contains("set sort=threads"));
+        assert!(rendered.contains("bind index j next-entry"));
         assert!(rendered.contains("set smtp_url = \"smtp://alias%40proton.me@127.0.0.1:1025/\""));
         assert!(rendered.contains("# set imap_pass = \"<bridge-password>\""));
         assert!(!rendered.contains("set imap_pass = \"bridge-pass\""));

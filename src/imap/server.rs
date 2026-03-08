@@ -232,7 +232,7 @@ async fn handle_connection(
             .map_err(|err| super::ImapError::Tls(err.to_string()))?;
         let (read, write) = tokio::io::split(tls_stream);
         let mut tls_session = ImapSession::with_starttls(read, write, config, false);
-        let _ = tls_session.run().await?;
+        let _ = tls_session.run_after_starttls().await?;
     }
 
     Ok(())

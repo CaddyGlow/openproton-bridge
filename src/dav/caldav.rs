@@ -352,6 +352,27 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+#[derive(Debug)]
+struct ParsedIcsDateTime {
+    unix_seconds: i64,
+    all_day: bool,
+    timezone: Option<String>,
+}
+
+impl ParsedIcsDateTime {
+    fn timezone_or_utc(&self) -> String {
+        self.timezone.clone().unwrap_or_else(|| "UTC".to_string())
+    }
+}
+
+#[derive(Debug, Default)]
+struct ParsedIcsEvent {
+    uid: Option<String>,
+    dt_start: Option<ParsedIcsDateTime>,
+    dt_end: Option<ParsedIcsDateTime>,
+    duration_seconds: Option<i64>,
+}
+
 fn parse_ics(
     id: &str,
     calendar_id: &str,
@@ -359,27 +380,47 @@ fn parse_ics(
     create_time: i64,
     edit_time: i64,
 ) -> CalendarEvent {
-    let mut uid = None;
-    let mut dtstart = None;
-    let mut dtend = None;
+    let normalized_payload = calendar_crypto::normalize_ics_payload(raw);
+    let ParsedIcsEvent {
+        uid,
+        dt_start,
+        dt_end,
+        duration_seconds,
+    } = parse_ics_metadata(&normalized_payload);
 
-    for raw_line in raw.lines() {
-        let line = raw_line.trim();
-        if let Some((name, value)) = line.split_once(':') {
-            let name_upper = name.to_ascii_uppercase();
-            if name_upper == "UID" {
-                uid = Some(value.trim().to_string());
-            } else if name_upper.starts_with("DTSTART") {
-                dtstart = parse_ics_datetime(value.trim());
-            } else if name_upper.starts_with("DTEND") {
-                dtend = parse_ics_datetime(value.trim());
-            }
-        }
-    }
+    let event_start = dt_start.unwrap_or_else(|| ParsedIcsDateTime {
+        unix_seconds: edit_time,
+        all_day: false,
+        timezone: None,
+    });
+    let end_fallback = if event_start.all_day {
+        event_start.unix_seconds + 86_400
+    } else {
+        event_start.unix_seconds + 3600
+    };
+    let start_timezone = event_start.timezone.clone();
+    let event_end = dt_end
+        .or_else(|| {
+            duration_seconds.map(|duration| ParsedIcsDateTime {
+                unix_seconds: event_start.unix_seconds.saturating_add(duration),
+                all_day: event_start.all_day,
+                timezone: start_timezone.clone(),
+            })
+        })
+        .unwrap_or_else(|| ParsedIcsDateTime {
+            unix_seconds: end_fallback,
+            all_day: event_start.all_day,
+            timezone: start_timezone.clone(),
+        });
 
-    let start_time = dtstart.unwrap_or(edit_time);
-    let end_time = dtend.unwrap_or(start_time + 3600);
     let uid = uid.unwrap_or_else(|| format!("uid-{id}"));
+
+    let start_timezone = event_start.timezone_or_utc();
+    let end_timezone = event_end
+        .timezone
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|| start_timezone.clone());
 
     CalendarEvent {
         id: id.to_string(),
@@ -388,11 +429,11 @@ fn parse_ics(
         shared_event_id: format!("shared-{id}"),
         create_time,
         last_edit_time: edit_time,
-        start_time,
-        end_time,
-        start_timezone: "UTC".to_string(),
-        end_timezone: "UTC".to_string(),
-        full_day: 0,
+        start_time: event_start.unix_seconds,
+        end_time: event_end.unix_seconds,
+        start_timezone,
+        end_timezone,
+        full_day: i32::from(event_start.all_day),
         author: String::new(),
         permissions: 0,
         attendees: vec![],
@@ -402,7 +443,7 @@ fn parse_ics(
         calendar_events: vec![CalendarEventPart {
             member_id: String::new(),
             kind: 0,
-            data: raw.to_string(),
+            data: normalized_payload,
             signature: None,
             author: None,
         }],
@@ -411,16 +452,155 @@ fn parse_ics(
     }
 }
 
-fn render_minimal_ics(uid: &str, start_time: i64, end_time: i64) -> String {
-    format!(
-        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-        uid,
-        format_ics_datetime(start_time),
-        format_ics_datetime(end_time)
-    )
+fn parse_ics_metadata(raw: &str) -> ParsedIcsEvent {
+    let mut parsed = ParsedIcsEvent::default();
+    let mut component_stack: Vec<String> = Vec::new();
+    let mut current_component: Option<String> = None;
+
+    for raw_line in calendar_crypto::unfold_ics_lines(raw).into_iter() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, params, value)) = split_ics_property(line) else {
+            continue;
+        };
+        let name_upper = name.to_ascii_uppercase();
+
+        if name_upper == "BEGIN" {
+            let component = value.trim().to_ascii_uppercase();
+            component_stack.push(component.clone());
+            if current_component.is_none() && is_supported_calendar_component(&component) {
+                current_component = Some(component);
+            }
+            continue;
+        }
+        if name_upper == "END" {
+            if let Some(end_component) = component_stack.pop() {
+                if current_component.as_ref() == Some(&end_component) {
+                    current_component = None;
+                }
+            }
+            continue;
+        }
+
+        if current_component.is_none() {
+            continue;
+        }
+
+        match name_upper.as_str() {
+            "UID" => {
+                if parsed.uid.is_none() {
+                    parsed.uid = Some(value.trim().to_string());
+                }
+            }
+            "DTSTART" => {
+                if parsed.dt_start.is_none() {
+                    parsed.dt_start = parse_ics_datetime_property(&name_upper, &params, value);
+                }
+            }
+            "DTEND" => {
+                if parsed.dt_end.is_none() {
+                    parsed.dt_end = parse_ics_datetime_property(&name_upper, &params, value);
+                }
+            }
+            "DUE" => {
+                if parsed.dt_end.is_none() {
+                    parsed.dt_end = parse_ics_datetime_property(&name_upper, &params, value);
+                }
+            }
+            "DURATION" => {
+                if parsed.duration_seconds.is_none() {
+                    parsed.duration_seconds = parse_ics_duration(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    parsed
+}
+
+fn is_supported_calendar_component(component: &str) -> bool {
+    matches!(component, "VEVENT" | "VTODO" | "VJOURNAL")
+}
+
+fn split_ics_property(line: &str) -> Option<(String, Vec<(String, String)>, &str)> {
+    let (left, value) = line.split_once(':')?;
+    let mut chunks = left.split(';');
+    let name = chunks.next()?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let mut params = Vec::new();
+    for chunk in chunks {
+        let chunk = chunk.trim();
+        if chunk.is_empty() {
+            continue;
+        }
+        let (key, value) = match chunk.split_once('=') {
+            Some(part) => part,
+            None => continue,
+        };
+        let key = key.trim().to_ascii_uppercase();
+        let value = unescape_ics_value(value.trim_matches('"'));
+        params.push((key, value.to_string()));
+    }
+    Some((name, params, value))
+}
+
+fn parse_ics_datetime_property(
+    name: &str,
+    params: &[(String, String)],
+    value: &str,
+) -> Option<ParsedIcsDateTime> {
+    let tzid = find_ics_param_value(params, "TZID").map(|value| value.to_string());
+    let value_type_date = find_ics_param_value(params, "VALUE")
+        .is_some_and(|value| value.eq_ignore_ascii_case("DATE"));
+    if value_type_date {
+        let date_value = parse_ics_date(value).map(|unix_seconds| ParsedIcsDateTime {
+            unix_seconds,
+            all_day: true,
+            timezone: Some("UTC".to_string()),
+        })?;
+        return Some(date_value);
+    }
+
+    let datetime = value.trim();
+    let all_day = false;
+    if let Some(tzid) = tzid {
+        if name == "DTSTART" || name == "DTEND" {
+            if let Some(dt) = parse_ics_datetime(datetime) {
+                return Some(ParsedIcsDateTime {
+                    unix_seconds: dt,
+                    all_day,
+                    timezone: Some(tzid),
+                });
+            }
+        }
+    }
+
+    if let Some(dt) = parse_ics_datetime(datetime) {
+        return Some(ParsedIcsDateTime {
+            unix_seconds: dt,
+            all_day,
+            timezone: None,
+        });
+    }
+    if name == "DTSTART" || name == "DTEND" || name == "DUE" {
+        if let Some(date) = parse_ics_date(datetime) {
+            return Some(ParsedIcsDateTime {
+                unix_seconds: date,
+                all_day: true,
+                timezone: Some("UTC".to_string()),
+            });
+        }
+    }
+    None
 }
 
 fn parse_ics_datetime(value: &str) -> Option<i64> {
+    let value = value.trim();
     if value.len() >= 15 && value.contains('T') {
         let cleaned = value.trim_end_matches('Z');
         let year = cleaned.get(0..4)?.parse::<i32>().ok()?;
@@ -431,6 +611,11 @@ fn parse_ics_datetime(value: &str) -> Option<i64> {
         let second = cleaned.get(13..15)?.parse::<u32>().ok()?;
         return to_unix_utc(year, month, day, hour, minute, second);
     }
+    None
+}
+
+fn parse_ics_date(value: &str) -> Option<i64> {
+    let value = value.trim();
     if value.len() == 8 {
         let year = value.get(0..4)?.parse::<i32>().ok()?;
         let month = value.get(4..6)?.parse::<u32>().ok()?;
@@ -438,6 +623,91 @@ fn parse_ics_datetime(value: &str) -> Option<i64> {
         return to_unix_utc(year, month, day, 0, 0, 0);
     }
     None
+}
+
+fn parse_ics_duration(value: &str) -> Option<i64> {
+    let mut value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if !value.starts_with('P') {
+        return None;
+    }
+    value = value.trim_start_matches('P');
+    let mut total_seconds: i64 = 0;
+    let mut seen_designator = false;
+    let mut in_time = false;
+    let mut idx = 0usize;
+    let bytes = value.as_bytes();
+
+    while idx < bytes.len() {
+        if bytes[idx] == b'T' {
+            in_time = true;
+            idx += 1;
+            continue;
+        }
+        if idx >= bytes.len() {
+            break;
+        }
+        let start = idx;
+        while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        if start == idx {
+            return None;
+        }
+        let number = std::str::from_utf8(&bytes[start..idx])
+            .ok()?
+            .parse::<i64>()
+            .ok()?;
+        if idx >= bytes.len() {
+            return None;
+        }
+        seen_designator = true;
+        let unit = bytes[idx] as char;
+        idx += 1;
+
+        match (in_time, unit) {
+            (false, 'W') => total_seconds += number * 7 * 24 * 3600,
+            (false, 'D') => total_seconds += number * 24 * 3600,
+            (true, 'H') => total_seconds += number * 3600,
+            (true, 'M') => total_seconds += number * 60,
+            (true, 'S') => total_seconds += number,
+            _ => return None,
+        }
+    }
+
+    if seen_designator {
+        Some(total_seconds)
+    } else {
+        None
+    }
+}
+
+fn find_ics_param_value<'a>(params: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let needle = name.to_ascii_uppercase();
+    params
+        .iter()
+        .find_map(|(key, value)| (key == &needle).then_some(value.as_str()))
+}
+
+fn unescape_ics_value(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\N", "\n")
+        .replace("\\;", ";")
+        .replace("\\,", ",")
+        .replace("\\\\", "\\")
+        .replace("\\r", "\r")
+}
+
+fn render_minimal_ics(uid: &str, start_time: i64, end_time: i64) -> String {
+    format!(
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
+        uid,
+        format_ics_datetime(start_time),
+        format_ics_datetime(end_time)
+    )
 }
 
 fn format_ics_datetime(unix_seconds: i64) -> String {
@@ -609,13 +879,90 @@ fn epoch_seconds() -> i64 {
 mod tests {
     use super::{
         accepted_proppatch_props, format_ics_datetime, parse_calendar_collection_id,
-        parse_event_resource_id, parse_ics_datetime, prop_patch_ok_response,
+        parse_event_resource_id, parse_ics, parse_ics_datetime, prop_patch_ok_response,
     };
 
     #[test]
     fn parses_and_formats_ics_timestamps() {
         let ts = parse_ics_datetime("20260305T123456Z").expect("parse timestamp");
         assert_eq!(format_ics_datetime(ts), "20260305T123456Z");
+    }
+
+    #[test]
+    fn parses_ics_event_metadata_with_tzid() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+VERSION:2.0\r
+BEGIN:VEVENT\r
+UID:evt-1\r
+DTSTART;TZID=Europe/Paris:20260305T120000\r
+DTEND;TZID=Europe/Paris:20260305T130000\r
+SUMMARY:Meeting\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+        let event = parse_ics("event-1", "cal-1", payload, 1, 2);
+        assert_eq!(event.uid, "evt-1");
+        assert_eq!(event.start_timezone, "Europe/Paris");
+        assert_eq!(event.end_timezone, "Europe/Paris");
+        assert_eq!(
+            event.start_time,
+            parse_ics_datetime("20260305T120000").unwrap()
+        );
+        assert_eq!(
+            event.end_time,
+            parse_ics_datetime("20260305T130000").unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_all_day_events() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:all-day-1\r
+DTSTART;VALUE=DATE:20260307\r
+DTEND;VALUE=DATE:20260308\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+        let event = parse_ics("event-2", "cal-1", payload, 1, 2);
+        assert_eq!(event.full_day, 1);
+        assert_eq!(event.start_timezone, "UTC");
+        assert_eq!(event.end_timezone, "UTC");
+        assert_eq!(event.end_time - event.start_time, 86_400);
+    }
+
+    #[test]
+    fn calculates_end_from_duration() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:dur-1\r
+DTSTART:20260307T100000Z\r
+DURATION:PT2H\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+        let event = parse_ics("event-3", "cal-1", payload, 1, 2);
+        let expected_start = parse_ics_datetime("20260307T100000Z").unwrap();
+        assert_eq!(event.start_time, expected_start);
+        assert_eq!(event.end_time, expected_start + 7_200);
+    }
+
+    #[test]
+    fn parses_and_stores_folded_properties() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:fold-1\r
+SUMMARY:Very long summary value line\r
+ with continuation\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+        let event = parse_ics("event-4", "cal-1", payload, 1, 2);
+        assert_eq!(event.uid, "fold-1");
     }
 
     #[test]

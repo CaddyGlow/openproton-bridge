@@ -128,6 +128,7 @@ async fn imap_starttls_upgrade_and_capability_reflects_tls_state() {
     write.flush().await.unwrap();
     let pre_tls_capability = read_until_prefix(&mut reader, "a001 ").await;
     assert!(pre_tls_capability.contains("STARTTLS"));
+    assert!(pre_tls_capability.contains("UIDPLUS"));
 
     write.write_all(b"a002 STARTTLS\r\n").await.unwrap();
     write.flush().await.unwrap();
@@ -160,6 +161,10 @@ async fn imap_starttls_upgrade_and_capability_reflects_tls_state() {
     }
 
     assert!(!post_tls.contains("STARTTLS"), "{post_tls}");
+    assert!(
+        !post_tls.contains("openproton-bridge ready"),
+        "unexpected post-STARTTLS greeting: {post_tls}"
+    );
 
     server_handle.abort();
 }
@@ -343,6 +348,7 @@ async fn capabilities_without_tls_do_not_advertise_starttls() {
     imap_write.flush().await.unwrap();
     let imap_capability = read_until_prefix(&mut imap_reader, "a001 ").await;
     assert!(!imap_capability.contains("STARTTLS"), "{imap_capability}");
+    assert!(imap_capability.contains("UIDPLUS"), "{imap_capability}");
 
     // SMTP EHLO should not advertise STARTTLS but still advertise AUTH methods.
     let smtp_stream = TcpStream::connect(&smtp_addr).await.unwrap();

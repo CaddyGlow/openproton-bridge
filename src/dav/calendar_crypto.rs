@@ -388,7 +388,7 @@ pub fn normalize_ics_payload(raw: &str) -> String {
     canonical.join("\r\n") + "\r\n"
 }
 
-fn unfold_ics_lines(raw: &str) -> Vec<String> {
+pub fn unfold_ics_lines(raw: &str) -> Vec<String> {
     let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
     let mut lines: Vec<String> = Vec::new();
     for line in normalized.split('\n') {

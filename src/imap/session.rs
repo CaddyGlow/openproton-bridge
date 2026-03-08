@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -107,7 +107,17 @@ where
     }
 
     pub async fn run(&mut self) -> Result<SessionAction> {
-        self.greet().await?;
+        self.run_inner(true).await
+    }
+
+    pub async fn run_after_starttls(&mut self) -> Result<SessionAction> {
+        self.run_inner(false).await
+    }
+
+    async fn run_inner(&mut self, send_greeting: bool) -> Result<SessionAction> {
+        if send_greeting {
+            self.greet().await?;
+        }
 
         loop {
             let mut line = String::new();
@@ -226,6 +236,12 @@ where
                 ref mailbox,
                 uid,
             } => self.cmd_copy(tag, sequence, mailbox, uid).await?,
+            Command::Move {
+                ref tag,
+                ref sequence,
+                ref mailbox,
+                uid,
+            } => self.cmd_move(tag, sequence, mailbox, uid).await?,
             Command::Examine {
                 ref tag,
                 ref mailbox,
@@ -242,12 +258,12 @@ where
     async fn cmd_capability(&mut self, tag: &str) -> Result<()> {
         let caps = if self.state == State::NotAuthenticated {
             if self.starttls_available {
-                "CAPABILITY IMAP4rev1 STARTTLS IDLE"
+                "CAPABILITY IMAP4rev1 STARTTLS IDLE UIDPLUS MOVE"
             } else {
-                "CAPABILITY IMAP4rev1 IDLE"
+                "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE"
             }
         } else {
-            "CAPABILITY IMAP4rev1 IDLE"
+            "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE"
         };
         self.writer.untagged(caps).await?;
         self.writer
@@ -611,6 +627,63 @@ where
         }
     }
 
+    fn resolve_target_uids(
+        &self,
+        all_uids: &[u32],
+        sequence: &SequenceSet,
+        uid_mode: bool,
+    ) -> Vec<u32> {
+        if all_uids.is_empty() {
+            return Vec::new();
+        }
+
+        let max_uid = *all_uids.last().unwrap_or(&0);
+        let max_seq = all_uids.len() as u32;
+
+        if uid_mode {
+            all_uids
+                .iter()
+                .filter(|&&uid| sequence.contains(uid, max_uid))
+                .copied()
+                .collect()
+        } else {
+            all_uids
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| sequence.contains(*i as u32 + 1, max_seq))
+                .map(|(_, &uid)| uid)
+                .collect()
+        }
+    }
+
+    async fn copy_message_local(
+        &self,
+        source_mailbox: &str,
+        dest_mailbox: &str,
+        source_uid: u32,
+    ) -> Result<Option<u32>> {
+        let store = self.config.store.clone();
+        let Some(proton_id) = store.get_proton_id(source_mailbox, source_uid).await? else {
+            return Ok(None);
+        };
+        let Some(metadata) = store.get_metadata(source_mailbox, source_uid).await? else {
+            return Ok(None);
+        };
+
+        let dest_uid = store
+            .store_metadata(dest_mailbox, &proton_id, metadata)
+            .await?;
+
+        let flags = store.get_flags(source_mailbox, source_uid).await?;
+        store.set_flags(dest_mailbox, dest_uid, flags).await?;
+
+        if let Some(rfc822) = store.get_rfc822(source_mailbox, source_uid).await? {
+            store.store_rfc822(dest_mailbox, dest_uid, rfc822).await?;
+        }
+
+        Ok(Some(dest_uid))
+    }
+
     async fn emit_selected_mailbox_exists_update(&mut self) -> Result<()> {
         if self.state != State::Selected {
             return Ok(());
@@ -794,19 +867,35 @@ where
                 ..Default::default()
             };
 
-            let meta_resp = match messages::get_message_metadata(client, &filter, 0, 150).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "failed to fetch message metadata");
-                    return self.writer.tagged_no(tag, "failed to fetch messages").await;
-                }
-            };
+            let mut page = 0;
+            let mut loaded = 0usize;
+            loop {
+                let meta_resp =
+                    match messages::get_message_metadata(client, &filter, page, 150).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, page, "failed to fetch message metadata");
+                            return self.writer.tagged_no(tag, "failed to fetch messages").await;
+                        }
+                    };
 
-            // Populate store with message metadata
-            for meta in &meta_resp.messages {
-                store
-                    .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
-                    .await?;
+                if meta_resp.messages.is_empty() {
+                    break;
+                }
+
+                // Populate store with message metadata
+                for meta in &meta_resp.messages {
+                    store
+                        .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
+                        .await?;
+                }
+
+                loaded = loaded.saturating_add(meta_resp.messages.len());
+                let total = usize::try_from(meta_resp.total.max(0)).unwrap_or(usize::MAX);
+                if loaded >= total {
+                    break;
+                }
+                page += 1;
             }
         } else {
             info!(
@@ -975,26 +1064,51 @@ where
                 ..Default::default()
             };
 
-            let meta_resp = match messages::get_message_metadata(client, &filter, 0, 150).await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(error = %e, "failed to fetch message metadata");
-                    return self.writer.tagged_no(tag, "failed to fetch messages").await;
-                }
-            };
+            let mut page = 0;
+            let mut loaded = 0usize;
+            loop {
+                let meta_resp =
+                    match messages::get_message_metadata(client, &filter, page, 150).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(error = %e, page, "failed to fetch message metadata");
+                            return self.writer.tagged_no(tag, "failed to fetch messages").await;
+                        }
+                    };
 
-            for meta in &meta_resp.messages {
-                let uid = store
-                    .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
-                    .await?;
-                let flags = mailbox::message_flags(meta);
-                let flag_strings: Vec<String> = flags.iter().map(|s| s.to_string()).collect();
-                store.set_flags(&scoped_mailbox, uid, flag_strings).await?;
+                if meta_resp.messages.is_empty() {
+                    break;
+                }
+
+                for meta in &meta_resp.messages {
+                    store
+                        .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
+                        .await?;
+                }
+
+                loaded = loaded.saturating_add(meta_resp.messages.len());
+                let total = usize::try_from(meta_resp.total.max(0)).unwrap_or(usize::MAX);
+                if loaded >= total {
+                    break;
+                }
+                page += 1;
             }
         }
 
         let status = store.mailbox_status(&scoped_mailbox).await?;
         let snapshot = store.mailbox_snapshot(&scoped_mailbox).await?;
+        let selected_uids = store.list_uids(&scoped_mailbox).await?;
+        let first_unseen_seq = {
+            let mut first = None;
+            for (index, uid) in selected_uids.iter().enumerate() {
+                let flags = store.get_flags(&scoped_mailbox, *uid).await?;
+                if !flags.iter().any(|flag| flag == "\\Seen") {
+                    first = Some(index as u32 + 1);
+                    break;
+                }
+            }
+            first
+        };
 
         self.writer
             .untagged(&format!("{} EXISTS", status.exists))
@@ -1009,8 +1123,10 @@ where
         self.writer
             .untagged(&format!("OK [UIDNEXT {}]", status.next_uid))
             .await?;
-        if status.unseen > 0 {
-            self.writer.untagged("OK [UNSEEN 1]").await?;
+        if let Some(first_unseen_seq) = first_unseen_seq {
+            self.writer
+                .untagged(&format!("OK [UNSEEN {}]", first_unseen_seq))
+                .await?;
         }
 
         self.selected_mailbox = Some(mb.name.to_string());
@@ -1092,8 +1208,6 @@ where
             .unwrap_or_else(|| "unknown".to_string());
         let header_only_body_fetch = needs_body_sections && !needs_full_rfc822;
         let target_fetch_count = target_messages.len() as u32;
-        let include_uid_in_response =
-            uid_mode && !expanded.iter().any(|item| matches!(item, FetchItem::Uid));
         let mut cache_hits = 0u32;
         let mut cache_misses = 0u32;
 
@@ -1117,10 +1231,6 @@ where
 
             let mut parts: Vec<String> = Vec::with_capacity(expanded.len());
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
-
-            if include_uid_in_response {
-                parts.push(format!("UID {}", uid));
-            }
 
             let mut rfc822_data = None;
             if needs_body_sections && !header_only_body_fetch {
@@ -1176,8 +1286,7 @@ where
                             ));
                         }
                     }
-                    FetchItem::BodyStructure | FetchItem::Body => {
-                        // Build BODYSTRUCTURE from RFC822 data if available
+                    FetchItem::BodyStructure => {
                         let structure = if let Some(ref data) = rfc822_data {
                             rfc822::build_bodystructure(data)
                         } else if let Some(ref m) = meta {
@@ -1186,6 +1295,16 @@ where
                             rfc822::simple_text_structure(0)
                         };
                         parts.push(format!("BODYSTRUCTURE {}", structure));
+                    }
+                    FetchItem::Body => {
+                        let body = if let Some(ref data) = rfc822_data {
+                            rfc822::build_body(data)
+                        } else if let Some(ref m) = meta {
+                            rfc822::simple_text_body(m.size as usize)
+                        } else {
+                            rfc822::simple_text_body(0)
+                        };
+                        parts.push(format!("BODY {}", body));
                     }
                     FetchItem::BodySection { section, peek } => {
                         let section_tag = match section {
@@ -1231,11 +1350,9 @@ where
                             Vec::new()
                         };
 
-                        if !body_data.is_empty() {
-                            let idx = parts.len();
-                            parts.push(format!("{} {{{}}}", section_tag, body_data.len()));
-                            part_literals.insert(idx, body_data);
-                        }
+                        let idx = parts.len();
+                        parts.push(format!("{} {{{}}}", section_tag, body_data.len()));
+                        part_literals.insert(idx, body_data);
 
                         if !peek && !self.selected_read_only {
                             // Set \Seen flag
@@ -1251,11 +1368,19 @@ where
                                 // Mark as read on API
                                 if let Some(ref meta) = meta {
                                     if let Some(ref client) = self.client {
-                                        let _ = messages::mark_messages_read(
+                                        if let Err(err) = messages::mark_messages_read(
                                             client,
                                             &[meta.id.as_str()],
                                         )
-                                        .await;
+                                        .await
+                                        {
+                                            warn!(
+                                                error = %err,
+                                                mailbox = %mailbox,
+                                                proton_id = %meta.id,
+                                                "failed to sync read state upstream"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1456,23 +1581,7 @@ where
             return self.writer.tagged_ok(tag, None, "STORE completed").await;
         }
 
-        let max_uid = *all_uids.last().unwrap();
-        let max_seq = all_uids.len() as u32;
-
-        let target_uids: Vec<u32> = if uid_mode {
-            all_uids
-                .iter()
-                .filter(|&&uid| sequence.contains(uid, max_uid))
-                .copied()
-                .collect()
-        } else {
-            all_uids
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| sequence.contains(*i as u32 + 1, max_seq))
-                .map(|(_, &uid)| uid)
-                .collect()
-        };
+        let target_uids = self.resolve_target_uids(&all_uids, sequence, uid_mode);
 
         let flag_strings: Vec<String> = flags.iter().map(|f| f.as_str().to_string()).collect();
         let silent = matches!(
@@ -1483,6 +1592,10 @@ where
         );
 
         for &uid in &target_uids {
+            let previous_flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let had_seen = previous_flags.iter().any(|flag| flag == "\\Seen");
+            let had_flagged = previous_flags.iter().any(|flag| flag == "\\Flagged");
+
             match action {
                 StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
                     store
@@ -1503,40 +1616,64 @@ where
             if let Some(ref client) = self.client {
                 if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
                     let id_ref = proton_id.as_str();
-                    for flag in flags {
-                        let is_add = matches!(
-                            action,
-                            StoreAction::SetFlags
-                                | StoreAction::SetFlagsSilent
-                                | StoreAction::AddFlags
-                                | StoreAction::AddFlagsSilent
-                        );
-                        match flag {
-                            ImapFlag::Seen => {
-                                if is_add {
-                                    let _ = messages::mark_messages_read(client, &[id_ref]).await;
-                                } else {
-                                    let _ = messages::mark_messages_unread(client, &[id_ref]).await;
-                                }
+                    let current_flags = store.get_flags(&scoped_mailbox, uid).await?;
+                    let has_seen = current_flags.iter().any(|flag| flag == "\\Seen");
+                    let has_flagged = current_flags.iter().any(|flag| flag == "\\Flagged");
+
+                    if had_seen != has_seen {
+                        if has_seen {
+                            if let Err(err) = messages::mark_messages_read(client, &[id_ref]).await
+                            {
+                                warn!(
+                                    error = %err,
+                                    mailbox = %mailbox,
+                                    uid,
+                                    proton_id = %proton_id,
+                                    "failed to sync seen flag upstream"
+                                );
                             }
-                            ImapFlag::Flagged => {
-                                if is_add {
-                                    let _ = messages::label_messages(
-                                        client,
-                                        &[id_ref],
-                                        types::STARRED_LABEL,
-                                    )
-                                    .await;
-                                } else {
-                                    let _ = messages::unlabel_messages(
-                                        client,
-                                        &[id_ref],
-                                        types::STARRED_LABEL,
-                                    )
-                                    .await;
-                                }
+                        } else {
+                            if let Err(err) =
+                                messages::mark_messages_unread(client, &[id_ref]).await
+                            {
+                                warn!(
+                                    error = %err,
+                                    mailbox = %mailbox,
+                                    uid,
+                                    proton_id = %proton_id,
+                                    "failed to sync unseen flag upstream"
+                                );
                             }
-                            _ => {} // Other flags are local only
+                        }
+                    }
+
+                    if had_flagged != has_flagged {
+                        if has_flagged {
+                            if let Err(err) =
+                                messages::label_messages(client, &[id_ref], types::STARRED_LABEL)
+                                    .await
+                            {
+                                warn!(
+                                    error = %err,
+                                    mailbox = %mailbox,
+                                    uid,
+                                    proton_id = %proton_id,
+                                    "failed to sync flagged state upstream"
+                                );
+                            }
+                        } else {
+                            if let Err(err) =
+                                messages::unlabel_messages(client, &[id_ref], types::STARRED_LABEL)
+                                    .await
+                            {
+                                warn!(
+                                    error = %err,
+                                    mailbox = %mailbox,
+                                    uid,
+                                    proton_id = %proton_id,
+                                    "failed to sync unflagged state upstream"
+                                );
+                            }
                         }
                     }
                 }
@@ -1654,12 +1791,21 @@ where
                 // Move to trash via API
                 if let Some(ref client) = self.client {
                     if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
-                        let _ = messages::label_messages(
+                        if let Err(err) = messages::label_messages(
                             client,
                             &[proton_id.as_str()],
                             types::TRASH_LABEL,
                         )
-                        .await;
+                        .await
+                        {
+                            warn!(
+                                error = %err,
+                                mailbox = %mailbox,
+                                uid,
+                                proton_id = %proton_id,
+                                "failed to sync expunge->trash mutation upstream"
+                            );
+                        }
                     }
                 }
 
@@ -1719,12 +1865,21 @@ where
                 // Move to trash via API
                 if let Some(ref client) = self.client {
                     if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
-                        let _ = messages::label_messages(
+                        if let Err(err) = messages::label_messages(
                             client,
                             &[proton_id.as_str()],
                             types::TRASH_LABEL,
                         )
-                        .await;
+                        .await
+                        {
+                            warn!(
+                                error = %err,
+                                mailbox = %mailbox,
+                                uid,
+                                proton_id = %proton_id,
+                                "failed to sync uid expunge->trash mutation upstream"
+                            );
+                        }
                     }
                 }
 
@@ -1769,6 +1924,11 @@ where
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
+        let scoped_dest_mailbox = self.scoped_mailbox_name(dest_mb.name);
+        if scoped_mailbox == scoped_dest_mailbox {
+            return self.writer.tagged_ok(tag, None, "COPY completed").await;
+        }
+
         let store = &self.config.store;
         let all_uids = store.list_uids(&scoped_mailbox).await?;
 
@@ -1776,35 +1936,147 @@ where
             return self.writer.tagged_ok(tag, None, "COPY completed").await;
         }
 
-        let max_uid = *all_uids.last().unwrap();
-        let max_seq = all_uids.len() as u32;
+        let target_uids = self.resolve_target_uids(&all_uids, sequence, uid_mode);
 
-        let target_uids: Vec<u32> = if uid_mode {
-            all_uids
-                .iter()
-                .filter(|&&uid| sequence.contains(uid, max_uid))
-                .copied()
-                .collect()
-        } else {
-            all_uids
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| sequence.contains(*i as u32 + 1, max_seq))
-                .map(|(_, &uid)| uid)
-                .collect()
-        };
+        for &uid in &target_uids {
+            let _ = self
+                .copy_message_local(&scoped_mailbox, &scoped_dest_mailbox, uid)
+                .await?;
 
-        if let Some(ref client) = self.client {
-            for &uid in &target_uids {
+            if let Some(ref client) = self.client {
                 if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
-                    let _ =
+                    if let Err(err) =
                         messages::label_messages(client, &[proton_id.as_str()], dest_mb.label_id)
-                            .await;
+                            .await
+                    {
+                        warn!(
+                            error = %err,
+                            source_mailbox = %mailbox,
+                            destination_mailbox = %dest_mb.name,
+                            uid,
+                            proton_id = %proton_id,
+                            "failed to sync copy destination label upstream"
+                        );
+                    }
                 }
             }
         }
 
         self.writer.tagged_ok(tag, None, "COPY completed").await
+    }
+
+    async fn cmd_move(
+        &mut self,
+        tag: &str,
+        sequence: &SequenceSet,
+        dest_name: &str,
+        uid_mode: bool,
+    ) -> Result<()> {
+        if self.state != State::Selected {
+            return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+
+        if self.selected_read_only {
+            return self.writer.tagged_no(tag, "mailbox is read-only").await;
+        }
+
+        let dest_mb = match mailbox::find_mailbox(dest_name) {
+            Some(m) => m,
+            None => {
+                return self
+                    .writer
+                    .tagged_no(
+                        tag,
+                        &format!("[TRYCREATE] mailbox not found: {}", dest_name),
+                    )
+                    .await;
+            }
+        };
+
+        let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
+        let source_mb = mailbox::find_mailbox(&mailbox).unwrap_or(dest_mb);
+        let scoped_source_mailbox = self.scoped_mailbox_name(&mailbox);
+        let scoped_dest_mailbox = self.scoped_mailbox_name(dest_mb.name);
+        if scoped_source_mailbox == scoped_dest_mailbox {
+            return self.writer.tagged_ok(tag, None, "MOVE completed").await;
+        }
+
+        let store = &self.config.store;
+        let all_uids = store.list_uids(&scoped_source_mailbox).await?;
+        if all_uids.is_empty() {
+            return self.writer.tagged_ok(tag, None, "MOVE completed").await;
+        }
+
+        let target_uids = self.resolve_target_uids(&all_uids, sequence, uid_mode);
+        if target_uids.is_empty() {
+            return self.writer.tagged_ok(tag, None, "MOVE completed").await;
+        }
+
+        let target_uid_set: HashSet<u32> = target_uids.iter().copied().collect();
+        let mut expunged_seqs = Vec::new();
+        let mut offset = 0u32;
+
+        for (i, &uid) in all_uids.iter().enumerate() {
+            if !target_uid_set.contains(&uid) {
+                continue;
+            }
+
+            let Some(proton_id) = store.get_proton_id(&scoped_source_mailbox, uid).await? else {
+                continue;
+            };
+
+            let seq = i as u32 + 1 - offset;
+            let copied = self
+                .copy_message_local(&scoped_source_mailbox, &scoped_dest_mailbox, uid)
+                .await?;
+            if copied.is_none() {
+                continue;
+            }
+
+            if let Some(ref client) = self.client {
+                if let Err(err) =
+                    messages::label_messages(client, &[proton_id.as_str()], dest_mb.label_id).await
+                {
+                    warn!(
+                        error = %err,
+                        source_mailbox = %mailbox,
+                        destination_mailbox = %dest_mb.name,
+                        uid,
+                        proton_id = %proton_id,
+                        "failed to sync move destination label upstream"
+                    );
+                }
+
+                if source_mb.label_id != dest_mb.label_id {
+                    if let Err(err) = messages::unlabel_messages(
+                        client,
+                        &[proton_id.as_str()],
+                        source_mb.label_id,
+                    )
+                    .await
+                    {
+                        warn!(
+                            error = %err,
+                            source_mailbox = %mailbox,
+                            destination_mailbox = %dest_mb.name,
+                            uid,
+                            proton_id = %proton_id,
+                            "failed to sync move source label removal upstream"
+                        );
+                    }
+                }
+            }
+
+            store.remove_message(&scoped_source_mailbox, uid).await?;
+            expunged_seqs.push(seq);
+            offset += 1;
+        }
+
+        for seq in expunged_seqs {
+            self.writer.untagged(&format!("{seq} EXPUNGE")).await?;
+        }
+
+        self.writer.tagged_ok(tag, None, "MOVE completed").await
     }
 
     /// Get stream halves for TLS upgrade.
@@ -2149,7 +2421,7 @@ mod tests {
     use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
     use crate::bridge::auth_router::AuthRouter;
     use crate::imap::store::InMemoryStore;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_session() -> crate::api::types::Session {
@@ -2203,6 +2475,14 @@ mod tests {
             is_forwarded: 0,
             num_attachments: 0,
         }
+    }
+
+    fn metadata_page_response(messages: Vec<MessageMetadata>, total: i64) -> serde_json::Value {
+        serde_json::json!({
+            "Code": 1000,
+            "Messages": messages,
+            "Total": total
+        })
     }
 
     async fn create_session_pair(
@@ -2281,6 +2561,8 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("IMAP4rev1"));
         assert!(response.contains("STARTTLS"));
+        assert!(response.contains("UIDPLUS"));
+        assert!(response.contains("MOVE"));
         assert!(!response.contains("AUTH=PLAIN"));
         assert!(response.contains("a001 OK"));
     }
@@ -2592,6 +2874,523 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("a001 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_select_paginates_metadata_fetch() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .and(body_string_contains("\"Page\":0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(metadata_page_response(vec![make_meta("msg-1", 1)], 2)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .and(body_string_contains("\"Page\":1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(metadata_page_response(vec![make_meta("msg-2", 1)], 2)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        session.handle_line("a001 SELECT INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("2 EXISTS"), "response={response}");
+        assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
+
+        let uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(uids.len(), 2);
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_body_returns_body_item_not_bodystructure() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_rfc822(
+                "test-uid::INBOX",
+                uid,
+                b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nbody".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        session.handle_line("a001 FETCH 1 BODY").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains(" FETCH (BODY ("), "response={response}");
+        assert!(!response.contains("BODYSTRUCTURE"), "response={response}");
+        assert!(response.contains("a001 OK FETCH completed"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_body_section_returns_empty_literal_when_content_missing() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line("a001 FETCH 1 BODY[TEXT]")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("BODY[TEXT] {0}"), "response={response}");
+        assert!(response.contains("a001 OK FETCH completed"));
+    }
+
+    #[tokio::test]
+    async fn test_store_set_flags_syncs_remote_removals() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/unread"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/unlabel"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .set_flags(
+                "test-uid::INBOX",
+                uid,
+                vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+            )
+            .await
+            .unwrap();
+
+        session.handle_line("a001 STORE 1 FLAGS ()").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("FLAGS ()"), "response={response}");
+        assert!(response.contains("a001 OK STORE completed"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_copy_copies_local_message_and_labels_destination_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/label"))
+            .and(body_string_contains("\"LabelID\":\"6\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        let src_uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 COPY 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("a001 OK COPY completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids, vec![src_uid]);
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+        let archived_proton_id = config
+            .store
+            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(archived_proton_id.as_deref(), Some("msg-1"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_move_moves_local_message_and_syncs_label_add_remove_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/label"))
+            .and(body_string_contains("\"LabelID\":\"6\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/unlabel"))
+            .and(body_string_contains("\"LabelID\":\"0\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 MOVE 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 1 EXPUNGE"), "response={response}");
+        assert!(
+            response.contains("a001 OK MOVE completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids.len(), 1);
+        let inbox_proton_id = config
+            .store
+            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(inbox_proton_id.as_deref(), Some("msg-2"));
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+        let archive_proton_id = config
+            .store
+            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(archive_proton_id.as_deref(), Some("msg-1"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_uid_move_uses_uid_selection_and_sequence_expunge_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/label"))
+            .and(body_string_contains("\"LabelID\":\"6\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/unlabel"))
+            .and(body_string_contains("\"LabelID\":\"0\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let uid2 = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line(&format!("a001 UID MOVE {uid2} Archive"))
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 2 EXPUNGE"), "response={response}");
+        assert!(
+            response.contains("a001 OK MOVE completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids.len(), 1);
+        let inbox_proton_id = config
+            .store
+            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(inbox_proton_id.as_deref(), Some("msg-1"));
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+        let archive_proton_id = config
+            .store
+            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(archive_proton_id.as_deref(), Some("msg-2"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_expunge_syncs_trash_label_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/label"))
+            .and(body_string_contains("\"LabelID\":\"3\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXPUNGE").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 1 EXPUNGE"), "response={response}");
+        assert!(
+            response.contains("a001 OK EXPUNGE completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert!(inbox_uids.is_empty());
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_examine_reports_first_unseen_sequence_number() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 0))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("OK [UNSEEN 2]"), "response={response}");
+        assert!(response.contains("a001 OK [READ-ONLY] EXAMINE completed"));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
+use std::collections::HashSet;
 
 use regex::Regex;
 
@@ -21,6 +22,13 @@ use super::etag;
 use super::http::DavResponse;
 
 const CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone)]
+struct CalendarQueryRequest {
+    range: CalendarEventRange,
+    component_filters: Vec<String>,
+    prop_filters: Vec<String>,
+}
 
 pub async fn handle_report(
     raw_path: &str,
@@ -51,7 +59,8 @@ pub async fn handle_report(
     }
 
     if let Some(calendar_id) = parse_calendar_collection_path(&path, &auth.account_id.0) {
-        if body_text.contains("calendar-query") {
+        if has_named_xml_tag(body_text, "calendar-query") {
+            let query = parse_calendar_query_request(body_text)?;
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_query(
@@ -59,11 +68,12 @@ pub async fn handle_report(
                 store,
                 &auth.account_id.0,
                 &calendar_id,
-                body_text,
+                &query,
                 decrypt_context.as_ref(),
             )?));
         }
-        if body_text.contains("calendar-multiget") {
+        if has_named_xml_tag(body_text, "calendar-multiget") {
+            let hrefs = parse_calendar_multiget_hrefs(body_text)?;
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_multiget(
@@ -71,11 +81,11 @@ pub async fn handle_report(
                 store,
                 &auth.account_id.0,
                 &calendar_id,
-                body_text,
+                &hrefs,
                 decrypt_context.as_ref(),
             )?));
         }
-        if body_text.contains("sync-collection") {
+        if has_named_xml_tag(body_text, "sync-collection") {
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(
@@ -131,10 +141,10 @@ fn calendar_query(
     store: &Arc<PimStore>,
     account_id: &str,
     calendar_id: &str,
-    body: &str,
+    query: &CalendarQueryRequest,
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
-    let range = parse_calendar_time_range(body);
+    let range = query.range.clone();
     let events = adapter
         .list_calendar_events(
             calendar_id,
@@ -165,6 +175,8 @@ fn calendar_query(
         report = "calendar-query",
         account_id,
         calendar_id,
+        component_filters = ?query.component_filters,
+        prop_filters = ?query.prop_filters,
         item_count,
         payload_count,
         "dav report assembled"
@@ -177,21 +189,24 @@ fn calendar_multiget(
     store: &Arc<PimStore>,
     account_id: &str,
     calendar_id: &str,
-    body: &str,
+    hrefs: &[String],
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
-    let hrefs = extract_report_hrefs(body);
     let mut items = Vec::with_capacity(hrefs.len());
+    let mut seen_event_ids = HashSet::new();
     for href in hrefs {
         let Some(event_id) = parse_event_id_from_href(&href, account_id, calendar_id) else {
             continue;
         };
+        if !seen_event_ids.insert(event_id.clone()) {
+            continue;
+        }
         let event = adapter
             .get_calendar_event(&event_id, false)
             .map_err(|err| DavError::Backend(err.to_string()))?;
         let Some(event) = event else {
             items.push(ReportItem {
-                href,
+                href: href.clone(),
                 etag: String::new(),
                 calendar_data: None,
                 content_type: None,
@@ -200,7 +215,7 @@ fn calendar_multiget(
             continue;
         };
         items.push(ReportItem {
-            href,
+            href: href.clone(),
             etag: etag::from_updated_ms(&event.id, event.updated_at_ms),
             calendar_data: load_calendar_data(store, &event.id, false, decrypt_context),
             content_type: Some("text/calendar; charset=utf-8".to_string()),
@@ -475,20 +490,172 @@ pub(crate) fn calendar_collection_sync_version(
     Ok(calendar_version.max(event_version))
 }
 
-fn parse_calendar_time_range(body: &str) -> CalendarEventRange {
-    let start = extract_attr(body, "start").and_then(parse_ics_datetime);
-    let end = extract_attr(body, "end").and_then(parse_ics_datetime);
-    CalendarEventRange {
-        start_time_from: start,
-        start_time_to: end,
-    }
+fn parse_calendar_query_request(body: &str) -> Result<CalendarQueryRequest> {
+    let query = extract_xml_element(body, "calendar-query")
+        .ok_or(DavError::InvalidRequest("calendar-query request is malformed"))?;
+
+    let range = parse_calendar_time_range_request(&query)?;
+
+    let filter = extract_xml_element(&query, "filter");
+    let component_filters = filter
+        .as_deref()
+        .map(|filter| {
+            extract_xml_start_tags(filter, "comp-filter")
+                .into_iter()
+                .filter_map(|tag| extract_xml_attribute(&tag, "name"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let prop_filters = filter
+        .as_deref()
+        .map(|filter| {
+            extract_xml_start_tags(filter, "prop-filter")
+                .into_iter()
+                .filter_map(|tag| extract_xml_attribute(&tag, "name"))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(CalendarQueryRequest {
+        range,
+        component_filters,
+        prop_filters,
+    })
 }
 
-fn extract_attr(body: &str, name: &str) -> Option<String> {
-    let needle = format!(r#"{name}=""#);
-    let (_, rest) = body.split_once(&needle)?;
-    let (value, _) = rest.split_once('"')?;
-    Some(value.to_string())
+fn parse_calendar_time_range_request(body: &str) -> Result<CalendarEventRange> {
+    let Some(time_range) = extract_xml_start_tags(body, "time-range").into_iter().next() else {
+        return Ok(CalendarEventRange::default());
+    };
+
+    let start = match extract_xml_attribute(&time_range, "start") {
+        Some(value) => Some(
+            parse_ics_timestamp(&value)
+                .ok_or(DavError::InvalidRequest("calendar-query has invalid time-range start"))?,
+        ),
+        None => None,
+    };
+
+    let end = match extract_xml_attribute(&time_range, "end") {
+        Some(value) => Some(
+            parse_ics_timestamp(&value)
+                .ok_or(DavError::InvalidRequest("calendar-query has invalid time-range end"))?,
+        ),
+        None => None,
+    };
+
+    if let (Some(start), Some(end)) = (start, end) {
+        if start > end {
+            return Err(DavError::InvalidRequest(
+                "calendar-query time-range start must be before end",
+            ));
+        }
+    }
+
+    Ok(CalendarEventRange {
+        start_time_from: start,
+        start_time_to: end,
+    })
+}
+
+fn parse_calendar_multiget_hrefs(body: &str) -> Result<Vec<String>> {
+    let multiget = extract_xml_element(body, "calendar-multiget")
+        .ok_or(DavError::InvalidRequest("calendar-multiget request is malformed"))?;
+
+    let hrefs = extract_report_hrefs(&multiget)
+        .into_iter()
+        .filter(|href| !href.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    if hrefs.is_empty() {
+        return Err(DavError::InvalidRequest(
+            "calendar-multiget requires at least one href",
+        ));
+    }
+
+    let mut unique_hrefs = Vec::with_capacity(hrefs.len());
+    let mut seen = HashSet::new();
+    for href in hrefs {
+        if seen.insert(href.clone()) {
+            unique_hrefs.push(href);
+        }
+    }
+
+    Ok(unique_hrefs)
+}
+
+fn has_named_xml_tag(body: &str, local_name: &str) -> bool {
+    let pattern = format!(
+        r"(?is)<(?:[A-Za-z0-9_-]+:)?{tag}\b",
+        tag = regex::escape(local_name)
+    );
+    Regex::new(&pattern)
+        .ok()
+        .is_some_and(|re| re.is_match(body))
+}
+
+fn extract_xml_elements(body: &str, local_name: &str) -> Vec<String> {
+    let pattern = format!(
+        r"(?is)<(?:[A-Za-z0-9_-]+:)?{tag}\b[^>]*>(?P<value>.*?)</(?:[A-Za-z0-9_-]+:)?{tag}>",
+        tag = regex::escape(local_name)
+    );
+    let Ok(re) = Regex::new(&pattern) else {
+        return Vec::new();
+    };
+
+    re.captures_iter(body)
+        .filter_map(|caps| caps.name("value"))
+        .map(|capture| capture.as_str().to_string())
+        .collect()
+}
+
+fn extract_xml_element(body: &str, local_name: &str) -> Option<String> {
+    extract_xml_elements(body, local_name).into_iter().next()
+}
+
+fn extract_xml_start_tags(body: &str, local_name: &str) -> Vec<String> {
+    let pattern = format!(
+        r"(?is)<(?:[A-Za-z0-9_-]+:)?{tag}\b[^>]*>",
+        tag = regex::escape(local_name)
+    );
+    let Ok(re) = Regex::new(&pattern) else {
+        return Vec::new();
+    };
+
+    re.find_iter(body).map(|tag| tag.as_str().to_string()).collect()
+}
+
+fn extract_xml_attribute(tag: &str, name: &str) -> Option<String> {
+    let pattern = format!(
+        r#"(?is)\b{name}\s*=\s*(?:\"(?P<double>[^"]*)\"|'(?P<single>[^']*)')"#,
+        name = regex::escape(name)
+    );
+    let Ok(re) = Regex::new(&pattern) else {
+        return None;
+    };
+    re.captures(tag)
+        .and_then(|caps| caps.name("double").or_else(|| caps.name("single")))
+        .map(|value| value.as_str().to_string())
+}
+
+fn parse_ics_timestamp(value: &str) -> Option<i64> {
+    let compact = value.replace('-', "");
+    parse_ics_datetime(value.to_string())
+        .or_else(|| parse_ics_datetime(compact.clone()))
+        .or_else(|| parse_ics_date(value))
+        .or_else(|| parse_ics_date(&compact))
+}
+
+fn parse_ics_date(value: &str) -> Option<i64> {
+    let value = value.trim();
+    if value.len() != 8 {
+        return None;
+    }
+    let year = value.get(0..4)?.parse::<i32>().ok()?;
+    let month = value.get(4..6)?.parse::<u32>().ok()?;
+    let day = value.get(6..8)?.parse::<u32>().ok()?;
+    to_unix_utc(year, month, day, 0, 0, 0)
 }
 
 fn extract_sync_token(body: &str) -> Option<String> {
@@ -887,7 +1054,9 @@ mod tests {
     use super::{
         backfill_cooldown_elapsed, caldav_backfill_scope, escape_xml, extract_report_hrefs,
         extract_sync_token, extract_sync_token_version, multistatus_response,
-        parse_calendar_collection_path, parse_calendar_time_range, parse_event_id_from_href,
+        DavError,
+        parse_calendar_multiget_hrefs, parse_calendar_query_request,
+        parse_calendar_collection_path, parse_calendar_time_range_request, parse_event_id_from_href,
         ReportItem,
     };
     use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
@@ -944,11 +1113,69 @@ mod tests {
 
     #[test]
     fn parses_calendar_time_range_attributes() {
-        let range = parse_calendar_time_range(
+        let range = parse_calendar_time_range_request(
             r#"<cal:calendar-query><cal:filter><cal:comp-filter name="VCALENDAR"><cal:comp-filter name="VEVENT"><cal:time-range start="20260305T120000Z" end="20260305T130000Z"/></cal:comp-filter></cal:comp-filter></cal:filter></cal:calendar-query>"#,
-        );
+        )
+        .expect("valid time-range should parse");
         assert!(range.start_time_from.is_some());
         assert!(range.start_time_to.is_some());
+    }
+
+    #[test]
+    fn parses_flexible_time_range_timestamps() {
+        let range = parse_calendar_time_range_request(
+            r#"<calendar-query><filter><comp-filter name="VEVENT"><time-range start="2026-03-05T120000Z" end="2026-03-05T130000Z"/></comp-filter></filter></calendar-query>"#,
+        )
+        .expect("valid time-range should parse");
+        assert!(range.start_time_from.is_some());
+        assert!(range.start_time_to.is_some());
+    }
+
+    #[test]
+    fn parses_calendar_query_request_filters_and_range() {
+        let parsed = parse_calendar_query_request(
+            r#"<c:calendar-query xmlns:c="urn:ietf:params:xml:ns:caldav"><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:prop-filter name="SUMMARY"/><c:time-range start="20260305T120000Z" end="20260305T130000Z"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#,
+        )
+        .expect("valid query should parse");
+
+        assert_eq!(parsed.component_filters, vec!["VCALENDAR", "VEVENT"]);
+        assert_eq!(parsed.prop_filters, vec!["SUMMARY"]);
+        assert!(parsed.range.start_time_from.is_some());
+        assert!(parsed.range.start_time_to.is_some());
+    }
+
+    #[test]
+    fn rejects_invalid_calendar_query_time_range_start() {
+        let err = parse_calendar_query_request(
+            r#"<cal:calendar-query><cal:filter><cal:comp-filter><cal:time-range start="2026-13-40T250000Z" end="20260305T130000Z"/></cal:comp-filter></cal:filter></cal:calendar-query>"#,
+        )
+        .expect_err("invalid time should reject");
+        assert!(matches!(err, DavError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn rejects_empty_calendar_multiget() {
+        let err = parse_calendar_multiget_hrefs(
+            r#"<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav"/>"#,
+        )
+        .expect_err("missing href should reject");
+        assert!(matches!(err, DavError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn deduplicates_calendar_multiget_hrefs() {
+        let hrefs = parse_calendar_multiget_hrefs(
+            r#"<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav"><c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</c:href><c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</c:href><c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-2.ics</c:href></c:calendar-multiget>"#,
+        )
+        .expect("valid multiget should parse");
+
+        assert_eq!(
+            hrefs,
+            vec![
+                "https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics".to_string(),
+                "https://127.0.0.1:8080/dav/uid-1/calendars/work/event-2.ics".to_string(),
+            ]
+        );
     }
 
     #[test]

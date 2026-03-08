@@ -155,6 +155,44 @@ fn filter_headers(header: &str) -> String {
 /// Format per RFC 3501 section 7.4.2:
 /// Non-multipart: (type subtype (params) id desc encoding size [lines] [md5] [disposition] [language] [location])
 /// Multipart: ((part1)(part2)... "subtype" (params) [disposition] [language] [location])
+pub fn build_body(data: &[u8]) -> String {
+    let text = String::from_utf8_lossy(data);
+    let (header_section, body_section) = split_header_body(&text);
+    let content_type = extract_content_type(&header_section);
+
+    match &content_type {
+        ContentType::Multipart { subtype, boundary } => {
+            let parts = parse_multipart_parts(&body_section, boundary);
+            let part_bodies: Vec<String> = parts.iter().map(|p| build_part_body(p)).collect();
+
+            if part_bodies.is_empty() {
+                simple_text_body(data.len())
+            } else {
+                format!("({} \"{}\")", part_bodies.join(""), subtype.to_uppercase())
+            }
+        }
+        ContentType::Simple {
+            type_main,
+            subtype,
+            charset,
+        } => {
+            let encoding = extract_content_transfer_encoding(&header_section);
+            let size = data.len();
+            let lines = text.lines().count();
+
+            format!(
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
+                type_main.to_uppercase(),
+                subtype.to_uppercase(),
+                charset,
+                encoding.to_uppercase(),
+                size,
+                lines
+            )
+        }
+    }
+}
+
 pub fn build_bodystructure(data: &[u8]) -> String {
     let text = String::from_utf8_lossy(data);
     let (header_section, body_section) = split_header_body(&text);
@@ -204,6 +242,13 @@ pub fn build_bodystructure(data: &[u8]) -> String {
 }
 
 /// Build a simple text/plain BODYSTRUCTURE (fallback)
+pub fn simple_text_body(size: usize) -> String {
+    format!(
+        "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {} 0)",
+        size
+    )
+}
+
 pub fn simple_text_structure(size: usize) -> String {
     format!(
         "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"8BIT\" {} 0 NIL NIL NIL)",
@@ -359,6 +404,38 @@ fn build_part_structure(part: &str) -> String {
                 subtype.to_uppercase(),
                 boundary
             )
+        }
+    }
+}
+
+fn build_part_body(part: &str) -> String {
+    let (header, body) = split_header_body(part);
+    let content_type = extract_content_type(&header);
+
+    match content_type {
+        ContentType::Simple {
+            type_main,
+            subtype,
+            charset,
+        } => {
+            let encoding = extract_content_transfer_encoding(&header);
+            let size = part.len();
+            let lines = body.lines().count();
+
+            format!(
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
+                type_main.to_uppercase(),
+                subtype.to_uppercase(),
+                charset,
+                encoding.to_uppercase(),
+                size,
+                lines
+            )
+        }
+        ContentType::Multipart { subtype, boundary } => {
+            let parts = parse_multipart_parts(&body, &boundary);
+            let part_bodies: Vec<String> = parts.iter().map(|p| build_part_body(p)).collect();
+            format!("({} \"{}\")", part_bodies.join(""), subtype.to_uppercase())
         }
     }
 }

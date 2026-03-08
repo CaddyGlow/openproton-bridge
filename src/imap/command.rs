@@ -86,6 +86,12 @@ pub enum Command {
         mailbox: String,
         uid: bool,
     },
+    Move {
+        tag: String,
+        sequence: SequenceSet,
+        mailbox: String,
+        uid: bool,
+    },
     Examine {
         tag: String,
         mailbox: String,
@@ -283,6 +289,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "SEARCH" => parse_search(&tag, args, false),
         "EXPUNGE" => Ok(Command::Expunge { tag }),
         "COPY" => parse_copy(&tag, args, false),
+        "MOVE" => parse_move(&tag, args, false),
         "EXAMINE" => parse_examine(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
@@ -300,6 +307,7 @@ fn parse_uid_command(tag: &str, args: &str) -> Result<Command> {
         "STORE" => parse_store(tag, rest, true),
         "SEARCH" => parse_search(tag, rest, true),
         "COPY" => parse_copy(tag, rest, true),
+        "MOVE" => parse_move(tag, rest, true),
         "EXPUNGE" => parse_uid_expunge(tag, rest),
         _ => Err(ImapError::Protocol(format!(
             "unknown UID subcommand: {}",
@@ -309,7 +317,12 @@ fn parse_uid_command(tag: &str, args: &str) -> Result<Command> {
 }
 
 fn parse_uid_expunge(tag: &str, args: &str) -> Result<Command> {
-    let (seq_str, _) = split_first_word(args)?;
+    let (seq_str, rest) = split_first_word(args)?;
+    if !rest.trim().is_empty() {
+        return Err(ImapError::Protocol(
+            "UID EXPUNGE accepts exactly one sequence-set argument".to_string(),
+        ));
+    }
     let sequence = parse_sequence_set(&seq_str)?;
     Ok(Command::UidExpunge {
         tag: tag.to_string(),
@@ -524,9 +537,16 @@ fn parse_seq_num(s: &str) -> Result<SeqNum> {
     if s == "*" {
         Ok(SeqNum::Wild)
     } else {
-        s.parse::<u32>()
-            .map(SeqNum::Num)
-            .map_err(|_| ImapError::Protocol(format!("invalid sequence number: {}", s)))
+        let num = s
+            .parse::<u32>()
+            .map_err(|_| ImapError::Protocol(format!("invalid sequence number: {}", s)))?;
+        if num == 0 {
+            return Err(ImapError::Protocol(format!(
+                "invalid sequence number (must be non-zero): {}",
+                s
+            )));
+        }
+        Ok(SeqNum::Num(num))
     }
 }
 
@@ -540,6 +560,16 @@ fn parse_fetch(tag: &str, args: &str, uid: bool) -> Result<Command> {
         items,
         uid,
     })
+}
+
+fn starts_fetch_item_keyword(upper: &str, keyword: &str) -> bool {
+    if !upper.starts_with(keyword) {
+        return false;
+    }
+    if upper.len() == keyword.len() {
+        return true;
+    }
+    upper.as_bytes()[keyword.len()].is_ascii_whitespace()
 }
 
 fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
@@ -568,22 +598,22 @@ fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
 
     while !remaining.is_empty() {
         let upper_rem = remaining.to_uppercase();
-        if upper_rem.starts_with("FLAGS") {
+        if starts_fetch_item_keyword(&upper_rem, "FLAGS") {
             items.push(FetchItem::Flags);
             remaining = remaining[5..].trim_start();
-        } else if upper_rem.starts_with("UID") {
+        } else if starts_fetch_item_keyword(&upper_rem, "UID") {
             items.push(FetchItem::Uid);
             remaining = remaining[3..].trim_start();
-        } else if upper_rem.starts_with("ENVELOPE") {
+        } else if starts_fetch_item_keyword(&upper_rem, "ENVELOPE") {
             items.push(FetchItem::Envelope);
             remaining = remaining[8..].trim_start();
-        } else if upper_rem.starts_with("RFC822.SIZE") {
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822.SIZE") {
             items.push(FetchItem::Rfc822Size);
             remaining = remaining[11..].trim_start();
-        } else if upper_rem.starts_with("INTERNALDATE") {
+        } else if starts_fetch_item_keyword(&upper_rem, "INTERNALDATE") {
             items.push(FetchItem::InternalDate);
             remaining = remaining[12..].trim_start();
-        } else if upper_rem.starts_with("BODYSTRUCTURE") {
+        } else if starts_fetch_item_keyword(&upper_rem, "BODYSTRUCTURE") {
             items.push(FetchItem::BodyStructure);
             remaining = remaining[13..].trim_start();
         } else if upper_rem.starts_with("BODY.PEEK[") {
@@ -594,16 +624,19 @@ fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
             let (item, rest) = parse_body_section(remaining, false)?;
             items.push(item);
             remaining = rest.trim_start();
-        } else if upper_rem.starts_with("BODY")
-            && !upper_rem.starts_with("BODY[")
-            && !upper_rem.starts_with("BODY.")
-        {
+        } else if starts_fetch_item_keyword(&upper_rem, "BODY") {
             items.push(FetchItem::Body);
             remaining = remaining[4..].trim_start();
         } else {
-            // Skip unknown token
-            let end = remaining.find(' ').unwrap_or(remaining.len());
-            remaining = remaining[end..].trim_start();
+            let token = remaining
+                .split_whitespace()
+                .next()
+                .unwrap_or(remaining)
+                .to_string();
+            return Err(ImapError::Protocol(format!(
+                "unknown fetch item: {}",
+                token
+            )));
         }
     }
 
@@ -740,19 +773,17 @@ fn parse_imap_date(s: &str) -> Result<i64> {
 }
 
 fn parse_search_criteria(s: &str) -> Result<Vec<SearchKey>> {
+    if s.trim().is_empty() {
+        return Ok(vec![SearchKey::All]);
+    }
+
     let mut criteria = Vec::new();
     let mut remaining = s.trim();
 
     while !remaining.is_empty() {
         let (criterion, rest) = parse_search_criterion(remaining)?;
-        if let Some(key) = criterion {
-            criteria.push(key);
-        }
+        criteria.push(criterion);
         remaining = rest.trim_start();
-    }
-
-    if criteria.is_empty() {
-        criteria.push(SearchKey::All);
     }
 
     Ok(criteria)
@@ -768,145 +799,142 @@ fn starts_search_keyword(upper: &str, keyword: &str) -> bool {
     upper.as_bytes()[keyword.len()].is_ascii_whitespace()
 }
 
-fn parse_search_criterion(s: &str) -> Result<(Option<SearchKey>, &str)> {
+fn parse_search_criterion(s: &str) -> Result<(SearchKey, &str)> {
     let remaining = s.trim_start();
     if remaining.is_empty() {
-        return Ok((None, ""));
+        return Err(ImapError::Protocol("missing SEARCH criterion".to_string()));
     }
     let upper = remaining.to_uppercase();
 
     if starts_search_keyword(&upper, "ALL") {
-        Ok((Some(SearchKey::All), remaining[3..].trim_start()))
+        Ok((SearchKey::All, remaining[3..].trim_start()))
     } else if starts_search_keyword(&upper, "UNSEEN") {
-        Ok((Some(SearchKey::Unseen), remaining[6..].trim_start()))
+        Ok((SearchKey::Unseen, remaining[6..].trim_start()))
     } else if starts_search_keyword(&upper, "SEEN") {
-        Ok((Some(SearchKey::Seen), remaining[4..].trim_start()))
+        Ok((SearchKey::Seen, remaining[4..].trim_start()))
     } else if starts_search_keyword(&upper, "FLAGGED") {
-        Ok((Some(SearchKey::Flagged), remaining[7..].trim_start()))
+        Ok((SearchKey::Flagged, remaining[7..].trim_start()))
     } else if starts_search_keyword(&upper, "DELETED") {
-        Ok((Some(SearchKey::Deleted), remaining[7..].trim_start()))
+        Ok((SearchKey::Deleted, remaining[7..].trim_start()))
     } else if starts_search_keyword(&upper, "ANSWERED") {
-        Ok((Some(SearchKey::Answered), remaining[8..].trim_start()))
+        Ok((SearchKey::Answered, remaining[8..].trim_start()))
     } else if starts_search_keyword(&upper, "DRAFT") {
-        Ok((Some(SearchKey::Draft), remaining[5..].trim_start()))
+        Ok((SearchKey::Draft, remaining[5..].trim_start()))
     } else if starts_search_keyword(&upper, "NEW") {
-        Ok((Some(SearchKey::New), remaining[3..].trim_start()))
+        Ok((SearchKey::New, remaining[3..].trim_start()))
     } else if starts_search_keyword(&upper, "OLD") {
-        Ok((Some(SearchKey::Old), remaining[3..].trim_start()))
+        Ok((SearchKey::Old, remaining[3..].trim_start()))
     } else if starts_search_keyword(&upper, "RECENT") {
-        Ok((Some(SearchKey::Recent), remaining[6..].trim_start()))
+        Ok((SearchKey::Recent, remaining[6..].trim_start()))
     } else if starts_search_keyword(&upper, "SUBJECT") {
         let remaining = &remaining[7..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Subject(val)), rest.trim_start()))
+        Ok((SearchKey::Subject(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "FROM") {
         let remaining = &remaining[4..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::From(val)), rest.trim_start()))
+        Ok((SearchKey::From(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "TO") {
         let remaining = &remaining[2..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::To(val)), rest.trim_start()))
+        Ok((SearchKey::To(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "CC") {
         let remaining = &remaining[2..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Cc(val)), rest.trim_start()))
+        Ok((SearchKey::Cc(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "BCC") {
         let remaining = &remaining[3..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Bcc(val)), rest.trim_start()))
+        Ok((SearchKey::Bcc(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "BODY") {
         let remaining = &remaining[4..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Body(val)), rest.trim_start()))
+        Ok((SearchKey::Body(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "TEXT") {
         let remaining = &remaining[4..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Text(val)), rest.trim_start()))
+        Ok((SearchKey::Text(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "KEYWORD") {
         let remaining = &remaining[7..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Keyword(val)), rest.trim_start()))
+        Ok((SearchKey::Keyword(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "UNKEYWORD") {
         let remaining = &remaining[9..];
         let (val, rest) = parse_astring(remaining)?;
-        Ok((Some(SearchKey::Unkeyword(val)), rest.trim_start()))
+        Ok((SearchKey::Unkeyword(val), rest.trim_start()))
     } else if starts_search_keyword(&upper, "HEADER") {
         let remaining = &remaining[6..];
         let (field, rest) = parse_astring(remaining)?;
         let (value, rest2) = parse_astring(rest.trim_start())?;
-        Ok((Some(SearchKey::Header(field, value)), rest2.trim_start()))
+        Ok((SearchKey::Header(field, value), rest2.trim_start()))
     } else if starts_search_keyword(&upper, "BEFORE") {
         let remaining = &remaining[6..];
         let (date_str, rest) = parse_astring(remaining)?;
         let ts = parse_imap_date(&date_str)?;
-        Ok((Some(SearchKey::Before(ts)), rest.trim_start()))
+        Ok((SearchKey::Before(ts), rest.trim_start()))
     } else if starts_search_keyword(&upper, "SINCE") {
         let remaining = &remaining[5..];
         let (date_str, rest) = parse_astring(remaining)?;
         let ts = parse_imap_date(&date_str)?;
-        Ok((Some(SearchKey::Since(ts)), rest.trim_start()))
+        Ok((SearchKey::Since(ts), rest.trim_start()))
     } else if starts_search_keyword(&upper, "ON") {
         let remaining = &remaining[2..];
         let (date_str, rest) = parse_astring(remaining)?;
         let ts = parse_imap_date(&date_str)?;
-        Ok((Some(SearchKey::On(ts)), rest.trim_start()))
+        Ok((SearchKey::On(ts), rest.trim_start()))
     } else if starts_search_keyword(&upper, "SENTBEFORE") {
         let remaining = &remaining[10..];
         let (date_str, rest) = parse_astring(remaining)?;
         let ts = parse_imap_date(&date_str)?;
-        Ok((Some(SearchKey::SentBefore(ts)), rest.trim_start()))
+        Ok((SearchKey::SentBefore(ts), rest.trim_start()))
     } else if starts_search_keyword(&upper, "SENTSINCE") {
         let remaining = &remaining[9..];
         let (date_str, rest) = parse_astring(remaining)?;
         let ts = parse_imap_date(&date_str)?;
-        Ok((Some(SearchKey::SentSince(ts)), rest.trim_start()))
+        Ok((SearchKey::SentSince(ts), rest.trim_start()))
     } else if starts_search_keyword(&upper, "SENTON") {
         let remaining = &remaining[6..];
         let (date_str, rest) = parse_astring(remaining)?;
         let ts = parse_imap_date(&date_str)?;
-        Ok((Some(SearchKey::SentOn(ts)), rest.trim_start()))
+        Ok((SearchKey::SentOn(ts), rest.trim_start()))
     } else if starts_search_keyword(&upper, "LARGER") {
         let remaining = &remaining[6..];
         let (size_str, rest) = split_first_word(remaining)?;
         let size: i64 = size_str
             .parse()
             .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
-        Ok((Some(SearchKey::Larger(size)), rest.trim_start()))
+        Ok((SearchKey::Larger(size), rest.trim_start()))
     } else if starts_search_keyword(&upper, "SMALLER") {
         let remaining = &remaining[7..];
         let (size_str, rest) = split_first_word(remaining)?;
         let size: i64 = size_str
             .parse()
             .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
-        Ok((Some(SearchKey::Smaller(size)), rest.trim_start()))
+        Ok((SearchKey::Smaller(size), rest.trim_start()))
     } else if starts_search_keyword(&upper, "UID") {
         let remaining = &remaining[3..];
         let (seq_str, rest) = split_first_word(remaining)?;
         let seq = parse_sequence_set(&seq_str)?;
-        Ok((Some(SearchKey::Uid(seq)), rest.trim_start()))
+        Ok((SearchKey::Uid(seq), rest.trim_start()))
     } else if starts_search_keyword(&upper, "OR") {
         let remaining = remaining[2..].trim_start();
         let (left, rest_left) = parse_search_criterion(remaining)?;
-        let Some(left) = left else {
-            return Ok((None, rest_left));
-        };
         let (right, rest_right) = parse_search_criterion(rest_left)?;
-        if let Some(right) = right {
-            Ok((
-                Some(SearchKey::Or(Box::new(left), Box::new(right))),
-                rest_right,
-            ))
-        } else {
-            Ok((Some(left), rest_left))
-        }
+        Ok((SearchKey::Or(Box::new(left), Box::new(right)), rest_right))
     } else if starts_search_keyword(&upper, "NOT") {
         let remaining = remaining[3..].trim_start();
         let (inner, rest) = parse_search_criterion(remaining)?;
-        Ok((inner.map(|c| SearchKey::Not(Box::new(c))), rest))
+        Ok((SearchKey::Not(Box::new(inner)), rest))
     } else {
-        let end = remaining.find(' ').unwrap_or(remaining.len());
-        Ok((None, remaining[end..].trim_start()))
+        let token = remaining
+            .split_whitespace()
+            .next()
+            .unwrap_or(remaining)
+            .to_string();
+        Err(ImapError::Protocol(format!(
+            "unknown SEARCH criterion: {}",
+            token
+        )))
     }
 }
 
@@ -915,6 +943,18 @@ fn parse_copy(tag: &str, args: &str, uid: bool) -> Result<Command> {
     let sequence = parse_sequence_set(&seq_str)?;
     let (mailbox, _) = parse_astring(rest.trim_start())?;
     Ok(Command::Copy {
+        tag: tag.to_string(),
+        sequence,
+        mailbox,
+        uid,
+    })
+}
+
+fn parse_move(tag: &str, args: &str, uid: bool) -> Result<Command> {
+    let (seq_str, rest) = split_first_word(args)?;
+    let sequence = parse_sequence_set(&seq_str)?;
+    let (mailbox, _) = parse_astring(rest.trim_start())?;
+    Ok(Command::Move {
         tag: tag.to_string(),
         sequence,
         mailbox,
@@ -1215,6 +1255,41 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_move() {
+        let cmd = parse_command("a013 MOVE 1:5 Archive").unwrap();
+        match cmd {
+            Command::Move {
+                tag, mailbox, uid, ..
+            } => {
+                assert_eq!(tag, "a013");
+                assert_eq!(mailbox, "Archive");
+                assert!(!uid);
+            }
+            _ => panic!("expected Move"),
+        }
+    }
+
+    #[test]
+    fn test_parse_uid_move() {
+        let cmd = parse_command("a013 UID MOVE 4,9 Trash").unwrap();
+        match cmd {
+            Command::Move {
+                sequence,
+                mailbox,
+                uid,
+                ..
+            } => {
+                assert!(uid);
+                assert_eq!(mailbox, "Trash");
+                assert!(sequence.contains(4, 9));
+                assert!(sequence.contains(9, 9));
+                assert!(!sequence.contains(7, 9));
+            }
+            _ => panic!("expected Move"),
+        }
+    }
+
+    #[test]
     fn test_parse_close() {
         let cmd = parse_command("a014 CLOSE").unwrap();
         assert_eq!(
@@ -1396,5 +1471,25 @@ mod tests {
             }
             _ => panic!("expected UidExpunge"),
         }
+    }
+
+    #[test]
+    fn test_parse_fetch_rejects_zero_sequence_number() {
+        assert!(parse_command("a001 FETCH 0 FLAGS").is_err());
+    }
+
+    #[test]
+    fn test_parse_fetch_rejects_unknown_item() {
+        assert!(parse_command("a001 FETCH 1 (FLAGS BOGUS)").is_err());
+    }
+
+    #[test]
+    fn test_parse_search_rejects_unknown_criterion() {
+        assert!(parse_command("a001 SEARCH BOGUS").is_err());
+    }
+
+    #[test]
+    fn test_parse_uid_expunge_rejects_extra_args() {
+        assert!(parse_command("a001 UID EXPUNGE 1:5 extra").is_err());
     }
 }

@@ -64,6 +64,7 @@ pub fn handle_propfind_with_store(
     let depth = parse_depth(headers)?;
     let path = normalize_path(raw_path);
     let mode = parse_propfind_mode(body)?;
+    tracing::debug!(path = %path, depth = ?depth, mode = ?mode, "dav propfind request");
 
     if path == discovery::PRINCIPAL_ME_PATH {
         let resources = principal_resources(auth, depth);

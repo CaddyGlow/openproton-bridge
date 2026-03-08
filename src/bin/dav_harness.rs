@@ -64,5 +64,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn default_db_path() -> PathBuf {
-    std::env::temp_dir().join("openproton-dav-harness").join("account.db")
+    std::env::temp_dir()
+        .join("openproton-dav-harness")
+        .join("account.db")
 }

@@ -86,6 +86,14 @@ pub async fn handle_request(
                 let Some(existing) = existing else {
                     return Ok(Some(not_found_response()));
                 };
+                let accepted_props = accepted_proppatch_props(body);
+                tracing::debug!(
+                    path = %raw_path,
+                    calendar_id = %calendar_id,
+                    request_body = %String::from_utf8_lossy(body),
+                    accepted_props = %accepted_props,
+                    "dav caldav proppatch request"
+                );
                 let display_name = extract_prop_text(body, "displayname")
                     .filter(|value| !value.trim().is_empty())
                     .unwrap_or_else(|| existing.name.clone());
@@ -108,7 +116,7 @@ pub async fn handle_request(
                     })
                     .map_err(|err| DavError::Backend(err.to_string()))?;
 
-                Ok(Some(prop_patch_ok_response(raw_path, body)))
+                Ok(Some(prop_patch_ok_response(raw_path, &accepted_props)))
             }
             "DELETE" => {
                 let exists = adapter
@@ -526,9 +534,8 @@ fn precondition_failed_response() -> DavResponse {
     }
 }
 
-fn prop_patch_ok_response(path: &str, body: &[u8]) -> DavResponse {
+fn prop_patch_ok_response(path: &str, accepted_props: &str) -> DavResponse {
     let href = normalize_path(path);
-    let accepted_props = accepted_proppatch_props(body);
     DavResponse {
         status: "207 Multi-Status",
         headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
@@ -642,7 +649,10 @@ mod tests {
     #[test]
     fn prop_patch_ok_response_lists_accepted_properties() {
         let body = br#"<?xml version="1.0" encoding="utf-8"?><d:propertyupdate xmlns:d="DAV:" xmlns:ical="http://apple.com/ns/ical/"><d:set><d:prop><d:displayname>Renamed</d:displayname><ical:calendar-color>#FF9500</ical:calendar-color></d:prop></d:set></d:propertyupdate>"#;
-        let response = prop_patch_ok_response("/dav/uid-1/calendars/work/", body);
+        let response = prop_patch_ok_response(
+            "/dav/uid-1/calendars/work/",
+            &accepted_proppatch_props(body),
+        );
         let wire = String::from_utf8(response.body).expect("utf8");
         assert!(wire.contains("<d:displayname/>"));
         assert!(wire.contains("<ical:calendar-color/>"));

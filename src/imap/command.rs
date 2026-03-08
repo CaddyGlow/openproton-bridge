@@ -53,6 +53,9 @@ pub enum Command {
         mailbox: String,
         items: Vec<StatusDataItem>,
     },
+    Check {
+        tag: String,
+    },
     Close {
         tag: String,
     },
@@ -276,6 +279,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "SUBSCRIBE" => parse_subscribe(&tag, args),
         "UNSUBSCRIBE" => parse_unsubscribe(&tag, args),
         "STATUS" => parse_status(&tag, args),
+        "CHECK" => Ok(Command::Check { tag }),
         "CLOSE" => Ok(Command::Close { tag }),
         "FETCH" => parse_fetch(&tag, args, false),
         "STORE" => parse_store(&tag, args, false),
@@ -1061,6 +1065,17 @@ mod tests {
                     StatusDataItem::Recent,
                     StatusDataItem::Messages,
                 ],
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_check() {
+        let cmd = parse_command("a006 CHECK").unwrap();
+        assert_eq!(
+            cmd,
+            Command::Check {
+                tag: "a006".to_string()
             }
         );
     }

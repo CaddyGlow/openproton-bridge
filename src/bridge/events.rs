@@ -912,18 +912,9 @@ async fn apply_metadata_to_store(
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         let in_mailbox = metadata.label_ids.iter().any(|label| label == mb.label_id);
         if in_mailbox {
-            let uid = config
-                .store
-                .store_metadata(&scoped, &metadata.id, metadata.clone())
-                .await
-                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-            let flags = mailbox::message_flags(metadata)
-                .iter()
-                .map(|f| f.to_string())
-                .collect::<Vec<_>>();
             config
                 .store
-                .set_flags(&scoped, uid, flags)
+                .store_metadata(&scoped, &metadata.id, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         } else if let Some(uid) = config
@@ -1099,6 +1090,21 @@ async fn bounded_resync_account_for_generation(
         let mut end_id: Option<String> = None;
         loop {
             ensure_account_generation(config, expected_generation, "bounded_resync_page").await?;
+            let request_phase = if end_id.is_some() {
+                "continuation"
+            } else {
+                "mailbox_start"
+            };
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                mailbox = %mb.name,
+                label_id = %mb.label_id,
+                phase = request_phase,
+                end_id = end_id.as_deref().unwrap_or_default(),
+                page_size = RESYNC_PAGE_SIZE,
+                "resync mailbox metadata request"
+            );
             let filter = MessageFilter {
                 label_id: Some(mb.label_id.to_string()),
                 end_id: end_id.clone(),
@@ -1117,6 +1123,19 @@ async fn bounded_resync_account_for_generation(
 
             completed_steps = completed_steps.saturating_add(1);
             let page_count = messages.len() as i32;
+            let next_end_id = messages.last().map(|metadata| metadata.id.as_str());
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                mailbox = %mb.name,
+                label_id = %mb.label_id,
+                phase = request_phase,
+                end_id = end_id.as_deref().unwrap_or_default(),
+                messages_count = messages.len(),
+                first_message_id = ?messages.first().map(|metadata| metadata.id.as_str()),
+                last_message_id = ?next_end_id,
+                "resync mailbox metadata page"
+            );
             if page_count == RESYNC_PAGE_SIZE {
                 total_steps = total_steps.saturating_add(1);
             }
@@ -1131,7 +1150,7 @@ async fn bounded_resync_account_for_generation(
                 break;
             }
 
-            end_id = messages.last().map(|metadata| metadata.id.clone());
+            end_id = next_end_id.map(str::to_string);
 
             for metadata in messages {
                 if synced_message_ids.insert(metadata.id.clone()) {
@@ -1329,6 +1348,51 @@ async fn cached_message_count_for_generation(
     Ok(total)
 }
 
+async fn bootstrap_latest_event_cursor_for_generation(
+    config: &EventWorkerConfig,
+    expected_generation: u64,
+) -> Result<String, EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "startup_cursor_init").await?;
+    let mut session = config
+        .runtime_accounts
+        .with_valid_access_token(&config.account_id)
+        .await?;
+
+    let base_url = resolve_api_base_url_for_mode(&config.api_base_url, session.api_mode);
+    let mut client = ProtonClient::authenticated_with_mode(
+        &base_url,
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )?;
+
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        "bootstrapping baseline event cursor from cached message store"
+    );
+    let response = fetch_events_with_retry(config, &mut session, &mut client, "").await?;
+    let event_id = response.event_id.trim().to_string();
+    if event_id.is_empty() {
+        return Err(EventWorkerError::Payload(
+            "latest event cursor bootstrap returned empty event id".to_string(),
+        ));
+    }
+
+    ensure_account_generation(config, expected_generation, "startup_cursor_commit").await?;
+    let checkpoint = EventCheckpoint {
+        last_event_id: event_id.clone(),
+        last_event_ts: Some(unix_now()),
+        sync_state: Some("baseline_cursor".to_string()),
+    };
+    config
+        .checkpoint_store
+        .save_checkpoint(&config.account_id, &checkpoint)
+        .map_err(|_| EventWorkerError::Checkpoint)?;
+
+    Ok(event_id)
+}
+
 pub async fn poll_account_once(
     config: &EventWorkerConfig,
     last_event_id: &str,
@@ -1414,7 +1478,6 @@ async fn poll_account_once_for_generation(
         ensure_account_generation(config, expected_generation, "poll_after_fetch").await?;
 
         let mut address_changed = response.refresh != 0;
-        let mut labels_changed = false;
         let mut resync_state: Option<&str> = None;
         if response.refresh != 0 && forced_sync_state.is_none() {
             info!(
@@ -1452,9 +1515,7 @@ async fn poll_account_once_for_generation(
                     EventDelta::MessageDelete(id) => {
                         apply_message_delete(config, &id, expected_generation).await?;
                     }
-                    EventDelta::LabelsChanged => {
-                        labels_changed = true;
-                    }
+                    EventDelta::LabelsChanged => {}
                     EventDelta::AddressesChanged => {
                         address_changed = true;
                     }
@@ -1486,17 +1547,6 @@ async fn poll_account_once_for_generation(
                     );
                 }
             }
-        }
-
-        if labels_changed && resync_state.is_none() {
-            bounded_resync_account_for_generation(
-                config,
-                &mut session,
-                &mut client,
-                expected_generation,
-            )
-            .await?;
-            resync_state = Some("label_resync");
         }
 
         if address_changed {
@@ -1616,10 +1666,80 @@ async fn run_event_worker_with_shutdown(
                     }
                 };
                 if startup_resync_pending {
-                    if !last_event_id.trim().is_empty() {
-                        match cached_message_count_for_generation(&config, expected_generation).await
-                        {
-                            Ok(cached_count) if cached_count > 0 => {
+                    match cached_message_count_for_generation(&config, expected_generation).await {
+                        Ok(cached_count) if cached_count > 0 => {
+                            if last_event_id.trim().is_empty() {
+                                match bootstrap_latest_event_cursor_for_generation(
+                                    &config,
+                                    expected_generation,
+                                )
+                                .await
+                                {
+                                    Ok(event_id) => {
+                                        info!(
+                                            service = "user-events",
+                                            user = %config.account_id.0,
+                                            account_id = %config.account_id.0,
+                                            account_email = %config.account_email,
+                                            count = cached_count,
+                                            event_id = %event_id,
+                                            msg = "Bootstrapped latest event cursor from cached messages",
+                                            "Bootstrapped latest event cursor from cached messages"
+                                        );
+                                        last_event_id = event_id;
+                                        startup_resync_pending = false;
+                                        next_delay = Duration::ZERO;
+                                        continue;
+                                    }
+                                    Err(err) => {
+                                        let now = unix_now();
+                                        let failure_class = classify_worker_failure_class(&err);
+                                        stats.record_failure(failure_class, now);
+                                        consecutive_failures =
+                                            consecutive_failures.saturating_add(1);
+                                        if let Some(next_health) = classify_worker_health(&err) {
+                                            let _ = config
+                                                .runtime_accounts
+                                                .set_health(&config.account_id, next_health)
+                                                .await;
+                                        }
+                                        let jitter_ms = rand::thread_rng().gen_range(0..=500_u64);
+                                        next_delay = compute_failure_delay(
+                                            poll_interval,
+                                            consecutive_failures,
+                                            jitter_ms,
+                                        );
+                                        warn!(
+                                            account_id = %config.account_id.0,
+                                            account_email = %config.account_email,
+                                            error = %err,
+                                            failure_class = ?failure_class,
+                                            consecutive_failures,
+                                            retry_delay_ms = next_delay.as_millis() as u64,
+                                            poll_attempts = stats.poll_attempts,
+                                            failed_polls = stats.failed_polls,
+                                            auth_failures = stats.auth_failures,
+                                            transient_failures = stats.transient_failures,
+                                            permanent_failures = stats.permanent_failures,
+                                            "event worker startup cursor bootstrap failed"
+                                        );
+                                        if stats.poll_attempts % WORKER_STATS_LOG_EVERY_ATTEMPTS == 0 {
+                                            warn!(
+                                                account_id = %config.account_id.0,
+                                                account_email = %config.account_email,
+                                                poll_attempts = stats.poll_attempts,
+                                                successful_polls = stats.successful_polls,
+                                                failed_polls = stats.failed_polls,
+                                                auth_failures = stats.auth_failures,
+                                                transient_failures = stats.transient_failures,
+                                                permanent_failures = stats.permanent_failures,
+                                                "event worker stats"
+                                            );
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else {
                                 info!(
                                     service = "imap",
                                     user = %config.account_id.0,
@@ -1634,15 +1754,15 @@ async fn run_event_worker_with_shutdown(
                                 next_delay = Duration::ZERO;
                                 continue;
                             }
-                            Ok(_) => {}
-                            Err(err) => {
-                                warn!(
-                                    account_id = %config.account_id.0,
-                                    account_email = %config.account_email,
-                                    error = %err,
-                                    "failed to inspect cached message state before startup resync"
-                                );
-                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            warn!(
+                                account_id = %config.account_id.0,
+                                account_email = %config.account_email,
+                                error = %err,
+                                "failed to inspect cached message state before startup resync"
+                            );
                         }
                     }
                     let startup_result = match run_startup_resync_for_generation(
@@ -3179,7 +3299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_account_once_label_event_uses_bounded_resync() {
+    async fn poll_account_once_label_event_does_not_trigger_resync() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/core/v4/events/event-0"))
@@ -3197,29 +3317,6 @@ mod tests {
                             "Name": "Projects"
                         }
                     }]
-                }]
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/mail/v4/messages"))
-            .and(header("x-http-method-override", "GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "Total": 1,
-                "Messages": [{
-                    "ID": "msg-label-resync-1",
-                    "AddressID": "addr-1",
-                    "LabelIDs": ["0"],
-                    "Subject": "Resynced from label event",
-                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
-                    "ToList": [],
-                    "CCList": [],
-                    "BCCList": [],
-                    "Time": 1700000000,
-                    "Size": 100,
-                    "Unread": 1,
-                    "NumAttachments": 0
                 }]
             })))
             .mount(&server)
@@ -3247,18 +3344,15 @@ mod tests {
         let next = poll_account_once(&config, "event-0").await.unwrap();
         assert_eq!(next, "event-1");
         assert_eq!(
-            store
-                .get_uid("uid-1::INBOX", "msg-label-resync-1")
-                .await
-                .unwrap(),
-            Some(1)
+            store.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
         );
 
         let checkpoint = checkpoints
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("label_resync"));
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
     }
 
     #[tokio::test]
@@ -3364,7 +3458,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_account_once_message_and_label_batch_sets_label_resync_state() {
+    async fn poll_account_once_message_and_label_batch_stays_incremental() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/core/v4/events/event-0"))
@@ -3387,29 +3481,6 @@ mod tests {
                 &["0"],
                 1,
             )))
-            .mount(&server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/mail/v4/messages"))
-            .and(header("x-http-method-override", "GET"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "Total": 1,
-                "Messages": [{
-                    "ID": "msg-1",
-                    "AddressID": "addr-1",
-                    "LabelIDs": ["0"],
-                    "Subject": "Event Subject",
-                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
-                    "ToList": [],
-                    "CCList": [],
-                    "BCCList": [],
-                    "Time": 1700000000,
-                    "Size": 100,
-                    "Unread": 1,
-                    "NumAttachments": 0
-                }]
-            })))
             .mount(&server)
             .await;
 
@@ -3442,7 +3513,7 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("label_resync"));
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
     }
 
     #[tokio::test]
@@ -4005,6 +4076,129 @@ mod tests {
         let _ = handle_2.await;
 
         assert_eq!(checkpoint_after_restart.last_event_id, "event-2");
+    }
+
+    #[tokio::test]
+    async fn startup_with_cached_mail_and_missing_cursor_bootstraps_latest_event_id() {
+        let tmp = tempdir().unwrap();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/latest"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-1"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        crate::vault::save_session(&session, tmp.path()).unwrap();
+
+        let store_root = tmp.path().join("gluon");
+        let mut account_storage_ids = HashMap::new();
+        account_storage_ids.insert("uid-1".to_string(), "storage-uid-1".to_string());
+        let store = crate::imap::store::new_runtime_message_store(
+            store_root.clone(),
+            account_storage_ids.clone(),
+        )
+        .unwrap();
+        store
+            .store_metadata(
+                "uid-1::INBOX",
+                "msg-1",
+                MessageMetadata {
+                    id: "msg-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["0".to_string()],
+                    external_id: None,
+                    subject: "Cached message".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: vec![],
+                    cc_list: vec![],
+                    bcc_list: vec![],
+                    reply_tos: vec![],
+                    flags: 0,
+                    time: 1700000000,
+                    size: 100,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session.clone()]));
+        let auth_router = AuthRouter::new(AccountRegistry::from_single_session(session));
+        let store_after_restart =
+            crate::imap::store::new_runtime_message_store(store_root, account_storage_ids).unwrap();
+        let checkpoints: SharedCheckpointStore =
+            Arc::new(VaultCheckpointStore::new(tmp.path().to_path_buf()));
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store_after_restart.clone(),
+            checkpoints.clone(),
+        );
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(run_event_worker_with_shutdown(
+            config,
+            Duration::from_secs(3600),
+            shutdown_rx,
+        ));
+        let checkpoint = wait_for_checkpoint_event_id(
+            checkpoints.as_ref(),
+            &AccountId("uid-1".to_string()),
+            "event-1",
+            Duration::from_secs(8),
+        )
+        .await
+        .expect("cached restart should bootstrap a latest event cursor");
+        let _ = shutdown_tx.send(true);
+        let _ = handle.await;
+
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("baseline_cursor"));
+        assert_eq!(
+            store_after_restart
+                .get_uid("uid-1::INBOX", "msg-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
     }
 
     #[tokio::test]

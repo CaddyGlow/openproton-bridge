@@ -3143,6 +3143,28 @@ fn print_interactive_serve_config(config: &InteractiveServeConfig) {
     );
 }
 
+fn dav_url_scheme(dav_tls_mode: bridge::mail_runtime::DavTlsMode) -> &'static str {
+    match dav_tls_mode {
+        bridge::mail_runtime::DavTlsMode::None => "http",
+        bridge::mail_runtime::DavTlsMode::StartTls => "https",
+    }
+}
+
+fn dav_calendar_home_url(
+    bind: &str,
+    dav_port: u16,
+    dav_tls_mode: bridge::mail_runtime::DavTlsMode,
+    account_id: &str,
+) -> String {
+    format!(
+        "{}://{}:{}{}",
+        dav_url_scheme(dav_tls_mode),
+        bind,
+        dav_port,
+        dav::discovery::calendar_home_path(account_id)
+    )
+}
+
 async fn cmd_login(
     username_arg: Option<String>,
     password_arg: Option<String>,
@@ -4721,6 +4743,16 @@ fn print_serve_configuration(
     println!("  Server: {}", bind);
     println!("  Port: {}", dav_port);
     println!("  TLS mode: {}", dav_tls_mode.as_str());
+    if dav_enable {
+        println!("  CalDAV URLs:");
+        for session in active_sessions {
+            println!(
+                "    {} = {}",
+                session.email,
+                dav_calendar_home_url(bind, dav_port, dav_tls_mode, &session.uid)
+            );
+        }
+    }
     println!();
     println!("SMTP server configuration:");
     println!("  Server: {}", bind);
@@ -5759,6 +5791,8 @@ mod tests {
         assert!(rendered.contains("set from = \"alias@proton.me\""));
         assert!(rendered.contains("set imap_user = \"alias@proton.me\""));
         assert!(rendered.contains("set folder = \"imap://127.0.0.1:1143/\""));
+        assert!(rendered.contains("set sort=threads"));
+        assert!(rendered.contains("bind index j next-entry"));
         assert!(rendered.contains("set smtp_url = \"smtp://alias%40proton.me@127.0.0.1:1025/\""));
         assert!(rendered.contains("# set imap_pass = \"<bridge-password>\""));
         assert!(!rendered.contains("set imap_pass = \"bridge-pass\""));

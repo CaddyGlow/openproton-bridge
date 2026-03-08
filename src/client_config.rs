@@ -54,6 +54,15 @@ pub fn render_mutt_config(template: &MuttConfigTemplate, include_password: bool)
     out.push_str("set spoolfile = \"+INBOX\"\n");
     out.push_str("set postponed = \"+Drafts\"\n");
     out.push_str("set record = \"+Sent\"\n");
+    out.push_str("\n# Threaded mailbox view with newest activity first.\n");
+    out.push_str("set sort=threads\n");
+    out.push_str("set sort_aux=last-date-received\n");
+    out.push_str("set reverse_sort=yes\n");
+    out.push_str("\n# Basic Vim-style navigation.\n");
+    out.push_str("bind index j next-entry\n");
+    out.push_str("bind index k previous-entry\n");
+    out.push_str("bind pager j next-line\n");
+    out.push_str("bind pager k previous-line\n");
     let _ = writeln!(
         out,
         "set smtp_url = \"{smtp_scheme}://{smtp_user}@{}:{}/\"",
@@ -137,6 +146,11 @@ mod tests {
         let rendered = render_mutt_config(&sample_template(), false);
         assert!(rendered.contains("set imap_authenticators = \"login\""));
         assert!(rendered.contains("set folder = \"imap://127.0.0.1:1143/\""));
+        assert!(rendered.contains("set sort=threads"));
+        assert!(rendered.contains("set sort_aux=last-date-received"));
+        assert!(rendered.contains("set reverse_sort=yes"));
+        assert!(rendered.contains("bind index j next-entry"));
+        assert!(rendered.contains("bind pager k previous-line"));
         assert!(
             rendered.contains("set smtp_url = \"smtp://alice%2Bqa%40proton.me@127.0.0.1:1025/\"")
         );

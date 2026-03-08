@@ -120,6 +120,8 @@ openproton-bridge mutt-config --account user@proton.me
 openproton-bridge mutt-config --account user@proton.me --include-password --output ~/.mutt/openproton.muttrc
 ```
 
+The generated mutt snippet includes threaded sorting defaults and basic `j`/`k` Vim-style navigation in index and pager views.
+
 ## Runtime Behavior
 
 - `serve` loads all saved accounts from vault and starts one event worker per account.

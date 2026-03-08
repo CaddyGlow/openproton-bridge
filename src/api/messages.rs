@@ -69,6 +69,9 @@ pub async fn get_message_metadata(
     info!(
         page = page,
         page_size = page_size,
+        label_id = filter.label_id.as_deref().unwrap_or_default(),
+        end_id = filter.end_id.as_deref().unwrap_or_default(),
+        continuation = filter.end_id.is_some(),
         "fetching message metadata"
     );
 
@@ -103,8 +106,13 @@ pub async fn get_message_metadata(
             info!(
                 page = page,
                 page_size = page_size,
+                label_id = filter.label_id.as_deref().unwrap_or_default(),
+                end_id = filter.end_id.as_deref().unwrap_or_default(),
+                continuation = filter.end_id.is_some(),
                 messages_count = meta_resp.messages.len(),
                 total = meta_resp.total,
+                first_message_id = ?meta_resp.messages.first().map(|message| message.id.as_str()),
+                last_message_id = ?meta_resp.messages.last().map(|message| message.id.as_str()),
                 attempt = attempt + 1,
                 duration_ms = fetch_started.elapsed().as_millis() as u64,
                 "metadata_fetch"

@@ -1090,6 +1090,21 @@ async fn bounded_resync_account_for_generation(
         let mut end_id: Option<String> = None;
         loop {
             ensure_account_generation(config, expected_generation, "bounded_resync_page").await?;
+            let request_phase = if end_id.is_some() {
+                "continuation"
+            } else {
+                "mailbox_start"
+            };
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                mailbox = %mb.name,
+                label_id = %mb.label_id,
+                phase = request_phase,
+                end_id = end_id.as_deref().unwrap_or_default(),
+                page_size = RESYNC_PAGE_SIZE,
+                "resync mailbox metadata request"
+            );
             let filter = MessageFilter {
                 label_id: Some(mb.label_id.to_string()),
                 end_id: end_id.clone(),
@@ -1108,6 +1123,19 @@ async fn bounded_resync_account_for_generation(
 
             completed_steps = completed_steps.saturating_add(1);
             let page_count = messages.len() as i32;
+            let next_end_id = messages.last().map(|metadata| metadata.id.as_str());
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                mailbox = %mb.name,
+                label_id = %mb.label_id,
+                phase = request_phase,
+                end_id = end_id.as_deref().unwrap_or_default(),
+                messages_count = messages.len(),
+                first_message_id = ?messages.first().map(|metadata| metadata.id.as_str()),
+                last_message_id = ?next_end_id,
+                "resync mailbox metadata page"
+            );
             if page_count == RESYNC_PAGE_SIZE {
                 total_steps = total_steps.saturating_add(1);
             }
@@ -1122,7 +1150,7 @@ async fn bounded_resync_account_for_generation(
                 break;
             }
 
-            end_id = messages.last().map(|metadata| metadata.id.clone());
+            end_id = next_end_id.map(str::to_string);
 
             for metadata in messages {
                 if synced_message_ids.insert(metadata.id.clone()) {

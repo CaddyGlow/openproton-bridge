@@ -709,9 +709,22 @@ fn parse_imap_date(s: &str) -> Result<i64> {
     let year: i32 = parts[2]
         .parse()
         .map_err(|_| ImapError::Protocol(format!("invalid year: {}", parts[2])))?;
+
+    if day == 0 {
+        return Err(ImapError::Protocol(format!("invalid day: {}", parts[0])));
+    }
+
     // Simple calculation: days since epoch (1970-01-01)
     let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
     let is_leap = |y: i32| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let mut max_day = days_in_month[(month - 1) as usize];
+    if month == 2 && is_leap(year) {
+        max_day += 1;
+    }
+    if day > max_day {
+        return Err(ImapError::Protocol(format!("invalid day: {}", parts[0])));
+    }
+
     let mut total_days: i64 = 0;
     for y in 1970..year {
         total_days += if is_leap(y) { 366 } else { 365 };
@@ -1318,6 +1331,11 @@ mod tests {
             }
             _ => panic!("expected Search"),
         }
+    }
+
+    #[test]
+    fn test_parse_search_before_rejects_day_zero() {
+        assert!(parse_command("a001 SEARCH BEFORE 0-Jan-2020").is_err());
     }
 
     #[test]

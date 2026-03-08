@@ -907,12 +907,10 @@ where
         if self.state != State::Selected {
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
-        if self.selected_read_only {
-            return self.writer.tagged_no(tag, "mailbox is read-only").await;
+        if !self.selected_read_only {
+            // Silently expunge deleted messages for read-write selections.
+            self.do_expunge(true).await?;
         }
-
-        // Silently expunge deleted messages
-        self.do_expunge(true).await?;
 
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
@@ -1221,7 +1219,7 @@ where
                             part_literals.insert(idx, body_data);
                         }
 
-                        if !peek {
+                        if !peek && !self.selected_read_only {
                             // Set \Seen flag
                             if !has_seen {
                                 store
@@ -2708,6 +2706,112 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("a002 OK [READ-WRITE] SELECT completed"));
         assert!(!session.selected_read_only);
+    }
+
+    #[tokio::test]
+    async fn test_close_after_examine_deselects_mailbox() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(session.selected_read_only);
+        assert_eq!(session.state, State::Selected);
+
+        session.handle_line("a002 CLOSE").await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a002 OK CLOSE completed"), "response={response}");
+        assert_eq!(session.state, State::Authenticated);
+        assert!(session.selected_mailbox.is_none());
+        assert!(!session.selected_read_only);
+    }
+
+    #[tokio::test]
+    async fn test_examine_fetch_body_does_not_mark_read() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(0)
+            .named("read-only fetch must not mark message as read")
+            .mount(&server)
+            .await;
+
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_rfc822(
+                "test-uid::INBOX",
+                uid,
+                b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nbody".to_vec(),
+            )
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(session.selected_read_only);
+
+        session.handle_line("a002 FETCH 1 (BODY[])").await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("BODY[]"), "response={response}");
+        assert!(response.contains("a002 OK FETCH completed"), "response={response}");
+
+        let flags = config
+            .store
+            .get_flags("test-uid::INBOX", uid)
+            .await
+            .unwrap();
+        assert!(
+            !flags.iter().any(|f| f == "\\Seen"),
+            "flags were mutated in read-only mode: {flags:?}"
+        );
+
+        server.verify().await;
     }
 
     #[tokio::test]

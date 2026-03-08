@@ -701,6 +701,18 @@ where
 
         let status = store.mailbox_status(&scoped_mailbox).await?;
         let snapshot = store.mailbox_snapshot(&scoped_mailbox).await?;
+        let selected_uids = store.list_uids(&scoped_mailbox).await?;
+        let first_unseen_seq = {
+            let mut first = None;
+            for (index, uid) in selected_uids.iter().enumerate() {
+                let flags = store.get_flags(&scoped_mailbox, *uid).await?;
+                if !flags.iter().any(|flag| flag == "\\Seen") {
+                    first = Some(index as u32 + 1);
+                    break;
+                }
+            }
+            first
+        };
 
         self.writer
             .untagged(&format!("{} EXISTS", status.exists))
@@ -710,13 +722,18 @@ where
             .untagged("FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
             .await?;
         self.writer
+            .untagged("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]")
+            .await?;
+        self.writer
             .untagged(&format!("OK [UIDVALIDITY {}]", status.uid_validity))
             .await?;
         self.writer
             .untagged(&format!("OK [UIDNEXT {}]", status.next_uid))
             .await?;
-        if status.unseen > 0 {
-            self.writer.untagged("OK [UNSEEN 1]").await?;
+        if let Some(first_unseen_seq) = first_unseen_seq {
+            self.writer
+                .untagged(&format!("OK [UNSEEN {}]", first_unseen_seq))
+                .await?;
         }
 
         self.selected_mailbox = Some(mb.name.to_string());
@@ -2373,6 +2390,39 @@ mod tests {
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
 
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_select_reports_first_unseen_sequence_and_permanentflags() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 0))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 SELECT INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("2 EXISTS"));
+        assert!(response.contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"));
+        assert!(response.contains("OK [UNSEEN 2]"));
+        assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
     }
 
     #[test]

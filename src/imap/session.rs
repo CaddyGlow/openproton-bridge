@@ -180,6 +180,7 @@ where
                 ref mailbox,
                 ref items,
             } => self.cmd_status(tag, mailbox, items).await?,
+            Command::Check { ref tag } => self.cmd_check(tag).await?,
             Command::Close { ref tag } => self.cmd_close(tag).await?,
             Command::Fetch {
                 ref tag,
@@ -807,6 +808,15 @@ where
         self.selected_mailbox_mod_seq = None;
         self.state = State::Authenticated;
         self.writer.tagged_ok(tag, None, "CLOSE completed").await
+    }
+
+    async fn cmd_check(&mut self, tag: &str) -> Result<()> {
+        if self.state != State::Selected {
+            return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+
+        self.emit_selected_mailbox_exists_update().await?;
+        self.writer.tagged_ok(tag, None, "CHECK completed").await
     }
 
     async fn cmd_fetch(
@@ -2131,6 +2141,26 @@ mod tests {
         assert!(response.contains("RECENT 0"));
         assert!(response.contains("MESSAGES 1"));
         assert!(response.contains("a001 OK STATUS completed"));
+    }
+
+    #[tokio::test]
+    async fn test_check_selected_mailbox() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.selected_mailbox_mod_seq = Some(0);
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        session.handle_line("a001 CHECK").await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a001 OK CHECK completed"));
     }
 
     #[tokio::test]

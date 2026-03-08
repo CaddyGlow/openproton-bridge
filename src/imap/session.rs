@@ -171,10 +171,27 @@ where
                 ref reference,
                 ref pattern,
             } => self.cmd_list(tag, reference, pattern).await?,
+            Command::Lsub {
+                ref tag,
+                ref reference,
+                ref pattern,
+            } => self.cmd_lsub(tag, reference, pattern).await?,
             Command::Select {
                 ref tag,
                 ref mailbox,
             } => self.cmd_select(tag, mailbox).await?,
+            Command::Create {
+                ref tag,
+                ref mailbox,
+            } => self.cmd_create(tag, mailbox).await?,
+            Command::Subscribe {
+                ref tag,
+                ref mailbox,
+            } => self.cmd_subscribe(tag, mailbox).await?,
+            Command::Unsubscribe {
+                ref tag,
+                ref mailbox,
+            } => self.cmd_unsubscribe(tag, mailbox).await?,
             Command::Status {
                 ref tag,
                 ref mailbox,
@@ -636,6 +653,98 @@ where
         }
 
         self.writer.tagged_ok(tag, None, "LIST completed").await
+    }
+
+    async fn cmd_lsub(&mut self, tag: &str, _reference: &str, pattern: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        if pattern.is_empty() {
+            // RFC 3501: empty pattern returns hierarchy delimiter
+            self.writer.untagged("LSUB (\\Noselect) \"/\" \"\"").await?;
+        } else {
+            // All system mailboxes are considered subscribed
+            let mailboxes = mailbox::system_mailboxes();
+            for mb in mailboxes {
+                if pattern == "*" || pattern == "%" || mb.name.eq_ignore_ascii_case(pattern) {
+                    let mut attrs = Vec::new();
+                    if !mb.selectable {
+                        attrs.push("\\Noselect");
+                    }
+                    if let Some(su) = mb.special_use {
+                        attrs.push(su);
+                    }
+                    let attr_str = if attrs.is_empty() {
+                        String::new()
+                    } else {
+                        attrs.join(" ")
+                    };
+                    self.writer
+                        .untagged(&format!("LSUB ({}) \"/\" \"{}\"", attr_str, mb.name))
+                        .await?;
+                }
+            }
+        }
+
+        self.writer.tagged_ok(tag, None, "LSUB completed").await
+    }
+
+    async fn cmd_create(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        // Check if mailbox already exists
+        if mailbox::find_mailbox(mailbox_name).is_some() {
+            return self
+                .writer
+                .tagged_no(tag, "[ALREADYEXISTS] mailbox already exists")
+                .await;
+        }
+
+        // Custom mailbox creation is not supported - return NO with CANNOT
+        self.writer
+            .tagged_no(tag, "[CANNOT] custom mailbox creation not supported")
+            .await
+    }
+
+    async fn cmd_subscribe(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        // Check if mailbox exists - if so, silently succeed (all mailboxes are subscribed)
+        if mailbox::find_mailbox(mailbox_name).is_some() {
+            return self
+                .writer
+                .tagged_ok(tag, None, "SUBSCRIBE completed")
+                .await;
+        }
+
+        // Mailbox doesn't exist
+        self.writer
+            .tagged_no(tag, "[NONEXISTENT] mailbox does not exist")
+            .await
+    }
+
+    async fn cmd_unsubscribe(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        // Check if mailbox exists - if so, silently succeed (we don't actually unsubscribe)
+        if mailbox::find_mailbox(mailbox_name).is_some() {
+            return self
+                .writer
+                .tagged_ok(tag, None, "UNSUBSCRIBE completed")
+                .await;
+        }
+
+        // Mailbox doesn't exist
+        self.writer
+            .tagged_no(tag, "[NONEXISTENT] mailbox does not exist")
+            .await
     }
 
     async fn cmd_select(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {

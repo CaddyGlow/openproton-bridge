@@ -27,7 +27,24 @@ pub enum Command {
         reference: String,
         pattern: String,
     },
+    Lsub {
+        tag: String,
+        reference: String,
+        pattern: String,
+    },
     Select {
+        tag: String,
+        mailbox: String,
+    },
+    Create {
+        tag: String,
+        mailbox: String,
+    },
+    Subscribe {
+        tag: String,
+        mailbox: String,
+    },
+    Unsubscribe {
         tag: String,
         mailbox: String,
     },
@@ -219,7 +236,11 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "IDLE" => Ok(Command::Idle { tag }),
         "STARTTLS" => Ok(Command::StartTls { tag }),
         "LIST" => parse_list(&tag, args),
+        "LSUB" => parse_lsub(&tag, args),
         "SELECT" => parse_select(&tag, args),
+        "CREATE" => parse_create(&tag, args),
+        "SUBSCRIBE" => parse_subscribe(&tag, args),
+        "UNSUBSCRIBE" => parse_unsubscribe(&tag, args),
         "STATUS" => parse_status(&tag, args),
         "CLOSE" => Ok(Command::Close { tag }),
         "FETCH" => parse_fetch(&tag, args, false),
@@ -324,6 +345,40 @@ fn parse_list(tag: &str, args: &str) -> Result<Command> {
         tag: tag.to_string(),
         reference,
         pattern,
+    })
+}
+
+fn parse_lsub(tag: &str, args: &str) -> Result<Command> {
+    let (reference, rest) = parse_astring(args.trim_start())?;
+    let (pattern, _) = parse_astring(rest.trim_start())?;
+    Ok(Command::Lsub {
+        tag: tag.to_string(),
+        reference,
+        pattern,
+    })
+}
+
+fn parse_create(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, _) = parse_astring(args.trim_start())?;
+    Ok(Command::Create {
+        tag: tag.to_string(),
+        mailbox,
+    })
+}
+
+fn parse_subscribe(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, _) = parse_astring(args.trim_start())?;
+    Ok(Command::Subscribe {
+        tag: tag.to_string(),
+        mailbox,
+    })
+}
+
+fn parse_unsubscribe(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, _) = parse_astring(args.trim_start())?;
+    Ok(Command::Unsubscribe {
+        tag: tag.to_string(),
+        mailbox,
     })
 }
 

@@ -928,8 +928,11 @@ where
         let max_uid = *all_uids.last().unwrap();
         let max_seq = all_uids.len() as u32;
 
-        // Expand macro items
-        let expanded = expand_fetch_items(items);
+        // Expand macro items and ensure UID is included for UID FETCH (RFC 3501 7.4.2)
+        let mut expanded = expand_fetch_items(items);
+        if uid_mode && !expanded.contains(&FetchItem::Uid) {
+            expanded.insert(0, FetchItem::Uid);
+        }
         let needs_body_sections = expanded
             .iter()
             .any(|i| matches!(i, FetchItem::BodySection { .. }));

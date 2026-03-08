@@ -906,6 +906,9 @@ where
         if self.state != State::Selected {
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
+        if self.selected_read_only {
+            return self.writer.tagged_no(tag, "mailbox is read-only").await;
+        }
 
         // Silently expunge deleted messages
         self.do_expunge(true).await?;
@@ -1907,9 +1910,7 @@ fn evaluate_search_key(
                     .to_lowercase()
                     .contains(&s.to_lowercase())
             } else {
-                meta.as_ref()
-                    .map(|m| m.subject.to_lowercase().contains(&s.to_lowercase()))
-                    .unwrap_or(false)
+                false
             }
         }
         SearchKey::Before(ts) => meta.as_ref().map(|m| m.time < *ts).unwrap_or(false),

@@ -728,175 +728,14 @@ fn parse_imap_date(s: &str) -> Result<i64> {
 
 fn parse_search_criteria(s: &str) -> Result<Vec<SearchKey>> {
     let mut criteria = Vec::new();
-    let mut remaining = s;
+    let mut remaining = s.trim();
 
     while !remaining.is_empty() {
-        let upper = remaining.to_uppercase();
-        if upper.starts_with("ALL") {
-            criteria.push(SearchKey::All);
-            remaining = remaining[3..].trim_start();
-        } else if upper.starts_with("UNSEEN") {
-            criteria.push(SearchKey::Unseen);
-            remaining = remaining[6..].trim_start();
-        } else if upper.starts_with("SEEN") {
-            criteria.push(SearchKey::Seen);
-            remaining = remaining[4..].trim_start();
-        } else if upper.starts_with("FLAGGED") {
-            criteria.push(SearchKey::Flagged);
-            remaining = remaining[7..].trim_start();
-        } else if upper.starts_with("DELETED") {
-            criteria.push(SearchKey::Deleted);
-            remaining = remaining[7..].trim_start();
-        } else if upper.starts_with("ANSWERED") {
-            criteria.push(SearchKey::Answered);
-            remaining = remaining[8..].trim_start();
-        } else if upper.starts_with("DRAFT") {
-            criteria.push(SearchKey::Draft);
-            remaining = remaining[5..].trim_start();
-        } else if upper.starts_with("NEW") {
-            criteria.push(SearchKey::New);
-            remaining = remaining[3..].trim_start();
-        } else if upper.starts_with("OLD") {
-            criteria.push(SearchKey::Old);
-            remaining = remaining[3..].trim_start();
-        } else if upper.starts_with("RECENT") && !upper.starts_with("RECENT ") {
-            criteria.push(SearchKey::Recent);
-            remaining = remaining[6..].trim_start();
-        } else if upper.starts_with("SUBJECT ") {
-            remaining = &remaining[8..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Subject(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("FROM ") {
-            remaining = &remaining[5..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::From(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("TO ") {
-            remaining = &remaining[3..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::To(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("CC ") {
-            remaining = &remaining[3..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Cc(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("BCC ") {
-            remaining = &remaining[4..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Bcc(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("BODY ") {
-            remaining = &remaining[5..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Body(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("TEXT ") {
-            remaining = &remaining[5..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Text(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("KEYWORD ") {
-            remaining = &remaining[8..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Keyword(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("UNKEYWORD ") {
-            remaining = &remaining[10..];
-            let (val, rest) = parse_astring(remaining)?;
-            criteria.push(SearchKey::Unkeyword(val));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("HEADER ") {
-            remaining = &remaining[7..];
-            let (field, rest) = parse_astring(remaining)?;
-            let (value, rest2) = parse_astring(rest.trim_start())?;
-            criteria.push(SearchKey::Header(field, value));
-            remaining = rest2.trim_start();
-        } else if upper.starts_with("BEFORE ") {
-            remaining = &remaining[7..];
-            let (date_str, rest) = parse_astring(remaining)?;
-            let ts = parse_imap_date(&date_str)?;
-            criteria.push(SearchKey::Before(ts));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("SINCE ") {
-            remaining = &remaining[6..];
-            let (date_str, rest) = parse_astring(remaining)?;
-            let ts = parse_imap_date(&date_str)?;
-            criteria.push(SearchKey::Since(ts));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("ON ") {
-            remaining = &remaining[3..];
-            let (date_str, rest) = parse_astring(remaining)?;
-            let ts = parse_imap_date(&date_str)?;
-            criteria.push(SearchKey::On(ts));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("SENTBEFORE ") {
-            remaining = &remaining[11..];
-            let (date_str, rest) = parse_astring(remaining)?;
-            let ts = parse_imap_date(&date_str)?;
-            criteria.push(SearchKey::SentBefore(ts));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("SENTSINCE ") {
-            remaining = &remaining[10..];
-            let (date_str, rest) = parse_astring(remaining)?;
-            let ts = parse_imap_date(&date_str)?;
-            criteria.push(SearchKey::SentSince(ts));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("SENTON ") {
-            remaining = &remaining[7..];
-            let (date_str, rest) = parse_astring(remaining)?;
-            let ts = parse_imap_date(&date_str)?;
-            criteria.push(SearchKey::SentOn(ts));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("LARGER ") {
-            remaining = &remaining[7..];
-            let (size_str, rest) = split_first_word(remaining)?;
-            let size: i64 = size_str
-                .parse()
-                .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
-            criteria.push(SearchKey::Larger(size));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("SMALLER ") {
-            remaining = &remaining[8..];
-            let (size_str, rest) = split_first_word(remaining)?;
-            let size: i64 = size_str
-                .parse()
-                .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
-            criteria.push(SearchKey::Smaller(size));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("UID ") {
-            remaining = &remaining[4..];
-            let (seq_str, rest) = split_first_word(remaining)?;
-            let seq = parse_sequence_set(&seq_str)?;
-            criteria.push(SearchKey::Uid(seq));
-            remaining = rest.trim_start();
-        } else if upper.starts_with("OR ") {
-            remaining = remaining[3..].trim_start();
-            // OR requires exactly two search keys
-            let sub1 = parse_search_criteria(remaining)?;
-            if sub1.len() >= 2 {
-                criteria.push(SearchKey::Or(
-                    Box::new(sub1[0].clone()),
-                    Box::new(sub1[1].clone()),
-                ));
-            } else if sub1.len() == 1 {
-                criteria.push(sub1[0].clone());
-            }
-            break;
-        } else if upper.starts_with("NOT ") {
-            remaining = remaining[4..].trim_start();
-            // Parse the next single criterion
-            let sub_criteria = parse_search_criteria(remaining)?;
-            if let Some(first) = sub_criteria.into_iter().next() {
-                criteria.push(SearchKey::Not(Box::new(first)));
-            }
-            break;
-        } else {
-            // Skip unrecognized token
-            let end = remaining.find(' ').unwrap_or(remaining.len());
-            remaining = remaining[end..].trim_start();
+        let (criterion, rest) = parse_search_criterion(remaining)?;
+        if let Some(key) = criterion {
+            criteria.push(key);
         }
+        remaining = rest.trim_start();
     }
 
     if criteria.is_empty() {
@@ -904,6 +743,158 @@ fn parse_search_criteria(s: &str) -> Result<Vec<SearchKey>> {
     }
 
     Ok(criteria)
+}
+
+fn starts_search_keyword(upper: &str, keyword: &str) -> bool {
+    if !upper.starts_with(keyword) {
+        return false;
+    }
+    if upper.len() == keyword.len() {
+        return true;
+    }
+    upper.as_bytes()[keyword.len()].is_ascii_whitespace()
+}
+
+fn parse_search_criterion(s: &str) -> Result<(Option<SearchKey>, &str)> {
+    let remaining = s.trim_start();
+    if remaining.is_empty() {
+        return Ok((None, ""));
+    }
+    let upper = remaining.to_uppercase();
+
+    if starts_search_keyword(&upper, "ALL") {
+        Ok((Some(SearchKey::All), remaining[3..].trim_start()))
+    } else if starts_search_keyword(&upper, "UNSEEN") {
+        Ok((Some(SearchKey::Unseen), remaining[6..].trim_start()))
+    } else if starts_search_keyword(&upper, "SEEN") {
+        Ok((Some(SearchKey::Seen), remaining[4..].trim_start()))
+    } else if starts_search_keyword(&upper, "FLAGGED") {
+        Ok((Some(SearchKey::Flagged), remaining[7..].trim_start()))
+    } else if starts_search_keyword(&upper, "DELETED") {
+        Ok((Some(SearchKey::Deleted), remaining[7..].trim_start()))
+    } else if starts_search_keyword(&upper, "ANSWERED") {
+        Ok((Some(SearchKey::Answered), remaining[8..].trim_start()))
+    } else if starts_search_keyword(&upper, "DRAFT") {
+        Ok((Some(SearchKey::Draft), remaining[5..].trim_start()))
+    } else if starts_search_keyword(&upper, "NEW") {
+        Ok((Some(SearchKey::New), remaining[3..].trim_start()))
+    } else if starts_search_keyword(&upper, "OLD") {
+        Ok((Some(SearchKey::Old), remaining[3..].trim_start()))
+    } else if starts_search_keyword(&upper, "RECENT") {
+        Ok((Some(SearchKey::Recent), remaining[6..].trim_start()))
+    } else if starts_search_keyword(&upper, "SUBJECT") {
+        let remaining = &remaining[7..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Subject(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "FROM") {
+        let remaining = &remaining[4..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::From(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "TO") {
+        let remaining = &remaining[2..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::To(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "CC") {
+        let remaining = &remaining[2..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Cc(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "BCC") {
+        let remaining = &remaining[3..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Bcc(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "BODY") {
+        let remaining = &remaining[4..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Body(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "TEXT") {
+        let remaining = &remaining[4..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Text(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "KEYWORD") {
+        let remaining = &remaining[7..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Keyword(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "UNKEYWORD") {
+        let remaining = &remaining[9..];
+        let (val, rest) = parse_astring(remaining)?;
+        Ok((Some(SearchKey::Unkeyword(val)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "HEADER") {
+        let remaining = &remaining[6..];
+        let (field, rest) = parse_astring(remaining)?;
+        let (value, rest2) = parse_astring(rest.trim_start())?;
+        Ok((Some(SearchKey::Header(field, value)), rest2.trim_start()))
+    } else if starts_search_keyword(&upper, "BEFORE") {
+        let remaining = &remaining[6..];
+        let (date_str, rest) = parse_astring(remaining)?;
+        let ts = parse_imap_date(&date_str)?;
+        Ok((Some(SearchKey::Before(ts)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "SINCE") {
+        let remaining = &remaining[5..];
+        let (date_str, rest) = parse_astring(remaining)?;
+        let ts = parse_imap_date(&date_str)?;
+        Ok((Some(SearchKey::Since(ts)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "ON") {
+        let remaining = &remaining[2..];
+        let (date_str, rest) = parse_astring(remaining)?;
+        let ts = parse_imap_date(&date_str)?;
+        Ok((Some(SearchKey::On(ts)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "SENTBEFORE") {
+        let remaining = &remaining[10..];
+        let (date_str, rest) = parse_astring(remaining)?;
+        let ts = parse_imap_date(&date_str)?;
+        Ok((Some(SearchKey::SentBefore(ts)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "SENTSINCE") {
+        let remaining = &remaining[9..];
+        let (date_str, rest) = parse_astring(remaining)?;
+        let ts = parse_imap_date(&date_str)?;
+        Ok((Some(SearchKey::SentSince(ts)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "SENTON") {
+        let remaining = &remaining[6..];
+        let (date_str, rest) = parse_astring(remaining)?;
+        let ts = parse_imap_date(&date_str)?;
+        Ok((Some(SearchKey::SentOn(ts)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "LARGER") {
+        let remaining = &remaining[6..];
+        let (size_str, rest) = split_first_word(remaining)?;
+        let size: i64 = size_str
+            .parse()
+            .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
+        Ok((Some(SearchKey::Larger(size)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "SMALLER") {
+        let remaining = &remaining[7..];
+        let (size_str, rest) = split_first_word(remaining)?;
+        let size: i64 = size_str
+            .parse()
+            .map_err(|_| ImapError::Protocol(format!("invalid size: {}", size_str)))?;
+        Ok((Some(SearchKey::Smaller(size)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "UID") {
+        let remaining = &remaining[3..];
+        let (seq_str, rest) = split_first_word(remaining)?;
+        let seq = parse_sequence_set(&seq_str)?;
+        Ok((Some(SearchKey::Uid(seq)), rest.trim_start()))
+    } else if starts_search_keyword(&upper, "OR") {
+        let remaining = remaining[2..].trim_start();
+        let (left, rest_left) = parse_search_criterion(remaining)?;
+        let Some(left) = left else {
+            return Ok((None, rest_left));
+        };
+        let (right, rest_right) = parse_search_criterion(rest_left)?;
+        if let Some(right) = right {
+            Ok((
+                Some(SearchKey::Or(Box::new(left), Box::new(right))),
+                rest_right,
+            ))
+        } else {
+            Ok((Some(left), rest_left))
+        }
+    } else if starts_search_keyword(&upper, "NOT") {
+        let remaining = remaining[3..].trim_start();
+        let (inner, rest) = parse_search_criterion(remaining)?;
+        Ok((inner.map(|c| SearchKey::Not(Box::new(c))), rest))
+    } else {
+        let end = remaining.find(' ').unwrap_or(remaining.len());
+        Ok((None, remaining[end..].trim_start()))
+    }
 }
 
 fn parse_copy(tag: &str, args: &str, uid: bool) -> Result<Command> {

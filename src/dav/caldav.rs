@@ -369,12 +369,159 @@ impl ParsedIcsDateTime {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedIcsProperty {
+    component: String,
+    name: String,
+    params: Vec<(String, String)>,
+    value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IcsParseIssue {
+    line: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IcsParseMode {
+    Strict,
+    Lenient,
+}
+
 #[derive(Debug, Default)]
 struct ParsedIcsEvent {
     uid: Option<String>,
     dt_start: Option<ParsedIcsDateTime>,
     dt_end: Option<ParsedIcsDateTime>,
     duration_seconds: Option<i64>,
+    preserved_properties: Vec<ParsedIcsProperty>,
+    parse_issues: Vec<IcsParseIssue>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IcsParser {
+    mode: IcsParseMode,
+}
+
+impl IcsParser {
+    fn new(mode: IcsParseMode) -> Self {
+        Self { mode }
+    }
+
+    fn parse_event_metadata(
+        &self,
+        raw: &str,
+    ) -> std::result::Result<ParsedIcsEvent, IcsParseIssue> {
+        let mut parsed = ParsedIcsEvent::default();
+        let mut component_stack: Vec<String> = Vec::new();
+        let mut current_component: Option<String> = None;
+
+        for raw_line in calendar_crypto::unfold_ics_lines(raw).into_iter() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Some((name, params, value)) = split_ics_property(line) else {
+                let issue = IcsParseIssue {
+                    line: line.to_string(),
+                    reason: "malformed iCalendar property (missing ':')".to_string(),
+                };
+                self.handle_issue(&mut parsed, issue)?;
+                continue;
+            };
+            let name_upper = name.to_ascii_uppercase();
+
+            if name_upper == "BEGIN" {
+                let component = value.trim().to_ascii_uppercase();
+                component_stack.push(component.clone());
+                if current_component.is_none() && is_supported_calendar_component(&component) {
+                    current_component = Some(component);
+                }
+                continue;
+            }
+            if name_upper == "END" {
+                if let Some(end_component) = component_stack.pop() {
+                    if current_component.as_ref() == Some(&end_component) {
+                        current_component = None;
+                    }
+                }
+                continue;
+            }
+
+            let Some(component) = current_component.as_ref() else {
+                continue;
+            };
+
+            match name_upper.as_str() {
+                "UID" => {
+                    if parsed.uid.is_none() {
+                        parsed.uid = Some(value.trim().to_string());
+                    }
+                }
+                "DTSTART" => {
+                    if parsed.dt_start.is_none() {
+                        parsed.dt_start = parse_ics_datetime_property(&name_upper, &params, value);
+                        if parsed.dt_start.is_none() {
+                            let issue = IcsParseIssue {
+                                line: line.to_string(),
+                                reason: "invalid DTSTART value".to_string(),
+                            };
+                            self.handle_issue(&mut parsed, issue)?;
+                        }
+                    }
+                }
+                "DTEND" | "DUE" => {
+                    if parsed.dt_end.is_none() {
+                        parsed.dt_end = parse_ics_datetime_property(&name_upper, &params, value);
+                        if parsed.dt_end.is_none() {
+                            let issue = IcsParseIssue {
+                                line: line.to_string(),
+                                reason: format!("invalid {} value", name_upper),
+                            };
+                            self.handle_issue(&mut parsed, issue)?;
+                        }
+                    }
+                }
+                "DURATION" => {
+                    if parsed.duration_seconds.is_none() {
+                        parsed.duration_seconds = parse_ics_duration(value);
+                        if parsed.duration_seconds.is_none() {
+                            let issue = IcsParseIssue {
+                                line: line.to_string(),
+                                reason: "invalid DURATION value".to_string(),
+                            };
+                            self.handle_issue(&mut parsed, issue)?;
+                        }
+                    }
+                }
+                _ => {
+                    parsed.preserved_properties.push(ParsedIcsProperty {
+                        component: component.clone(),
+                        name: name_upper,
+                        params,
+                        value: value.trim().to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(parsed)
+    }
+
+    fn handle_issue(
+        &self,
+        parsed: &mut ParsedIcsEvent,
+        issue: IcsParseIssue,
+    ) -> std::result::Result<(), IcsParseIssue> {
+        match self.mode {
+            IcsParseMode::Strict => Err(issue),
+            IcsParseMode::Lenient => {
+                parsed.parse_issues.push(issue);
+                Ok(())
+            }
+        }
+    }
 }
 
 fn parse_ics(
@@ -390,6 +537,7 @@ fn parse_ics(
         dt_start,
         dt_end,
         duration_seconds,
+        ..
     } = parse_ics_metadata(&normalized_payload);
 
     let event_start = dt_start.unwrap_or_else(|| ParsedIcsDateTime {
@@ -457,72 +605,9 @@ fn parse_ics(
 }
 
 fn parse_ics_metadata(raw: &str) -> ParsedIcsEvent {
-    let mut parsed = ParsedIcsEvent::default();
-    let mut component_stack: Vec<String> = Vec::new();
-    let mut current_component: Option<String> = None;
-
-    for raw_line in calendar_crypto::unfold_ics_lines(raw).into_iter() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, params, value)) = split_ics_property(line) else {
-            continue;
-        };
-        let name_upper = name.to_ascii_uppercase();
-
-        if name_upper == "BEGIN" {
-            let component = value.trim().to_ascii_uppercase();
-            component_stack.push(component.clone());
-            if current_component.is_none() && is_supported_calendar_component(&component) {
-                current_component = Some(component);
-            }
-            continue;
-        }
-        if name_upper == "END" {
-            if let Some(end_component) = component_stack.pop() {
-                if current_component.as_ref() == Some(&end_component) {
-                    current_component = None;
-                }
-            }
-            continue;
-        }
-
-        if current_component.is_none() {
-            continue;
-        }
-
-        match name_upper.as_str() {
-            "UID" => {
-                if parsed.uid.is_none() {
-                    parsed.uid = Some(value.trim().to_string());
-                }
-            }
-            "DTSTART" => {
-                if parsed.dt_start.is_none() {
-                    parsed.dt_start = parse_ics_datetime_property(&name_upper, &params, value);
-                }
-            }
-            "DTEND" => {
-                if parsed.dt_end.is_none() {
-                    parsed.dt_end = parse_ics_datetime_property(&name_upper, &params, value);
-                }
-            }
-            "DUE" => {
-                if parsed.dt_end.is_none() {
-                    parsed.dt_end = parse_ics_datetime_property(&name_upper, &params, value);
-                }
-            }
-            "DURATION" => {
-                if parsed.duration_seconds.is_none() {
-                    parsed.duration_seconds = parse_ics_duration(value);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    parsed
+    IcsParser::new(IcsParseMode::Lenient)
+        .parse_event_metadata(raw)
+        .unwrap_or_default()
 }
 
 fn is_supported_calendar_component(component: &str) -> bool {
@@ -895,7 +980,7 @@ mod tests {
     use super::{
         accepted_proppatch_props, format_ics_datetime, handle_request,
         parse_calendar_collection_id, parse_event_resource_id, parse_ics, parse_ics_datetime,
-        prop_patch_ok_response,
+        prop_patch_ok_response, IcsParseMode, IcsParser,
     };
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
@@ -983,6 +1068,69 @@ END:VCALENDAR\r
 ";
         let event = parse_ics("event-4", "cal-1", payload, 1, 2);
         assert_eq!(event.uid, "fold-1");
+    }
+
+    #[test]
+    fn parser_lenient_mode_preserves_unknown_properties_and_params() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:unknown-1\r
+X-APPLE-TRAVEL-ADVISORY-BEHAVIOR;X-OPENPROTON=keep:AUTOMATIC\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+
+        let parsed = IcsParser::new(IcsParseMode::Lenient)
+            .parse_event_metadata(payload)
+            .expect("lenient parser should accept unknown properties");
+        assert_eq!(parsed.uid.as_deref(), Some("unknown-1"));
+        assert_eq!(parsed.preserved_properties.len(), 1);
+        let preserved = &parsed.preserved_properties[0];
+        assert_eq!(preserved.component, "VEVENT");
+        assert_eq!(preserved.name, "X-APPLE-TRAVEL-ADVISORY-BEHAVIOR");
+        assert_eq!(
+            preserved.params,
+            vec![("X-OPENPROTON".to_string(), "keep".to_string())]
+        );
+        assert_eq!(preserved.value, "AUTOMATIC");
+    }
+
+    #[test]
+    fn parser_strict_mode_rejects_malformed_property_lines() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:strict-1\r
+DTSTART;TZID=Europe/Paris20260305T120000\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+
+        let err = IcsParser::new(IcsParseMode::Strict)
+            .parse_event_metadata(payload)
+            .expect_err("strict parser should reject malformed lines");
+        assert!(err.reason.contains("malformed iCalendar property"));
+    }
+
+    #[test]
+    fn parser_lenient_mode_records_parse_issues() {
+        let payload = "\
+BEGIN:VCALENDAR\r
+BEGIN:VEVENT\r
+UID:lenient-1\r
+DURATION:NOT-A-DURATION\r
+END:VEVENT\r
+END:VCALENDAR\r
+";
+
+        let parsed = IcsParser::new(IcsParseMode::Lenient)
+            .parse_event_metadata(payload)
+            .expect("lenient parser should not fail hard");
+        assert_eq!(parsed.uid.as_deref(), Some("lenient-1"));
+        assert_eq!(parsed.duration_seconds, None);
+        assert_eq!(parsed.parse_issues.len(), 1);
+        assert!(parsed.parse_issues[0].reason.contains("invalid DURATION"));
     }
 
     #[test]

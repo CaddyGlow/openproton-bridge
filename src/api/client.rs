@@ -14,6 +14,8 @@ const DEFAULT_WEBMAIL_APP_VERSION: &str = "web-mail@5.0.103.3";
 const DEFAULT_WEBMAIL_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
 const DEFAULT_TRANSIENT_RETRY_DELAY_MS: u64 = 200;
+const API_SUCCESS_CODE: i64 = 1000;
+const API_MULTI_CODE: i64 = 1001;
 
 fn bridge_app_version() -> String {
     let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
@@ -330,22 +332,64 @@ pub async fn send_logged(req: reqwest::RequestBuilder) -> Result<reqwest::Respon
 /// Check API response JSON for error codes.
 /// Proton API returns Code: 1000 for success.
 pub fn check_api_response(json: &serde_json::Value) -> Result<()> {
-    if let Some(code) = json.get("Code").and_then(|c| c.as_i64()) {
-        if code != 1000 {
-            let message = json
-                .get("Error")
-                .and_then(|e| e.as_str())
-                .unwrap_or("Unknown API error")
-                .to_string();
-            let details = json.get("Details").cloned();
-            return Err(ApiError::Api {
-                code,
-                message,
-                details,
-            });
+    let Some(code) = json.get("Code").and_then(|c| c.as_i64()) else {
+        return Ok(());
+    };
+
+    if code == API_SUCCESS_CODE {
+        return Ok(());
+    }
+
+    if code == API_MULTI_CODE {
+        if let Some(responses) = json.get("Responses").and_then(|r| r.as_array()) {
+            let mut first_err: Option<(i64, String, Option<serde_json::Value>)> = None;
+            for item in responses {
+                let response = item.get("Response").unwrap_or(item);
+                let response_code = response.get("Code").and_then(|c| c.as_i64());
+                if response_code == Some(API_SUCCESS_CODE) {
+                    continue;
+                }
+
+                let item_code = response_code.unwrap_or(API_MULTI_CODE);
+                let item_message = response
+                    .get("Error")
+                    .and_then(|e| e.as_str())
+                    .or_else(|| json.get("Error").and_then(|e| e.as_str()))
+                    .unwrap_or("Unknown API error")
+                    .to_string();
+                let item_details = response
+                    .get("Details")
+                    .cloned()
+                    .or_else(|| json.get("Details").cloned())
+                    .or_else(|| Some(item.clone()));
+
+                first_err = Some((item_code, item_message, item_details));
+                break;
+            }
+
+            if let Some((code, message, details)) = first_err {
+                return Err(ApiError::Api {
+                    code,
+                    message,
+                    details,
+                });
+            }
+
+            return Ok(());
         }
     }
-    Ok(())
+
+    let message = json
+        .get("Error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("Unknown API error")
+        .to_string();
+    let details = json.get("Details").cloned();
+    Err(ApiError::Api {
+        code,
+        message,
+        details,
+    })
 }
 
 pub(crate) fn is_transient_http_status(status: StatusCode) -> bool {
@@ -401,6 +445,47 @@ mod tests {
     fn test_check_api_response_success() {
         let json = serde_json::json!({"Code": 1000});
         check_api_response(&json).unwrap();
+    }
+
+    #[test]
+    fn test_check_api_response_multicode_all_success() {
+        let json = serde_json::json!({
+            "Code": 1001,
+            "Responses": [
+                { "ID": "m-1", "Response": { "Code": 1000 } },
+                { "ID": "m-2", "Response": { "Code": 1000 } }
+            ]
+        });
+        check_api_response(&json).unwrap();
+    }
+
+    #[test]
+    fn test_check_api_response_multicode_propagates_nested_error() {
+        let json = serde_json::json!({
+            "Code": 1001,
+            "Responses": [
+                {
+                    "ID": "m-1",
+                    "Response": {
+                        "Code": 2500,
+                        "Error": "Message does not exist"
+                    }
+                }
+            ]
+        });
+        let err = check_api_response(&json).unwrap_err();
+        match err {
+            ApiError::Api {
+                code,
+                message,
+                details,
+            } => {
+                assert_eq!(code, 2500);
+                assert_eq!(message, "Message does not exist");
+                assert!(details.is_some());
+            }
+            _ => panic!("expected ApiError::Api"),
+        }
     }
 
     #[test]

@@ -4,5 +4,11 @@
   <headers>
     <if-match>"stale-etag"</if-match>
   </headers>
-  <body>BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bad-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n</body>
+  <body>BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:bad-event
+END:VEVENT
+END:VCALENDAR
+</body>
 </dav-request>

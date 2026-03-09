@@ -1133,7 +1133,7 @@ mod tests {
         let mut response = vec![0; 1024];
         let _ = client.read(&mut response).await?;
 
-        let initial_report_body = r#"<sync-collection xmlns="DAV:"><sync-token></sync-token><sync-level>1</sync-level><prop><getetag/></prop></sync-collection>"#;
+        let initial_report_body = r#"<sync-collection xmlns="DAV:"><sync-token>0</sync-token><sync-level>1</sync-level><prop><getetag/></prop></sync-collection>"#;
         let initial_report = format!(
             "REPORT /dav/uid-1/calendars/default/ HTTP/1.1\r\nHost: localhost\r\nAuthorization: Basic {auth}\r\nContent-Length: {}\r\n\r\n{}",
             initial_report_body.len(),

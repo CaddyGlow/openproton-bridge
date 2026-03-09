@@ -38,6 +38,23 @@ fn read_fixture(path: &str) -> String {
 }
 
 #[tokio::test]
+async fn a1_report_rejects_malformed_addressbook_query_fixture() {
+    let store = gap_store();
+    let response = handle_report(
+        "/dav/uid-1/addressbooks/default/",
+        read_fixture("tests/fixtures/rfc-6352-4791/must_fail/addressbook-query-malformed.xml")
+            .as_bytes(),
+        &gap_auth(),
+        &store,
+        None,
+    )
+    .await
+    .expect("handler")
+    .expect("response");
+    assert_eq!(response.status, "400 Bad Request");
+}
+
+#[tokio::test]
 async fn a1_report_rejects_missing_sync_token_fixture() {
     let store = gap_store();
     let response = handle_report(
@@ -62,6 +79,42 @@ async fn a1_report_rejects_malformed_sync_token_fixture() {
             "tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-malformed.xml",
         )
         .as_bytes(),
+        &gap_auth(),
+        &store,
+        None,
+    )
+    .await
+    .expect("handler")
+    .expect("response");
+    assert_eq!(response.status, "400 Bad Request");
+}
+
+#[tokio::test]
+async fn a1_report_rejects_malformed_calendar_query_time_range_fixture() {
+    let store = gap_store();
+    let response = handle_report(
+        "/dav/uid-1/calendars/default/",
+        read_fixture(
+            "tests/fixtures/rfc-6352-4791/must_fail/calendar-query-malformed-time-range.xml",
+        )
+        .as_bytes(),
+        &gap_auth(),
+        &store,
+        None,
+    )
+    .await
+    .expect("handler")
+    .expect("response");
+    assert_eq!(response.status, "400 Bad Request");
+}
+
+#[tokio::test]
+async fn a1_report_rejects_empty_calendar_multiget_hrefs_fixture() {
+    let store = gap_store();
+    let response = handle_report(
+        "/dav/uid-1/calendars/default/",
+        read_fixture("tests/fixtures/rfc-6352-4791/must_fail/calendar-multiget-empty-hrefs.xml")
+            .as_bytes(),
         &gap_auth(),
         &store,
         None,

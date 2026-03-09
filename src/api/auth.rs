@@ -320,7 +320,7 @@ pub async fn get_granted_scopes(client: &ProtonClient) -> Result<Vec<String>> {
 }
 
 /// Submit TOTP 2FA code.
-pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorResponse> {
+pub async fn submit_2fa(client: &mut ProtonClient, code: &str) -> Result<TwoFactorResponse> {
     info!("submitting 2FA code");
     let body = json!({ "TwoFactorCode": code });
 
@@ -334,6 +334,7 @@ pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorRe
     } else {
         info!(scope = %result.scopes.join(" "), "2FA accepted");
     }
+    update_client_after_2fa(client, &result);
     Ok(result)
 }
 
@@ -343,7 +344,7 @@ pub async fn submit_2fa(client: &ProtonClient, code: &str) -> Result<TwoFactorRe
 /// `clientData`/`authenticatorData`/`signature`/`credentialId` fields,
 /// or a WebAuthn-style object containing `rawId` and `response`.
 pub async fn submit_fido_2fa(
-    client: &ProtonClient,
+    client: &mut ProtonClient,
     authentication_options: &Value,
     assertion_payload: &[u8],
 ) -> Result<TwoFactorResponse> {
@@ -415,7 +416,18 @@ pub async fn submit_fido_2fa(
             "FIDO2 assertion accepted"
         );
     }
+    update_client_after_2fa(client, &result);
     Ok(result)
+}
+
+fn update_client_after_2fa(client: &mut ProtonClient, result: &TwoFactorResponse) {
+    if let (Some(uid), Some(token)) = (&result.uid, &result.access_token) {
+        debug!("updating client auth with tokens from 2FA response");
+        client.set_auth(uid, token);
+    } else if let Some(token) = &result.access_token {
+        debug!("updating client access token from 2FA response");
+        client.update_access_token(token);
+    }
 }
 
 fn extract_first_binary(payload: &Value, paths: &[&[&str]], field_name: &str) -> Result<Vec<u8>> {

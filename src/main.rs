@@ -152,13 +152,13 @@ enum Command {
         #[arg(long, default_value = "1025")]
         smtp_port: u16,
         /// Enable local DAV server (CardDAV + CalDAV)
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = true)]
         dav_enable: bool,
         /// DAV port to listen on
         #[arg(long, default_value = "8080")]
         dav_port: u16,
         /// DAV transport mode
-        #[arg(long, value_enum, default_value = "none")]
+        #[arg(long, value_enum, default_value = "starttls")]
         dav_tls_mode: DavTlsModeArg,
         /// Address to bind to
         #[arg(long, default_value = "127.0.0.1")]
@@ -747,9 +747,9 @@ impl Default for InteractiveServeConfig {
         Self {
             imap_port: 1143,
             smtp_port: 1025,
-            dav_enable: false,
+            dav_enable: true,
             dav_port: 8080,
-            dav_tls_mode: bridge::mail_runtime::DavTlsMode::None,
+            dav_tls_mode: bridge::mail_runtime::DavTlsMode::StartTls,
             bind: "127.0.0.1".to_string(),
             no_tls: false,
             event_poll_secs: 30,
@@ -848,7 +848,7 @@ const fn default_pim_reconcile_tick_secs() -> i32 {
 }
 
 const fn default_dav_enable() -> bool {
-    false
+    true
 }
 
 const fn default_dav_port() -> i32 {
@@ -856,7 +856,7 @@ const fn default_dav_port() -> i32 {
 }
 
 fn default_dav_tls_mode() -> String {
-    "none".to_string()
+    "starttls".to_string()
 }
 
 fn parse_dav_tls_mode(value: &str) -> bridge::mail_runtime::DavTlsMode {
@@ -3215,7 +3215,7 @@ async fn cmd_login(
 
     // SRP authentication with optional human-verification retries.
     let mut hv_details: Option<api::types::HumanVerificationDetails> = None;
-    let auth = loop {
+    let mut auth = loop {
         match api::auth::login(
             &mut client,
             &username,
@@ -3310,7 +3310,7 @@ async fn cmd_login(
     };
 
     let second_factor_scopes =
-        match complete_cli_second_factor(&client, &auth, totp_code_arg.as_deref()).await {
+        match complete_cli_second_factor(&mut client, &mut auth, totp_code_arg.as_deref()).await {
             Ok(scopes) => scopes,
             Err(err) => {
                 tracing::warn!(
@@ -3440,13 +3440,15 @@ async fn cmd_login(
 }
 
 async fn complete_cli_second_factor(
-    client: &api::client::ProtonClient,
-    auth: &api::types::AuthResponse,
+    client: &mut api::client::ProtonClient,
+    auth: &mut api::types::AuthResponse,
     totp_code: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     if !auth.two_factor.requires_second_factor() {
         return Ok(Vec::new());
     }
+
+    let scopes;
 
     if auth.two_factor.totp_required() {
         tracing::info!(
@@ -3459,10 +3461,9 @@ async fn complete_cli_second_factor(
             None => rpassword::prompt_password("2FA code: ").context("failed to read 2FA code")?,
         };
         let result = api::auth::submit_2fa(client, code.trim()).await?;
-        return Ok(api::auth::normalize_scope_list(Some(&result.scopes)));
-    }
-
-    if auth.two_factor.fido_supported() {
+        apply_2fa_tokens(auth, &result);
+        scopes = api::auth::normalize_scope_list(Some(&result.scopes));
+    } else if auth.two_factor.fido_supported() {
         let auth_options = auth
             .two_factor
             .fido_authentication_options()
@@ -3470,10 +3471,41 @@ async fn complete_cli_second_factor(
         let assertion_payload = read_cli_fido_assertion_payload(&auth_options)?;
         let result =
             api::auth::submit_fido_2fa(client, &auth_options, assertion_payload.as_bytes()).await?;
-        return Ok(api::auth::normalize_scope_list(Some(&result.scopes)));
+        apply_2fa_tokens(auth, &result);
+        scopes = api::auth::normalize_scope_list(Some(&result.scopes));
+    } else {
+        anyhow::bail!("unsupported second-factor mode returned by API");
     }
 
-    anyhow::bail!("unsupported second-factor mode returned by API");
+    // The bridge API endpoint invalidates the initial access token after 2FA.
+    // The Go bridge handles this transparently via automatic 401 retry with
+    // token refresh. We refresh explicitly here to match that behavior.
+    let refreshed = api::auth::refresh_auth(
+        client,
+        &auth.uid,
+        &auth.refresh_token,
+        Some(&auth.access_token),
+    )
+    .await?;
+    auth.access_token = refreshed.access_token;
+    auth.refresh_token = refreshed.refresh_token;
+    if !refreshed.uid.is_empty() {
+        auth.uid = refreshed.uid;
+    }
+
+    Ok(scopes)
+}
+
+fn apply_2fa_tokens(auth: &mut api::types::AuthResponse, result: &api::types::TwoFactorResponse) {
+    if let Some(token) = &result.access_token {
+        auth.access_token = token.clone();
+    }
+    if let Some(token) = &result.refresh_token {
+        auth.refresh_token = token.clone();
+    }
+    if let Some(uid) = &result.uid {
+        auth.uid = uid.clone();
+    }
 }
 
 fn cmd_fido_assert(
@@ -4660,8 +4692,8 @@ async fn cmd_serve(
         dav_port,
         dav_tls_mode,
         disable_tls: no_tls,
-        use_ssl_for_imap: !no_tls,
-        use_ssl_for_smtp: !no_tls,
+        use_ssl_for_imap: false,
+        use_ssl_for_smtp: false,
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(
@@ -4790,8 +4822,8 @@ async fn start_interactive_runtime(
         dav_port: config.dav_port,
         dav_tls_mode: config.dav_tls_mode,
         disable_tls: config.no_tls,
-        use_ssl_for_imap: !config.no_tls,
-        use_ssl_for_smtp: !config.no_tls,
+        use_ssl_for_imap: false,
+        use_ssl_for_smtp: false,
         event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(config.pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(
@@ -5126,6 +5158,25 @@ mod tests {
                 _ => panic!("expected accounts use subcommand"),
             },
             _ => panic!("expected accounts command"),
+        }
+    }
+
+    #[test]
+    fn parse_serve_defaults_enable_dav_starttls_and_local_bind() {
+        let cli = Cli::try_parse_from(["openproton-bridge", "serve"]).unwrap();
+
+        match cli.command {
+            Command::Serve {
+                dav_enable,
+                dav_tls_mode,
+                bind,
+                ..
+            } => {
+                assert!(dav_enable);
+                assert_eq!(dav_tls_mode, DavTlsModeArg::Starttls);
+                assert_eq!(bind, "127.0.0.1");
+            }
+            _ => panic!("expected serve command"),
         }
     }
 

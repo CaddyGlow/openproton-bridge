@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use regex::Regex;
+use serde_json::Value;
 
 use crate::api::{calendar, client::ProtonClient};
 use crate::bridge::accounts::RuntimeAccountRegistry;
@@ -51,6 +52,9 @@ pub async fn handle_report(
 
     if path == card_collection {
         if body_text.contains("addressbook-query") {
+            if let Err(err) = parse_addressbook_query_request(body_text) {
+                return Ok(Some(invalid_report_payload_response(&err.to_string())));
+            }
             return Ok(Some(addressbook_query(&adapter, &auth.account_id.0)?));
         }
         if body_text.contains("sync-collection") {
@@ -70,7 +74,10 @@ pub async fn handle_report(
 
     if let Some(calendar_id) = parse_calendar_collection_path(&path, &auth.account_id.0) {
         if has_named_xml_tag(body_text, "calendar-query") {
-            let query = parse_calendar_query_request(body_text)?;
+            let query = match parse_calendar_query_request(body_text) {
+                Ok(query) => query,
+                Err(err) => return Ok(Some(invalid_report_payload_response(&err.to_string()))),
+            };
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_query(
@@ -83,7 +90,10 @@ pub async fn handle_report(
             )?));
         }
         if has_named_xml_tag(body_text, "calendar-multiget") {
-            let hrefs = parse_calendar_multiget_hrefs(body_text)?;
+            let hrefs = match parse_calendar_multiget_hrefs(body_text) {
+                Ok(hrefs) => hrefs,
+                Err(err) => return Ok(Some(invalid_report_payload_response(&err.to_string()))),
+            };
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_multiget(
@@ -96,6 +106,10 @@ pub async fn handle_report(
             )?));
         }
         if has_named_xml_tag(body_text, "sync-collection") {
+            let sync_token = match parse_sync_collection_token(body_text) {
+                Ok(sync_token) => sync_token,
+                Err(err) => return Ok(Some(invalid_report_payload_response(&err.to_string()))),
+            };
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(
@@ -105,7 +119,7 @@ pub async fn handle_report(
                     runtime_accounts,
                     &auth.account_id.0,
                     &calendar_id,
-                    body_text,
+                    sync_token,
                     decrypt_context.as_ref(),
                 )
                 .await?,
@@ -310,7 +324,7 @@ async fn caldav_sync_collection(
     runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
     account_id: &str,
     calendar_id: &str,
-    body: &str,
+    request_sync_token: i64,
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
     maybe_backfill_empty_caldav_sync(adapter, store, runtime_accounts, account_id, calendar_id)
@@ -330,7 +344,7 @@ async fn caldav_sync_collection(
         .get_sync_state_int(&caldav_sync_scope(account_id, calendar_id))
         .map_err(|err| DavError::Backend(err.to_string()))?;
     let since = if prior_sync_token.is_some() {
-        extract_sync_token_version(body)
+        Some(request_sync_token)
     } else {
         None
     };
@@ -373,7 +387,7 @@ async fn caldav_sync_collection(
         account_id,
         calendar_id,
         prior_sync_known = prior_sync_token.is_some(),
-        request_sync_token = extract_sync_token(body).as_deref().unwrap_or_default(),
+        request_sync_token = request_sync_token,
         item_count,
         payload_count,
         tombstone_count,
@@ -538,6 +552,40 @@ fn parse_calendar_query_request(body: &str) -> Result<CalendarQueryRequest> {
         component_filters,
         prop_filters,
     })
+}
+
+fn parse_addressbook_query_request(body: &str) -> Result<()> {
+    let query = extract_xml_element(body, "addressbook-query").ok_or(DavError::InvalidRequest(
+        "addressbook-query request is malformed",
+    ))?;
+    if extract_xml_start_tags(&query, "prop-filter")
+        .into_iter()
+        .any(|tag| extract_xml_attribute(&tag, "name").is_none())
+    {
+        return Err(DavError::InvalidRequest(
+            "addressbook-query property filters must include name attribute",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_sync_collection_token(body: &str) -> Result<i64> {
+    let token = extract_sync_token(body).ok_or(DavError::InvalidRequest(
+        "sync-collection request is missing sync-token",
+    ))?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(DavError::InvalidRequest(
+            "sync-collection sync-token is empty",
+        ));
+    }
+    token
+        .parse::<i64>()
+        .ok()
+        .or_else(|| sync_token_version_from_uri(token))
+        .ok_or(DavError::InvalidRequest(
+            "sync-collection sync-token is malformed",
+        ))
 }
 
 fn parse_calendar_time_range_request(body: &str) -> Result<CalendarEventRange> {
@@ -876,24 +924,230 @@ fn load_calendar_data(
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Option<String> {
     store
-        .get_calendar_event_payload(event_id, include_deleted)
+        .get_calendar_event_payload_with_raw(event_id, include_deleted)
         .ok()
         .flatten()
-        .map(|event| render_report_calendar_data(&event, decrypt_context))
+        .map(|(event, raw)| render_report_calendar_data(&event, Some(&raw), decrypt_context))
 }
 
 fn render_report_calendar_data(
     event: &crate::api::calendar::CalendarEvent,
+    raw_json: Option<&Value>,
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> String {
-    calendar_crypto::best_event_ics(event, decrypt_context).unwrap_or_else(|| {
-        format!(
-            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//OpenProton Bridge//EN\r\nBEGIN:VEVENT\r\nUID:{}\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:OpenProton Event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n",
-            event.uid,
-            format_ics_datetime(event.start_time),
-            format_ics_datetime(event.end_time)
-        )
-    })
+    if let Some(ics) = calendar_crypto::best_event_ics(event, decrypt_context) {
+        let mut enriched = ics.clone();
+        let mut fields =
+            calendar_crypto::best_event_text_fields(event, decrypt_context, Some(ics.as_str()));
+        if let Some(raw) = raw_json {
+            fill_missing_text_fields_from_raw_json(&mut fields, raw);
+        }
+        let has_summary = has_ics_property(ics.as_str(), "SUMMARY");
+        let has_location = has_ics_property(ics.as_str(), "LOCATION");
+        let has_description = has_ics_property(ics.as_str(), "DESCRIPTION");
+
+        let mut added_summary = false;
+        let mut added_location = false;
+        let mut added_description = false;
+
+        if !has_summary {
+            if let Some(value) = fields
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(escape_ics_text_value)
+            {
+                if insert_ics_property(&mut enriched, "SUMMARY", &value) {
+                    added_summary = true;
+                }
+            }
+        }
+        if !has_location {
+            if let Some(value) = fields
+                .location
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(escape_ics_text_value)
+            {
+                if insert_ics_property(&mut enriched, "LOCATION", &value) {
+                    added_location = true;
+                }
+            }
+        }
+        if !has_description {
+            if let Some(value) = fields
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(escape_ics_text_value)
+            {
+                if insert_ics_property(&mut enriched, "DESCRIPTION", &value) {
+                    added_description = true;
+                }
+            }
+        }
+
+        if added_summary || added_location || added_description {
+            tracing::warn!(
+                event_id = %event.id,
+                calendar_id = %event.calendar_id,
+                had_summary = has_summary,
+                had_location = has_location,
+                had_description = has_description,
+                added_summary,
+                added_location,
+                added_description,
+                decrypted_context = decrypt_context.is_some(),
+                "dav calendar-data sparse ICS enriched with recovered text fields"
+            );
+            return enriched;
+        }
+
+        if !has_summary || !has_location || !has_description {
+            tracing::warn!(
+                event_id = %event.id,
+                calendar_id = %event.calendar_id,
+                has_summary,
+                has_location,
+                has_description,
+                recovered_summary = fields.summary.is_some(),
+                recovered_location = fields.location.is_some(),
+                recovered_description = fields.description.is_some(),
+                decrypted_context = decrypt_context.is_some(),
+                "dav calendar-data sparse ICS could not be enriched"
+            );
+        }
+
+        return ics;
+    }
+
+    let mut fallback_fields = calendar_crypto::best_event_text_fields(event, decrypt_context, None);
+    if let Some(raw) = raw_json {
+        fill_missing_text_fields_from_raw_json(&mut fallback_fields, raw);
+    }
+    let summary = fallback_fields
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(escape_ics_text_value)
+        .unwrap_or_else(|| "OpenProton Event".to_string());
+    let location = fallback_fields
+        .location
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(escape_ics_text_value);
+    let description = fallback_fields
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(escape_ics_text_value);
+
+    tracing::warn!(
+        event_id = %event.id,
+        calendar_id = %event.calendar_id,
+        has_summary = !summary.is_empty(),
+        has_location = location.is_some(),
+        has_description = description.is_some(),
+        decrypted_context = decrypt_context.is_some(),
+        "dav calendar-data fallback rendered without best-event ICS candidate"
+    );
+
+    let mut ics = String::new();
+    ics.push_str("BEGIN:VCALENDAR\r\n");
+    ics.push_str("VERSION:2.0\r\n");
+    ics.push_str("PRODID:-//OpenProton Bridge//EN\r\n");
+    ics.push_str("BEGIN:VEVENT\r\n");
+    ics.push_str("UID:");
+    ics.push_str(&escape_ics_text_value(&event.uid));
+    ics.push_str("\r\nDTSTART:");
+    ics.push_str(&format_ics_datetime(event.start_time));
+    ics.push_str("\r\nDTEND:");
+    ics.push_str(&format_ics_datetime(event.end_time));
+    ics.push_str("\r\nSUMMARY:");
+    ics.push_str(&summary);
+    if let Some(location) = location {
+        ics.push_str("\r\nLOCATION:");
+        ics.push_str(&location);
+    }
+    if let Some(description) = description {
+        ics.push_str("\r\nDESCRIPTION:");
+        ics.push_str(&description);
+    }
+    ics.push_str("\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n");
+    ics
+}
+
+fn fill_missing_text_fields_from_raw_json(
+    fields: &mut calendar_crypto::EventTextFields,
+    raw: &Value,
+) {
+    if fields.summary.is_none() {
+        fields.summary = find_first_string_value(raw, &["Summary", "Title", "Name"]);
+    }
+    if fields.location.is_none() {
+        fields.location = find_first_string_value(raw, &["Location", "Place", "Address"]);
+    }
+    if fields.description.is_none() {
+        fields.description = find_first_string_value(raw, &["Description", "Notes"]);
+    }
+}
+
+fn find_first_string_value(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            for key in keys {
+                if let Some(Value::String(s)) = map.get(*key) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            for nested in map.values() {
+                if let Some(found) = find_first_string_value(nested, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        Value::Array(items) => items
+            .iter()
+            .find_map(|item| find_first_string_value(item, keys)),
+        _ => None,
+    }
+}
+
+fn escape_ics_text_value(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace("\r\n", "\\n")
+        .replace('\n', "\\n")
+        .replace('\r', "\\n")
+        .replace(';', "\\;")
+        .replace(',', "\\,")
+}
+
+fn has_ics_property(ics: &str, property: &str) -> bool {
+    let prefix = format!("{property}:");
+    let folded_prefix = format!("{property};");
+    ics.lines()
+        .any(|line| line.starts_with(&prefix) || line.starts_with(&folded_prefix))
+}
+
+fn insert_ics_property(ics: &mut String, property: &str, value: &str) -> bool {
+    let marker = "\r\nEND:VEVENT";
+    let Some(pos) = ics.find(marker) else {
+        return false;
+    };
+    let insertion = format!("\r\n{property}:{value}");
+    ics.insert_str(pos, &insertion);
+    true
 }
 
 fn extract_report_hrefs(body: &str) -> Vec<String> {
@@ -1093,10 +1347,12 @@ mod tests {
     use super::{
         backfill_cooldown_elapsed, caldav_backfill_scope, escape_xml, extract_report_hrefs,
         extract_sync_token, extract_sync_token_version, handle_report, multistatus_response,
-        parse_calendar_collection_path, parse_calendar_multiget_hrefs,
-        parse_calendar_query_request, parse_calendar_time_range_request, parse_event_id_from_href,
-        DavError, ReportItem,
+        parse_addressbook_query_request, parse_calendar_collection_path,
+        parse_calendar_multiget_hrefs, parse_calendar_query_request,
+        parse_calendar_time_range_request, parse_event_id_from_href, parse_sync_collection_token,
+        render_report_calendar_data, DavError, ReportItem,
     };
+    use crate::api::calendar::{CalendarEvent, CalendarEventPart};
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
     use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
@@ -1118,6 +1374,12 @@ mod tests {
     );
     const FIXTURE_CAL_MULTIGET_EMPTY: &str = include_str!(
         "../../tests/fixtures/rfc-6352-4791/must_fail/calendar-multiget-empty-hrefs.xml"
+    );
+    const FIXTURE_CARD_QUERY_MALFORMED: &str = include_str!(
+        "../../tests/fixtures/rfc-6352-4791/must_fail/addressbook-query-malformed.xml"
+    );
+    const FIXTURE_CAL_SYNC_TOKEN_MALFORMED: &str = include_str!(
+        "../../tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-malformed.xml"
     );
 
     fn test_adapter() -> StoreBackedDavAdapter {
@@ -1251,9 +1513,23 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_addressbook_query_without_prop_filter_name() {
+        let err = parse_addressbook_query_request(FIXTURE_CARD_QUERY_MALFORMED)
+            .expect_err("invalid addressbook-query should reject");
+        assert!(matches!(err, DavError::InvalidRequest(_)));
+    }
+
+    #[test]
     fn rejects_empty_calendar_multiget() {
         let err = parse_calendar_multiget_hrefs(FIXTURE_CAL_MULTIGET_EMPTY)
             .expect_err("missing href should reject");
+        assert!(matches!(err, DavError::InvalidRequest(_)));
+    }
+
+    #[test]
+    fn rejects_malformed_sync_collection_token() {
+        let err = parse_sync_collection_token(FIXTURE_CAL_SYNC_TOKEN_MALFORMED)
+            .expect_err("invalid sync-token should reject");
         assert!(matches!(err, DavError::InvalidRequest(_)));
     }
 
@@ -1334,6 +1610,118 @@ mod tests {
             calendar_data.len()
         )));
         assert!(body.contains("<cal:calendar-data>"));
+    }
+
+    #[test]
+    fn fallback_calendar_data_uses_extracted_text_properties() {
+        let event = CalendarEvent {
+            id: "event-1".to_string(),
+            uid: "uid-1".to_string(),
+            calendar_id: "work".to_string(),
+            start_time: 1_772_675_200,
+            end_time: 1_772_678_800,
+            calendar_events: vec![CalendarEventPart {
+                member_id: String::new(),
+                kind: 0,
+                data: "SUMMARY:Roadmap Review\nLOCATION:Paris\nDESCRIPTION:Quarterly planning"
+                    .to_string(),
+                signature: None,
+                author: None,
+            }],
+            ..CalendarEvent::default()
+        };
+
+        let rendered = render_report_calendar_data(&event, None, None);
+        assert!(rendered.contains("SUMMARY:Roadmap Review\r\n"));
+        assert!(rendered.contains("LOCATION:Paris\r\n"));
+        assert!(rendered.contains("DESCRIPTION:Quarterly planning\r\n"));
+    }
+
+    #[test]
+    fn enriches_sparse_ics_with_recovered_text_properties() {
+        let event = CalendarEvent {
+            id: "event-3".to_string(),
+            uid: "uid-3".to_string(),
+            calendar_id: "work".to_string(),
+            start_time: 1_772_675_200,
+            end_time: 1_772_678_800,
+            calendar_events: vec![CalendarEventPart {
+                member_id: String::new(),
+                kind: 0,
+                data: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-3\r\nDTSTART:20260305T120000Z\r\nDTEND:20260305T130000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_string(),
+                signature: None,
+                author: None,
+            }],
+            shared_events: vec![CalendarEventPart {
+                member_id: String::new(),
+                kind: 0,
+                data: "SUMMARY:Recovered title\nLOCATION:Recovered place\nDESCRIPTION:Recovered notes"
+                    .to_string(),
+                signature: None,
+                author: None,
+            }],
+            ..CalendarEvent::default()
+        };
+
+        let rendered = render_report_calendar_data(&event, None, None);
+        assert!(rendered.contains("SUMMARY:Recovered title\r\n"));
+        assert!(rendered.contains("LOCATION:Recovered place\r\n"));
+        assert!(rendered.contains("DESCRIPTION:Recovered notes\r\n"));
+    }
+
+    #[test]
+    fn fallback_calendar_data_escapes_text_values() {
+        let event = CalendarEvent {
+            id: "event-2".to_string(),
+            uid: "uid-2".to_string(),
+            calendar_id: "work".to_string(),
+            start_time: 1_772_675_200,
+            end_time: 1_772_678_800,
+            calendar_events: vec![CalendarEventPart {
+                member_id: String::new(),
+                kind: 0,
+                data:
+                    "SUMMARY:Sync, Team; Core\nLOCATION:HQ\\Floor 3\nDESCRIPTION:Line 1, Team; Core"
+                        .to_string(),
+                signature: None,
+                author: None,
+            }],
+            ..CalendarEvent::default()
+        };
+
+        let rendered = render_report_calendar_data(&event, None, None);
+        assert!(rendered.contains("SUMMARY:Sync\\, Team\\; Core\r\n"));
+        assert!(rendered.contains("LOCATION:HQ\\\\Floor 3\r\n"));
+        assert!(rendered.contains("DESCRIPTION:Line 1\\, Team\\; Core\r\n"));
+    }
+
+    #[test]
+    fn enriches_sparse_ics_with_raw_json_fields() {
+        let event = CalendarEvent {
+            id: "event-4".to_string(),
+            uid: "uid-4".to_string(),
+            calendar_id: "work".to_string(),
+            start_time: 1_772_675_200,
+            end_time: 1_772_678_800,
+            shared_events: vec![CalendarEventPart {
+                member_id: String::new(),
+                kind: 3,
+                data: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-4\r\nSUMMARY:Only summary in ICS\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_string(),
+                signature: None,
+                author: None,
+            }],
+            ..CalendarEvent::default()
+        };
+        let raw = serde_json::json!({
+            "Summary": "Only summary in ICS",
+            "Location": "From raw JSON",
+            "Description": "From raw notes"
+        });
+
+        let rendered = render_report_calendar_data(&event, Some(&raw), None);
+        assert!(rendered.contains("SUMMARY:Only summary in ICS\r\n"));
+        assert!(rendered.contains("LOCATION:From raw JSON\r\n"));
+        assert!(rendered.contains("DESCRIPTION:From raw notes\r\n"));
     }
 
     #[test]

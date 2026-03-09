@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OptionalExtension};
+use serde_json::Value;
 
 use crate::api::{calendar, contacts};
 
@@ -268,6 +269,34 @@ impl PimStore {
             .optional()?;
         match raw_json {
             Some(raw) => Ok(Some(serde_json::from_str::<calendar::CalendarEvent>(&raw)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_calendar_event_payload_with_raw(
+        &self,
+        event_id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<(calendar::CalendarEvent, Value)>> {
+        if event_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = open_read_connection(self)?;
+        let raw_json = conn
+            .query_row(
+                "SELECT raw_json
+                 FROM pim_calendar_events
+                 WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
+                rusqlite::params![event_id, bool_to_sql(include_deleted)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match raw_json {
+            Some(raw) => {
+                let raw_value: Value = serde_json::from_str(&raw)?;
+                let event: calendar::CalendarEvent = serde_json::from_value(raw_value.clone())?;
+                Ok(Some((event, raw_value)))
+            }
             None => Ok(None),
         }
     }

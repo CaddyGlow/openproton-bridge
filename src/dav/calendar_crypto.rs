@@ -16,6 +16,13 @@ pub struct CalendarDecryptContext {
     keyring: Keyring,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EventTextFields {
+    pub summary: Option<String>,
+    pub location: Option<String>,
+    pub description: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum IcsCandidateSource {
     PlainShared,
@@ -26,6 +33,26 @@ enum IcsCandidateSource {
     DecryptedCalendar,
     DecryptedPersonal,
     DecryptedAttendee,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct PartDiagnostics {
+    group: &'static str,
+    index: usize,
+    kind: i32,
+    data_len: usize,
+    plaintext_has_ics: bool,
+    plaintext_has_summary: bool,
+    plaintext_has_location: bool,
+    plaintext_has_description: bool,
+    decrypt_attempted: bool,
+    decrypt_ok: bool,
+    decrypt_error: Option<&'static str>,
+    decrypted_has_ics: bool,
+    decrypted_has_summary: bool,
+    decrypted_has_location: bool,
+    decrypted_has_description: bool,
 }
 
 impl IcsCandidateSource {
@@ -137,7 +164,7 @@ pub fn best_event_ics(
     }
 
     if let Some(ctx) = decrypt_context {
-        for (source, candidate) in decrypted_candidates(event, ctx) {
+        for (source, candidate) in decrypted_ics_candidates(event, ctx) {
             let score = ics_score(&candidate, source);
             if score > best_score {
                 best_score = score;
@@ -169,9 +196,77 @@ pub fn best_event_ics(
             payload_len = ics.len(),
             "dav calendar ics candidate selected"
         );
+
+        if !upper.contains("SUMMARY:")
+            || !upper.contains("LOCATION:")
+            || !upper.contains("DESCRIPTION:")
+        {
+            let diagnostics = collect_sparse_ics_diagnostics(event, decrypt_context);
+            tracing::debug!(
+                event_id = %event.id,
+                calendar_id = %event.calendar_id,
+                source = source.as_str(),
+                decrypted = source.is_decrypted(),
+                shared_parts = event.shared_events.len(),
+                calendar_parts = event.calendar_events.len(),
+                personal_parts = event.personal_events.len(),
+                attendee_parts = event.attendees_events.len(),
+                diagnostics = ?diagnostics,
+                "dav sparse ics diagnostics"
+            );
+        }
     }
 
     best
+}
+
+pub fn best_event_text_fields(
+    event: &CalendarEvent,
+    decrypt_context: Option<&CalendarDecryptContext>,
+    selected_ics: Option<&str>,
+) -> EventTextFields {
+    let mut fields = EventTextFields::default();
+
+    if let Some(ics) = selected_ics {
+        fill_missing_event_text_fields(&mut fields, &ics);
+        if event_text_fields_complete(&fields) {
+            return fields;
+        }
+    }
+
+    for text in plaintext_text_candidates(event) {
+        fill_missing_event_text_fields(&mut fields, &text);
+        if event_text_fields_complete(&fields) {
+            return fields;
+        }
+    }
+
+    if let Some(ctx) = decrypt_context {
+        for text in decrypted_candidates(event, ctx) {
+            fill_missing_event_text_fields(&mut fields, &text);
+            if event_text_fields_complete(&fields) {
+                return fields;
+            }
+        }
+    }
+
+    fields
+}
+
+fn fill_missing_event_text_fields(fields: &mut EventTextFields, payload: &str) {
+    if fields.summary.is_none() {
+        fields.summary = first_property_value(payload, "SUMMARY");
+    }
+    if fields.location.is_none() {
+        fields.location = first_property_value(payload, "LOCATION");
+    }
+    if fields.description.is_none() {
+        fields.description = first_property_value(payload, "DESCRIPTION");
+    }
+}
+
+fn event_text_fields_complete(fields: &EventTextFields) -> bool {
+    fields.summary.is_some() && fields.location.is_some() && fields.description.is_some()
 }
 
 fn build_address_keyrings(
@@ -261,6 +356,24 @@ fn plaintext_candidates(event: &CalendarEvent) -> Vec<(IcsCandidateSource, Strin
     out
 }
 
+fn plaintext_text_candidates(event: &CalendarEvent) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_plaintext_text_candidates(&mut out, &event.shared_events);
+    collect_plaintext_text_candidates(&mut out, &event.calendar_events);
+    collect_plaintext_text_candidates(&mut out, &event.personal_events);
+    collect_plaintext_text_candidates(&mut out, &event.attendees_events);
+    out
+}
+
+fn collect_plaintext_text_candidates(out: &mut Vec<String>, parts: &[CalendarEventPart]) {
+    out.extend(
+        parts
+            .iter()
+            .filter_map(|part| extract_text_payload(&part.data))
+            .filter(|payload| !payload.trim().is_empty()),
+    );
+}
+
 fn collect_plaintext_candidates(
     out: &mut Vec<(IcsCandidateSource, String)>,
     parts: &[CalendarEventPart],
@@ -273,13 +386,43 @@ fn collect_plaintext_candidates(
     );
 }
 
-fn decrypted_candidates(
+fn decrypted_candidates(event: &CalendarEvent, ctx: &CalendarDecryptContext) -> Vec<String> {
+    let mut out = Vec::new();
+    for part in &event.shared_events {
+        if let Some(text) = decrypt_part_text(part, &event.shared_key_packet, &ctx.keyring) {
+            out.push(text);
+        }
+    }
+    for part in &event.calendar_events {
+        let key_packet = if event.calendar_key_packet.trim().is_empty() {
+            &event.shared_key_packet
+        } else {
+            &event.calendar_key_packet
+        };
+        if let Some(text) = decrypt_part_text(part, key_packet, &ctx.keyring) {
+            out.push(text);
+        }
+    }
+    for part in &event.personal_events {
+        if let Some(text) = decrypt_part_text(part, &event.shared_key_packet, &ctx.keyring) {
+            out.push(text);
+        }
+    }
+    for part in &event.attendees_events {
+        if let Some(text) = decrypt_part_text(part, &event.shared_key_packet, &ctx.keyring) {
+            out.push(text);
+        }
+    }
+    out
+}
+
+fn decrypted_ics_candidates(
     event: &CalendarEvent,
     ctx: &CalendarDecryptContext,
 ) -> Vec<(IcsCandidateSource, String)> {
     let mut out = Vec::new();
     for part in &event.shared_events {
-        if let Some(ics) = decrypt_part(part, &event.shared_key_packet, &ctx.keyring) {
+        if let Some(ics) = decrypt_part_ics(part, &event.shared_key_packet, &ctx.keyring) {
             out.push((IcsCandidateSource::DecryptedShared, ics));
         }
     }
@@ -289,31 +432,201 @@ fn decrypted_candidates(
         } else {
             &event.calendar_key_packet
         };
-        if let Some(ics) = decrypt_part(part, key_packet, &ctx.keyring) {
+        if let Some(ics) = decrypt_part_ics(part, key_packet, &ctx.keyring) {
             out.push((IcsCandidateSource::DecryptedCalendar, ics));
         }
     }
     for part in &event.personal_events {
-        if let Some(ics) = decrypt_part(part, &event.shared_key_packet, &ctx.keyring) {
+        if let Some(ics) = decrypt_part_ics(part, &event.shared_key_packet, &ctx.keyring) {
             out.push((IcsCandidateSource::DecryptedPersonal, ics));
         }
     }
     for part in &event.attendees_events {
-        if let Some(ics) = decrypt_part(part, &event.shared_key_packet, &ctx.keyring) {
+        if let Some(ics) = decrypt_part_ics(part, &event.shared_key_packet, &ctx.keyring) {
             out.push((IcsCandidateSource::DecryptedAttendee, ics));
         }
     }
     out
 }
 
-fn decrypt_part(part: &CalendarEventPart, key_packet: &str, keyring: &Keyring) -> Option<String> {
-    if part.kind != 1 || key_packet.trim().is_empty() {
+fn collect_sparse_ics_diagnostics(
+    event: &CalendarEvent,
+    decrypt_context: Option<&CalendarDecryptContext>,
+) -> Vec<PartDiagnostics> {
+    let mut out = Vec::new();
+    collect_part_diagnostics(
+        &mut out,
+        "shared",
+        &event.shared_events,
+        &event.shared_key_packet,
+        decrypt_context,
+    );
+    let calendar_packet = if event.calendar_key_packet.trim().is_empty() {
+        &event.shared_key_packet
+    } else {
+        &event.calendar_key_packet
+    };
+    collect_part_diagnostics(
+        &mut out,
+        "calendar",
+        &event.calendar_events,
+        calendar_packet,
+        decrypt_context,
+    );
+    collect_part_diagnostics(
+        &mut out,
+        "personal",
+        &event.personal_events,
+        &event.shared_key_packet,
+        decrypt_context,
+    );
+    collect_part_diagnostics(
+        &mut out,
+        "attendee",
+        &event.attendees_events,
+        &event.shared_key_packet,
+        decrypt_context,
+    );
+    out
+}
+
+fn collect_part_diagnostics(
+    out: &mut Vec<PartDiagnostics>,
+    group: &'static str,
+    parts: &[CalendarEventPart],
+    key_packet: &str,
+    decrypt_context: Option<&CalendarDecryptContext>,
+) {
+    for (index, part) in parts.iter().enumerate().take(8) {
+        out.push(build_part_diagnostics(
+            group,
+            index,
+            part,
+            key_packet,
+            decrypt_context,
+        ));
+    }
+}
+
+fn build_part_diagnostics(
+    group: &'static str,
+    index: usize,
+    part: &CalendarEventPart,
+    key_packet: &str,
+    decrypt_context: Option<&CalendarDecryptContext>,
+) -> PartDiagnostics {
+    let plaintext_ics = extract_inline_ics_payload(&part.data);
+    let plaintext_text = extract_text_payload(&part.data);
+    let plaintext_source = plaintext_ics.as_deref().or(plaintext_text.as_deref());
+    let (plaintext_has_summary, plaintext_has_location, plaintext_has_description) =
+        property_presence(plaintext_source);
+
+    let (decrypt_attempted, decrypt_ok, decrypt_error, decrypted_source) =
+        if let Some(ctx) = decrypt_context {
+            match decrypt_part_text_diagnostic(part, key_packet, &ctx.keyring) {
+                Ok(text) => {
+                    let decrypted_ics = extract_inline_ics_payload(&text);
+                    let source = decrypted_ics.unwrap_or(text);
+                    (true, true, None, Some(source))
+                }
+                Err(err) => (true, false, Some(err), None),
+            }
+        } else {
+            (false, false, Some("decrypt context unavailable"), None)
+        };
+
+    let (decrypted_has_summary, decrypted_has_location, decrypted_has_description) =
+        property_presence(decrypted_source.as_deref());
+    let decrypted_has_ics = decrypted_source
+        .as_deref()
+        .map(|value| {
+            value.contains("BEGIN:VCALENDAR")
+                && value.contains("BEGIN:VEVENT")
+                && value.contains("END:VEVENT")
+        })
+        .unwrap_or(false);
+
+    PartDiagnostics {
+        group,
+        index,
+        kind: part.kind,
+        data_len: part.data.len(),
+        plaintext_has_ics: plaintext_ics.is_some(),
+        plaintext_has_summary,
+        plaintext_has_location,
+        plaintext_has_description,
+        decrypt_attempted,
+        decrypt_ok,
+        decrypt_error,
+        decrypted_has_ics,
+        decrypted_has_summary,
+        decrypted_has_location,
+        decrypted_has_description,
+    }
+}
+
+fn property_presence(payload: Option<&str>) -> (bool, bool, bool) {
+    let Some(payload) = payload else {
+        return (false, false, false);
+    };
+    let upper = payload.to_ascii_uppercase();
+    (
+        upper.contains("SUMMARY:") || upper.contains("SUMMARY;"),
+        upper.contains("LOCATION:") || upper.contains("LOCATION;"),
+        upper.contains("DESCRIPTION:") || upper.contains("DESCRIPTION;"),
+    )
+}
+
+fn decrypt_part_text(
+    part: &CalendarEventPart,
+    key_packet: &str,
+    keyring: &Keyring,
+) -> Option<String> {
+    if key_packet.trim().is_empty() || part.data.trim().is_empty() {
         return None;
     }
     let data_packets = BASE64.decode(part.data.trim()).ok()?;
     let decrypted = decrypt::decrypt_attachment(keyring, key_packet, &data_packets).ok()?;
     let text = String::from_utf8(decrypted).ok()?;
-    extract_inline_ics_payload(&text)
+    extract_text_payload(&text)
+}
+
+fn decrypt_part_text_diagnostic(
+    part: &CalendarEventPart,
+    key_packet: &str,
+    keyring: &Keyring,
+) -> std::result::Result<String, &'static str> {
+    if key_packet.trim().is_empty() {
+        return Err("missing key packet");
+    }
+    if part.data.trim().is_empty() {
+        return Err("empty part data");
+    }
+    let data_packets = BASE64
+        .decode(part.data.trim())
+        .map_err(|_| "base64 decode failed")?;
+    let decrypted = decrypt::decrypt_attachment(keyring, key_packet, &data_packets)
+        .map_err(|_| "attachment decrypt failed")?;
+    let text = String::from_utf8(decrypted).map_err(|_| "decrypted payload is not utf-8")?;
+    extract_text_payload(&text).ok_or("decrypted payload extraction failed")
+}
+
+fn decrypt_part_ics(
+    part: &CalendarEventPart,
+    key_packet: &str,
+    keyring: &Keyring,
+) -> Option<String> {
+    decrypt_part_text(part, key_packet, keyring).and_then(|text| extract_inline_ics_payload(&text))
+}
+
+fn extract_text_payload(raw: &str) -> Option<String> {
+    if raw
+        .trim_start()
+        .starts_with("-----BEGIN PGP SIGNED MESSAGE-----")
+    {
+        return extract_clearsigned_body(raw);
+    }
+    Some(raw.to_string())
 }
 
 pub(crate) fn extract_inline_ics_payload(raw: &str) -> Option<String> {

@@ -1723,7 +1723,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         info!(username = %username, "starting grpc 2FA submission");
 
         let mut pending_guard = self.state.pending_login.lock().await;
-        let Some(pending) = pending_guard.take() else {
+        let Some(mut pending) = pending_guard.take() else {
             return Err(Status::failed_precondition("no pending login for 2FA"));
         };
 
@@ -1734,7 +1734,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             ));
         }
 
-        let second_factor = match api::auth::submit_2fa(&pending.client, code.trim()).await {
+        let second_factor = match api::auth::submit_2fa(&mut pending.client, code.trim()).await {
             Ok(result) => result,
             Err(err) => {
                 *pending_guard = Some(pending);
@@ -1743,6 +1743,35 @@ impl pb::bridge_server::Bridge for BridgeService {
                 return Err(status_from_api_error(err));
             }
         };
+        if let Some(token) = &second_factor.access_token {
+            pending.access_token = token.clone();
+        }
+        if let Some(token) = &second_factor.refresh_token {
+            pending.refresh_token = token.clone();
+        }
+        if let Some(uid) = &second_factor.uid {
+            pending.uid = uid.clone();
+        }
+        // Refresh token after 2FA to match Go bridge behavior (auto 401 retry).
+        match api::auth::refresh_auth(
+            &mut pending.client,
+            &pending.uid,
+            &pending.refresh_token,
+            Some(&pending.access_token),
+        )
+        .await
+        {
+            Ok(refreshed) => {
+                pending.access_token = refreshed.access_token;
+                pending.refresh_token = refreshed.refresh_token;
+                if !refreshed.uid.is_empty() {
+                    pending.uid = refreshed.uid;
+                }
+            }
+            Err(err) => {
+                warn!(username = %username, error = %err, "post-2FA token refresh failed");
+            }
+        }
         info!(username = %username, "grpc 2FA submission accepted");
 
         drop(pending_guard);
@@ -1830,7 +1859,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
 
         let mut pending_guard = self.state.pending_login.lock().await;
-        let Some(pending) = pending_guard.take() else {
+        let Some(mut pending) = pending_guard.take() else {
             return Err(Status::failed_precondition("no pending login for FIDO"));
         };
 
@@ -1849,7 +1878,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         };
 
         let second_factor = match api::auth::submit_fido_2fa(
-            &pending.client,
+            &mut pending.client,
             &authentication_options,
             &req.password,
         )
@@ -1862,6 +1891,35 @@ impl pb::bridge_server::Bridge for BridgeService {
                 return Err(status_from_api_error(err));
             }
         };
+        if let Some(token) = &second_factor.access_token {
+            pending.access_token = token.clone();
+        }
+        if let Some(token) = &second_factor.refresh_token {
+            pending.refresh_token = token.clone();
+        }
+        if let Some(uid) = &second_factor.uid {
+            pending.uid = uid.clone();
+        }
+        // Refresh token after 2FA to match Go bridge behavior (auto 401 retry).
+        match api::auth::refresh_auth(
+            &mut pending.client,
+            &pending.uid,
+            &pending.refresh_token,
+            Some(&pending.access_token),
+        )
+        .await
+        {
+            Ok(refreshed) => {
+                pending.access_token = refreshed.access_token;
+                pending.refresh_token = refreshed.refresh_token;
+                if !refreshed.uid.is_empty() {
+                    pending.uid = refreshed.uid;
+                }
+            }
+            Err(err) => {
+                warn!(username = %username, error = %err, "post-2FA FIDO token refresh failed");
+            }
+        }
 
         drop(pending_guard);
         let granted_scopes = api::auth::normalize_scope_list(Some(&second_factor.scopes));

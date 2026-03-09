@@ -414,7 +414,7 @@ async fn run_single_attempt(
     };
 
     let second_factor_scopes =
-        match complete_second_factor(&client, &auth, totp_config, totp_code_override).await {
+        match complete_second_factor(&mut client, &auth, totp_config, totp_code_override).await {
             Ok(scopes) => scopes,
             Err(err) => {
                 return Ok(AttemptResult {
@@ -461,7 +461,7 @@ async fn run_single_attempt(
 }
 
 async fn complete_second_factor(
-    client: &api::client::ProtonClient,
+    client: &mut api::client::ProtonClient,
     auth: &api::types::AuthResponse,
     totp_config: Option<&TotpConfig>,
     totp_code_override: Option<&str>,
@@ -469,6 +469,7 @@ async fn complete_second_factor(
     if !auth.two_factor.requires_second_factor() {
         return Ok(Vec::new());
     }
+    let scopes;
     if auth.two_factor.totp_required() {
         let code = match totp_code_override {
             Some(code) => code.to_string(),
@@ -480,9 +481,19 @@ async fn complete_second_factor(
             },
         };
         let result = api::auth::submit_2fa(client, code.trim()).await?;
-        return Ok(api::auth::normalize_scope_list(Some(&result.scopes)));
+        scopes = api::auth::normalize_scope_list(Some(&result.scopes));
+    } else {
+        anyhow::bail!("unsupported second-factor mode returned by API");
     }
-    anyhow::bail!("unsupported second-factor mode returned by API");
+    // Refresh token after 2FA to match Go bridge behavior.
+    let _ = api::auth::refresh_auth(
+        client,
+        &auth.uid,
+        &auth.refresh_token,
+        Some(&auth.access_token),
+    )
+    .await;
+    Ok(scopes)
 }
 
 fn parse_totp_config(raw: Option<&str>) -> Result<Option<TotpConfig>> {

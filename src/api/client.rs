@@ -9,7 +9,6 @@ use super::error::{ApiError, Result};
 use super::types::ApiMode;
 
 const DEFAULT_BRIDGE_APP_VERSION: &str = "3.22.0+git";
-const DEFAULT_BRIDGE_APP_NAMESPACE: &str = "mail";
 const DEFAULT_WEBMAIL_APP_VERSION: &str = "web-mail@5.0.103.3";
 const DEFAULT_WEBMAIL_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
@@ -19,25 +18,14 @@ const API_MULTI_CODE: i64 = 1001;
 
 fn bridge_app_version() -> String {
     let bridge_version = std::env::var("OPENPROTON_PM_APP_VERSION")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-        .unwrap_or_else(|| DEFAULT_BRIDGE_APP_VERSION.to_string());
-    if bridge_version.contains('@') {
-        return bridge_version;
-    }
-    let namespace = std::env::var("OPENPROTON_PM_APP_NAMESPACE")
-        .ok()
-        .map(|raw| raw.trim().to_string())
-        .filter(|raw| !raw.is_empty())
-        .unwrap_or_else(|| DEFAULT_BRIDGE_APP_NAMESPACE.to_string());
+        .unwrap_or_else(|_| DEFAULT_BRIDGE_APP_VERSION.to_string());
     let os = match std::env::consts::OS {
         "macos" => "macos",
         "linux" => "linux",
         "windows" => "windows",
         _ => "linux",
     };
-    format!("{os}-{namespace}@{bridge_version}")
+    format!("{os}-bridge@{bridge_version}")
 }
 
 fn bridge_user_agent() -> String {
@@ -177,6 +165,11 @@ impl ProtonClient {
     /// Set auth credentials after login.
     pub fn set_auth(&mut self, uid: &str, access_token: &str) {
         self.uid = Some(uid.to_string());
+        self.access_token = Some(access_token.to_string());
+    }
+
+    /// Update only the access token (e.g. after 2FA elevates the session).
+    pub fn update_access_token(&mut self, access_token: &str) {
         self.access_token = Some(access_token.to_string());
     }
 

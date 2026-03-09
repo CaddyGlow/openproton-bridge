@@ -15,8 +15,8 @@
   requirement: "addressbook-query malformed payload must be rejected with deterministic 4xx"
   expected_status: 400
   owner: "Agent E"
-  dependency: "report::parse_calendar_query_request"
-  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  dependency: "report::parse_addressbook_query_request"
+  acceptance_check: "tests/dav/rfc_a1_negative_paths.rs"
   must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/addressbook-query-malformed.xml"
 
 - A1
@@ -26,7 +26,7 @@
   expected_status: 400
   owner: "Agent B"
   dependency: "report::parse_calendar_time_range_request"
-  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  acceptance_check: "tests/dav/rfc_a1_negative_paths.rs"
   must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-query-malformed-time-range.xml"
 
 - A1
@@ -36,7 +36,7 @@
   expected_status: 400
   owner: "Agent B"
   dependency: "report::parse_calendar_multiget_hrefs"
-  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  acceptance_check: "tests/dav/rfc_a1_negative_paths.rs"
   must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-multiget-empty-hrefs.xml"
 
 - A1
@@ -45,7 +45,7 @@
   requirement: "calendar sync-collection request without sync-token must be rejected as bad request"
   expected_status: 400
   owner: "Agent C"
-  dependency: "report::caldav_sync_collection"
+  dependency: "report::parse_sync_collection_token"
   acceptance_check: "tests/dav/rfc_a1_negative_paths.rs"
   must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-missing.xml"
 
@@ -55,7 +55,7 @@
   requirement: "calendar sync-collection with malformed sync-token must return explicit bad request"
   expected_status: 400
   owner: "Agent C"
-  dependency: "report::extract_sync_token"
+  dependency: "report::parse_sync_collection_token"
   acceptance_check: "tests/dav/rfc_a1_negative_paths.rs"
   must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-malformed.xml"
 

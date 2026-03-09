@@ -146,19 +146,34 @@ Last updated: 2026-03-09
     - Verifies all acceptance check paths and fixture references resolve.
   - Added `tests/fixtures/rfc-6352-4791/gaps/phase-a1.yaml`.
     - Includes baseline items for RFC 6352 section 5.1.1, RFC 6352 7.6, RFC 4791 7.2, RFC 4791 7.3.
+    - Expanded with sync-token and conditional-write contract rows:
+      - RFC 6578 5.2.1 (missing `sync-token`)
+      - RFC 6578 5.3 (malformed `sync-token`)
+      - RFC 4918 10.4.1 (stale `If-Match`)
+      - RFC 4918 10.4.2 (`If-None-Match:*` conflict)
   - Added malformed must-fail payload fixtures under `tests/fixtures/rfc-6352-4791/must_fail/`.
     - `addressbook-query-malformed.xml`
     - `calendar-query-malformed-time-range.xml`
     - `calendar-multiget-empty-hrefs.xml`
+    - `calendar-sync-token-missing.xml`
+    - `calendar-sync-token-malformed.xml`
+    - `calendar-put-stale-if-match.xml`
+    - `calendar-put-if-none-match-existing.xml`
+  - Added dedicated negative-path acceptance coverage in `tests/dav/rfc_a1_negative_paths.rs` for:
+    - malformed `addressbook-query` payload rejection
+    - sync-token validation
+    - stale `If-Match` handling
+    - `If-None-Match` conflict handling
+    - malformed `calendar-query` time-range parsing
+    - malformed `calendar-multiget` href extraction
   - Added protocol-hardening coverage in implementation:
     - `src/dav/report.rs` now returns deterministic 400 responses for missing/unsupported REPORT bodies.
     - `src/dav/caldav.rs` now validates CALDAV PUT payloads contain an iCalendar envelope before upsert.
 - Evidence state:
   - `A1` inventory and malformed must-fail fixtures are now frozen and versioned in git as a baseline.
-  - Remaining items are not yet represented as executable tests and are open items below.
+  - Sync-token and conditional-write negative-path cases are now represented as executable tests and are marked as passing/failing baselines for implementation follow-up.
 - Next A1-to-A2 boundary:
-  - Expand this fixture set so every non-governed RFC 6352/4791 must-fail and success-path contract gets an explicit test artifact and acceptance check.
-  - Add dedicated fixture rows for sync-token and conditional write negative paths before merging B1/B2 hardening work.
+  - Expand success-path A1 contracts and finish all non-governed RFC 6352/4791 must-fail coverage as implementation work continues.
 
 ### Phase A2 (parallelizable): Parser and payload correctness
 

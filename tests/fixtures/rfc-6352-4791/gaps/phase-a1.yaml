@@ -38,3 +38,43 @@
   dependency: "report::parse_calendar_multiget_hrefs"
   acceptance_check: "tests/dav/rfc_gap_inventory.rs"
   must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-multiget-empty-hrefs.xml"
+
+- A1
+  rfc: "6578"
+  section: "RFC 6578 5.2.1"
+  requirement: "calendar sync-collection request without sync-token must be rejected as bad request"
+  expected_status: 400
+  owner: "Agent C"
+  dependency: "report::caldav_sync_collection"
+  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-missing.xml"
+
+- A1
+  rfc: "6578"
+  section: "RFC 6578 5.3"
+  requirement: "calendar sync-collection with malformed sync-token must return explicit bad request"
+  expected_status: 400
+  owner: "Agent C"
+  dependency: "report::extract_sync_token"
+  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-malformed.xml"
+
+- A1
+  rfc: "4918"
+  section: "RFC 4918 10.4.1"
+  requirement: "PUT with stale If-Match on existing calendar resource must return 412"
+  expected_status: 412
+  owner: "Agent B"
+  dependency: "caldav::handle_request"
+  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-put-stale-if-match.xml"
+
+- A1
+  rfc: "4918"
+  section: "RFC 4918 10.4.2"
+  requirement: "PUT with matching If-None-Match on existing calendar resource must return 412"
+  expected_status: 412
+  owner: "Agent B"
+  dependency: "caldav::handle_request"
+  acceptance_check: "tests/dav/rfc_gap_inventory.rs"
+  must_fail_fixture: "tests/fixtures/rfc-6352-4791/must_fail/calendar-put-if-none-match-existing.xml"

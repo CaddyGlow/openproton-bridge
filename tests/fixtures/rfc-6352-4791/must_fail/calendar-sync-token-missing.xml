@@ -1,0 +1,9 @@
+<d:sync-collection xmlns:d="DAV:">
+  <d:sync-token></d:sync-token>
+  <d:limit>
+    <d:nresults>25</d:nresults>
+  </d:limit>
+  <d:prop>
+    <d:getetag/>
+  </d:prop>
+</d:sync-collection>

@@ -1,0 +1,8 @@
+<dav-request>
+  <method>PUT</method>
+  <path>/dav/uid-1/calendars/default/bad-event.ics</path>
+  <headers>
+    <if-match>"stale-etag"</if-match>
+  </headers>
+  <body>BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:bad-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n</body>
+</dav-request>

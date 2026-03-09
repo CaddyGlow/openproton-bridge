@@ -1,0 +1,8 @@
+<dav-request>
+  <method>PUT</method>
+  <path>/dav/uid-1/calendars/default/existing-event.ics</path>
+  <headers>
+    <if-none-match>*</if-none-match>
+  </headers>
+  <body>BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:existing-event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n</body>
+</dav-request>

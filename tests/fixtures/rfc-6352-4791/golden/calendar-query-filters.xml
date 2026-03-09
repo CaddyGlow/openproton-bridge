@@ -1,0 +1,10 @@
+<c:calendar-query xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:prop-filter name="SUMMARY"/>
+        <c:time-range start="20260305T120000Z" end="20260305T130000Z"/>
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>

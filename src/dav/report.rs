@@ -1104,6 +1104,22 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
+    const FIXTURE_CAL_QUERY_TIME_RANGE: &str =
+        include_str!("../../tests/fixtures/rfc-6352-4791/golden/calendar-query-time-range.xml");
+    const FIXTURE_CAL_QUERY_FLEXIBLE_TIME_RANGE: &str = include_str!(
+        "../../tests/fixtures/rfc-6352-4791/golden/calendar-query-flexible-time-range.xml"
+    );
+    const FIXTURE_CAL_QUERY_FILTERS: &str =
+        include_str!("../../tests/fixtures/rfc-6352-4791/golden/calendar-query-filters.xml");
+    const FIXTURE_CAL_MULTIGET_DEDUP: &str =
+        include_str!("../../tests/fixtures/rfc-6352-4791/golden/calendar-multiget-dedup.xml");
+    const FIXTURE_CAL_QUERY_INVALID_TIME_RANGE: &str = include_str!(
+        "../../tests/fixtures/rfc-6352-4791/must_fail/calendar-query-malformed-time-range.xml"
+    );
+    const FIXTURE_CAL_MULTIGET_EMPTY: &str = include_str!(
+        "../../tests/fixtures/rfc-6352-4791/must_fail/calendar-multiget-empty-hrefs.xml"
+    );
+
     fn test_adapter() -> StoreBackedDavAdapter {
         let tmp = tempdir().unwrap();
         let db_path = tmp.path().join("account.db");
@@ -1202,30 +1218,24 @@ mod tests {
 
     #[test]
     fn parses_calendar_time_range_attributes() {
-        let range = parse_calendar_time_range_request(
-            r#"<cal:calendar-query><cal:filter><cal:comp-filter name="VCALENDAR"><cal:comp-filter name="VEVENT"><cal:time-range start="20260305T120000Z" end="20260305T130000Z"/></cal:comp-filter></cal:comp-filter></cal:filter></cal:calendar-query>"#,
-        )
-        .expect("valid time-range should parse");
+        let range = parse_calendar_time_range_request(FIXTURE_CAL_QUERY_TIME_RANGE)
+            .expect("valid time-range should parse");
         assert!(range.start_time_from.is_some());
         assert!(range.start_time_to.is_some());
     }
 
     #[test]
     fn parses_flexible_time_range_timestamps() {
-        let range = parse_calendar_time_range_request(
-            r#"<calendar-query><filter><comp-filter name="VEVENT"><time-range start="2026-03-05T120000Z" end="2026-03-05T130000Z"/></comp-filter></filter></calendar-query>"#,
-        )
-        .expect("valid time-range should parse");
+        let range = parse_calendar_time_range_request(FIXTURE_CAL_QUERY_FLEXIBLE_TIME_RANGE)
+            .expect("valid time-range should parse");
         assert!(range.start_time_from.is_some());
         assert!(range.start_time_to.is_some());
     }
 
     #[test]
     fn parses_calendar_query_request_filters_and_range() {
-        let parsed = parse_calendar_query_request(
-            r#"<c:calendar-query xmlns:c="urn:ietf:params:xml:ns:caldav"><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:prop-filter name="SUMMARY"/><c:time-range start="20260305T120000Z" end="20260305T130000Z"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>"#,
-        )
-        .expect("valid query should parse");
+        let parsed = parse_calendar_query_request(FIXTURE_CAL_QUERY_FILTERS)
+            .expect("valid query should parse");
 
         assert_eq!(parsed.component_filters, vec!["VCALENDAR", "VEVENT"]);
         assert_eq!(parsed.prop_filters, vec!["SUMMARY"]);
@@ -1235,28 +1245,22 @@ mod tests {
 
     #[test]
     fn rejects_invalid_calendar_query_time_range_start() {
-        let err = parse_calendar_query_request(
-            r#"<cal:calendar-query><cal:filter><cal:comp-filter><cal:time-range start="2026-13-40T250000Z" end="20260305T130000Z"/></cal:comp-filter></cal:filter></cal:calendar-query>"#,
-        )
-        .expect_err("invalid time should reject");
+        let err = parse_calendar_query_request(FIXTURE_CAL_QUERY_INVALID_TIME_RANGE)
+            .expect_err("invalid time should reject");
         assert!(matches!(err, DavError::InvalidRequest(_)));
     }
 
     #[test]
     fn rejects_empty_calendar_multiget() {
-        let err = parse_calendar_multiget_hrefs(
-            r#"<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav"/>"#,
-        )
-        .expect_err("missing href should reject");
+        let err = parse_calendar_multiget_hrefs(FIXTURE_CAL_MULTIGET_EMPTY)
+            .expect_err("missing href should reject");
         assert!(matches!(err, DavError::InvalidRequest(_)));
     }
 
     #[test]
     fn deduplicates_calendar_multiget_hrefs() {
-        let hrefs = parse_calendar_multiget_hrefs(
-            r#"<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav"><c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</c:href><c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</c:href><c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-2.ics</c:href></c:calendar-multiget>"#,
-        )
-        .expect("valid multiget should parse");
+        let hrefs = parse_calendar_multiget_hrefs(FIXTURE_CAL_MULTIGET_DEDUP)
+            .expect("valid multiget should parse");
 
         assert_eq!(
             hrefs,

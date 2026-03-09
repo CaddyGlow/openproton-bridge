@@ -1,0 +1,7 @@
+<calendar-query>
+  <filter>
+    <comp-filter name="VEVENT">
+      <time-range start="2026-03-05T120000Z" end="2026-03-05T130000Z"/>
+    </comp-filter>
+  </filter>
+</calendar-query>

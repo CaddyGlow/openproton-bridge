@@ -1,0 +1,5 @@
+<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</c:href>
+  <c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-1.ics</c:href>
+  <c:href>https://127.0.0.1:8080/dav/uid-1/calendars/work/event-2.ics</c:href>
+</c:calendar-multiget>

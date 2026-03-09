@@ -458,6 +458,7 @@ async fn prepare_runtime_context(
         auth_router: auth_router.clone(),
         runtime_accounts: runtime_accounts.clone(),
         store,
+        mutation_mode: imap::session::MutationMode::Compat,
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {

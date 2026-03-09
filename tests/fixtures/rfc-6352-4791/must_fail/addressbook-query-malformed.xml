@@ -1,0 +1,6 @@
+<c:addressbook-query xmlns:c="urn:ietf:params:xml:ns:carddav">
+  <c:filter>
+    <c:prop-filter name="FN"/>
+    <c:prop-filter/>
+  </c:filter>
+</c:addressbook-query>

@@ -1,6 +1,6 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::HashSet;
 
 use regex::Regex;
 
@@ -41,6 +41,11 @@ pub async fn handle_report(
     let body_text = std::str::from_utf8(body)
         .map_err(|_| DavError::InvalidRequest("REPORT body is not utf-8"))?;
     let adapter = StoreBackedDavAdapter::new(store.clone());
+    if body_text.trim().is_empty() {
+        return Ok(Some(invalid_report_payload_response(
+            "REPORT body is missing or empty",
+        )));
+    }
 
     let card_collection = discovery::default_addressbook_path(&auth.account_id.0);
 
@@ -54,6 +59,11 @@ pub async fn handle_report(
                 &auth.account_id.0,
                 body_text,
             )?));
+        }
+        if is_xml_like(body_text) {
+            return Ok(Some(invalid_report_payload_response(
+                "unsupported CardDAV REPORT payload",
+            )));
         }
         return Ok(Some(not_implemented_report()));
     }
@@ -100,6 +110,11 @@ pub async fn handle_report(
                 )
                 .await?,
             ));
+        }
+        if is_xml_like(body_text) {
+            return Ok(Some(invalid_report_payload_response(
+                "unsupported CalDAV REPORT payload",
+            )));
         }
         return Ok(Some(not_implemented_report()));
     }
@@ -491,8 +506,9 @@ pub(crate) fn calendar_collection_sync_version(
 }
 
 fn parse_calendar_query_request(body: &str) -> Result<CalendarQueryRequest> {
-    let query = extract_xml_element(body, "calendar-query")
-        .ok_or(DavError::InvalidRequest("calendar-query request is malformed"))?;
+    let query = extract_xml_element(body, "calendar-query").ok_or(DavError::InvalidRequest(
+        "calendar-query request is malformed",
+    ))?;
 
     let range = parse_calendar_time_range_request(&query)?;
 
@@ -525,23 +541,24 @@ fn parse_calendar_query_request(body: &str) -> Result<CalendarQueryRequest> {
 }
 
 fn parse_calendar_time_range_request(body: &str) -> Result<CalendarEventRange> {
-    let Some(time_range) = extract_xml_start_tags(body, "time-range").into_iter().next() else {
+    let Some(time_range) = extract_xml_start_tags(body, "time-range")
+        .into_iter()
+        .next()
+    else {
         return Ok(CalendarEventRange::default());
     };
 
     let start = match extract_xml_attribute(&time_range, "start") {
-        Some(value) => Some(
-            parse_ics_timestamp(&value)
-                .ok_or(DavError::InvalidRequest("calendar-query has invalid time-range start"))?,
-        ),
+        Some(value) => Some(parse_ics_timestamp(&value).ok_or(DavError::InvalidRequest(
+            "calendar-query has invalid time-range start",
+        ))?),
         None => None,
     };
 
     let end = match extract_xml_attribute(&time_range, "end") {
-        Some(value) => Some(
-            parse_ics_timestamp(&value)
-                .ok_or(DavError::InvalidRequest("calendar-query has invalid time-range end"))?,
-        ),
+        Some(value) => Some(parse_ics_timestamp(&value).ok_or(DavError::InvalidRequest(
+            "calendar-query has invalid time-range end",
+        ))?),
         None => None,
     };
 
@@ -560,8 +577,9 @@ fn parse_calendar_time_range_request(body: &str) -> Result<CalendarEventRange> {
 }
 
 fn parse_calendar_multiget_hrefs(body: &str) -> Result<Vec<String>> {
-    let multiget = extract_xml_element(body, "calendar-multiget")
-        .ok_or(DavError::InvalidRequest("calendar-multiget request is malformed"))?;
+    let multiget = extract_xml_element(body, "calendar-multiget").ok_or(
+        DavError::InvalidRequest("calendar-multiget request is malformed"),
+    )?;
 
     let hrefs = extract_report_hrefs(&multiget)
         .into_iter()
@@ -623,7 +641,9 @@ fn extract_xml_start_tags(body: &str, local_name: &str) -> Vec<String> {
         return Vec::new();
     };
 
-    re.find_iter(body).map(|tag| tag.as_str().to_string()).collect()
+    re.find_iter(body)
+        .map(|tag| tag.as_str().to_string())
+        .collect()
 }
 
 fn extract_xml_attribute(tag: &str, name: &str) -> Option<String> {
@@ -1010,6 +1030,25 @@ fn not_implemented_report() -> DavResponse {
     }
 }
 
+fn invalid_report_payload_response(message: &str) -> DavResponse {
+    DavResponse {
+        status: "400 Bad Request",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: message.as_bytes().to_vec(),
+    }
+}
+
+fn is_xml_like(body: &str) -> bool {
+    let trimmed = body.trim();
+    if !trimmed.starts_with('<') {
+        return false;
+    }
+    let Ok(re) = Regex::new(r"(?is)<[^>]+>") else {
+        return false;
+    };
+    re.is_match(trimmed)
+}
+
 fn normalize_path(path: &str) -> String {
     path.split_once('?')
         .map(|(head, _)| head)
@@ -1053,12 +1092,13 @@ fn epoch_millis() -> i64 {
 mod tests {
     use super::{
         backfill_cooldown_elapsed, caldav_backfill_scope, escape_xml, extract_report_hrefs,
-        extract_sync_token, extract_sync_token_version, multistatus_response,
-        DavError,
-        parse_calendar_multiget_hrefs, parse_calendar_query_request,
-        parse_calendar_collection_path, parse_calendar_time_range_request, parse_event_id_from_href,
-        ReportItem,
+        extract_sync_token, extract_sync_token_version, handle_report, multistatus_response,
+        parse_calendar_collection_path, parse_calendar_multiget_hrefs,
+        parse_calendar_query_request, parse_calendar_time_range_request, parse_event_id_from_href,
+        DavError, ReportItem,
     };
+    use crate::bridge::auth_router::AuthRoute;
+    use crate::bridge::types::AccountId;
     use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
     use crate::pim::store::PimStore;
     use std::sync::Arc;
@@ -1069,6 +1109,13 @@ mod tests {
         let db_path = tmp.path().join("account.db");
         Box::leak(Box::new(tmp));
         StoreBackedDavAdapter::new(Arc::new(PimStore::new(db_path).unwrap()))
+    }
+
+    fn store() -> Arc<PimStore> {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("account.db");
+        Box::leak(Box::new(tmp));
+        Arc::new(PimStore::new(db_path).unwrap())
     }
 
     #[test]
@@ -1094,6 +1141,48 @@ mod tests {
             ),
             Some(456)
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_xml_report_payload_returns_bad_request_for_carddav_collection() {
+        let store = store();
+        let response = handle_report(
+            "/dav/uid-1/addressbooks/default/",
+            br#"<unknown-report xmlns="DAV:"><foo>bar</foo></unknown-report>"#,
+            &AuthRoute {
+                account_id: AccountId("uid-1".to_string()),
+                primary_email: "alice@proton.me".to_string(),
+            },
+            &store,
+            None,
+        )
+        .await
+        .expect("handler")
+        .expect("response");
+        assert_eq!(response.status, "400 Bad Request");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(body.contains("unsupported CardDAV REPORT payload"));
+    }
+
+    #[tokio::test]
+    async fn unknown_xml_report_payload_returns_bad_request_for_caldav_collection() {
+        let store = store();
+        let response = handle_report(
+            "/dav/uid-1/calendars/default/",
+            br#"<unknown-report xmlns="DAV:"><foo>bar</foo></unknown-report>"#,
+            &AuthRoute {
+                account_id: AccountId("uid-1".to_string()),
+                primary_email: "alice@proton.me".to_string(),
+            },
+            &store,
+            None,
+        )
+        .await
+        .expect("handler")
+        .expect("response");
+        assert_eq!(response.status, "400 Bad Request");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(body.contains("unsupported CalDAV REPORT payload"));
     }
 
     #[test]

@@ -153,3 +153,14 @@ Operational notes:
 - Point `litmus` at the DAV collection root or routed DAV base URL exposed by your deployment.
 - Run `caldavtester` against the CalDAV endpoint when validating calendar REPORT, sync, and recurrence behavior.
 - Keep both in the DAV rollout checklist before broad enablement, especially after changes to auth, XML serialization, sync-token handling, or write preconditions.
+
+## RFC 6352 / RFC 4791 conformance evidence
+
+- Current phase evidence path:
+  - `tests/dav/rfc_gap_inventory.rs`
+  - `tests/fixtures/rfc-6352-4791/gaps/phase-a1.yaml`
+  - `tests/fixtures/rfc-6352-4791/must_fail/*.xml`
+- Phase workflow tracked in:
+  - `docs/rfc-6352-4791-full-support-plan.md`
+- Suggested rollout check:
+  - keep this section and the plan file updated when a gap row is closed with test coverage and passing behavior.

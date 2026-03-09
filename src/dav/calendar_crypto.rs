@@ -316,7 +316,7 @@ fn decrypt_part(part: &CalendarEventPart, key_packet: &str, keyring: &Keyring) -
     extract_inline_ics_payload(&text)
 }
 
-fn extract_inline_ics_payload(raw: &str) -> Option<String> {
+pub(crate) fn extract_inline_ics_payload(raw: &str) -> Option<String> {
     let payload = if raw
         .trim_start()
         .starts_with("-----BEGIN PGP SIGNED MESSAGE-----")

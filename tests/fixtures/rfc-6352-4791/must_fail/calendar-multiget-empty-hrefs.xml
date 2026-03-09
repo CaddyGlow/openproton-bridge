@@ -1,0 +1,6 @@
+<c:calendar-multiget xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <c:prop>
+    <d:getetag xmlns:d="DAV:"/>
+    <c:calendar-data xmlns:cal="urn:ietf:params:xml:ns:caldav"/>
+  </c:prop>
+</c:calendar-multiget>

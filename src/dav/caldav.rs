@@ -206,9 +206,13 @@ pub async fn handle_request(
                 return Ok(Some(precondition_failed_response()));
             }
 
-            ensure_calendar_exists(&adapter, &calendar_id)?;
             let payload = std::str::from_utf8(body)
                 .map_err(|_| DavError::InvalidRequest("CalDAV PUT body is not utf-8"))?;
+            if calendar_crypto::extract_inline_ics_payload(payload).is_none() {
+                return Ok(Some(invalid_ics_payload_response()));
+            }
+
+            ensure_calendar_exists(&adapter, &calendar_id)?;
             let now = epoch_seconds();
             let create_time = store
                 .get_calendar_event_payload(&event_id, true)
@@ -804,6 +808,14 @@ fn precondition_failed_response() -> DavResponse {
     }
 }
 
+fn invalid_ics_payload_response() -> DavResponse {
+    DavResponse {
+        status: "400 Bad Request",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"caldav payload is not a valid iCalendar document\n".to_vec(),
+    }
+}
+
 fn prop_patch_ok_response(path: &str, accepted_props: &str) -> DavResponse {
     let href = normalize_path(path);
     DavResponse {
@@ -877,10 +889,18 @@ fn epoch_seconds() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::{
-        accepted_proppatch_props, format_ics_datetime, parse_calendar_collection_id,
-        parse_event_resource_id, parse_ics, parse_ics_datetime, prop_patch_ok_response,
+        accepted_proppatch_props, format_ics_datetime, handle_request,
+        parse_calendar_collection_id, parse_event_resource_id, parse_ics, parse_ics_datetime,
+        prop_patch_ok_response,
     };
+    use crate::bridge::auth_router::AuthRoute;
+    use crate::bridge::types::AccountId;
+    use crate::pim::store::PimStore;
+    use tempfile::tempdir;
 
     #[test]
     fn parses_and_formats_ics_timestamps() {
@@ -1004,5 +1024,39 @@ END:VCALENDAR\r
         assert!(wire.contains("<d:displayname/>"));
         assert!(wire.contains("<ical:calendar-color/>"));
         assert!(wire.contains("<d:status>HTTP/1.1 200 OK</d:status>"));
+    }
+
+    fn store() -> Arc<PimStore> {
+        let tmp = tempdir().unwrap();
+        let db_path = tmp.path().join("account.db");
+        Box::leak(Box::new(tmp));
+        Arc::new(PimStore::new(db_path).unwrap())
+    }
+
+    fn auth() -> AuthRoute {
+        AuthRoute {
+            account_id: AccountId("uid-1".to_string()),
+            primary_email: "alice@proton.me".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_icalendar_put_when_payload_has_no_vcalendar_envelope() {
+        let store = store();
+        let response = handle_request(
+            "PUT",
+            "/dav/uid-1/calendars/default/bad-event.ics",
+            &HashMap::new(),
+            b"not an iCalendar document",
+            &auth(),
+            &store,
+            None,
+        )
+        .await
+        .expect("response");
+        let response = response.expect("body response");
+        assert_eq!(response.status, "400 Bad Request");
+        let body = String::from_utf8(response.body).expect("utf8");
+        assert!(body.contains("caldav payload is not a valid iCalendar document"));
     }
 }

@@ -440,6 +440,117 @@ fn build_part_body(part: &str) -> String {
     }
 }
 
+/// Extract a specific MIME part from RFC822 data by part number.
+///
+/// Part specs: "1" = first part, "2" = second part, "2.1" = first sub-part of second part.
+/// Returns None if the part doesn't exist.
+pub fn extract_mime_part(data: &[u8], part_spec: &str) -> Option<Vec<u8>> {
+    let text = String::from_utf8_lossy(data);
+
+    // Parse the part spec suffix for MIME/HEADER/TEXT qualifiers
+    let (numbers, qualifier) = parse_part_spec(part_spec);
+    if numbers.is_empty() {
+        return None;
+    }
+
+    let part_text = navigate_to_part(&text, &numbers)?;
+
+    match qualifier {
+        PartQualifier::Body => {
+            let (_, body) = split_header_body(&part_text);
+            Some(body.into_bytes())
+        }
+        PartQualifier::Mime => {
+            let (header, _) = split_header_body(&part_text);
+            Some(format!("{}\r\n", header).into_bytes())
+        }
+        PartQualifier::Header => {
+            let (header, _) = split_header_body(&part_text);
+            Some(format!("{}\r\n", header).into_bytes())
+        }
+        PartQualifier::Text => {
+            let (_, body) = split_header_body(&part_text);
+            Some(body.into_bytes())
+        }
+    }
+}
+
+enum PartQualifier {
+    Body,
+    Mime,
+    Header,
+    Text,
+}
+
+fn parse_part_spec(spec: &str) -> (Vec<usize>, PartQualifier) {
+    let upper = spec.to_uppercase();
+
+    // Check for trailing qualifiers like "1.MIME", "1.2.HEADER", "1.TEXT"
+    if let Some(pos) = upper.rfind(".MIME") {
+        if pos > 0 && upper[pos..] == *".MIME" {
+            let nums = parse_part_numbers(&spec[..pos]);
+            return (nums, PartQualifier::Mime);
+        }
+    }
+    if let Some(pos) = upper.rfind(".HEADER") {
+        if pos > 0 && upper[pos..] == *".HEADER" {
+            let nums = parse_part_numbers(&spec[..pos]);
+            return (nums, PartQualifier::Header);
+        }
+    }
+    if let Some(pos) = upper.rfind(".TEXT") {
+        if pos > 0 && upper[pos..] == *".TEXT" {
+            let nums = parse_part_numbers(&spec[..pos]);
+            return (nums, PartQualifier::Text);
+        }
+    }
+
+    let nums = parse_part_numbers(spec);
+    (nums, PartQualifier::Body)
+}
+
+fn parse_part_numbers(s: &str) -> Vec<usize> {
+    s.split('.')
+        .filter_map(|p| p.parse::<usize>().ok())
+        .collect()
+}
+
+fn navigate_to_part(text: &str, numbers: &[usize]) -> Option<String> {
+    if numbers.is_empty() {
+        return None;
+    }
+
+    let mut current = text.to_string();
+
+    for &num in numbers {
+        if num == 0 {
+            return None;
+        }
+
+        let (header, body) = split_header_body(&current);
+        let content_type = extract_content_type(&header);
+
+        match content_type {
+            ContentType::Multipart { boundary, .. } => {
+                let parts = parse_multipart_parts(&body, &boundary);
+                if num > parts.len() {
+                    return None;
+                }
+                current = parts[num - 1].clone();
+            }
+            ContentType::Simple { .. } => {
+                // For non-multipart, only part 1 is valid (the message itself)
+                if num != 1 {
+                    return None;
+                }
+                // current stays as-is
+            }
+        }
+    }
+
+    Some(current)
+}
+
 /// Build an IMAP ENVELOPE response string from metadata and parsed headers.
 ///
 /// Format per RFC 3501 section 7.4.2:
@@ -807,5 +918,40 @@ mod tests {
             }
             _ => panic!("expected Multipart"),
         }
+    }
+
+    #[test]
+    fn test_extract_mime_part_simple_multipart() {
+        let msg = b"Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sep\r\nContent-Type: text/plain\r\n\r\nHello world\r\n--sep\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>\r\n--sep--\r\n";
+
+        let part1 = extract_mime_part(msg, "1").unwrap();
+        assert_eq!(String::from_utf8_lossy(&part1), "Hello world");
+
+        let part2 = extract_mime_part(msg, "2").unwrap();
+        assert_eq!(String::from_utf8_lossy(&part2), "<p>Hello</p>");
+
+        assert!(extract_mime_part(msg, "3").is_none());
+        assert!(extract_mime_part(msg, "0").is_none());
+    }
+
+    #[test]
+    fn test_extract_mime_part_with_mime_qualifier() {
+        let msg = b"Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sep\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello\r\n--sep--\r\n";
+
+        let mime = extract_mime_part(msg, "1.MIME").unwrap();
+        let mime_str = String::from_utf8_lossy(&mime);
+        assert!(mime_str.contains("Content-Type: text/plain"));
+    }
+
+    #[test]
+    fn test_extract_mime_part_nonexistent() {
+        let msg = b"Content-Type: text/plain\r\n\r\nSimple message";
+
+        // For non-multipart, part 1 is the message itself
+        let part1 = extract_mime_part(msg, "1");
+        assert!(part1.is_some());
+
+        // Part 2 doesn't exist
+        assert!(extract_mime_part(msg, "2").is_none());
     }
 }

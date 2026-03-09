@@ -216,6 +216,18 @@ pub async fn unlabel_messages(client: &ProtonClient, ids: &[&str], label_id: &st
     Ok(())
 }
 
+/// Permanently delete messages.
+///
+/// Reference: go-proton-api/message.go DeleteMessage
+pub async fn delete_messages(client: &ProtonClient, ids: &[&str]) -> Result<()> {
+    info!(count = ids.len(), "permanently deleting messages");
+    let body = serde_json::json!({ "IDs": ids });
+    let resp = send_logged(client.put("/mail/v4/messages/delete").json(&body)).await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    Ok(())
+}
+
 /// Create a draft message with an encrypted body.
 ///
 /// Reference: go-proton-api/message_send.go CreateDraft
@@ -299,6 +311,25 @@ pub async fn send_draft(
     check_api_response(&json)?;
     let send_resp: SendDraftResponse = serde_json::from_value(json)?;
     Ok(send_resp)
+}
+
+/// Fetch user labels and folders.
+///
+/// Reference: go-proton-api/label.go ListLabels
+pub async fn get_labels(
+    client: &ProtonClient,
+    label_types: &[i32],
+) -> Result<super::types::LabelsResponse> {
+    let mut url = String::from("/core/v4/labels");
+    for (i, t) in label_types.iter().enumerate() {
+        url.push(if i == 0 { '?' } else { '&' });
+        url.push_str(&format!("Type={t}"));
+    }
+    let resp = send_logged(client.get(&url)).await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let labels_resp: super::types::LabelsResponse = serde_json::from_value(json)?;
+    Ok(labels_resp)
 }
 
 #[cfg(test)]

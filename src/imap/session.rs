@@ -72,6 +72,7 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     selected_mailbox_mod_seq: Option<u64>,
     selected_read_only: bool,
     authenticated_account_id: Option<String>,
+    user_labels: Vec<mailbox::ResolvedMailbox>,
     starttls_available: bool,
     connection_id: u64,
 }
@@ -103,6 +104,7 @@ where
             selected_mailbox_mod_seq: None,
             selected_read_only: false,
             authenticated_account_id: None,
+            user_labels: Vec::new(),
             starttls_available,
             connection_id: NEXT_IMAP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
         }
@@ -258,6 +260,16 @@ where
                 ref tag,
                 ref sequence,
             } => self.cmd_uid_expunge(tag, sequence).await?,
+            Command::Append {
+                ref tag,
+                ref mailbox,
+                ref flags,
+                ref date,
+                literal_size,
+            } => {
+                self.cmd_append(tag, mailbox, flags, date, literal_size)
+                    .await?
+            }
         }
 
         Ok(SessionAction::Continue)
@@ -547,6 +559,25 @@ where
                 .await;
         }
 
+        // Fetch user labels/folders (best-effort; failure doesn't block login)
+        match messages::get_labels(
+            &client,
+            &[types::LABEL_TYPE_LABEL, types::LABEL_TYPE_FOLDER],
+        )
+        .await
+        {
+            Ok(resp) => {
+                self.user_labels = mailbox::labels_to_mailboxes(&resp.labels);
+                info!(
+                    user_labels = self.user_labels.len(),
+                    "loaded user labels/folders"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to fetch user labels; continuing with system mailboxes only");
+            }
+        }
+
         self.client = Some(client);
         self.user_keyring = Some(user_keyring);
         self.addr_keyrings = Some(addr_keyrings);
@@ -639,6 +670,25 @@ where
         self.config.mutation_mode == MutationMode::Strict
     }
 
+    fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
+        if let Some(m) = mailbox::find_mailbox(name) {
+            return Some(m.into());
+        }
+        self.user_labels
+            .iter()
+            .find(|m| m.name.eq_ignore_ascii_case(name))
+            .cloned()
+    }
+
+    fn all_mailboxes(&self) -> Vec<mailbox::ResolvedMailbox> {
+        let mut all: Vec<mailbox::ResolvedMailbox> = mailbox::system_mailboxes()
+            .iter()
+            .map(|m| mailbox::ResolvedMailbox::from(*m))
+            .collect();
+        all.extend(self.user_labels.iter().cloned());
+        all
+    }
+
     fn resolve_target_uids(
         &self,
         all_uids: &[u32],
@@ -716,33 +766,41 @@ where
         Ok(())
     }
 
+    fn matches_list_pattern(name: &str, pattern: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+        if pattern == "%" {
+            // "%" matches one level -- exclude names containing "/"
+            return !name.contains('/');
+        }
+        name.eq_ignore_ascii_case(pattern)
+    }
+
+    fn format_list_entry(kind: &str, mb: &mailbox::ResolvedMailbox) -> String {
+        let mut attrs = Vec::new();
+        if !mb.selectable {
+            attrs.push("\\Noselect".to_string());
+        }
+        if let Some(su) = &mb.special_use {
+            attrs.push(su.clone());
+        }
+        let attr_str = attrs.join(" ");
+        format!("{kind} ({attr_str}) \"/\" \"{name}\"", name = mb.name)
+    }
+
     async fn cmd_list(&mut self, tag: &str, _reference: &str, pattern: &str) -> Result<()> {
         if self.state == State::NotAuthenticated {
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
         if pattern.is_empty() {
-            // RFC 3501: empty pattern returns hierarchy delimiter
             self.writer.untagged("LIST (\\Noselect) \"/\" \"\"").await?;
         } else {
-            let mailboxes = mailbox::system_mailboxes();
-            for mb in mailboxes {
-                // Simple pattern matching: "*" matches everything, "%" matches one level
-                if pattern == "*" || pattern == "%" || mb.name.eq_ignore_ascii_case(pattern) {
-                    let mut attrs = Vec::new();
-                    if !mb.selectable {
-                        attrs.push("\\Noselect");
-                    }
-                    if let Some(su) = mb.special_use {
-                        attrs.push(su);
-                    }
-                    let attr_str = if attrs.is_empty() {
-                        String::new()
-                    } else {
-                        attrs.join(" ")
-                    };
+            for mb in self.all_mailboxes() {
+                if Self::matches_list_pattern(&mb.name, pattern) {
                     self.writer
-                        .untagged(&format!("LIST ({}) \"/\" \"{}\"", attr_str, mb.name))
+                        .untagged(&Self::format_list_entry("LIST", &mb))
                         .await?;
                 }
             }
@@ -757,27 +815,12 @@ where
         }
 
         if pattern.is_empty() {
-            // RFC 3501: empty pattern returns hierarchy delimiter
             self.writer.untagged("LSUB (\\Noselect) \"/\" \"\"").await?;
         } else {
-            // All system mailboxes are considered subscribed
-            let mailboxes = mailbox::system_mailboxes();
-            for mb in mailboxes {
-                if pattern == "*" || pattern == "%" || mb.name.eq_ignore_ascii_case(pattern) {
-                    let mut attrs = Vec::new();
-                    if !mb.selectable {
-                        attrs.push("\\Noselect");
-                    }
-                    if let Some(su) = mb.special_use {
-                        attrs.push(su);
-                    }
-                    let attr_str = if attrs.is_empty() {
-                        String::new()
-                    } else {
-                        attrs.join(" ")
-                    };
+            for mb in self.all_mailboxes() {
+                if Self::matches_list_pattern(&mb.name, pattern) {
                     self.writer
-                        .untagged(&format!("LSUB ({}) \"/\" \"{}\"", attr_str, mb.name))
+                        .untagged(&Self::format_list_entry("LSUB", &mb))
                         .await?;
                 }
             }
@@ -792,7 +835,7 @@ where
         }
 
         // Check if mailbox already exists
-        if mailbox::find_mailbox(mailbox_name).is_some() {
+        if self.resolve_mailbox(mailbox_name).is_some() {
             return self
                 .writer
                 .tagged_no(tag, "[ALREADYEXISTS] mailbox already exists")
@@ -811,7 +854,7 @@ where
         }
 
         // Check if mailbox exists - if so, silently succeed (all mailboxes are subscribed)
-        if mailbox::find_mailbox(mailbox_name).is_some() {
+        if self.resolve_mailbox(mailbox_name).is_some() {
             return self
                 .writer
                 .tagged_ok(tag, None, "SUBSCRIBE completed")
@@ -830,7 +873,7 @@ where
         }
 
         // Check if mailbox exists - if so, silently succeed (we don't actually unsubscribe)
-        if mailbox::find_mailbox(mailbox_name).is_some() {
+        if self.resolve_mailbox(mailbox_name).is_some() {
             return self
                 .writer
                 .tagged_ok(tag, None, "UNSUBSCRIBE completed")
@@ -848,7 +891,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match mailbox::find_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name) {
             Some(m) => m,
             None => {
                 return self
@@ -866,7 +909,7 @@ where
         }
 
         let store = self.config.store.clone();
-        let scoped_mailbox = self.scoped_mailbox_name(mb.name);
+        let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
         let cached_uids = store.list_uids(&scoped_mailbox).await?;
 
         if cached_uids.is_empty() {
@@ -874,7 +917,7 @@ where
 
             // Fetch metadata from Proton API
             let filter = MessageFilter {
-                label_id: Some(mb.label_id.to_string()),
+                label_id: Some(mb.label_id.clone()),
                 desc: 1,
                 ..Default::default()
             };
@@ -985,7 +1028,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match mailbox::find_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name) {
             Some(m) => m,
             None => {
                 return self
@@ -995,7 +1038,7 @@ where
             }
         };
 
-        let scoped_mailbox = self.scoped_mailbox_name(mb.name);
+        let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
         let status = self.config.store.mailbox_status(&scoped_mailbox).await?;
 
         let mut attrs = Vec::new();
@@ -1046,7 +1089,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match mailbox::find_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name) {
             Some(m) => m,
             None => {
                 return self
@@ -1064,14 +1107,14 @@ where
         }
 
         let store = self.config.store.clone();
-        let scoped_mailbox = self.scoped_mailbox_name(mb.name);
+        let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
         let cached_uids = store.list_uids(&scoped_mailbox).await?;
 
         if cached_uids.is_empty() {
             let client = self.client.as_ref().unwrap();
 
             let filter = MessageFilter {
-                label_id: Some(mb.label_id.to_string()),
+                label_id: Some(mb.label_id.clone()),
                 desc: 1,
                 ..Default::default()
             };
@@ -1245,7 +1288,9 @@ where
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
 
             let mut rfc822_data = None;
-            if needs_body_sections && !header_only_body_fetch {
+            let needs_rfc822_load =
+                (needs_body_sections && !header_only_body_fetch) || needs_full_rfc822;
+            if needs_rfc822_load {
                 rfc822_data = store.get_rfc822(&scoped_mailbox, uid).await?;
                 if rfc822_data.is_some() {
                     cache_hits = cache_hits.saturating_add(1);
@@ -1318,10 +1363,18 @@ where
                         };
                         parts.push(format!("BODY {}", body));
                     }
-                    FetchItem::BodySection { section, peek } => {
-                        let section_tag = match section {
-                            Some(s) => format!("BODY[{}]", s),
-                            None => "BODY[]".to_string(),
+                    FetchItem::BodySection {
+                        section,
+                        peek,
+                        partial,
+                    } => {
+                        let section_tag = match (section, partial) {
+                            (Some(s), Some((origin, _))) => {
+                                format!("BODY[{}]<{}>", s, origin)
+                            }
+                            (Some(s), None) => format!("BODY[{}]", s),
+                            (None, Some((origin, _))) => format!("BODY[]<{}>", origin),
+                            (None, None) => "BODY[]".to_string(),
                         };
 
                         let body_data = if let Some(ref data) = rfc822_data {
@@ -1336,6 +1389,12 @@ where
                                         extract_header_section(data).into_bytes()
                                     } else if upper == "TEXT" {
                                         extract_text_section(data)
+                                    } else if s
+                                        .as_bytes()
+                                        .first()
+                                        .is_some_and(|b| b.is_ascii_digit())
+                                    {
+                                        rfc822::extract_mime_part(data, s).unwrap_or_default()
                                     } else {
                                         data.clone()
                                     }
@@ -1360,6 +1419,20 @@ where
                             }
                         } else {
                             Vec::new()
+                        };
+
+                        // Apply partial range if specified
+                        let body_data = if let Some((origin, count)) = partial {
+                            let origin = *origin as usize;
+                            let count = *count as usize;
+                            if origin >= body_data.len() {
+                                Vec::new()
+                            } else {
+                                let end = (origin + count).min(body_data.len());
+                                body_data[origin..end].to_vec()
+                            }
+                        } else {
+                            body_data
                         };
 
                         let idx = parts.len();
@@ -1827,22 +1900,36 @@ where
             if flags.iter().any(|f| f == "\\Deleted") {
                 let seq = i as u32 + 1 - offset;
 
-                // Move to trash via API
+                // Permanently delete if already in Trash or Spam, otherwise move to Trash
                 if let Some(ref client) = self.client {
                     if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
-                        if let Err(err) = messages::label_messages(
-                            client,
-                            &[proton_id.as_str()],
-                            types::TRASH_LABEL,
-                        )
-                        .await
-                        {
+                        let is_trash_or_spam = self
+                            .resolve_mailbox(&mailbox)
+                            .map(|mb| {
+                                mb.label_id == types::TRASH_LABEL
+                                    || mb.label_id == types::SPAM_LABEL
+                            })
+                            .unwrap_or(false);
+
+                        let result = if is_trash_or_spam {
+                            messages::delete_messages(client, &[proton_id.as_str()]).await
+                        } else {
+                            messages::label_messages(
+                                client,
+                                &[proton_id.as_str()],
+                                types::TRASH_LABEL,
+                            )
+                            .await
+                        };
+
+                        if let Err(err) = result {
                             warn!(
                                 error = %err,
                                 mailbox = %mailbox,
                                 uid,
                                 proton_id = %proton_id,
-                                "failed to sync expunge->trash mutation upstream"
+                                permanent = is_trash_or_spam,
+                                "failed to sync expunge mutation upstream"
                             );
                             if self.strict_mutation_mode() {
                                 if let Some(tag) = tag {
@@ -1909,22 +1996,36 @@ where
             if flags.iter().any(|f| f == "\\Deleted") {
                 let seq = i as u32 + 1 - offset;
 
-                // Move to trash via API
+                // Permanently delete if in Trash or Spam, otherwise move to Trash
                 if let Some(ref client) = self.client {
                     if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
-                        if let Err(err) = messages::label_messages(
-                            client,
-                            &[proton_id.as_str()],
-                            types::TRASH_LABEL,
-                        )
-                        .await
-                        {
+                        let is_trash_or_spam = self
+                            .resolve_mailbox(&mailbox)
+                            .map(|mb| {
+                                mb.label_id == types::TRASH_LABEL
+                                    || mb.label_id == types::SPAM_LABEL
+                            })
+                            .unwrap_or(false);
+
+                        let result = if is_trash_or_spam {
+                            messages::delete_messages(client, &[proton_id.as_str()]).await
+                        } else {
+                            messages::label_messages(
+                                client,
+                                &[proton_id.as_str()],
+                                types::TRASH_LABEL,
+                            )
+                            .await
+                        };
+
+                        if let Err(err) = result {
                             warn!(
                                 error = %err,
                                 mailbox = %mailbox,
                                 uid,
                                 proton_id = %proton_id,
-                                "failed to sync uid expunge->trash mutation upstream"
+                                permanent = is_trash_or_spam,
+                                "failed to sync uid expunge mutation upstream"
                             );
                             if self.strict_mutation_mode() {
                                 return self
@@ -1962,7 +2063,7 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
-        let dest_mb = match mailbox::find_mailbox(dest_name) {
+        let dest_mb = match self.resolve_mailbox(dest_name) {
             Some(m) => m,
             None => {
                 return self
@@ -1977,7 +2078,7 @@ where
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let scoped_dest_mailbox = self.scoped_mailbox_name(dest_mb.name);
+        let scoped_dest_mailbox = self.scoped_mailbox_name(&dest_mb.name);
         if scoped_mailbox == scoped_dest_mailbox {
             return self.writer.tagged_ok(tag, None, "COPY completed").await;
         }
@@ -1991,11 +2092,14 @@ where
 
         let target_uids = self.resolve_target_uids(&all_uids, sequence, uid_mode);
 
+        let mut src_uids = Vec::new();
+        let mut dst_uids = Vec::new();
+
         for &uid in &target_uids {
             if let Some(ref client) = self.client {
                 if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
                     if let Err(err) =
-                        messages::label_messages(client, &[proton_id.as_str()], dest_mb.label_id)
+                        messages::label_messages(client, &[proton_id.as_str()], &dest_mb.label_id)
                             .await
                     {
                         warn!(
@@ -2016,12 +2120,20 @@ where
                 }
             }
 
-            let _ = self
+            if let Some(dest_uid) = self
                 .copy_message_local(&scoped_mailbox, &scoped_dest_mailbox, uid)
-                .await?;
+                .await?
+            {
+                src_uids.push(uid);
+                dst_uids.push(dest_uid);
+            }
         }
 
-        self.writer.tagged_ok(tag, None, "COPY completed").await
+        let dest_status = store.mailbox_status(&scoped_dest_mailbox).await?;
+        let copyuid_code = format_copyuid(dest_status.uid_validity, &src_uids, &dst_uids);
+        self.writer
+            .tagged_ok(tag, Some(&copyuid_code), "COPY completed")
+            .await
     }
 
     async fn cmd_move(
@@ -2039,7 +2151,7 @@ where
             return self.writer.tagged_no(tag, "mailbox is read-only").await;
         }
 
-        let dest_mb = match mailbox::find_mailbox(dest_name) {
+        let dest_mb = match self.resolve_mailbox(dest_name) {
             Some(m) => m,
             None => {
                 return self
@@ -2053,9 +2165,11 @@ where
         };
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
-        let source_mb = mailbox::find_mailbox(&mailbox).unwrap_or(dest_mb);
+        let source_mb = self
+            .resolve_mailbox(&mailbox)
+            .unwrap_or_else(|| dest_mb.clone());
         let scoped_source_mailbox = self.scoped_mailbox_name(&mailbox);
-        let scoped_dest_mailbox = self.scoped_mailbox_name(dest_mb.name);
+        let scoped_dest_mailbox = self.scoped_mailbox_name(&dest_mb.name);
         if scoped_source_mailbox == scoped_dest_mailbox {
             return self.writer.tagged_ok(tag, None, "MOVE completed").await;
         }
@@ -2072,6 +2186,8 @@ where
         }
 
         let target_uid_set: HashSet<u32> = target_uids.iter().copied().collect();
+        let mut src_uids = Vec::new();
+        let mut dst_uids = Vec::new();
         let mut expunged_seqs = Vec::new();
         let mut offset = 0u32;
 
@@ -2088,7 +2204,7 @@ where
 
             if let Some(ref client) = self.client {
                 if let Err(err) =
-                    messages::label_messages(client, &[proton_id.as_str()], dest_mb.label_id).await
+                    messages::label_messages(client, &[proton_id.as_str()], &dest_mb.label_id).await
                 {
                     warn!(
                         error = %err,
@@ -2110,7 +2226,7 @@ where
                     if let Err(err) = messages::unlabel_messages(
                         client,
                         &[proton_id.as_str()],
-                        source_mb.label_id,
+                        &source_mb.label_id,
                     )
                     .await
                     {
@@ -2132,29 +2248,178 @@ where
                 }
             }
 
-            let copied = self
+            if let Some(dest_uid) = self
                 .copy_message_local(&scoped_source_mailbox, &scoped_dest_mailbox, uid)
-                .await?;
-            if copied.is_none() {
-                continue;
+                .await?
+            {
+                src_uids.push(uid);
+                dst_uids.push(dest_uid);
+                store.remove_message(&scoped_source_mailbox, uid).await?;
+                expunged_seqs.push(seq);
+                offset += 1;
             }
-
-            store.remove_message(&scoped_source_mailbox, uid).await?;
-            expunged_seqs.push(seq);
-            offset += 1;
         }
+
+        let dest_status = store.mailbox_status(&scoped_dest_mailbox).await?;
+        let copyuid_code = format_copyuid(dest_status.uid_validity, &src_uids, &dst_uids);
 
         for seq in expunged_seqs {
             self.writer.untagged(&format!("{seq} EXPUNGE")).await?;
         }
 
-        self.writer.tagged_ok(tag, None, "MOVE completed").await
+        self.writer
+            .tagged_ok(tag, Some(&copyuid_code), "MOVE completed")
+            .await
+    }
+
+    async fn cmd_append(
+        &mut self,
+        tag: &str,
+        mailbox_name: &str,
+        flags: &[ImapFlag],
+        _date: &Option<String>,
+        literal_size: u32,
+    ) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        let mb = match self.resolve_mailbox(mailbox_name) {
+            Some(m) => m,
+            None => {
+                // Consume and discard the literal before responding
+                self.writer.continuation("Ready").await?;
+                let mut discard = vec![0u8; literal_size as usize];
+                tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut discard).await?;
+                let mut crlf = [0u8; 2];
+                let _ = tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut crlf).await;
+                return self
+                    .writer
+                    .tagged_no(
+                        tag,
+                        &format!("[TRYCREATE] mailbox not found: {}", mailbox_name),
+                    )
+                    .await;
+            }
+        };
+
+        if !mb.selectable {
+            self.writer.continuation("Ready").await?;
+            let mut discard = vec![0u8; literal_size as usize];
+            tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut discard).await?;
+            let mut crlf = [0u8; 2];
+            let _ = tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut crlf).await;
+            return self.writer.tagged_no(tag, "mailbox not selectable").await;
+        }
+
+        // Send continuation and read the literal data
+        self.writer.continuation("Ready").await?;
+        let mut literal = vec![0u8; literal_size as usize];
+        tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut literal).await?;
+        // Consume trailing CRLF after literal
+        let mut crlf = [0u8; 2];
+        let _ = tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut crlf).await;
+
+        // Build metadata from the RFC822 message
+        let header_text = extract_header_section(&literal);
+        let subject = header_text
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("subject:"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        let from = header_text
+            .lines()
+            .find(|l| l.to_lowercase().starts_with("from:"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim().to_string())
+            .unwrap_or_default();
+        let time = extract_sent_date(&literal).unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        });
+
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let proton_id = format!("local-append-{ts}");
+        let meta = types::MessageMetadata {
+            id: proton_id.clone(),
+            address_id: String::new(),
+            label_ids: vec![mb.label_id.clone()],
+            external_id: None,
+            subject,
+            sender: types::EmailAddress {
+                name: String::new(),
+                address: from,
+            },
+            to_list: vec![],
+            cc_list: vec![],
+            bcc_list: vec![],
+            reply_tos: vec![],
+            flags: 0,
+            time,
+            size: literal.len() as i64,
+            unread: if flags.iter().any(|f| matches!(f, ImapFlag::Seen)) {
+                0
+            } else {
+                1
+            },
+            is_replied: 0,
+            is_replied_all: 0,
+            is_forwarded: 0,
+            num_attachments: 0,
+        };
+
+        let store = self.config.store.clone();
+        let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
+        let uid = store
+            .store_metadata(&scoped_mailbox, &proton_id, meta)
+            .await?;
+        store.store_rfc822(&scoped_mailbox, uid, literal).await?;
+
+        // Apply flags
+        let flag_strs: Vec<String> = flags.iter().map(|f| f.as_str().to_string()).collect();
+        if !flag_strs.is_empty() {
+            store.set_flags(&scoped_mailbox, uid, flag_strs).await?;
+        }
+
+        let status = store.mailbox_status(&scoped_mailbox).await?;
+        let appenduid_code = format!("APPENDUID {} {}", status.uid_validity, uid);
+
+        info!(
+            mailbox = %mb.name,
+            uid,
+            size = literal_size,
+            "APPEND stored locally"
+        );
+
+        self.writer
+            .tagged_ok(tag, Some(&appenduid_code), "APPEND completed")
+            .await
     }
 
     /// Get stream halves for TLS upgrade.
     pub fn into_parts(self) -> (R, W) {
         (self.reader.into_inner(), self.writer.into_inner())
     }
+}
+
+fn format_copyuid(uid_validity: u32, src_uids: &[u32], dst_uids: &[u32]) -> String {
+    let src = src_uids
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let dst = dst_uids
+        .iter()
+        .map(|u| u.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("COPYUID {} {} {}", uid_validity, src, dst)
 }
 
 fn expand_fetch_items(items: &[FetchItem]) -> Vec<FetchItem> {
@@ -2299,14 +2564,25 @@ fn evaluate_search_key(
                 .unwrap_or(false)
         }
         SearchKey::SentBefore(ts) => {
-            // Use message time as approximation for sent date
-            meta.as_ref().map(|m| m.time < *ts).unwrap_or(false)
+            let sent_time = rfc822_data
+                .and_then(extract_sent_date)
+                .or_else(|| meta.as_ref().map(|m| m.time));
+            sent_time.map(|t| t < *ts).unwrap_or(false)
         }
-        SearchKey::SentSince(ts) => meta.as_ref().map(|m| m.time >= *ts).unwrap_or(false),
-        SearchKey::SentOn(ts) => meta
-            .as_ref()
-            .map(|m| m.time >= *ts && m.time < *ts + 86400)
-            .unwrap_or(false),
+        SearchKey::SentSince(ts) => {
+            let sent_time = rfc822_data
+                .and_then(extract_sent_date)
+                .or_else(|| meta.as_ref().map(|m| m.time));
+            sent_time.map(|t| t >= *ts).unwrap_or(false)
+        }
+        SearchKey::SentOn(ts) => {
+            let sent_time = rfc822_data
+                .and_then(extract_sent_date)
+                .or_else(|| meta.as_ref().map(|m| m.time));
+            sent_time
+                .map(|t| t >= *ts && t < *ts + 86400)
+                .unwrap_or(false)
+        }
         SearchKey::Larger(size) => meta.as_ref().map(|m| m.size > *size).unwrap_or(false),
         SearchKey::Smaller(size) => meta.as_ref().map(|m| m.size < *size).unwrap_or(false),
         SearchKey::Uid(seq) => seq.contains(uid, max_uid),
@@ -2322,13 +2598,109 @@ fn evaluate_search_key(
 
 fn search_key_needs_rfc822(key: &SearchKey) -> bool {
     match key {
-        SearchKey::Header(_, _) | SearchKey::Body(_) | SearchKey::Text(_) => true,
+        SearchKey::Header(_, _)
+        | SearchKey::Body(_)
+        | SearchKey::Text(_)
+        | SearchKey::SentBefore(_)
+        | SearchKey::SentSince(_)
+        | SearchKey::SentOn(_) => true,
         SearchKey::Not(inner) => search_key_needs_rfc822(inner),
         SearchKey::Or(left, right) => {
             search_key_needs_rfc822(left) || search_key_needs_rfc822(right)
         }
         _ => false,
     }
+}
+
+/// Extract the Date header from RFC822 data and parse it to a unix timestamp.
+///
+/// Parses common RFC2822 date formats like:
+///   "Mon, 14 Nov 2023 22:13:20 +0000"
+///   "14 Nov 2023 22:13:20 +0000"
+fn extract_sent_date(data: &[u8]) -> Option<i64> {
+    let header = extract_header_section(data);
+    let date_line = header
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("date:"))?;
+    let date_str = date_line.split_once(':')?.1.trim();
+    parse_rfc2822_date(date_str)
+}
+
+fn parse_rfc2822_date(s: &str) -> Option<i64> {
+    let months = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+
+    // Strip optional day-of-week prefix (e.g., "Mon, ")
+    let s = if let Some(pos) = s.find(',') {
+        s[pos + 1..].trim()
+    } else {
+        s.trim()
+    };
+
+    // Expected: "14 Nov 2023 22:13:20 +0000" or "14 Nov 2023 22:13:20 -0500"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+
+    let day: u32 = parts[0].parse().ok()?;
+    let month = months
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(parts[1]))? as u32
+        + 1;
+    let year: i32 = parts[2].parse().ok()?;
+
+    let time_parts: Vec<&str> = parts[3].split(':').collect();
+    if time_parts.len() < 2 {
+        return None;
+    }
+    let hours: i64 = time_parts[0].parse().ok()?;
+    let minutes: i64 = time_parts[1].parse().ok()?;
+    let seconds: i64 = if time_parts.len() > 2 {
+        time_parts[2].parse().unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Parse timezone offset
+    let tz_offset_secs: i64 = if parts.len() > 4 {
+        let tz = parts[4];
+        if tz.len() >= 4 {
+            let sign = if tz.starts_with('-') { -1i64 } else { 1 };
+            let tz_digits = tz.trim_start_matches(['+', '-']);
+            if tz_digits.len() >= 4 {
+                let tz_hours: i64 = tz_digits[..2].parse().unwrap_or(0);
+                let tz_mins: i64 = tz_digits[2..4].parse().unwrap_or(0);
+                sign * (tz_hours * 3600 + tz_mins * 60)
+            } else {
+                0
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Convert to unix timestamp
+    let days_in_month = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = |y: i32| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+
+    let mut total_days: i64 = 0;
+    for y in 1970..year {
+        total_days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        total_days += days_in_month[(m - 1) as usize] as i64;
+        if m == 2 && is_leap(year) {
+            total_days += 1;
+        }
+    }
+    total_days += (day as i64) - 1;
+
+    let timestamp = total_days * 86400 + hours * 3600 + minutes * 60 + seconds - tz_offset_secs;
+    Some(timestamp)
 }
 
 fn parse_header_field_names(section: &str) -> Vec<String> {
@@ -3199,9 +3571,10 @@ mod tests {
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("COPY completed"), "response={response}");
         assert!(
-            response.contains("a001 OK COPY completed"),
-            "response={response}"
+            response.contains("[COPYUID"),
+            "response should contain COPYUID: {response}"
         );
 
         let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
@@ -3242,10 +3615,7 @@ mod tests {
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(
-            response.contains("a001 OK COPY completed"),
-            "response={response}"
-        );
+        assert!(response.contains("COPY completed"), "response={response}");
 
         let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
         assert_eq!(inbox_uids, vec![src_uid]);
@@ -3284,10 +3654,7 @@ mod tests {
             .await
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(
-            response.contains("a001 OK COPY completed"),
-            "response={response}"
-        );
+        assert!(response.contains("COPY completed"), "response={response}");
 
         let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
         assert_eq!(archive_uids.len(), 1);
@@ -3385,10 +3752,7 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("* 1 EXPUNGE"), "response={response}");
-        assert!(
-            response.contains("a001 OK MOVE completed"),
-            "response={response}"
-        );
+        assert!(response.contains("MOVE completed"), "response={response}");
 
         let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
         assert_eq!(inbox_uids.len(), 1);
@@ -3440,10 +3804,7 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("* 1 EXPUNGE"), "response={response}");
-        assert!(
-            response.contains("a001 OK MOVE completed"),
-            "response={response}"
-        );
+        assert!(response.contains("MOVE completed"), "response={response}");
 
         let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
         assert_eq!(inbox_uids.len(), 1);
@@ -3567,10 +3928,7 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("* 2 EXPUNGE"), "response={response}");
-        assert!(
-            response.contains("a001 OK MOVE completed"),
-            "response={response}"
-        );
+        assert!(response.contains("MOVE completed"), "response={response}");
 
         let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
         assert_eq!(inbox_uids.len(), 1);
@@ -3625,10 +3983,7 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("* 2 EXPUNGE"), "response={response}");
-        assert!(
-            response.contains("a001 OK MOVE completed"),
-            "response={response}"
-        );
+        assert!(response.contains("MOVE completed"), "response={response}");
 
         let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
         assert_eq!(inbox_uids.len(), 1);
@@ -4365,6 +4720,100 @@ mod tests {
         let flags = vec![];
         assert!(!evaluate_search_key(
             &SearchKey::Not(Box::new(SearchKey::All)),
+            1,
+            &meta,
+            &flags,
+            1,
+            None
+        ));
+    }
+
+    #[test]
+    fn test_format_copyuid() {
+        assert_eq!(
+            format_copyuid(1700000000, &[1, 2, 3], &[10, 11, 12]),
+            "COPYUID 1700000000 1,2,3 10,11,12"
+        );
+    }
+
+    #[test]
+    fn test_format_copyuid_single() {
+        assert_eq!(format_copyuid(42, &[5], &[100]), "COPYUID 42 5 100");
+    }
+
+    #[test]
+    fn test_format_copyuid_empty() {
+        assert_eq!(format_copyuid(42, &[], &[]), "COPYUID 42  ");
+    }
+
+    #[test]
+    fn test_parse_rfc2822_date_basic() {
+        // Mon, 14 Nov 2023 22:13:20 +0000
+        let ts = parse_rfc2822_date("Mon, 14 Nov 2023 22:13:20 +0000");
+        assert_eq!(ts, Some(1700000000));
+    }
+
+    #[test]
+    fn test_parse_rfc2822_date_no_dow() {
+        let ts = parse_rfc2822_date("14 Nov 2023 22:13:20 +0000");
+        assert_eq!(ts, Some(1700000000));
+    }
+
+    #[test]
+    fn test_parse_rfc2822_date_with_timezone() {
+        // Same instant but expressed in UTC-5
+        let ts = parse_rfc2822_date("Tue, 14 Nov 2023 17:13:20 -0500");
+        assert_eq!(ts, Some(1700000000));
+    }
+
+    #[test]
+    fn test_parse_rfc2822_date_invalid() {
+        assert!(parse_rfc2822_date("not a date").is_none());
+        assert!(parse_rfc2822_date("").is_none());
+    }
+
+    #[test]
+    fn test_extract_sent_date() {
+        let rfc822 = b"Date: Mon, 14 Nov 2023 22:13:20 +0000\r\nSubject: test\r\n\r\nbody";
+        let ts = extract_sent_date(rfc822);
+        assert_eq!(ts, Some(1700000000));
+    }
+
+    #[test]
+    fn test_sent_search_uses_date_header() {
+        let meta = Some(make_meta("msg-1", 0));
+        let flags = vec![];
+        // Meta time is 1700000000 but the Date header says a day earlier
+        let rfc822 = b"Date: Mon, 13 Nov 2023 22:13:20 +0000\r\nSubject: test\r\n\r\nbody";
+        let day_before_ts = 1700000000 - 86400; // 13 Nov
+
+        // SENTON should match the Date header day, not meta.time
+        assert!(evaluate_search_key(
+            &SearchKey::SentOn(day_before_ts),
+            1,
+            &meta,
+            &flags,
+            1,
+            Some(rfc822)
+        ));
+        // Should NOT match meta.time day
+        assert!(!evaluate_search_key(
+            &SearchKey::SentOn(1700000000),
+            1,
+            &meta,
+            &flags,
+            1,
+            Some(rfc822)
+        ));
+    }
+
+    #[test]
+    fn test_sent_search_falls_back_to_meta_time() {
+        let meta = Some(make_meta("msg-1", 0));
+        let flags = vec![];
+        // No RFC822 data available - should fall back to meta.time
+        assert!(evaluate_search_key(
+            &SearchKey::SentOn(1700000000),
             1,
             &meta,
             &flags,

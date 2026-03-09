@@ -1,6 +1,7 @@
 use crate::api::types::{
-    self, MessageMetadata, ALL_DRAFTS_LABEL, DRAFTS_LABEL, MESSAGE_FLAG_FORWARDED,
-    MESSAGE_FLAG_REPLIED, MESSAGE_FLAG_REPLIED_ALL, STARRED_LABEL,
+    self, MessageMetadata, ProtonLabel, ALL_DRAFTS_LABEL, DRAFTS_LABEL, LABEL_TYPE_FOLDER,
+    LABEL_TYPE_LABEL, MESSAGE_FLAG_FORWARDED, MESSAGE_FLAG_REPLIED, MESSAGE_FLAG_REPLIED_ALL,
+    STARRED_LABEL,
 };
 
 #[derive(Clone, Copy)]
@@ -9,6 +10,55 @@ pub struct ImapMailbox {
     pub label_id: &'static str,
     pub special_use: Option<&'static str>,
     pub selectable: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedMailbox {
+    pub name: String,
+    pub label_id: String,
+    pub special_use: Option<String>,
+    pub selectable: bool,
+}
+
+impl From<ImapMailbox> for ResolvedMailbox {
+    fn from(m: ImapMailbox) -> Self {
+        Self {
+            name: m.name.to_string(),
+            label_id: m.label_id.to_string(),
+            special_use: m.special_use.map(String::from),
+            selectable: m.selectable,
+        }
+    }
+}
+
+impl ResolvedMailbox {
+    pub fn from_proton_label(label: &ProtonLabel) -> Self {
+        let name = match label.label_type {
+            LABEL_TYPE_FOLDER => {
+                if label.path.is_empty() {
+                    format!("Folders/{}", label.name)
+                } else {
+                    format!("Folders/{}", label.path)
+                }
+            }
+            LABEL_TYPE_LABEL => format!("Labels/{}", label.name),
+            _ => label.name.clone(),
+        };
+        Self {
+            name,
+            label_id: label.id.clone(),
+            special_use: None,
+            selectable: true,
+        }
+    }
+}
+
+pub fn labels_to_mailboxes(labels: &[ProtonLabel]) -> Vec<ResolvedMailbox> {
+    labels
+        .iter()
+        .filter(|l| l.label_type == LABEL_TYPE_LABEL || l.label_type == LABEL_TYPE_FOLDER)
+        .map(ResolvedMailbox::from_proton_label)
+        .collect()
 }
 
 const SYSTEM_MAILBOXES: [ImapMailbox; 8] = [
@@ -238,5 +288,88 @@ mod tests {
     fn test_all_mail_not_selectable() {
         let mb = find_mailbox("All Mail").unwrap();
         assert!(!mb.selectable);
+    }
+
+    #[test]
+    fn test_labels_to_mailboxes_folder() {
+        let label = ProtonLabel {
+            id: "abc123".to_string(),
+            name: "Work".to_string(),
+            path: "Work".to_string(),
+            label_type: LABEL_TYPE_FOLDER,
+            parent_id: None,
+            color: None,
+        };
+        let mailboxes = labels_to_mailboxes(&[label]);
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].name, "Folders/Work");
+        assert_eq!(mailboxes[0].label_id, "abc123");
+        assert!(mailboxes[0].selectable);
+        assert!(mailboxes[0].special_use.is_none());
+    }
+
+    #[test]
+    fn test_labels_to_mailboxes_nested_folder() {
+        let label = ProtonLabel {
+            id: "def456".to_string(),
+            name: "Clients".to_string(),
+            path: "Work/Clients".to_string(),
+            label_type: LABEL_TYPE_FOLDER,
+            parent_id: Some("abc123".to_string()),
+            color: None,
+        };
+        let mailboxes = labels_to_mailboxes(&[label]);
+        assert_eq!(mailboxes[0].name, "Folders/Work/Clients");
+    }
+
+    #[test]
+    fn test_labels_to_mailboxes_label() {
+        let label = ProtonLabel {
+            id: "lbl789".to_string(),
+            name: "Important".to_string(),
+            path: "Important".to_string(),
+            label_type: LABEL_TYPE_LABEL,
+            parent_id: None,
+            color: Some("#ff0000".to_string()),
+        };
+        let mailboxes = labels_to_mailboxes(&[label]);
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].name, "Labels/Important");
+        assert_eq!(mailboxes[0].label_id, "lbl789");
+    }
+
+    #[test]
+    fn test_labels_to_mailboxes_skips_contact_groups() {
+        let labels = vec![
+            ProtonLabel {
+                id: "l1".to_string(),
+                name: "Work".to_string(),
+                path: "Work".to_string(),
+                label_type: LABEL_TYPE_LABEL,
+                parent_id: None,
+                color: None,
+            },
+            ProtonLabel {
+                id: "l2".to_string(),
+                name: "Friends".to_string(),
+                path: "Friends".to_string(),
+                label_type: types::LABEL_TYPE_CONTACT_GROUP,
+                parent_id: None,
+                color: None,
+            },
+        ];
+        let mailboxes = labels_to_mailboxes(&labels);
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].name, "Labels/Work");
+    }
+
+    #[test]
+    fn test_resolved_mailbox_from_system() {
+        let system = find_mailbox("INBOX").unwrap();
+        let resolved: ResolvedMailbox = system.into();
+        assert_eq!(resolved.name, "INBOX");
+        assert_eq!(resolved.label_id, "0");
+        assert!(resolved.special_use.is_none());
+        assert!(resolved.selectable);
     }
 }

@@ -216,6 +216,12 @@ const TWO_FACTOR_STATUS_HAS_FIDO2: i32 = 2;
 #[serde(rename_all = "PascalCase")]
 pub struct TwoFactorResponse {
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(rename = "UID", default)]
+    pub uid: Option<String>,
 }
 
 /// API response from GET /core/v4/users
@@ -479,6 +485,32 @@ pub const MESSAGE_FLAG_FORWARDED: i64 = 1 << 7;
 // Recipient type constants
 pub const RECIPIENT_INTERNAL: i32 = 1;
 pub const RECIPIENT_EXTERNAL: i32 = 2;
+
+// Label type constants
+pub const LABEL_TYPE_LABEL: i32 = 1;
+pub const LABEL_TYPE_CONTACT_GROUP: i32 = 2;
+pub const LABEL_TYPE_FOLDER: i32 = 3;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ProtonLabel {
+    #[serde(rename = "ID")]
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(rename = "Type")]
+    pub label_type: i32,
+    #[serde(rename = "ParentID", default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct LabelsResponse {
+    pub labels: Vec<ProtonLabel>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]

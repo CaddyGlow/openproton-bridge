@@ -100,6 +100,13 @@ pub enum Command {
         tag: String,
         sequence: SequenceSet,
     },
+    Append {
+        tag: String,
+        mailbox: String,
+        flags: Vec<ImapFlag>,
+        date: Option<String>,
+        literal_size: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -128,7 +135,11 @@ pub enum FetchItem {
     InternalDate,
     BodyStructure,
     Body,
-    BodySection { section: Option<String>, peek: bool },
+    BodySection {
+        section: Option<String>,
+        peek: bool,
+        partial: Option<(u32, u32)>,
+    },
     All,
     Fast,
     Full,
@@ -291,6 +302,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "COPY" => parse_copy(&tag, args, false),
         "MOVE" => parse_move(&tag, args, false),
         "EXAMINE" => parse_examine(&tag, args),
+        "APPEND" => parse_append(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
             cmd_word
@@ -454,6 +466,52 @@ fn parse_examine(tag: &str, args: &str) -> Result<Command> {
     Ok(Command::Examine {
         tag: tag.to_string(),
         mailbox,
+    })
+}
+
+fn parse_append(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, rest) = parse_astring(args.trim_start())?;
+    let rest = rest.trim_start();
+
+    let (flags, rest) = if rest.starts_with('(') {
+        let close = rest
+            .find(')')
+            .ok_or_else(|| ImapError::Protocol("unclosed flag list".to_string()))?;
+        let flag_str = &rest[..=close];
+        (parse_flag_list(flag_str)?, rest[close + 1..].trim_start())
+    } else {
+        (Vec::new(), rest)
+    };
+
+    let (date, rest) = if rest.starts_with('"') {
+        let (d, r) = parse_quoted_string(rest)?;
+        (Some(d), r.trim_start())
+    } else {
+        (None, rest)
+    };
+
+    let literal_size = if rest.starts_with('{') {
+        let end = rest
+            .find('}')
+            .ok_or_else(|| ImapError::Protocol("missing literal size".to_string()))?;
+        let size_str = &rest[1..end];
+        // Handle LITERAL+ non-synchronizing literal marker "+"
+        let size_str = size_str.trim_end_matches('+');
+        size_str
+            .parse::<u32>()
+            .map_err(|_| ImapError::Protocol("invalid literal size".to_string()))?
+    } else {
+        return Err(ImapError::Protocol(
+            "APPEND requires literal data".to_string(),
+        ));
+    };
+
+    Ok(Command::Append {
+        tag: tag.to_string(),
+        mailbox,
+        flags,
+        date,
+        literal_size,
     })
 }
 
@@ -661,9 +719,37 @@ fn parse_body_section(s: &str, peek: bool) -> Result<(FetchItem, &str)> {
         Some(section_str.to_string())
     };
 
+    let rest = &s[bracket_end + 1..];
+
+    // Parse optional partial: <origin.count>
+    let (partial, rest) = if rest.starts_with('<') {
+        if let Some(end) = rest.find('>') {
+            let partial_str = &rest[1..end];
+            if let Some((origin_str, count_str)) = partial_str.split_once('.') {
+                let origin: u32 = origin_str
+                    .parse()
+                    .map_err(|_| ImapError::Protocol("invalid partial origin".to_string()))?;
+                let count: u32 = count_str
+                    .parse()
+                    .map_err(|_| ImapError::Protocol("invalid partial count".to_string()))?;
+                (Some((origin, count)), &rest[end + 1..])
+            } else {
+                (None, rest)
+            }
+        } else {
+            (None, rest)
+        }
+    } else {
+        (None, rest)
+    };
+
     Ok((
-        FetchItem::BodySection { section, peek },
-        &s[bracket_end + 1..],
+        FetchItem::BodySection {
+            section,
+            peek,
+            partial,
+        },
+        rest,
     ))
 }
 
@@ -1161,11 +1247,101 @@ mod tests {
                     items,
                     vec![FetchItem::BodySection {
                         section: None,
-                        peek: true
+                        peek: true,
+                        partial: None,
                     }]
                 );
             }
             _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fetch_body_partial() {
+        let cmd = parse_command("a001 FETCH 1 BODY[]<0.1024>").unwrap();
+        match cmd {
+            Command::Fetch { items, .. } => {
+                assert_eq!(
+                    items,
+                    vec![FetchItem::BodySection {
+                        section: None,
+                        peek: false,
+                        partial: Some((0, 1024)),
+                    }]
+                );
+            }
+            _ => panic!("expected Fetch"),
+        }
+
+        let cmd = parse_command("a001 FETCH 1 BODY.PEEK[HEADER]<100.500>").unwrap();
+        match cmd {
+            Command::Fetch { items, .. } => {
+                assert_eq!(
+                    items,
+                    vec![FetchItem::BodySection {
+                        section: Some("HEADER".to_string()),
+                        peek: true,
+                        partial: Some((100, 500)),
+                    }]
+                );
+            }
+            _ => panic!("expected Fetch"),
+        }
+    }
+
+    #[test]
+    fn test_parse_append_basic() {
+        let cmd = parse_command("a001 APPEND INBOX {310}").unwrap();
+        match cmd {
+            Command::Append {
+                tag,
+                mailbox,
+                flags,
+                date,
+                literal_size,
+            } => {
+                assert_eq!(tag, "a001");
+                assert_eq!(mailbox, "INBOX");
+                assert!(flags.is_empty());
+                assert!(date.is_none());
+                assert_eq!(literal_size, 310);
+            }
+            _ => panic!("expected Append"),
+        }
+    }
+
+    #[test]
+    fn test_parse_append_with_flags_and_date() {
+        let cmd = parse_command(
+            "a001 APPEND \"Sent\" (\\Seen \\Flagged) \"14-Nov-2023 22:13:20 +0000\" {1024}",
+        )
+        .unwrap();
+        match cmd {
+            Command::Append {
+                tag,
+                mailbox,
+                flags,
+                date,
+                literal_size,
+            } => {
+                assert_eq!(tag, "a001");
+                assert_eq!(mailbox, "Sent");
+                assert_eq!(flags, vec![ImapFlag::Seen, ImapFlag::Flagged]);
+                assert_eq!(date.as_deref(), Some("14-Nov-2023 22:13:20 +0000"));
+                assert_eq!(literal_size, 1024);
+            }
+            _ => panic!("expected Append"),
+        }
+    }
+
+    #[test]
+    fn test_parse_append_literal_plus() {
+        let cmd = parse_command("a001 APPEND INBOX {310+}").unwrap();
+        match cmd {
+            Command::Append { literal_size, .. } => {
+                assert_eq!(literal_size, 310);
+            }
+            _ => panic!("expected Append"),
         }
     }
 

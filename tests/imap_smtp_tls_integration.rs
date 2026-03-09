@@ -4,7 +4,7 @@ use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
 use openproton_bridge::bridge::auth_router::AuthRouter;
 use openproton_bridge::imap::server::{run_server_with_tls_config as run_imap_server, ImapServer};
-use openproton_bridge::imap::session::SessionConfig;
+use openproton_bridge::imap::session::{MutationMode, SessionConfig};
 use openproton_bridge::imap::store::InMemoryStore;
 use openproton_bridge::smtp::server::{run_server_with_tls_config as run_smtp_server, SmtpServer};
 use openproton_bridge::smtp::session::SmtpSessionConfig;
@@ -36,6 +36,7 @@ fn test_imap_config() -> Arc<SessionConfig> {
         auth_router: AuthRouter::new(accounts),
         runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
         store: InMemoryStore::new(),
+        mutation_mode: MutationMode::Compat,
     })
 }
 

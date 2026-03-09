@@ -35,11 +35,19 @@ enum State {
     Logout,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MutationMode {
+    #[default]
+    Compat,
+    Strict,
+}
+
 pub struct SessionConfig {
     pub api_base_url: String,
     pub auth_router: AuthRouter,
     pub runtime_accounts: Arc<RuntimeAccountRegistry>,
     pub store: Arc<dyn MessageStore>,
+    pub mutation_mode: MutationMode,
 }
 
 static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -627,6 +635,10 @@ where
         }
     }
 
+    fn strict_mutation_mode(&self) -> bool {
+        self.config.mutation_mode == MutationMode::Strict
+    }
+
     fn resolve_target_uids(
         &self,
         all_uids: &[u32],
@@ -1011,7 +1023,7 @@ where
         }
         if !self.selected_read_only {
             // Silently expunge deleted messages for read-write selections.
-            self.do_expunge(true).await?;
+            let _ = self.do_expunge(true, None).await?;
         }
 
         self.selected_mailbox = None;
@@ -1631,6 +1643,12 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync seen flag upstream"
                                 );
+                                if self.strict_mutation_mode() {
+                                    return self
+                                        .writer
+                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                        .await;
+                                }
                             }
                         } else {
                             if let Err(err) =
@@ -1643,6 +1661,12 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync unseen flag upstream"
                                 );
+                                if self.strict_mutation_mode() {
+                                    return self
+                                        .writer
+                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -1660,6 +1684,12 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync flagged state upstream"
                                 );
+                                if self.strict_mutation_mode() {
+                                    return self
+                                        .writer
+                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                        .await;
+                                }
                             }
                         } else {
                             if let Err(err) =
@@ -1673,6 +1703,12 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync unflagged state upstream"
                                 );
+                                if self.strict_mutation_mode() {
+                                    return self
+                                        .writer
+                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -1767,14 +1803,17 @@ where
             return self.writer.tagged_no(tag, "mailbox is read-only").await;
         }
 
-        self.do_expunge(false).await?;
-        self.writer.tagged_ok(tag, None, "EXPUNGE completed").await
+        if self.do_expunge(false, Some(tag)).await? {
+            self.writer.tagged_ok(tag, None, "EXPUNGE completed").await
+        } else {
+            Ok(())
+        }
     }
 
-    async fn do_expunge(&mut self, silent: bool) -> Result<()> {
+    async fn do_expunge(&mut self, silent: bool, tag: Option<&str>) -> Result<bool> {
         let mailbox = match &self.selected_mailbox {
             Some(m) => m.clone(),
-            None => return Ok(()),
+            None => return Ok(true),
         };
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let store = &self.config.store;
@@ -1805,6 +1844,14 @@ where
                                 proton_id = %proton_id,
                                 "failed to sync expunge->trash mutation upstream"
                             );
+                            if self.strict_mutation_mode() {
+                                if let Some(tag) = tag {
+                                    self.writer
+                                        .tagged_no(tag, "EXPUNGE failed: upstream mutation failed")
+                                        .await?;
+                                    return Ok(false);
+                                }
+                            }
                         }
                     }
                 }
@@ -1821,7 +1868,7 @@ where
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     async fn cmd_uid_expunge(&mut self, tag: &str, sequence: &SequenceSet) -> Result<()> {
@@ -1879,6 +1926,12 @@ where
                                 proton_id = %proton_id,
                                 "failed to sync uid expunge->trash mutation upstream"
                             );
+                            if self.strict_mutation_mode() {
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "UID EXPUNGE failed: upstream mutation failed")
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -1939,10 +1992,6 @@ where
         let target_uids = self.resolve_target_uids(&all_uids, sequence, uid_mode);
 
         for &uid in &target_uids {
-            let _ = self
-                .copy_message_local(&scoped_mailbox, &scoped_dest_mailbox, uid)
-                .await?;
-
             if let Some(ref client) = self.client {
                 if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
                     if let Err(err) =
@@ -1957,9 +2006,19 @@ where
                             proton_id = %proton_id,
                             "failed to sync copy destination label upstream"
                         );
+                        if self.strict_mutation_mode() {
+                            return self
+                                .writer
+                                .tagged_no(tag, "COPY failed: upstream mutation failed")
+                                .await;
+                        }
                     }
                 }
             }
+
+            let _ = self
+                .copy_message_local(&scoped_mailbox, &scoped_dest_mailbox, uid)
+                .await?;
         }
 
         self.writer.tagged_ok(tag, None, "COPY completed").await
@@ -2026,12 +2085,6 @@ where
             };
 
             let seq = i as u32 + 1 - offset;
-            let copied = self
-                .copy_message_local(&scoped_source_mailbox, &scoped_dest_mailbox, uid)
-                .await?;
-            if copied.is_none() {
-                continue;
-            }
 
             if let Some(ref client) = self.client {
                 if let Err(err) =
@@ -2045,6 +2098,12 @@ where
                         proton_id = %proton_id,
                         "failed to sync move destination label upstream"
                     );
+                    if self.strict_mutation_mode() {
+                        return self
+                            .writer
+                            .tagged_no(tag, "MOVE failed: upstream mutation failed")
+                            .await;
+                    }
                 }
 
                 if source_mb.label_id != dest_mb.label_id {
@@ -2063,8 +2122,21 @@ where
                             proton_id = %proton_id,
                             "failed to sync move source label removal upstream"
                         );
+                        if self.strict_mutation_mode() {
+                            return self
+                                .writer
+                                .tagged_no(tag, "MOVE failed: upstream mutation failed")
+                                .await;
+                        }
                     }
                 }
+            }
+
+            let copied = self
+                .copy_message_local(&scoped_source_mailbox, &scoped_dest_mailbox, uid)
+                .await?;
+            if copied.is_none() {
+                continue;
             }
 
             store.remove_message(&scoped_source_mailbox, uid).await?;
@@ -2437,7 +2509,7 @@ mod tests {
         }
     }
 
-    fn test_config() -> Arc<SessionConfig> {
+    fn test_config_with_mode(mutation_mode: MutationMode) -> Arc<SessionConfig> {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
         Arc::new(SessionConfig {
@@ -2445,7 +2517,22 @@ mod tests {
             auth_router: AuthRouter::new(accounts),
             runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
             store: InMemoryStore::new(),
+            mutation_mode,
         })
+    }
+
+    fn test_config() -> Arc<SessionConfig> {
+        test_config_with_mode(MutationMode::Compat)
+    }
+
+    fn failing_client() -> ProtonClient {
+        ProtonClient::authenticated_with_mode(
+            "http://127.0.0.1:1",
+            crate::api::types::ApiMode::Bridge,
+            "test-uid",
+            "test-token",
+        )
+        .unwrap()
     }
 
     fn make_meta(id: &str, unread: i32) -> MessageMetadata {
@@ -2529,6 +2616,7 @@ mod tests {
             auth_router: AuthRouter::new(accounts),
             runtime_accounts,
             store: InMemoryStore::new(),
+            mutation_mode: MutationMode::Compat,
         })
     }
 
@@ -3132,6 +3220,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_copy_copies_local_message_without_api_client() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let src_uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 COPY 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("a001 OK COPY completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids, vec![src_uid]);
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+        let archived_proton_id = config
+            .store
+            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(archived_proton_id.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
+    async fn test_copy_compat_mode_succeeds_when_upstream_fails() {
+        let config = test_config_with_mode(MutationMode::Compat);
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(failing_client());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 COPY 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("a001 OK COPY completed"),
+            "response={response}"
+        );
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_copy_strict_mode_fails_when_upstream_fails() {
+        let config = test_config_with_mode(MutationMode::Strict);
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(failing_client());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 COPY 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a001 NO"), "response={response}");
+        assert!(
+            response.contains("COPY failed: upstream mutation failed"),
+            "response={response}"
+        );
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert!(archive_uids.is_empty());
+    }
+
+    #[tokio::test]
     async fn test_move_moves_local_message_and_syncs_label_add_remove_upstream() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
@@ -3213,6 +3409,101 @@ mod tests {
         assert_eq!(archive_proton_id.as_deref(), Some("msg-1"));
 
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_move_moves_local_message_without_api_client() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 MOVE 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 1 EXPUNGE"), "response={response}");
+        assert!(
+            response.contains("a001 OK MOVE completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids.len(), 1);
+        let inbox_proton_id = config
+            .store
+            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(inbox_proton_id.as_deref(), Some("msg-2"));
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+        let archive_proton_id = config
+            .store
+            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(archive_proton_id.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
+    async fn test_move_strict_mode_fails_when_upstream_fails() {
+        let config = test_config_with_mode(MutationMode::Strict);
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(failing_client());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 MOVE 1 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a001 NO"), "response={response}");
+        assert!(
+            response.contains("MOVE failed: upstream mutation failed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids.len(), 2);
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert!(archive_uids.is_empty());
     }
 
     #[tokio::test]
@@ -3303,6 +3594,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_uid_move_without_api_client_uses_uid_selection() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let uid2 = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+
+        session
+            .handle_line(&format!("a001 UID MOVE {uid2} Archive"))
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 2 EXPUNGE"), "response={response}");
+        assert!(
+            response.contains("a001 OK MOVE completed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids.len(), 1);
+        let inbox_proton_id = config
+            .store
+            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(inbox_proton_id.as_deref(), Some("msg-1"));
+
+        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        assert_eq!(archive_uids.len(), 1);
+        let archive_proton_id = config
+            .store
+            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .await
+            .unwrap();
+        assert_eq!(archive_proton_id.as_deref(), Some("msg-2"));
+    }
+
+    #[tokio::test]
     async fn test_expunge_syncs_trash_label_upstream() {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
@@ -3360,6 +3707,87 @@ mod tests {
         assert!(inbox_uids.is_empty());
 
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_expunge_strict_mode_fails_when_upstream_fails() {
+        let config = test_config_with_mode(MutationMode::Strict);
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(failing_client());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXPUNGE").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a001 NO"), "response={response}");
+        assert!(
+            response.contains("EXPUNGE failed: upstream mutation failed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids, vec![uid]);
+    }
+
+    #[tokio::test]
+    async fn test_uid_expunge_strict_mode_fails_when_upstream_fails() {
+        let config = test_config_with_mode(MutationMode::Strict);
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(failing_client());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .await
+            .unwrap();
+
+        session
+            .handle_line(&format!("a001 UID EXPUNGE {uid}"))
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a001 NO"), "response={response}");
+        assert!(
+            response.contains("UID EXPUNGE failed: upstream mutation failed"),
+            "response={response}"
+        );
+
+        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(inbox_uids, vec![uid]);
     }
 
     #[tokio::test]

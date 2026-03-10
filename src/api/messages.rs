@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use tokio::task::JoinSet;
 use tracing::info;
 
 use super::client::{
@@ -11,6 +12,224 @@ use super::types::{
     AttachmentResponse, CreateDraftReq, MessageFilter, MessageResponse, MessagesMetadataResponse,
     SendDraftReq, SendDraftResponse,
 };
+
+const API_SUCCESS_CODE: i64 = 1000;
+const API_MULTI_CODE: i64 = 1001;
+const MAX_MUTATION_BATCH_SIZE: usize = 150;
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct UndoToken {
+    token: String,
+    valid_until: i64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LabelMutationItemResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LabelMutationItem {
+    #[serde(rename = "ID", default)]
+    id: String,
+    response: LabelMutationItemResponse,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct LabelMutationResponse {
+    #[serde(default)]
+    code: i64,
+    #[serde(default)]
+    responses: Vec<LabelMutationItem>,
+    #[serde(default)]
+    undo_token: Option<UndoToken>,
+}
+
+fn first_label_mutation_failure(
+    response: &LabelMutationResponse,
+    raw_json: &serde_json::Value,
+) -> Option<ApiError> {
+    for item in &response.responses {
+        if item.response.code != API_SUCCESS_CODE {
+            let message = item
+                .response
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("label mutation failed for id {}", item.id));
+            let details = item
+                .response
+                .details
+                .clone()
+                .or_else(|| Some(raw_json.clone()));
+            return Some(ApiError::Api {
+                code: item.response.code,
+                message,
+                details,
+            });
+        }
+    }
+
+    None
+}
+
+async fn undo_actions(client: &ProtonClient, tokens: &[UndoToken]) -> Result<()> {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    for token in tokens {
+        if token.valid_until != 0 && token.valid_until < now_unix {
+            return Err(ApiError::Api {
+                code: 0,
+                message: "undo token expired".to_string(),
+                details: Some(serde_json::json!({
+                    "Token": token.token,
+                    "ValidUntil": token.valid_until
+                })),
+            });
+        }
+
+        let resp = send_logged(client.post("/mail/v4/undoactions").json(token)).await?;
+        let json: serde_json::Value = resp.json().await?;
+        check_api_response(&json)?;
+    }
+
+    Ok(())
+}
+
+async fn mutate_labels_with_rollback(
+    client: &ProtonClient,
+    endpoint: &str,
+    ids: &[&str],
+    label_id: &str,
+    action_name: &str,
+) -> Result<()> {
+    let mut successful_tokens: Vec<UndoToken> = Vec::new();
+
+    for chunk in ids.chunks(MAX_MUTATION_BATCH_SIZE) {
+        let body = serde_json::json!({ "LabelID": label_id, "IDs": chunk });
+        let resp = send_logged(client.put(endpoint).json(&body)).await?;
+        let json: serde_json::Value = resp.json().await?;
+
+        let parsed: LabelMutationResponse = serde_json::from_value(json.clone())?;
+
+        if parsed.code == API_SUCCESS_CODE && parsed.responses.is_empty() {
+            continue;
+        }
+
+        if parsed.code == API_MULTI_CODE || !parsed.responses.is_empty() {
+            if let Some(err) = first_label_mutation_failure(&parsed, &json) {
+                if !successful_tokens.is_empty() {
+                    undo_actions(client, &successful_tokens).await.map_err(|undo_err| {
+                        ApiError::Api {
+                            code: 0,
+                            message: format!(
+                                "failed to undo previous {action_name} actions after partial failure: {undo_err}"
+                            ),
+                            details: Some(json.clone()),
+                        }
+                    })?;
+                }
+                return Err(err);
+            }
+        } else {
+            check_api_response(&json)?;
+        }
+
+        if let Some(token) = parsed.undo_token {
+            if !token.token.trim().is_empty() {
+                successful_tokens.push(token);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn mutate_message_ids_in_chunks(
+    client: &ProtonClient,
+    endpoint: &str,
+    ids: &[&str],
+) -> Result<()> {
+    for chunk in ids.chunks(MAX_MUTATION_BATCH_SIZE) {
+        let body = serde_json::json!({ "IDs": chunk });
+        let resp = send_logged(client.put(endpoint).json(&body)).await?;
+        let json: serde_json::Value = resp.json().await?;
+        check_api_response(&json)?;
+    }
+    Ok(())
+}
+
+async fn delete_message_ids_in_chunks_parallel(client: &ProtonClient, ids: &[&str]) -> Result<()> {
+    let chunked_ids: Vec<Vec<String>> = ids
+        .chunks(MAX_MUTATION_BATCH_SIZE)
+        .map(|chunk| chunk.iter().map(|id| (*id).to_string()).collect())
+        .collect();
+
+    if chunked_ids.is_empty() {
+        return Ok(());
+    }
+
+    let max_parallelism = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
+    let concurrency = max_parallelism.min(chunked_ids.len()).max(1);
+
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = JoinSet::new();
+
+    for chunk in chunked_ids {
+        let client = client.clone();
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire_owned()
+                .await
+                .map_err(|err| ApiError::Api {
+                    code: 0,
+                    message: format!("delete chunk semaphore closed: {err}"),
+                    details: None,
+                })?;
+            let body = serde_json::json!({ "IDs": chunk });
+            let resp = send_logged(client.put("/mail/v4/messages/delete").json(&body)).await?;
+            let json: serde_json::Value = resp.json().await?;
+            check_api_response(&json)?;
+            Ok::<(), ApiError>(())
+        });
+    }
+
+    while let Some(joined) = join_set.join_next().await {
+        match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                return Err(err);
+            }
+            Err(err) => {
+                join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
+                return Err(ApiError::Api {
+                    code: 0,
+                    message: format!("delete chunk task failed: {err}"),
+                    details: None,
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
 
 fn build_message_metadata_body(
     filter: &MessageFilter,
@@ -77,57 +296,77 @@ pub async fn get_message_metadata(
 
     let body = build_message_metadata_body(filter, page, page_size)?;
 
-    for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
-        let fetch_started = Instant::now();
-        let resp = send_logged(
-            client
-                .post("/mail/v4/messages")
-                .header("X-HTTP-Method-Override", "GET")
-                .json(&body),
-        )
-        .await?;
+    let mut stale_round = 0usize;
+    'stale_retry: loop {
+        stale_round += 1;
 
-        let status = resp.status();
-        let retry_delay = retry_delay_from_headers(resp.headers());
-        let json: serde_json::Value = resp.json().await?;
+        for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
+            let fetch_started = Instant::now();
+            let resp = send_logged(
+                client
+                    .post("/mail/v4/messages")
+                    .header("X-HTTP-Method-Override", "GET")
+                    .json(&body),
+            )
+            .await?;
 
-        if !status.is_success()
-            && is_transient_http_status(status)
-            && attempt + 1 < MAX_TRANSIENT_ATTEMPTS
-        {
-            tokio::time::sleep(retry_delay).await;
-            continue;
+            let status = resp.status();
+            let retry_delay = retry_delay_from_headers(resp.headers());
+            let json: serde_json::Value = resp.json().await?;
+
+            if !status.is_success()
+                && is_transient_http_status(status)
+                && attempt + 1 < MAX_TRANSIENT_ATTEMPTS
+            {
+                tokio::time::sleep(retry_delay).await;
+                continue;
+            }
+
+            check_api_response(&json)?;
+
+            if status.is_success() {
+                let meta_resp: MessagesMetadataResponse = serde_json::from_value(json)?;
+                if meta_resp.stale != 0 {
+                    info!(
+                        page = page,
+                        page_size = page_size,
+                        label_id = filter.label_id.as_deref().unwrap_or_default(),
+                        end_id = filter.end_id.as_deref().unwrap_or_default(),
+                        continuation = filter.end_id.is_some(),
+                        stale_round,
+                        attempt = attempt + 1,
+                        duration_ms = fetch_started.elapsed().as_millis() as u64,
+                        "metadata_fetch_stale_retry"
+                    );
+                    continue 'stale_retry;
+                }
+
+                info!(
+                    page = page,
+                    page_size = page_size,
+                    label_id = filter.label_id.as_deref().unwrap_or_default(),
+                    end_id = filter.end_id.as_deref().unwrap_or_default(),
+                    continuation = filter.end_id.is_some(),
+                    messages_count = meta_resp.messages.len(),
+                    total = meta_resp.total,
+                    first_message_id = ?meta_resp.messages.first().map(|message| message.id.as_str()),
+                    last_message_id = ?meta_resp.messages.last().map(|message| message.id.as_str()),
+                    stale_round,
+                    attempt = attempt + 1,
+                    duration_ms = fetch_started.elapsed().as_millis() as u64,
+                    "metadata_fetch"
+                );
+                return Ok(meta_resp);
+            }
+
+            return Err(ApiError::Api {
+                code: i64::from(status.as_u16()),
+                message: format!("HTTP status {}", status.as_u16()),
+                details: Some(json),
+            });
         }
-
-        check_api_response(&json)?;
-
-        if status.is_success() {
-            let meta_resp: MessagesMetadataResponse = serde_json::from_value(json)?;
-            info!(
-                page = page,
-                page_size = page_size,
-                label_id = filter.label_id.as_deref().unwrap_or_default(),
-                end_id = filter.end_id.as_deref().unwrap_or_default(),
-                continuation = filter.end_id.is_some(),
-                messages_count = meta_resp.messages.len(),
-                total = meta_resp.total,
-                first_message_id = ?meta_resp.messages.first().map(|message| message.id.as_str()),
-                last_message_id = ?meta_resp.messages.last().map(|message| message.id.as_str()),
-                attempt = attempt + 1,
-                duration_ms = fetch_started.elapsed().as_millis() as u64,
-                "metadata_fetch"
-            );
-            return Ok(meta_resp);
-        }
-
-        return Err(ApiError::Api {
-            code: i64::from(status.as_u16()),
-            message: format!("HTTP status {}", status.as_u16()),
-            details: Some(json),
-        });
+        return Err(ApiError::Auth("exhausted transient retries".to_string()));
     }
-
-    Err(ApiError::Auth("exhausted transient retries".to_string()))
 }
 
 /// Fetch raw encrypted attachment data.
@@ -173,11 +412,7 @@ pub async fn get_attachment(client: &ProtonClient, attachment_id: &str) -> Resul
 /// Reference: go-proton-api/message.go MarkMessagesRead
 pub async fn mark_messages_read(client: &ProtonClient, ids: &[&str]) -> Result<()> {
     info!(count = ids.len(), "marking messages read");
-    let body = serde_json::json!({ "IDs": ids });
-    let resp = send_logged(client.put("/mail/v4/messages/read").json(&body)).await?;
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-    Ok(())
+    mutate_message_ids_in_chunks(client, "/mail/v4/messages/read", ids).await
 }
 
 /// Mark messages as unread.
@@ -185,11 +420,7 @@ pub async fn mark_messages_read(client: &ProtonClient, ids: &[&str]) -> Result<(
 /// Reference: go-proton-api/message.go MarkMessagesUnread
 pub async fn mark_messages_unread(client: &ProtonClient, ids: &[&str]) -> Result<()> {
     info!(count = ids.len(), "marking messages unread");
-    let body = serde_json::json!({ "IDs": ids });
-    let resp = send_logged(client.put("/mail/v4/messages/unread").json(&body)).await?;
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-    Ok(())
+    mutate_message_ids_in_chunks(client, "/mail/v4/messages/unread", ids).await
 }
 
 /// Add a label to messages.
@@ -197,11 +428,7 @@ pub async fn mark_messages_unread(client: &ProtonClient, ids: &[&str]) -> Result
 /// Reference: go-proton-api/message.go LabelMessages
 pub async fn label_messages(client: &ProtonClient, ids: &[&str], label_id: &str) -> Result<()> {
     info!(count = ids.len(), label_id = %label_id, "labeling messages");
-    let body = serde_json::json!({ "LabelID": label_id, "IDs": ids });
-    let resp = send_logged(client.put("/mail/v4/messages/label").json(&body)).await?;
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-    Ok(())
+    mutate_labels_with_rollback(client, "/mail/v4/messages/label", ids, label_id, "label").await
 }
 
 /// Remove a label from messages.
@@ -209,11 +436,14 @@ pub async fn label_messages(client: &ProtonClient, ids: &[&str], label_id: &str)
 /// Reference: go-proton-api/message.go UnlabelMessages
 pub async fn unlabel_messages(client: &ProtonClient, ids: &[&str], label_id: &str) -> Result<()> {
     info!(count = ids.len(), label_id = %label_id, "unlabeling messages");
-    let body = serde_json::json!({ "LabelID": label_id, "IDs": ids });
-    let resp = send_logged(client.put("/mail/v4/messages/unlabel").json(&body)).await?;
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-    Ok(())
+    mutate_labels_with_rollback(
+        client,
+        "/mail/v4/messages/unlabel",
+        ids,
+        label_id,
+        "unlabel",
+    )
+    .await
 }
 
 /// Permanently delete messages.
@@ -221,11 +451,7 @@ pub async fn unlabel_messages(client: &ProtonClient, ids: &[&str], label_id: &st
 /// Reference: go-proton-api/message.go DeleteMessage
 pub async fn delete_messages(client: &ProtonClient, ids: &[&str]) -> Result<()> {
     info!(count = ids.len(), "permanently deleting messages");
-    let body = serde_json::json!({ "IDs": ids });
-    let resp = send_logged(client.put("/mail/v4/messages/delete").json(&body)).await?;
-    let json: serde_json::Value = resp.json().await?;
-    check_api_response(&json)?;
-    Ok(())
+    delete_message_ids_in_chunks_parallel(client, ids).await
 }
 
 /// Import an encrypted RFC822 message into Proton.
@@ -517,6 +743,94 @@ mod tests {
         assert_eq!(resp.messages.len(), 2);
         assert_eq!(resp.messages[0].subject, "First");
         assert_eq!(resp.messages[1].subject, "Second");
+        assert_eq!(resp.stale, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_message_metadata_retries_while_stale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_task = calls.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let current = calls_task.fetch_add(1, Ordering::SeqCst);
+
+                let body = if current == 0 {
+                    serde_json::json!({
+                        "Code": 1000,
+                        "Total": 1,
+                        "Stale": 1,
+                        "Messages": [{
+                            "ID": "msg-stale-1",
+                            "AddressID": "addr-1",
+                            "LabelIDs": ["0"],
+                            "Subject": "Stale First",
+                            "Sender": {"Name": "Alice", "Address": "alice@example.com"},
+                            "ToList": [],
+                            "CCList": [],
+                            "BCCList": [],
+                            "Time": 1700000000,
+                            "Size": 128,
+                            "Unread": 1,
+                            "NumAttachments": 0
+                        }]
+                    })
+                } else {
+                    serde_json::json!({
+                        "Code": 1000,
+                        "Total": 1,
+                        "Stale": 0,
+                        "Messages": [{
+                            "ID": "msg-stale-2",
+                            "AddressID": "addr-1",
+                            "LabelIDs": ["0"],
+                            "Subject": "Fresh Second",
+                            "Sender": {"Name": "Alice", "Address": "alice@example.com"},
+                            "ToList": [],
+                            "CCList": [],
+                            "BCCList": [],
+                            "Time": 1700000001,
+                            "Size": 128,
+                            "Unread": 1,
+                            "NumAttachments": 0
+                        }]
+                    })
+                };
+
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let filter = MessageFilter {
+            label_id: Some("0".to_string()),
+            desc: 1,
+            ..Default::default()
+        };
+        let resp = get_message_metadata(&client, &filter, 0, 50).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(resp.stale, 0);
+        assert_eq!(resp.messages.len(), 1);
+        assert_eq!(resp.messages[0].id, "msg-stale-2");
+        server.await.unwrap();
     }
 
     #[test]
@@ -592,6 +906,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_mark_messages_read_chunks_large_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_task = calls.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 16384];
+                let _ = stream.read(&mut buf).await.unwrap();
+                calls_task.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::json!({ "Code": 1000 }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let ids_owned: Vec<String> = (0..152).map(|idx| format!("msg-{idx}")).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(String::as_str).collect();
+        mark_messages_read(&client, &ids).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_mark_messages_unread_chunks_large_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_task = calls.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 16384];
+                let _ = stream.read(&mut buf).await.unwrap();
+                calls_task.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::json!({ "Code": 1000 }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let ids_owned: Vec<String> = (0..152).map(|idx| format!("msg-{idx}")).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(String::as_str).collect();
+        mark_messages_unread(&client, &ids).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delete_messages_chunks_large_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_task = calls.clone();
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 16384];
+                let _ = stream.read(&mut buf).await.unwrap();
+                calls_task.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::json!({ "Code": 1000 }).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let ids_owned: Vec<String> = (0..152).map(|idx| format!("msg-{idx}")).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(String::as_str).collect();
+        delete_messages(&client, &ids).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_label_messages() {
         let server = MockServer::start().await;
         let client = setup_authenticated_client(&server).await;
@@ -621,6 +1049,158 @@ mod tests {
             .await;
 
         unlabel_messages(&client, &["msg-1"], "10").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_label_messages_rolls_back_previous_chunks_on_partial_failure() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_paths_task = seen_paths.clone();
+
+        let server = tokio::spawn(async move {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_paths_task.lock().unwrap().push(path.clone());
+
+                let body = match idx {
+                    0 => serde_json::json!({
+                        "Code": 1000,
+                        "Responses": [
+                            {"ID": "msg-0", "Response": {"Code": 1000}}
+                        ],
+                        "UndoToken": {"Token": "undo-a", "ValidUntil": 4102444800_i64}
+                    }),
+                    1 => serde_json::json!({
+                        "Code": 1001,
+                        "Responses": [
+                            {"ID": "msg-150", "Response": {"Code": 1000}},
+                            {"ID": "msg-151", "Response": {"Code": 2500, "Error": "Message does not exist"}}
+                        ]
+                    }),
+                    _ => serde_json::json!({
+                        "Code": 1000
+                    }),
+                }
+                .to_string();
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let ids_owned: Vec<String> = (0..152).map(|idx| format!("msg-{idx}")).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(String::as_str).collect();
+
+        let err = label_messages(&client, &ids, "10").await.unwrap_err();
+        assert!(err.to_string().contains("Message does not exist"));
+
+        server.await.unwrap();
+        let observed = seen_paths.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                "/mail/v4/messages/label".to_string(),
+                "/mail/v4/messages/label".to_string(),
+                "/mail/v4/undoactions".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unlabel_messages_rolls_back_previous_chunks_on_partial_failure() {
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_paths_task = seen_paths.clone();
+
+        let server = tokio::spawn(async move {
+            for idx in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap();
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/")
+                    .to_string();
+                seen_paths_task.lock().unwrap().push(path.clone());
+
+                let body = match idx {
+                    0 => serde_json::json!({
+                        "Code": 1000,
+                        "Responses": [
+                            {"ID": "msg-0", "Response": {"Code": 1000}}
+                        ],
+                        "UndoToken": {"Token": "undo-b", "ValidUntil": 4102444800_i64}
+                    }),
+                    1 => serde_json::json!({
+                        "Code": 1001,
+                        "Responses": [
+                            {"ID": "msg-150", "Response": {"Code": 1000}},
+                            {"ID": "msg-151", "Response": {"Code": 2500, "Error": "Message does not exist"}}
+                        ]
+                    }),
+                    _ => serde_json::json!({
+                        "Code": 1000
+                    }),
+                }
+                .to_string();
+
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let ids_owned: Vec<String> = (0..152).map(|idx| format!("msg-{idx}")).collect();
+        let ids: Vec<&str> = ids_owned.iter().map(String::as_str).collect();
+
+        let err = unlabel_messages(&client, &ids, "10").await.unwrap_err();
+        assert!(err.to_string().contains("Message does not exist"));
+
+        server.await.unwrap();
+        let observed = seen_paths.lock().unwrap().clone();
+        assert_eq!(
+            observed,
+            vec![
+                "/mail/v4/messages/unlabel".to_string(),
+                "/mail/v4/messages/unlabel".to_string(),
+                "/mail/v4/undoactions".to_string()
+            ]
+        );
     }
 
     #[tokio::test]

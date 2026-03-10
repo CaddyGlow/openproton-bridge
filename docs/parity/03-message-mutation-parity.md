@@ -1,0 +1,130 @@
+# Message Mutation Parity (IMAP -> API)
+
+## Scope
+
+This document compares IMAP-triggered remote mutations in OpenProton against `go-proton-api` and upstream `proton-bridge` behavior.
+
+Primary files:
+
+- `src/imap/session.rs`
+- `src/api/messages.rs`
+- `src/api/types.rs`
+- `../go-proton-api/message.go`
+- `../go-proton-api/message_types.go`
+
+## Implementation status (2026-03-10)
+
+- Done: metadata page `Stale` parity handling implemented.
+  - `MessagesMetadataResponse` now models `Stale`.
+  - `get_message_metadata` now retries while `Stale != 0` (upstream-compatible behavior).
+- Done: stale-value compatibility widened to bool-like payloads (`0/1`, booleans, numeric strings).
+- Done: regressions added:
+  - `test_get_message_metadata_retries_while_stale`
+  - `test_messages_metadata_response_deserializes_stale_boolish_values`
+- Done: label/unlabel partial-failure rollback semantics implemented (GPA-style previous-chunk undo).
+- Done: label/unlabel chunking parity implemented (`150` IDs per chunk) with rollback tests.
+- Done: broader mutation chunking implemented for read/unread/delete (`150` IDs per chunk).
+- Done: delete mutation now executes chunk pages in parallel (bounded by available parallelism) to match GPA throughput model.
+- Done: regressions added:
+  - `test_mark_messages_read_chunks_large_batches`
+  - `test_mark_messages_unread_chunks_large_batches`
+  - `test_delete_messages_chunks_large_batches`
+
+## Current findings
+
+### 1) Label/unlabel partial failure rollback mismatch (high)
+
+Observed:
+
+- GPA `LabelMessages` / `UnlabelMessages` validates per-message responses and invokes `UndoActions` on partial failure.
+- OpenProton now chunks requests (`150` IDs), inspects per-item responses, and calls `/mail/v4/undoactions`
+  for prior successful chunks when a later chunk fails.
+
+Risk:
+
+- Residual risk is low; rollback now matches upstream intent for prior successful chunks.
+
+Validation tasks:
+
+- Add wiremock fixtures returning mixed per-item responses for label/unlabel.
+- Verify local store and remote outcome alignment in compat and strict modes.
+
+### 2) Metadata page stale handling gap (high)
+
+Observed:
+
+- GPA `GetMessageMetadataPage` loops while response `Stale == true`.
+- OpenProton now models `Stale` and retries until a non-stale page is returned.
+
+Risk:
+
+- Residual risk is low and mostly around pathological repeated stale responses.
+
+Validation tasks:
+
+- Add API fixture with `Stale=true` then `Stale=false` for same request.
+- Confirm resync path (`src/bridge/events.rs`) retries until non-stale page.
+
+### 3) Chunking and throughput behavior parity (resolved)
+
+Observed:
+
+- GPA chunks most mutation calls by `maxPageSize` (150) and parallelizes delete pages.
+- OpenProton now enforces chunking (`150`) for label/unlabel/read/unread/delete, and parallelizes delete chunks.
+
+Risk:
+
+- Residual risk is low and mainly operational (burstier outbound delete requests under large batches).
+
+Validation tasks:
+
+- Keep stress tests for >150 IDs in parity suite.
+- Monitor rate-limit behavior under large delete bursts.
+
+### 4) Strict/compat policy is explicit in OpenProton IMAP path (informational)
+
+Observed:
+
+- OpenProton `MutationMode::{Compat,Strict}` governs whether upstream mutation errors fail IMAP commands.
+- Tests exist for strict failures (`COPY`, `MOVE`, `EXPUNGE`, `UID EXPUNGE`) and compat success fallback.
+
+Risk:
+
+- Behavior is intentional but should be explicitly documented as divergence if upstream command-level policy differs.
+
+Validation tasks:
+
+- Document command-by-command policy and expected client-visible responses.
+
+### 5) Draft/send parity still needs endpoint-contract pass (medium)
+
+Observed:
+
+- OpenProton has `create_draft` and `send_draft` wrappers.
+- GPA draft/send semantics live across additional message send/import types; parity not yet verified in this step.
+
+Risk:
+
+- Draft/package behaviors may differ in edge cases (attachments, encrypted packages, per-recipient statuses).
+
+Validation tasks:
+
+- Map OpenProton request/response fields against GPA draft/send types and add fixture tests.
+
+## Proposed implementation plan (step 4 execution)
+
+1. Extend `src/api/types.rs` and `src/api/messages.rs` to model and handle `Stale` for metadata page calls.
+2. Add robust result validation for label/unlabel responses; decide whether to implement undo semantics directly or document intentional non-rollback.
+3. Introduce chunk helpers for message ID mutations (or enforce at call-sites) and test with >150 IDs.
+4. Add targeted tests under `src/api/messages.rs` and `tests/parity/` for:
+   - partial label/unlabel failures
+   - stale metadata pages
+   - large mutation batches
+5. Update docs with strict vs compat policy table.
+
+## Acceptance gates for message mutation parity
+
+- No stale metadata accepted without retry.
+- Label/unlabel behavior is either rollback-safe or explicitly documented as intentional non-atomic behavior.
+- Large batch mutation behavior is deterministic and tested.
+- IMAP command responses under strict/compat modes are fully specified and covered.

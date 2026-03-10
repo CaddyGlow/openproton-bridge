@@ -1398,7 +1398,7 @@ async fn cmd_cli(
                             print_cli_prompt()?;
                             continue;
                         }
-                        let target = match resolve_account_selector_session(dir, &tokens[1]) {
+                        let target = match resolve_account_selector_session(dir, &tokens[1]).await {
                             Ok(session) => session.email,
                             Err(err) => {
                                 eprintln!("Error: {err:#}");
@@ -1428,7 +1428,7 @@ async fn cmd_cli(
                             print_cli_prompt()?;
                             continue;
                         }
-                        let target = match resolve_account_selector_session(dir, &tokens[1]) {
+                        let target = match resolve_account_selector_session(dir, &tokens[1]).await {
                             Ok(session) => session.email,
                             Err(err) => {
                                 eprintln!("Error: {err:#}");
@@ -1541,7 +1541,9 @@ async fn cmd_cli(
                                         }
                                     } else {
                                         let selected =
-                                            match resolve_account_selector_session(dir, &value) {
+                                            match resolve_account_selector_session(dir, &value)
+                                                .await
+                                            {
                                                 Ok(session) => session.email,
                                                 Err(err) => {
                                                     eprintln!("Error: {err:#}");
@@ -1738,7 +1740,9 @@ async fn cmd_cli(
                                 print_cli_prompt()?;
                                 continue;
                             }
-                            if let Err(err) = set_account_mode_by_selector(dir, &tokens[2], &tokens[3]) {
+                            if let Err(err) =
+                                set_account_mode_by_selector(dir, &tokens[2], &tokens[3]).await
+                            {
                                 eprintln!("Error: {err:#}");
                             }
                         } else if tokens
@@ -2777,6 +2781,7 @@ async fn set_disk_cache_path_for_cli(
 
     let target_path = std::path::PathBuf::from(target);
     let current_path = resolve_live_gluon_cache_root_for_cli(runtime_paths)
+        .await
         .unwrap_or_else(|| effective_disk_cache_path(runtime_paths));
 
     move_disk_cache_payload_for_cli(&current_path, &target_path).await?;
@@ -2799,15 +2804,15 @@ async fn set_disk_cache_path_for_cli(
     Ok(())
 }
 
-fn resolve_live_gluon_cache_root_for_cli(
+async fn resolve_live_gluon_cache_root_for_cli(
     runtime_paths: &paths::RuntimePaths,
 ) -> Option<std::path::PathBuf> {
-    let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
+    let sessions = match cli_managed_sessions(runtime_paths.settings_dir()).await {
         Ok(sessions) => sessions,
         Err(err) => {
             tracing::warn!(
                 error = %err,
-                "failed to load sessions while resolving live gluon cache root"
+                "failed to load cli managed sessions while resolving live gluon cache root"
             );
             return None;
         }
@@ -3052,11 +3057,25 @@ async fn run_interactive_reset(
     Ok(())
 }
 
-fn resolve_account_selector_session(
+async fn cli_managed_sessions(dir: &std::path::Path) -> anyhow::Result<Vec<api::types::Session>> {
+    let manager = bridge::session_manager::SessionManager::new(dir.to_path_buf());
+    match manager.load_sessions_from_vault().await {
+        Ok(sessions) => Ok(sessions),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                "falling back to raw persisted cli sessions for selector compatibility"
+            );
+            vault::list_sessions(dir).context("failed to load sessions")
+        }
+    }
+}
+
+async fn resolve_account_selector_session(
     dir: &std::path::Path,
     selector: &str,
 ) -> anyhow::Result<api::types::Session> {
-    let sessions = vault::list_sessions(dir).context("failed to load sessions")?;
+    let sessions = cli_managed_sessions(dir).await?;
     if sessions.is_empty() {
         anyhow::bail!("no accounts are configured");
     }
@@ -3081,12 +3100,12 @@ fn resolve_account_selector_session(
         .ok_or_else(|| anyhow::anyhow!("unknown account selector: {selector}"))
 }
 
-fn set_account_mode_by_selector(
+async fn set_account_mode_by_selector(
     dir: &std::path::Path,
     selector: &str,
     mode: &str,
 ) -> anyhow::Result<()> {
-    let session = resolve_account_selector_session(dir, selector)?;
+    let session = resolve_account_selector_session(dir, selector).await?;
 
     let enabled = match mode.trim().to_ascii_lowercase().as_str() {
         "split" => true,
@@ -3383,15 +3402,22 @@ async fn cmd_login(
     };
 
     // Reuse existing bridge password for cross-bridge compatibility.
-    let bridge_password = vault::load_session_by_account_id(dir, &auth.uid)
-        .ok()
-        .and_then(|stored| stored.bridge_password)
-        .or_else(|| {
-            vault::load_session_by_email(dir, &user.email)
-                .ok()
-                .and_then(|stored| stored.bridge_password)
-        })
-        .unwrap_or_else(generate_bridge_password);
+    let session_manager = bridge::session_manager::SessionManager::new(dir.to_path_buf());
+    let bridge_password = match session_manager.load_sessions_from_vault().await {
+        Ok(sessions) => sessions
+            .into_iter()
+            .find(|stored| stored.uid == auth.uid || stored.email.eq_ignore_ascii_case(&user.email))
+            .and_then(|stored| stored.bridge_password),
+        Err(err) => {
+            tracing::debug!(
+                error = %err,
+                user_id = %auth.uid,
+                "falling back to generated bridge password during cli login"
+            );
+            None
+        }
+    }
+    .unwrap_or_else(generate_bridge_password);
 
     // Build session
     let session = api::types::Session {
@@ -3405,7 +3431,10 @@ async fn cmd_login(
         bridge_password: Some(bridge_password.clone()),
     };
 
-    vault::save_session_with_user_id(&session, Some(user.id.as_str()), dir)?;
+    session_manager
+        .persist_session(session.clone(), Some(user.id.as_str()))
+        .await
+        .map_err(anyhow::Error::from)?;
     vault::set_default_email(dir, &session.email)?;
     tracing::info!(
         pkg = "bridge/login",
@@ -4080,7 +4109,7 @@ async fn cmd_account_info(
     dir: &std::path::Path,
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
-    let session = resolve_account_selector_session(dir, selector)?;
+    let session = resolve_account_selector_session(dir, selector).await?;
     let mail_settings = load_mail_settings_for_cli(runtime_paths).await?;
     let split_mode = vault::load_split_mode_by_account_id(dir, &session.uid)
         .context("failed to load account mode")?
@@ -4222,7 +4251,7 @@ async fn cmd_mutt_config(
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
     let session = if let Some(selector) = account_selector {
-        resolve_account_selector_session(dir, selector)?
+        resolve_account_selector_session(dir, selector).await?
     } else {
         vault::load_session(dir)
             .map_err(anyhow::Error::new)

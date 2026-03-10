@@ -77,6 +77,20 @@ impl SessionManager {
         self.seed_session(session).await
     }
 
+    pub async fn load_or_seed_session(&self, session: Session) -> Result<Session, SessionError> {
+        if session.uid.trim().is_empty() {
+            return Err(SessionError::InvalidState("session uid is empty"));
+        }
+        if session.refresh_token.trim().is_empty() {
+            return Err(SessionError::InvalidState("session refresh token is empty"));
+        }
+
+        self.runtime_accounts
+            .load_or_seed_session(session)
+            .await
+            .map_err(SessionError::from)
+    }
+
     pub async fn load_sessions_from_vault(&self) -> Result<Vec<Session>, SessionError> {
         let Some(vault_dir) = self.vault_dir.as_deref() else {
             return Ok(self.runtime_accounts.active_sessions().await);
@@ -293,5 +307,50 @@ mod tests {
 
         assert_eq!(merged.access_token, "live-token");
         assert_eq!(merged.refresh_token, "refresh-b");
+    }
+
+    #[tokio::test]
+    async fn load_or_seed_session_preserves_existing_runtime_tokens() {
+        let manager =
+            SessionManager::in_memory(vec![session("uid-1", "live-token", "refresh-new")]);
+
+        let loaded = manager
+            .load_or_seed_session(session("uid-1", "stale-token", "refresh-old"))
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.access_token, "live-token");
+        assert_eq!(loaded.refresh_token, "refresh-new");
+        assert_eq!(
+            manager
+                .session(&AccountId("uid-1".to_string()))
+                .await
+                .unwrap()
+                .access_token,
+            "live-token"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_or_seed_session_seeds_missing_runtime_session() {
+        let manager = SessionManager::in_memory(Vec::new());
+        let incoming = session("uid-1", "seed-token", "refresh-a");
+
+        let loaded = manager
+            .load_or_seed_session(incoming.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.uid, incoming.uid);
+        assert_eq!(loaded.access_token, incoming.access_token);
+        assert_eq!(loaded.refresh_token, incoming.refresh_token);
+
+        let stored = manager
+            .session(&AccountId("uid-1".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(stored.uid, "uid-1");
+        assert_eq!(stored.access_token, "seed-token");
+        assert_eq!(stored.refresh_token, "refresh-a");
     }
 }

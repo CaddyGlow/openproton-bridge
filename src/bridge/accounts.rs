@@ -336,6 +336,60 @@ impl RuntimeAccountRegistry {
         Ok(())
     }
 
+    pub async fn load_or_seed_session(
+        &self,
+        session: Session,
+    ) -> Result<Session, AccountRuntimeError> {
+        if !is_session_runtime_usable(&session) {
+            warn!(
+                email = %session.email,
+                uid = %session.uid,
+                has_refresh_token = !session.refresh_token.trim().is_empty(),
+                "skipping invalid account session while seeding runtime registry"
+            );
+            return Ok(session);
+        }
+
+        let account_id = AccountId(session.uid.clone());
+        let mut inserted = false;
+        let current = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get(&account_id).cloned() {
+                Some(existing) => existing,
+                None => {
+                    inserted = true;
+                    sessions.insert(account_id.clone(), session.clone());
+                    session
+                }
+            }
+        };
+
+        if inserted {
+            {
+                let mut health = self.health.write().await;
+                health
+                    .entry(account_id.clone())
+                    .or_insert(AccountHealth::Healthy);
+            }
+            {
+                let mut generations = self.runtime_generations.write().await;
+                generations.entry(account_id.clone()).or_insert(0);
+            }
+            {
+                let mut watchers = self
+                    .generation_watchers
+                    .lock()
+                    .expect("generation watcher lock poisoned");
+                watchers.entry(account_id).or_insert_with(|| {
+                    let (generation_tx, _generation_rx) = watch::channel(0);
+                    generation_tx
+                });
+            }
+        }
+
+        Ok(current)
+    }
+
     pub async fn get_auth_material(
         &self,
         account_id: &AccountId,

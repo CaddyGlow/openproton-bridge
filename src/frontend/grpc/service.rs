@@ -1088,22 +1088,26 @@ impl BridgeService {
 
         let account_id = bridge::types::AccountId(session.uid.clone());
         let session_manager = self.state.runtime_supervisor.session_manager();
-        if let Err(err) = session_manager.upsert_session(session.clone()).await {
-            warn!(
-                user_id = %session.uid,
-                error = %err,
-                "failed to seed grpc session manager before metadata refresh"
-            );
-            return None;
-        }
-        let refreshed = if session.access_token.trim().is_empty() {
+        let managed = match session_manager.load_or_seed_session(session.clone()).await {
+            Ok(managed) => managed,
+            Err(err) => {
+                warn!(
+                    user_id = %session.uid,
+                    error = %err,
+                    "failed to seed grpc session manager before metadata refresh"
+                );
+                return None;
+            }
+        };
+        let refreshed = if session.access_token.trim().is_empty()
+            || managed.access_token.trim().is_empty()
+        {
             session_manager.with_valid_access_token(&account_id).await
         } else {
             session_manager
                 .refresh_session_if_stale(&account_id, Some(session.access_token.as_str()))
                 .await
         };
-
         match refreshed {
             Ok(updated) if !updated.access_token.trim().is_empty() => {
                 self.cache_session_access_token(&updated).await;

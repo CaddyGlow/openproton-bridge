@@ -136,6 +136,22 @@ pub async fn run_server_with_listener_and_tls_config(
     run_server_from_listener(listener, config, tls_config).await
 }
 
+pub async fn run_server_with_listener_implicit_tls(
+    listener: TcpListener,
+    config: Arc<SessionConfig>,
+) -> Result<()> {
+    run_server_with_listener_and_tls_config_implicit_tls(listener, config, runtime_tls_config())
+        .await
+}
+
+pub async fn run_server_with_listener_and_tls_config_implicit_tls(
+    listener: TcpListener,
+    config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    run_server_from_listener_implicit_tls(listener, config, tls_config).await
+}
+
 pub async fn run_server_with_tls_config(
     addr: &str,
     config: Arc<SessionConfig>,
@@ -205,6 +221,72 @@ async fn run_server_from_listener(
     }
 }
 
+async fn run_server_from_listener_implicit_tls(
+    listener: TcpListener,
+    config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
+    let listener_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    info!(
+        pkg = "imap/server",
+        msg = "IMAP implicit TLS server listening",
+        addr = %listener_addr,
+        "IMAP implicit TLS server listening"
+    );
+
+    let tls_config = tls_config.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IMAP implicit TLS requested without TLS configuration",
+        )
+    })?;
+    let acceptor = TlsAcceptor::from(tls_config);
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+
+        {
+            let mut limiter = rate_limiter.lock().await;
+            if !limiter.check(peer.ip()) {
+                warn!(peer = %peer, "rate limited, dropping connection");
+                drop(stream);
+                continue;
+            }
+        }
+
+        info!(
+            pkg = "imap/server",
+            msg = "new IMAP implicit TLS connection",
+            peer = %peer,
+            "new IMAP implicit TLS connection"
+        );
+
+        let config = config.clone();
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_implicit_tls(stream, config, acceptor).await {
+                error!(
+                    pkg = "imap/server",
+                    msg = "implicit TLS connection error",
+                    peer = %peer,
+                    error = %e,
+                    "implicit TLS connection error"
+                );
+            }
+            info!(
+                pkg = "imap/server",
+                msg = "connection closed",
+                peer = %peer,
+                "connection closed"
+            );
+        });
+    }
+}
+
 async fn handle_connection(
     stream: TcpStream,
     config: Arc<SessionConfig>,
@@ -235,6 +317,21 @@ async fn handle_connection(
         let _ = tls_session.run_after_starttls().await?;
     }
 
+    Ok(())
+}
+
+async fn handle_connection_implicit_tls(
+    stream: TcpStream,
+    config: Arc<SessionConfig>,
+    acceptor: TlsAcceptor,
+) -> Result<()> {
+    let tls_stream = acceptor
+        .accept(stream)
+        .await
+        .map_err(|err| super::ImapError::Tls(err.to_string()))?;
+    let (read, write) = tokio::io::split(tls_stream);
+    let mut session = ImapSession::with_starttls(read, write, config, false);
+    let _ = session.run().await?;
     Ok(())
 }
 

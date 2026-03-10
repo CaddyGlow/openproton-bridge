@@ -53,6 +53,9 @@ pub struct MailRuntimeConfig {
     pub pim_calendar_horizon_reconcile_interval: Duration,
 }
 
+pub const DEFAULT_IMAP_IMPLICIT_TLS_PORT: u16 = 1993;
+pub const DEFAULT_SMTP_IMPLICIT_TLS_PORT: u16 = 1465;
+
 pub const DEFAULT_PIM_RECONCILE_TICK_INTERVAL: Duration = Duration::from_secs(10 * 60);
 pub const DEFAULT_PIM_CONTACTS_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 pub const DEFAULT_PIM_CALENDAR_RECONCILE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -119,6 +122,18 @@ pub enum MailRuntimeStartError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to bind IMAP implicit TLS listener on {addr}: {source}")]
+    ImapImplicitTlsBind {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to bind SMTP implicit TLS listener on {addr}: {source}")]
+    SmtpImplicitTlsBind {
+        addr: String,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to bind DAV listener on {addr}: {source}")]
     DavBind {
         addr: String,
@@ -134,6 +149,8 @@ impl MailRuntimeStartError {
         match self {
             Self::ImapBind { .. } => Some(MailProtocol::Imap),
             Self::SmtpBind { .. } => Some(MailProtocol::Smtp),
+            Self::ImapImplicitTlsBind { .. } => Some(MailProtocol::Imap),
+            Self::SmtpImplicitTlsBind { .. } => Some(MailProtocol::Smtp),
             Self::DavBind { .. } => Some(MailProtocol::Dav),
             Self::Prepare(_) => None,
         }
@@ -198,6 +215,8 @@ pub async fn start(
 
     let imap_addr = format!("{}:{}", config.bind_host, config.imap_port);
     let smtp_addr = format!("{}:{}", config.bind_host, config.smtp_port);
+    let imap_implicit_tls_addr = format!("{}:{}", config.bind_host, DEFAULT_IMAP_IMPLICIT_TLS_PORT);
+    let smtp_implicit_tls_addr = format!("{}:{}", config.bind_host, DEFAULT_SMTP_IMPLICIT_TLS_PORT);
     let dav_addr = format!("{}:{}", config.bind_host, config.dav_port);
 
     let imap_listener =
@@ -214,6 +233,30 @@ pub async fn start(
                 addr: smtp_addr.clone(),
                 source,
             })?;
+    let imap_implicit_tls_listener = if !config.disable_tls && config.use_ssl_for_imap {
+        Some(
+            TcpListener::bind(&imap_implicit_tls_addr)
+                .await
+                .map_err(|source| MailRuntimeStartError::ImapImplicitTlsBind {
+                    addr: imap_implicit_tls_addr.clone(),
+                    source,
+                })?,
+        )
+    } else {
+        None
+    };
+    let smtp_implicit_tls_listener = if !config.disable_tls && config.use_ssl_for_smtp {
+        Some(
+            TcpListener::bind(&smtp_implicit_tls_addr)
+                .await
+                .map_err(|source| MailRuntimeStartError::SmtpImplicitTlsBind {
+                    addr: smtp_implicit_tls_addr.clone(),
+                    source,
+                })?,
+        )
+    } else {
+        None
+    };
     let dav_listener = if config.dav_enable {
         Some(TcpListener::bind(&dav_addr).await.map_err(|source| {
             MailRuntimeStartError::DavBind {
@@ -230,6 +273,7 @@ pub async fn start(
     if config.dav_enable {
         log_protocol_start(MailProtocol::Dav, &config, transition);
     }
+    log_implicit_tls_start(&config, transition);
 
     let active_sessions = prepared.active_sessions.clone();
     let runtime_snapshot = prepared.runtime_snapshot.clone();
@@ -244,6 +288,8 @@ pub async fn start(
         transition,
         imap_listener,
         smtp_listener,
+        imap_implicit_tls_listener,
+        smtp_implicit_tls_listener,
         dav_listener,
         stop_rx,
         notify_tx,
@@ -509,6 +555,8 @@ async fn run_runtime(
     transition: MailRuntimeTransition,
     imap_listener: TcpListener,
     smtp_listener: TcpListener,
+    imap_implicit_tls_listener: Option<TcpListener>,
+    smtp_implicit_tls_listener: Option<TcpListener>,
     dav_listener: Option<TcpListener>,
     shutdown_rx: oneshot::Receiver<()>,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
@@ -609,11 +657,25 @@ async fn run_runtime(
         runtime_accounts.clone(),
         notify_tx.clone(),
     ));
+    let imap_config_for_starttls = imap_config.clone();
+    let smtp_config_for_starttls = smtp_config.clone();
     let mut imap_task = tokio::spawn(async move {
-        imap::server::run_server_with_listener(imap_listener, imap_config).await
+        imap::server::run_server_with_listener(imap_listener, imap_config_for_starttls).await
     });
     let mut smtp_task = tokio::spawn(async move {
-        smtp::server::run_server_with_listener(smtp_listener, smtp_config).await
+        smtp::server::run_server_with_listener(smtp_listener, smtp_config_for_starttls).await
+    });
+    let mut imap_implicit_tls_task = imap_implicit_tls_listener.map(|listener| {
+        let imap_config = imap_config.clone();
+        tokio::spawn(async move {
+            imap::server::run_server_with_listener_implicit_tls(listener, imap_config).await
+        })
+    });
+    let mut smtp_implicit_tls_task = smtp_implicit_tls_listener.map(|listener| {
+        let smtp_config = smtp_config.clone();
+        tokio::spawn(async move {
+            smtp::server::run_server_with_listener_implicit_tls(listener, smtp_config).await
+        })
     });
     let mut dav_task = dav_listener.map(|listener| {
         let config = dav::server::DavServerConfig {
@@ -643,6 +705,18 @@ async fn run_runtime(
                 Err(err) => Err(anyhow::Error::new(err).context("SMTP server task failed")),
             }
         }
+        result = async { imap_implicit_tls_task.as_mut().expect("imap implicit tls task missing despite guard").await }, if imap_implicit_tls_task.is_some() => {
+            match result {
+                Ok(inner) => inner.map_err(anyhow::Error::from),
+                Err(err) => Err(anyhow::Error::new(err).context("IMAP implicit TLS server task failed")),
+            }
+        }
+        result = async { smtp_implicit_tls_task.as_mut().expect("smtp implicit tls task missing despite guard").await }, if smtp_implicit_tls_task.is_some() => {
+            match result {
+                Ok(inner) => inner.map_err(anyhow::Error::from),
+                Err(err) => Err(anyhow::Error::new(err).context("SMTP implicit TLS server task failed")),
+            }
+        }
         result = async { dav_task.as_mut().expect("dav task missing despite guard").await }, if dav_task.is_some() => {
             match result {
                 Ok(inner) => inner.map_err(anyhow::Error::from),
@@ -656,6 +730,7 @@ async fn run_runtime(
     if config.dav_enable {
         log_protocol_stopping(MailProtocol::Dav, &config, transition);
     }
+    log_implicit_tls_stopping(&config, transition);
 
     if !imap_task.is_finished() {
         imap_task.abort();
@@ -668,8 +743,24 @@ async fn run_runtime(
             task.abort();
         }
     }
+    if let Some(task) = imap_implicit_tls_task.as_mut() {
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
+    if let Some(task) = smtp_implicit_tls_task.as_mut() {
+        if !task.is_finished() {
+            task.abort();
+        }
+    }
     let _ = imap_task.await;
     let _ = smtp_task.await;
+    if let Some(task) = imap_implicit_tls_task {
+        let _ = task.await;
+    }
+    if let Some(task) = smtp_implicit_tls_task {
+        let _ = task.await;
+    }
     if let Some(task) = dav_task {
         let _ = task.await;
     }
@@ -692,6 +783,20 @@ async fn run_runtime(
         transition = transition.as_str(),
         "SMTP server listener closed"
     );
+    if config.use_ssl_for_imap && !config.disable_tls {
+        tracing::info!(
+            port = DEFAULT_IMAP_IMPLICIT_TLS_PORT,
+            transition = transition.as_str(),
+            "IMAP implicit TLS listener closed"
+        );
+    }
+    if config.use_ssl_for_smtp && !config.disable_tls {
+        tracing::info!(
+            port = DEFAULT_SMTP_IMPLICIT_TLS_PORT,
+            transition = transition.as_str(),
+            "SMTP implicit TLS listener closed"
+        );
+    }
     if config.dav_enable {
         tracing::info!(
             port = config.dav_port,
@@ -779,6 +884,30 @@ fn log_protocol_start(
     }
 }
 
+fn log_implicit_tls_start(config: &MailRuntimeConfig, transition: MailRuntimeTransition) {
+    if config.disable_tls {
+        return;
+    }
+    if config.use_ssl_for_imap {
+        tracing::info!(
+            service = "server-manager",
+            port = DEFAULT_IMAP_IMPLICIT_TLS_PORT,
+            transition = transition.as_str(),
+            msg = "Starting IMAP implicit TLS server",
+            "Starting IMAP implicit TLS server"
+        );
+    }
+    if config.use_ssl_for_smtp {
+        tracing::info!(
+            service = "server-manager",
+            port = DEFAULT_SMTP_IMPLICIT_TLS_PORT,
+            transition = transition.as_str(),
+            msg = "Starting SMTP implicit TLS server",
+            "Starting SMTP implicit TLS server"
+        );
+    }
+}
+
 fn log_protocol_stopping(
     protocol: MailProtocol,
     config: &MailRuntimeConfig,
@@ -815,6 +944,30 @@ fn log_protocol_stopping(
                 "Stopping DAV server"
             );
         }
+    }
+}
+
+fn log_implicit_tls_stopping(config: &MailRuntimeConfig, transition: MailRuntimeTransition) {
+    if config.disable_tls {
+        return;
+    }
+    if config.use_ssl_for_imap {
+        tracing::info!(
+            service = "server-manager",
+            port = DEFAULT_IMAP_IMPLICIT_TLS_PORT,
+            transition = transition.as_str(),
+            msg = "Stopping IMAP implicit TLS server",
+            "Stopping IMAP implicit TLS server"
+        );
+    }
+    if config.use_ssl_for_smtp {
+        tracing::info!(
+            service = "server-manager",
+            port = DEFAULT_SMTP_IMPLICIT_TLS_PORT,
+            transition = transition.as_str(),
+            msg = "Stopping SMTP implicit TLS server",
+            "Stopping SMTP implicit TLS server"
+        );
     }
 }
 

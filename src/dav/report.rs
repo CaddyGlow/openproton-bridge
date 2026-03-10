@@ -45,6 +45,8 @@ pub async fn handle_report(
     if body_text.trim().is_empty() {
         return Ok(Some(invalid_report_payload_response(
             "REPORT body is missing or empty",
+            &path,
+            body_text,
         )));
     }
 
@@ -53,7 +55,11 @@ pub async fn handle_report(
     if path == card_collection {
         if body_text.contains("addressbook-query") {
             if let Err(err) = parse_addressbook_query_request(body_text) {
-                return Ok(Some(invalid_report_payload_response(&err.to_string())));
+                return Ok(Some(invalid_report_payload_response(
+                    &err.to_string(),
+                    &path,
+                    body_text,
+                )));
             }
             return Ok(Some(addressbook_query(&adapter, &auth.account_id.0)?));
         }
@@ -67,6 +73,8 @@ pub async fn handle_report(
         if is_xml_like(body_text) {
             return Ok(Some(invalid_report_payload_response(
                 "unsupported CardDAV REPORT payload",
+                &path,
+                body_text,
             )));
         }
         return Ok(Some(not_implemented_report()));
@@ -76,7 +84,13 @@ pub async fn handle_report(
         if has_named_xml_tag(body_text, "calendar-query") {
             let query = match parse_calendar_query_request(body_text) {
                 Ok(query) => query,
-                Err(err) => return Ok(Some(invalid_report_payload_response(&err.to_string()))),
+                Err(err) => {
+                    return Ok(Some(invalid_report_payload_response(
+                        &err.to_string(),
+                        &path,
+                        body_text,
+                    )))
+                }
             };
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
@@ -92,7 +106,13 @@ pub async fn handle_report(
         if has_named_xml_tag(body_text, "calendar-multiget") {
             let hrefs = match parse_calendar_multiget_hrefs(body_text) {
                 Ok(hrefs) => hrefs,
-                Err(err) => return Ok(Some(invalid_report_payload_response(&err.to_string()))),
+                Err(err) => {
+                    return Ok(Some(invalid_report_payload_response(
+                        &err.to_string(),
+                        &path,
+                        body_text,
+                    )))
+                }
             };
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
@@ -108,7 +128,13 @@ pub async fn handle_report(
         if has_named_xml_tag(body_text, "sync-collection") {
             let sync_token = match parse_sync_collection_token(body_text) {
                 Ok(sync_token) => sync_token,
-                Err(err) => return Ok(Some(invalid_report_payload_response(&err.to_string()))),
+                Err(err) => {
+                    return Ok(Some(invalid_report_payload_response(
+                        &err.to_string(),
+                        &path,
+                        body_text,
+                    )))
+                }
             };
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
@@ -128,6 +154,8 @@ pub async fn handle_report(
         if is_xml_like(body_text) {
             return Ok(Some(invalid_report_payload_response(
                 "unsupported CalDAV REPORT payload",
+                &path,
+                body_text,
             )));
         }
         return Ok(Some(not_implemented_report()));
@@ -570,14 +598,14 @@ fn parse_addressbook_query_request(body: &str) -> Result<()> {
 }
 
 fn parse_sync_collection_token(body: &str) -> Result<i64> {
-    let token = extract_sync_token(body).ok_or(DavError::InvalidRequest(
-        "sync-collection request is missing sync-token",
-    ))?;
+    // Interop: several CalDAV clients send initial sync-collection REPORTs with
+    // missing/empty sync-token. Treat those as an initial sync from token 0.
+    let Some(token) = extract_sync_token(body) else {
+        return Ok(0);
+    };
     let token = token.trim();
     if token.is_empty() {
-        return Err(DavError::InvalidRequest(
-            "sync-collection sync-token is empty",
-        ));
+        return Ok(0);
     }
     token
         .parse::<i64>()
@@ -936,129 +964,138 @@ fn render_report_calendar_data(
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> String {
     if let Some(ics) = calendar_crypto::best_event_ics(event, decrypt_context) {
-        let mut enriched = ics.clone();
-        let mut fields =
-            calendar_crypto::best_event_text_fields(event, decrypt_context, Some(ics.as_str()));
-        if let Some(raw) = raw_json {
-            fill_missing_text_fields_from_raw_json(&mut fields, raw);
-        }
-        let has_summary = has_ics_property(ics.as_str(), "SUMMARY");
-        let has_location = has_ics_property(ics.as_str(), "LOCATION");
-        let has_description = has_ics_property(ics.as_str(), "DESCRIPTION");
-
-        let mut added_summary = false;
-        let mut added_location = false;
-        let mut added_description = false;
-
-        if !has_summary {
-            if let Some(value) = fields
-                .summary
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(escape_ics_text_value)
-            {
-                if insert_ics_property(&mut enriched, "SUMMARY", &value) {
-                    added_summary = true;
-                }
-            }
-        }
-        if !has_location {
-            if let Some(value) = fields
-                .location
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(escape_ics_text_value)
-            {
-                if insert_ics_property(&mut enriched, "LOCATION", &value) {
-                    added_location = true;
-                }
-            }
-        }
-        if !has_description {
-            if let Some(value) = fields
-                .description
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(escape_ics_text_value)
-            {
-                if insert_ics_property(&mut enriched, "DESCRIPTION", &value) {
-                    added_description = true;
-                }
-            }
-        }
-
-        if added_summary || added_location || added_description {
-            tracing::debug!(
+        if !has_renderable_vevent_shape(ics.as_str()) {
+            tracing::warn!(
                 event_id = %event.id,
                 calendar_id = %event.calendar_id,
-                had_summary = has_summary,
-                had_location = has_location,
-                had_description = has_description,
-                added_summary,
-                added_location,
-                added_description,
                 decrypted_context = decrypt_context.is_some(),
-                "dav calendar-data sparse ICS enriched with recovered text fields"
+                "dav calendar-data selected ICS missing required VEVENT properties; using fallback"
             );
-            return enriched;
-        }
+        } else {
+            let mut enriched = ics.clone();
+            let mut fields =
+                calendar_crypto::best_event_text_fields(event, decrypt_context, Some(ics.as_str()));
+            if let Some(raw) = raw_json {
+                fill_missing_text_fields_from_raw_json(&mut fields, raw);
+            }
+            let has_summary = has_ics_property(ics.as_str(), "SUMMARY");
+            let has_location = has_ics_property(ics.as_str(), "LOCATION");
+            let has_description = has_ics_property(ics.as_str(), "DESCRIPTION");
 
-        let recovered_summary = fields
-            .summary
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        let recovered_location = fields
-            .location
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        let recovered_description = fields
-            .description
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty());
-        let missing_summary = !has_summary;
-        let missing_location = !has_location;
-        let missing_description = !has_description;
-        let missing_but_recoverable = (missing_summary && recovered_summary)
-            || (missing_location && recovered_location)
-            || (missing_description && recovered_description);
+            let mut added_summary = false;
+            let mut added_location = false;
+            let mut added_description = false;
 
-        if missing_summary || missing_location || missing_description {
-            if missing_but_recoverable {
-                tracing::warn!(
-                    event_id = %event.id,
-                    calendar_id = %event.calendar_id,
-                    has_summary = !missing_summary,
-                    has_location = !missing_location,
-                    has_description = !missing_description,
-                    recovered_summary,
-                    recovered_location,
-                    recovered_description,
-                    decrypted_context = decrypt_context.is_some(),
-                    "dav calendar-data sparse ICS could not be enriched"
-                );
-            } else {
+            if !has_summary {
+                if let Some(value) = fields
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(escape_ics_text_value)
+                {
+                    if insert_ics_property(&mut enriched, "SUMMARY", &value) {
+                        added_summary = true;
+                    }
+                }
+            }
+            if !has_location {
+                if let Some(value) = fields
+                    .location
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(escape_ics_text_value)
+                {
+                    if insert_ics_property(&mut enriched, "LOCATION", &value) {
+                        added_location = true;
+                    }
+                }
+            }
+            if !has_description {
+                if let Some(value) = fields
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(escape_ics_text_value)
+                {
+                    if insert_ics_property(&mut enriched, "DESCRIPTION", &value) {
+                        added_description = true;
+                    }
+                }
+            }
+
+            if added_summary || added_location || added_description {
                 tracing::debug!(
                     event_id = %event.id,
                     calendar_id = %event.calendar_id,
-                    has_summary = !missing_summary,
-                    has_location = !missing_location,
-                    has_description = !missing_description,
-                    recovered_summary,
-                    recovered_location,
-                    recovered_description,
+                    had_summary = has_summary,
+                    had_location = has_location,
+                    had_description = has_description,
+                    added_summary,
+                    added_location,
+                    added_description,
                     decrypted_context = decrypt_context.is_some(),
-                    "dav calendar-data sparse ICS could not be enriched"
+                    "dav calendar-data sparse ICS enriched with recovered text fields"
                 );
+                return enriched;
             }
-        }
 
-        return ics;
+            let recovered_summary = fields
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let recovered_location = fields
+                .location
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let recovered_description = fields
+                .description
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let missing_summary = !has_summary;
+            let missing_location = !has_location;
+            let missing_description = !has_description;
+            let missing_but_recoverable = (missing_summary && recovered_summary)
+                || (missing_location && recovered_location)
+                || (missing_description && recovered_description);
+
+            if missing_summary || missing_location || missing_description {
+                if missing_but_recoverable {
+                    tracing::warn!(
+                        event_id = %event.id,
+                        calendar_id = %event.calendar_id,
+                        has_summary = !missing_summary,
+                        has_location = !missing_location,
+                        has_description = !missing_description,
+                        recovered_summary,
+                        recovered_location,
+                        recovered_description,
+                        decrypted_context = decrypt_context.is_some(),
+                        "dav calendar-data sparse ICS could not be enriched"
+                    );
+                } else {
+                    tracing::debug!(
+                        event_id = %event.id,
+                        calendar_id = %event.calendar_id,
+                        has_summary = !missing_summary,
+                        has_location = !missing_location,
+                        has_description = !missing_description,
+                        recovered_summary,
+                        recovered_location,
+                        recovered_description,
+                        decrypted_context = decrypt_context.is_some(),
+                        "dav calendar-data sparse ICS could not be enriched"
+                    );
+                }
+            }
+
+            return ics;
+        }
     }
 
     let mut fallback_fields = calendar_crypto::best_event_text_fields(event, decrypt_context, None);
@@ -1175,6 +1212,14 @@ fn has_ics_property(ics: &str, property: &str) -> bool {
     let folded_prefix = format!("{property};");
     ics.lines()
         .any(|line| line.starts_with(&prefix) || line.starts_with(&folded_prefix))
+}
+
+fn has_renderable_vevent_shape(ics: &str) -> bool {
+    let upper = ics.to_ascii_uppercase();
+    if !upper.contains("BEGIN:VEVENT") {
+        return true;
+    }
+    has_ics_property(ics, "UID") && has_ics_property(ics, "DTSTART")
 }
 
 fn insert_ics_property(ics: &mut String, property: &str, value: &str) -> bool {
@@ -1321,12 +1366,41 @@ fn not_implemented_report() -> DavResponse {
     }
 }
 
-fn invalid_report_payload_response(message: &str) -> DavResponse {
+fn invalid_report_payload_response(message: &str, path: &str, body: &str) -> DavResponse {
+    tracing::warn!(
+        path = %path,
+        reason = %message,
+        body_snippet = %report_body_snippet(body, 320),
+        "dav report rejected with bad request"
+    );
     DavResponse {
         status: "400 Bad Request",
         headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
         body: message.as_bytes().to_vec(),
     }
+}
+
+fn report_body_snippet(body: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(max_chars.min(body.len()));
+    let mut count = 0usize;
+    let mut truncated = false;
+    for ch in body.chars() {
+        if count >= max_chars {
+            truncated = true;
+            break;
+        }
+        let normalized = match ch {
+            '\r' | '\n' | '\t' => ' ',
+            _ if ch.is_control() => continue,
+            _ => ch,
+        };
+        out.push(normalized);
+        count += 1;
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out.trim().to_string()
 }
 
 fn is_xml_like(body: &str) -> bool {
@@ -1456,6 +1530,24 @@ mod tests {
             ),
             Some(456)
         );
+    }
+
+    #[test]
+    fn accepts_sync_collection_without_token_as_initial_sync() {
+        let token = parse_sync_collection_token(
+            r#"<sync-collection xmlns="DAV:"><sync-level>1</sync-level><prop><getetag/></prop></sync-collection>"#,
+        )
+        .expect("missing sync-token should be treated as initial sync");
+        assert_eq!(token, 0);
+    }
+
+    #[test]
+    fn accepts_empty_sync_collection_token_as_initial_sync() {
+        let token = parse_sync_collection_token(
+            r#"<sync-collection xmlns="DAV:"><sync-token>   </sync-token><sync-level>1</sync-level><prop><getetag/></prop></sync-collection>"#,
+        )
+        .expect("empty sync-token should be treated as initial sync");
+        assert_eq!(token, 0);
     }
 
     #[tokio::test]
@@ -1759,6 +1851,31 @@ mod tests {
         assert!(rendered.contains("SUMMARY:Only summary in ICS\r\n"));
         assert!(rendered.contains("LOCATION:From raw JSON\r\n"));
         assert!(rendered.contains("DESCRIPTION:From raw notes\r\n"));
+    }
+
+    #[test]
+    fn falls_back_when_selected_ics_lacks_dtstart() {
+        let event = CalendarEvent {
+            id: "event-5".to_string(),
+            uid: "uid-5".to_string(),
+            calendar_id: "work".to_string(),
+            start_time: 1_772_675_200,
+            end_time: 1_772_678_800,
+            shared_events: vec![CalendarEventPart {
+                member_id: String::new(),
+                kind: 3,
+                data: "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:uid-5\r\nSUMMARY:Sparse entry\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_string(),
+                signature: None,
+                author: None,
+            }],
+            ..CalendarEvent::default()
+        };
+
+        let rendered = render_report_calendar_data(&event, None, None);
+        assert!(rendered.contains("UID:uid-5\r\n"));
+        assert!(rendered.contains("DTSTART:"));
+        assert!(rendered.contains("DTEND:"));
+        assert!(rendered.contains("SUMMARY:Sparse entry\r\n"));
     }
 
     #[test]

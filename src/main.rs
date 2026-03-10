@@ -833,8 +833,8 @@ impl Default for CliStoredMailSettings {
             dav_enable: default_dav_enable(),
             dav_port: default_dav_port(),
             dav_tls_mode: default_dav_tls_mode(),
-            use_ssl_for_imap: false,
-            use_ssl_for_smtp: false,
+            use_ssl_for_imap: true,
+            use_ssl_for_smtp: true,
             pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
             pim_contacts_reconcile_secs: default_pim_contacts_reconcile_secs(),
             pim_calendar_reconcile_secs: default_pim_calendar_reconcile_secs(),
@@ -4139,9 +4139,25 @@ async fn cmd_account_info_grpc(
         if user.split_mode { "split" } else { "combined" }
     );
     println!();
+    let imap_port = if mail_settings.use_ssl_for_imap {
+        bridge::mail_runtime::DEFAULT_IMAP_IMPLICIT_TLS_PORT
+    } else {
+        u16::try_from(mail_settings.imap_port)
+            .ok()
+            .filter(|port| *port > 0)
+            .unwrap_or(1143)
+    };
+    let smtp_port = if mail_settings.use_ssl_for_smtp {
+        bridge::mail_runtime::DEFAULT_SMTP_IMPLICIT_TLS_PORT
+    } else {
+        u16::try_from(mail_settings.smtp_port)
+            .ok()
+            .filter(|port| *port > 0)
+            .unwrap_or(1025)
+    };
     println!(
         "IMAP Settings\nAddress:   127.0.0.1\nIMAP port: {}\nUsername:  {}\nPassword:  {}\nSecurity:  {}",
-        mail_settings.imap_port,
+        imap_port,
         user.username,
         password,
         if mail_settings.use_ssl_for_imap {
@@ -4153,7 +4169,7 @@ async fn cmd_account_info_grpc(
     println!();
     println!(
         "SMTP Settings\nAddress:   127.0.0.1\nSMTP port: {}\nUsername:  {}\nPassword:  {}\nSecurity:  {}",
-        mail_settings.smtp_port,
+        smtp_port,
         user.username,
         password,
         if mail_settings.use_ssl_for_smtp {
@@ -4692,8 +4708,8 @@ async fn cmd_serve(
         dav_port,
         dav_tls_mode,
         disable_tls: no_tls,
-        use_ssl_for_imap: false,
-        use_ssl_for_smtp: false,
+        use_ssl_for_imap: true,
+        use_ssl_for_smtp: true,
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(
@@ -4822,8 +4838,8 @@ async fn start_interactive_runtime(
         dav_port: config.dav_port,
         dav_tls_mode: config.dav_tls_mode,
         disable_tls: config.no_tls,
-        use_ssl_for_imap: false,
-        use_ssl_for_smtp: false,
+        use_ssl_for_imap: true,
+        use_ssl_for_smtp: true,
         event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(config.pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(

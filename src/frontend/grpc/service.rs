@@ -238,6 +238,52 @@ impl BridgeService {
                 );
             }
         }
+        if settings.use_ssl_for_imap
+            && !is_bind_port_free(
+                &self.state.bind_host,
+                bridge::mail_runtime::DEFAULT_IMAP_IMPLICIT_TLS_PORT,
+            )
+            .await
+        {
+            startup_conflict = true;
+            self.log_startup_mail_runtime_error(
+                &settings,
+                &bridge::mail_runtime::MailRuntimeStartError::ImapImplicitTlsBind {
+                    addr: format!(
+                        "{}:{}",
+                        self.state.bind_host,
+                        bridge::mail_runtime::DEFAULT_IMAP_IMPLICIT_TLS_PORT
+                    ),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "IMAP implicit TLS port already in use",
+                    ),
+                },
+            );
+        }
+        if settings.use_ssl_for_smtp
+            && !is_bind_port_free(
+                &self.state.bind_host,
+                bridge::mail_runtime::DEFAULT_SMTP_IMPLICIT_TLS_PORT,
+            )
+            .await
+        {
+            startup_conflict = true;
+            self.log_startup_mail_runtime_error(
+                &settings,
+                &bridge::mail_runtime::MailRuntimeStartError::SmtpImplicitTlsBind {
+                    addr: format!(
+                        "{}:{}",
+                        self.state.bind_host,
+                        bridge::mail_runtime::DEFAULT_SMTP_IMPLICIT_TLS_PORT
+                    ),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::AddrInUse,
+                        "SMTP implicit TLS port already in use",
+                    ),
+                },
+            );
+        }
         if startup_conflict {
             return;
         }
@@ -297,6 +343,32 @@ impl BridgeService {
         {
             self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
             return Err(Status::failed_precondition("SMTP port is not available"));
+        }
+        if !previous.use_ssl_for_imap
+            && next.use_ssl_for_imap
+            && !is_bind_port_free(
+                &self.state.bind_host,
+                bridge::mail_runtime::DEFAULT_IMAP_IMPLICIT_TLS_PORT,
+            )
+            .await
+        {
+            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::ImapPortChangeError);
+            return Err(Status::failed_precondition(
+                "IMAP implicit TLS port is not available",
+            ));
+        }
+        if !previous.use_ssl_for_smtp
+            && next.use_ssl_for_smtp
+            && !is_bind_port_free(
+                &self.state.bind_host,
+                bridge::mail_runtime::DEFAULT_SMTP_IMPLICIT_TLS_PORT,
+            )
+            .await
+        {
+            self.emit_mail_settings_error(pb::MailServerSettingsErrorType::SmtpPortChangeError);
+            return Err(Status::failed_precondition(
+                "SMTP implicit TLS port is not available",
+            ));
         }
 
         if previous == next {

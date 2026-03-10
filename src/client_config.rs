@@ -1,3 +1,4 @@
+use crate::bridge::mail_runtime::{DEFAULT_IMAP_IMPLICIT_TLS_PORT, DEFAULT_SMTP_IMPLICIT_TLS_PORT};
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +26,16 @@ pub fn render_mutt_config(template: &MuttConfigTemplate, include_password: bool)
     };
     let smtp_user = percent_encode_userinfo(&template.account_address);
     let needs_starttls = !template.use_ssl_for_imap || !template.use_ssl_for_smtp;
+    let imap_port = if template.use_ssl_for_imap {
+        DEFAULT_IMAP_IMPLICIT_TLS_PORT
+    } else {
+        template.imap_port
+    };
+    let smtp_port = if template.use_ssl_for_smtp {
+        DEFAULT_SMTP_IMPLICIT_TLS_PORT
+    } else {
+        template.smtp_port
+    };
 
     let mut out = String::new();
     out.push_str("# openproton-bridge generated mutt/neomutt config\n");
@@ -49,7 +60,7 @@ pub fn render_mutt_config(template: &MuttConfigTemplate, include_password: bool)
     let _ = writeln!(
         out,
         "set folder = \"{imap_scheme}://{}:{}/\"",
-        template.hostname, template.imap_port
+        template.hostname, imap_port
     );
     out.push_str("set spoolfile = \"+INBOX\"\n");
     out.push_str("set postponed = \"+Drafts\"\n");
@@ -66,7 +77,7 @@ pub fn render_mutt_config(template: &MuttConfigTemplate, include_password: bool)
     let _ = writeln!(
         out,
         "set smtp_url = \"{smtp_scheme}://{smtp_user}@{}:{}/\"",
-        template.hostname, template.smtp_port
+        template.hostname, smtp_port
     );
     out.push_str("set ssl_force_tls = yes\n");
     if needs_starttls {
@@ -167,9 +178,9 @@ mod tests {
         template.bridge_password = Some("pw\"\\\\escaped".to_string());
 
         let rendered = render_mutt_config(&template, true);
-        assert!(rendered.contains("set folder = \"imaps://127.0.0.1:1143/\""));
+        assert!(rendered.contains("set folder = \"imaps://127.0.0.1:1993/\""));
         assert!(
-            rendered.contains("set smtp_url = \"smtps://alice%2Bqa%40proton.me@127.0.0.1:1025/\"")
+            rendered.contains("set smtp_url = \"smtps://alice%2Bqa%40proton.me@127.0.0.1:1465/\"")
         );
         assert!(rendered.contains("set ssl_starttls = no"));
         assert!(rendered.contains("set imap_pass = \"pw\\\"\\\\\\\\escaped\""));

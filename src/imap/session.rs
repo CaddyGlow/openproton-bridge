@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 use zeroize::Zeroize;
 
@@ -631,19 +630,23 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
+        let mut change_rx = self.config.store.subscribe_changes();
         self.writer.continuation("idling").await?;
         self.emit_selected_mailbox_exists_update().await?;
 
-        let idle_start = tokio::time::Instant::now();
-        let mut ticker = tokio::time::interval(Duration::from_secs(1));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+        let idle_timeout = tokio::time::sleep_until(idle_deadline);
+        tokio::pin!(idle_timeout);
 
         loop {
             let mut line = String::new();
             tokio::select! {
-                _ = ticker.tick() => {
-                    if idle_start.elapsed() > IDLE_TIMEOUT {
-                        debug!("IDLE timeout after 30 minutes");
+                _ = &mut idle_timeout => {
+                    debug!("IDLE timeout after 30 minutes");
+                    break;
+                }
+                changed = change_rx.changed() => {
+                    if changed.is_err() {
                         break;
                     }
                     self.emit_selected_mailbox_exists_update().await?;
@@ -3230,6 +3233,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(action, SessionAction::Continue));
+    }
+
+    #[tokio::test]
+    async fn test_idle_emits_exists_when_new_message_arrives_after_start() {
+        let config = test_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.selected_mailbox_mod_seq = Some(0);
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let idle_task =
+            tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"), "response={response}");
+
+        config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("1 EXISTS"), "response={response}");
+
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
+
+        let _ = tokio::time::timeout(Duration::from_secs(1), idle_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

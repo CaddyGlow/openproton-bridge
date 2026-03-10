@@ -135,6 +135,22 @@ pub async fn run_server_with_listener_and_tls_config(
     run_server_from_listener(listener, config, tls_config).await
 }
 
+pub async fn run_server_with_listener_implicit_tls(
+    listener: TcpListener,
+    config: Arc<SmtpSessionConfig>,
+) -> Result<()> {
+    run_server_with_listener_and_tls_config_implicit_tls(listener, config, runtime_tls_config())
+        .await
+}
+
+pub async fn run_server_with_listener_and_tls_config_implicit_tls(
+    listener: TcpListener,
+    config: Arc<SmtpSessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    run_server_from_listener_implicit_tls(listener, config, tls_config).await
+}
+
 pub async fn run_server_with_tls_config(
     addr: &str,
     config: Arc<SmtpSessionConfig>,
@@ -183,6 +199,52 @@ async fn run_server_from_listener(
     }
 }
 
+async fn run_server_from_listener_implicit_tls(
+    listener: TcpListener,
+    config: Arc<SmtpSessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> Result<()> {
+    let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
+    let listener_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    info!(addr = %listener_addr, "SMTP implicit TLS server listening");
+
+    let tls_config = tls_config.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "SMTP implicit TLS requested without TLS configuration",
+        )
+    })?;
+    let acceptor = TlsAcceptor::from(tls_config);
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+
+        {
+            let mut limiter = rate_limiter.lock().await;
+            if !limiter.check(peer.ip()) {
+                warn!(peer = %peer, "rate limited, dropping SMTP connection");
+                drop(stream);
+                continue;
+            }
+        }
+
+        info!(peer = %peer, "new SMTP implicit TLS connection");
+
+        let config = config.clone();
+        let acceptor = acceptor.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = handle_connection_implicit_tls(stream, config, acceptor).await {
+                error!(peer = %peer, error = %e, "SMTP implicit TLS connection error");
+            }
+            info!(peer = %peer, "SMTP connection closed");
+        });
+    }
+}
+
 async fn handle_connection(
     stream: TcpStream,
     config: Arc<SmtpSessionConfig>,
@@ -214,6 +276,21 @@ async fn handle_connection(
         let _ = tls_session.run().await?;
     }
 
+    Ok(())
+}
+
+async fn handle_connection_implicit_tls(
+    stream: TcpStream,
+    config: Arc<SmtpSessionConfig>,
+    acceptor: TlsAcceptor,
+) -> Result<()> {
+    let tls_stream = acceptor
+        .accept(stream)
+        .await
+        .map_err(|err| super::SmtpError::Tls(err.to_string()))?;
+    let (read, write) = tokio::io::split(tls_stream);
+    let mut session = SmtpSession::with_starttls(read, write, config, false, true);
+    let _ = session.run().await?;
     Ok(())
 }
 

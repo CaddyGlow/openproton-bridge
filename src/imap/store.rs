@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use base64::Engine;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::api::types::MessageMetadata;
@@ -53,6 +54,7 @@ pub trait MessageStore: Send + Sync {
     async fn remove_message(&self, mailbox: &str, uid: u32) -> Result<()>;
     async fn seq_to_uid(&self, mailbox: &str, seq: u32) -> Result<Option<u32>>;
     async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>>;
+    fn subscribe_changes(&self) -> watch::Receiver<u64>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,13 +99,26 @@ impl MailboxData {
 
 pub struct InMemoryStore {
     mailboxes: RwLock<HashMap<String, MailboxData>>,
+    change_seq: AtomicU64,
+    change_tx: watch::Sender<u64>,
 }
 
 impl InMemoryStore {
     pub fn new() -> Arc<Self> {
+        let (change_tx, _change_rx) = watch::channel(0);
         Arc::new(Self {
             mailboxes: RwLock::new(HashMap::new()),
+            change_seq: AtomicU64::new(0),
+            change_tx,
         })
+    }
+
+    fn publish_change(&self) {
+        let next = self
+            .change_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let _ = self.change_tx.send(next);
     }
 }
 
@@ -122,6 +137,8 @@ impl PersistentStore {
             root,
             inner: InMemoryStore {
                 mailboxes: RwLock::new(loaded),
+                change_seq: AtomicU64::new(0),
+                change_tx: watch::channel(0).0,
             },
         }))
     }
@@ -374,6 +391,8 @@ pub struct GluonStore {
     account_storage_ids: HashMap<String, String>,
     accounts: RwLock<HashMap<String, GluonAccountState>>,
     txn_manager: super::gluon_txn::GluonTxnManager,
+    change_seq: AtomicU64,
+    change_tx: watch::Sender<u64>,
 }
 
 impl GluonStore {
@@ -407,12 +426,23 @@ impl GluonStore {
                 path: root.join(".gluon-txn"),
                 reason: format!("failed to recover pending gluon transactions: {err}"),
             })?;
+        let (change_tx, _change_rx) = watch::channel(0);
         Ok(Arc::new(Self {
             root,
             account_storage_ids,
             accounts: RwLock::new(HashMap::new()),
             txn_manager,
+            change_seq: AtomicU64::new(0),
+            change_tx,
         }))
+    }
+
+    fn publish_change(&self) {
+        let next = self
+            .change_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let _ = self.change_tx.send(next);
     }
 
     fn split_scoped_mailbox(mailbox: &str) -> (String, String) {
@@ -650,10 +680,6 @@ impl GluonStore {
         self.persist_index_to_sqlite(storage_user_id, &index)
     }
 
-    fn default_blob_name_for_uid(uid: u32) -> String {
-        format!("{uid:08}.msg")
-    }
-
     fn blob_counter_from_name(name: &str) -> Option<u64> {
         let path = Path::new(name);
         let stem = path.file_stem()?.to_string_lossy();
@@ -767,7 +793,18 @@ impl GluonStore {
         }
 
         if repaired {
+            // Any index/blob repair can change effective UID->blob mapping.
+            // Force new UIDVALIDITY so IMAP clients drop stale UID caches.
+            let new_uid_validity = current_uid_validity();
+            for mailbox in index.mailboxes.values_mut() {
+                mailbox.uid_validity = new_uid_validity;
+            }
             self.persist_index_to_sqlite(storage_user_id, &index)?;
+            warn!(
+                account = %storage_user_id,
+                uid_validity = new_uid_validity,
+                "gluon index repaired; bumped mailbox uid_validity"
+            );
         }
 
         let mut max_blob_id = index.next_blob_id;
@@ -898,6 +935,7 @@ impl MessageStore for InMemoryStore {
             mb.metadata.insert(uid, meta);
             mb.flags.insert(uid, merged_flags);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
+            self.publish_change();
             return Ok(uid);
         }
 
@@ -912,6 +950,7 @@ impl MessageStore for InMemoryStore {
             merge_metadata_flags(None, mb.metadata.get(&uid).unwrap()),
         );
         mb.mod_seq = mb.mod_seq.saturating_add(1);
+        self.publish_change();
         Ok(uid)
     }
 
@@ -943,6 +982,7 @@ impl MessageStore for InMemoryStore {
             .or_insert_with(MailboxData::new);
         mb.rfc822.insert(uid, data);
         mb.mod_seq = mb.mod_seq.saturating_add(1);
+        self.publish_change();
         Ok(())
     }
 
@@ -1015,6 +1055,7 @@ impl MessageStore for InMemoryStore {
         if let Some(mb) = mailboxes.get_mut(mailbox) {
             mb.flags.insert(uid, flags);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
+            self.publish_change();
         }
         Ok(())
     }
@@ -1031,6 +1072,7 @@ impl MessageStore for InMemoryStore {
             }
             if entry.len() != before {
                 mb.mod_seq = mb.mod_seq.saturating_add(1);
+                self.publish_change();
             }
         }
         Ok(())
@@ -1044,6 +1086,7 @@ impl MessageStore for InMemoryStore {
                 current.retain(|f| !flags.contains(f));
                 if current.len() != before {
                     mb.mod_seq = mb.mod_seq.saturating_add(1);
+                    self.publish_change();
                 }
             }
         }
@@ -1076,6 +1119,7 @@ impl MessageStore for InMemoryStore {
             mb.flags.remove(&uid);
             mb.uid_order.retain(|&u| u != uid);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
+            self.publish_change();
         }
         Ok(())
     }
@@ -1095,6 +1139,10 @@ impl MessageStore for InMemoryStore {
                 .position(|&u| u == uid)
                 .map(|p| p as u32 + 1)
         }))
+    }
+
+    fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.change_tx.subscribe()
     }
 }
 
@@ -1176,6 +1224,10 @@ impl MessageStore for PersistentStore {
     async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
         self.inner.uid_to_seq(mailbox, uid).await
     }
+
+    fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.inner.subscribe_changes()
+    }
 }
 
 #[async_trait]
@@ -1243,6 +1295,7 @@ impl MessageStore for GluonStore {
 
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
+        self.publish_change();
         Ok(uid)
     }
 
@@ -1306,6 +1359,7 @@ impl MessageStore for GluonStore {
 
         self.persist_account(&storage_user_id, &next_state, &writes)?;
         accounts.insert(storage_user_id, next_state);
+        self.publish_change();
         Ok(())
     }
 
@@ -1315,12 +1369,14 @@ impl MessageStore for GluonStore {
 
         let blob_path = {
             let accounts = self.accounts.read().await;
-            accounts
+            match accounts
                 .get(&storage_user_id)
                 .and_then(|account| account.mailboxes.get(&mailbox_name))
                 .and_then(|mailbox| mailbox.uid_to_blob.get(&uid).cloned())
-                .map(|name| account_dir.join(name))
-                .unwrap_or_else(|| account_dir.join(Self::default_blob_name_for_uid(uid)))
+            {
+                Some(name) => account_dir.join(name),
+                None => return Ok(None), // no mapping; force re-fetch from API
+            }
         };
 
         if !blob_path.exists() {
@@ -1404,6 +1460,7 @@ impl MessageStore for GluonStore {
 
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
+        self.publish_change();
         Ok(())
     }
 
@@ -1432,6 +1489,7 @@ impl MessageStore for GluonStore {
         mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
+        self.publish_change();
         Ok(())
     }
 
@@ -1458,6 +1516,7 @@ impl MessageStore for GluonStore {
         mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
+        self.publish_change();
         Ok(())
     }
 
@@ -1504,6 +1563,7 @@ impl MessageStore for GluonStore {
 
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id.clone(), next_state);
+        self.publish_change();
 
         if let Some(blob_name) = removed_blob {
             let blob_path = self.account_store_dir(&storage_user_id).join(blob_name);
@@ -1545,6 +1605,10 @@ impl MessageStore for GluonStore {
                     .position(|known| *known == uid)
                     .map(|index| index as u32 + 1)
             }))
+    }
+
+    fn subscribe_changes(&self) -> watch::Receiver<u64> {
+        self.change_tx.subscribe()
     }
 }
 

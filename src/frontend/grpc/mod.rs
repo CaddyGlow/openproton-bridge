@@ -107,8 +107,8 @@ impl Default for StoredMailSettings {
         Self {
             imap_port: 1143,
             smtp_port: 1025,
-            use_ssl_for_imap: false,
-            use_ssl_for_smtp: false,
+            use_ssl_for_imap: true,
+            use_ssl_for_smtp: true,
             pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
             pim_contacts_reconcile_secs: default_pim_contacts_reconcile_secs(),
             pim_calendar_reconcile_secs: default_pim_calendar_reconcile_secs(),

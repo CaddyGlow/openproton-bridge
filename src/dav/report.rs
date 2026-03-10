@@ -991,7 +991,7 @@ fn render_report_calendar_data(
         }
 
         if added_summary || added_location || added_description {
-            tracing::warn!(
+            tracing::debug!(
                 event_id = %event.id,
                 calendar_id = %event.calendar_id,
                 had_summary = has_summary,
@@ -1006,19 +1006,56 @@ fn render_report_calendar_data(
             return enriched;
         }
 
-        if !has_summary || !has_location || !has_description {
-            tracing::warn!(
-                event_id = %event.id,
-                calendar_id = %event.calendar_id,
-                has_summary,
-                has_location,
-                has_description,
-                recovered_summary = fields.summary.is_some(),
-                recovered_location = fields.location.is_some(),
-                recovered_description = fields.description.is_some(),
-                decrypted_context = decrypt_context.is_some(),
-                "dav calendar-data sparse ICS could not be enriched"
-            );
+        let recovered_summary = fields
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let recovered_location = fields
+            .location
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let recovered_description = fields
+            .description
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        let missing_summary = !has_summary;
+        let missing_location = !has_location;
+        let missing_description = !has_description;
+        let missing_but_recoverable = (missing_summary && recovered_summary)
+            || (missing_location && recovered_location)
+            || (missing_description && recovered_description);
+
+        if missing_summary || missing_location || missing_description {
+            if missing_but_recoverable {
+                tracing::warn!(
+                    event_id = %event.id,
+                    calendar_id = %event.calendar_id,
+                    has_summary = !missing_summary,
+                    has_location = !missing_location,
+                    has_description = !missing_description,
+                    recovered_summary,
+                    recovered_location,
+                    recovered_description,
+                    decrypted_context = decrypt_context.is_some(),
+                    "dav calendar-data sparse ICS could not be enriched"
+                );
+            } else {
+                tracing::debug!(
+                    event_id = %event.id,
+                    calendar_id = %event.calendar_id,
+                    has_summary = !missing_summary,
+                    has_location = !missing_location,
+                    has_description = !missing_description,
+                    recovered_summary,
+                    recovered_location,
+                    recovered_description,
+                    decrypted_context = decrypt_context.is_some(),
+                    "dav calendar-data sparse ICS could not be enriched"
+                );
+            }
         }
 
         return ics;

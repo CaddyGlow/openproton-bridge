@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
 use crate::api::types::{ApiMode, Session};
+use crate::bridge::types::CheckpointSyncState;
 
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
@@ -510,7 +511,7 @@ pub type Result<T> = std::result::Result<T, VaultError>;
 pub struct StoredEventCheckpoint {
     pub last_event_id: String,
     pub last_event_ts: Option<i64>,
-    pub sync_state: Option<String>,
+    pub sync_state: Option<CheckpointSyncState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -747,7 +748,7 @@ struct UserData {
     #[serde(rename = "LastEventTS", default)]
     last_event_ts: Option<i64>,
     #[serde(rename = "SyncState", default)]
-    sync_state: Option<String>,
+    sync_state: Option<CheckpointSyncState>,
 
     #[serde(rename = "UIDValidity")]
     #[serde(deserialize_with = "deserialize_nullable_default")]
@@ -3287,7 +3288,7 @@ path = "custom-vault.key"
         let checkpoint = StoredEventCheckpoint {
             last_event_id: "event-123".to_string(),
             last_event_ts: Some(123),
-            sync_state: Some("ok".to_string()),
+            sync_state: Some(CheckpointSyncState::Ok),
         };
         save_event_checkpoint_by_account_id(tmp.path(), &session.uid, &checkpoint).unwrap();
 

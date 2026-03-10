@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use openproton_bridge::api::types::{ApiMode, EmailAddress, MessageMetadata, Session};
 use openproton_bridge::bridge::events::VaultCheckpointStore;
-use openproton_bridge::bridge::types::{AccountId, EventCheckpoint, EventCheckpointStore};
+use openproton_bridge::bridge::types::{
+    AccountId, CheckpointSyncState, EventCheckpoint, EventCheckpointStore,
+};
 use openproton_bridge::imap::store::{GluonStore, MessageStore};
 use openproton_bridge::vault;
 use rusqlite::OptionalExtension;
@@ -406,7 +408,7 @@ fn be031_event_persists_checkpoints_across_restart_and_session_delete() {
     let checkpoint_1 = EventCheckpoint {
         last_event_id: "evt-1".to_string(),
         last_event_ts: Some(1_700_000_010),
-        sync_state: Some("running".to_string()),
+        sync_state: Some(CheckpointSyncState::More),
     };
 
     let store = VaultCheckpointStore::new(temp.path().to_path_buf());
@@ -425,7 +427,7 @@ fn be031_event_persists_checkpoints_across_restart_and_session_delete() {
     let checkpoint_2 = EventCheckpoint {
         last_event_id: "evt-2".to_string(),
         last_event_ts: Some(1_700_000_020),
-        sync_state: Some("label_resync".to_string()),
+        sync_state: Some(CheckpointSyncState::RefreshResync),
     };
     restarted_store
         .save_checkpoint(&account_id, &checkpoint_2)

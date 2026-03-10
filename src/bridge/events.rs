@@ -26,7 +26,7 @@ use crate::pim::store::PimStore;
 use super::accounts::{
     AccountHealth, AccountRuntimeError, RuntimeAccountInfo, RuntimeAccountRegistry,
 };
-use super::types::{AccountId, EventCheckpoint, EventCheckpointStore};
+use super::types::{AccountId, CheckpointSyncState, EventCheckpoint, EventCheckpointStore};
 
 #[derive(Debug, Default)]
 pub struct InMemoryCheckpointStore {
@@ -1580,7 +1580,7 @@ async fn bootstrap_latest_event_cursor_for_generation(
     let checkpoint = EventCheckpoint {
         last_event_id: event_id.clone(),
         last_event_ts: Some(unix_now()),
-        sync_state: Some("baseline_cursor".to_string()),
+        sync_state: Some(CheckpointSyncState::BaselineCursor),
     };
     config
         .checkpoint_store
@@ -1635,7 +1635,7 @@ async fn poll_account_once_for_generation(
             break;
         }
 
-        let mut forced_sync_state: Option<&str> = None;
+        let mut forced_sync_state: Option<CheckpointSyncState> = None;
         let response =
             match fetch_events_with_retry(config, &mut session, &mut client, &cursor).await {
                 Ok(response) => response,
@@ -1666,7 +1666,7 @@ async fn poll_account_once_for_generation(
                         expected_generation,
                     )
                     .await?;
-                    forced_sync_state = Some("cursor_reset_resync");
+                    forced_sync_state = Some(CheckpointSyncState::CursorResetResync);
                     cursor.clear();
                     fetch_events_with_retry(config, &mut session, &mut client, &cursor).await?
                 }
@@ -1676,7 +1676,7 @@ async fn poll_account_once_for_generation(
 
         let refresh_requires_resync = has_mail_refresh_flag(response.refresh);
         let mut address_changed = refresh_requires_resync;
-        let mut resync_state: Option<&str> = None;
+        let mut resync_state: Option<CheckpointSyncState> = None;
         if refresh_requires_resync && forced_sync_state.is_none() {
             info!(
                 service = "user-events",
@@ -1694,7 +1694,7 @@ async fn poll_account_once_for_generation(
                 expected_generation,
             )
             .await?;
-            resync_state = Some("refresh_resync");
+            resync_state = Some(CheckpointSyncState::RefreshResync);
         }
         for event in &response.events {
             ensure_account_generation(config, expected_generation, "poll_event_delta").await?;
@@ -1794,15 +1794,15 @@ async fn poll_account_once_for_generation(
                 last_event_id: next_event_id.clone(),
                 last_event_ts: Some(unix_now()),
                 sync_state: Some(if let Some(state) = forced_sync_state {
-                    state.to_string()
+                    state
                 } else if let Some(state) = resync_state {
-                    state.to_string()
+                    state
                 } else if refresh_requires_resync {
-                    "refresh".to_string()
+                    CheckpointSyncState::Refresh
                 } else if response.more != 0 {
-                    "more".to_string()
+                    CheckpointSyncState::More
                 } else {
-                    "ok".to_string()
+                    CheckpointSyncState::Ok
                 }),
             };
             config
@@ -2470,7 +2470,7 @@ mod tests {
         let checkpoint = EventCheckpoint {
             last_event_id: "event-42".to_string(),
             last_event_ts: Some(42),
-            sync_state: Some("ok".to_string()),
+            sync_state: Some(CheckpointSyncState::Ok),
         };
 
         store.save_checkpoint(&account_id, &checkpoint).unwrap();
@@ -2791,7 +2791,7 @@ mod tests {
         let checkpoint = EventCheckpoint {
             last_event_id: "event-88".to_string(),
             last_event_ts: Some(88),
-            sync_state: Some("ok".to_string()),
+            sync_state: Some(CheckpointSyncState::Ok),
         };
         store.save_checkpoint(&account_id, &checkpoint).unwrap();
 
@@ -2811,7 +2811,7 @@ mod tests {
         let checkpoint = EventCheckpoint {
             last_event_id: "event-44".to_string(),
             last_event_ts: Some(44),
-            sync_state: Some("ok".to_string()),
+            sync_state: Some(CheckpointSyncState::Ok),
         };
         store.save_checkpoint(&account_id, &checkpoint).unwrap();
 
@@ -2876,7 +2876,7 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.last_event_id, "event-1");
         assert!(checkpoint.last_event_ts.is_some());
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
     }
 
     #[tokio::test]
@@ -3244,7 +3244,10 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::RefreshResync)
+        );
     }
 
     #[tokio::test]
@@ -3292,7 +3295,7 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
     }
 
     #[tokio::test]
@@ -3459,7 +3462,10 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::RefreshResync)
+        );
     }
 
     #[tokio::test]
@@ -3659,8 +3665,8 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.last_event_id, "event-2");
         assert_eq!(
-            checkpoint.sync_state.as_deref(),
-            Some("cursor_reset_resync")
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::CursorResetResync)
         );
     }
 
@@ -3718,7 +3724,7 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
     }
 
     #[tokio::test]
@@ -4034,7 +4040,10 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::RefreshResync)
+        );
     }
 
     #[tokio::test]
@@ -4093,7 +4102,7 @@ mod tests {
             .load_checkpoint(&AccountId("uid-1".to_string()))
             .unwrap()
             .unwrap();
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
     }
 
     #[tokio::test]
@@ -4771,7 +4780,10 @@ mod tests {
         let _ = shutdown_tx.send(true);
         let _ = handle.await;
 
-        assert_eq!(checkpoint.sync_state.as_deref(), Some("baseline_cursor"));
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::BaselineCursor)
+        );
         assert_eq!(
             store_after_restart
                 .get_uid("uid-1::INBOX", "msg-1")
@@ -4842,7 +4854,7 @@ mod tests {
                 &EventCheckpoint {
                     last_event_id: "stale-event".to_string(),
                     last_event_ts: Some(unix_now()),
-                    sync_state: Some("ok".to_string()),
+                    sync_state: Some(CheckpointSyncState::Ok),
                 },
             )
             .unwrap();
@@ -4879,8 +4891,8 @@ mod tests {
 
         assert_eq!(checkpoint_after_recovery.last_event_id, "event-2");
         assert_eq!(
-            checkpoint_after_recovery.sync_state.as_deref(),
-            Some("cursor_reset_resync")
+            checkpoint_after_recovery.sync_state,
+            Some(CheckpointSyncState::CursorResetResync)
         );
     }
 

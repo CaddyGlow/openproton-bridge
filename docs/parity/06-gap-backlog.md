@@ -34,6 +34,8 @@
    - Status: resolved in current pass (label rename/delete reconciliation + collision-safe label mailbox naming).
    - Target files: `src/bridge/events.rs`, `src/imap/mailbox.rs`, `docs/parity/04-imap-sync-propagation.md`
 4. Checkpoint state representation as free-form strings
+   - Status: resolved in current pass (strict typed `CheckpointSyncState` end-to-end).
+   - Target files: `src/bridge/types.rs`, `src/bridge/events.rs`, `src/vault.rs`, `docs/parity/05-checkpoint-recovery.md`
 5. Large batch mutation chunking behavior
    - Status: resolved in current pass (`150` chunking across label/unlabel/read/unread/delete + parallel delete chunks).
    - Target files: `src/api/messages.rs`, `docs/parity/03-message-mutation-parity.md`

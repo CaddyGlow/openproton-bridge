@@ -3094,7 +3094,7 @@ mod tests {
         let checkpoint = vault::StoredEventCheckpoint {
             last_event_id: "event-123".to_string(),
             last_event_ts: Some(1_700_000_000),
-            sync_state: Some("refresh_resync".to_string()),
+            sync_state: Some(crate::bridge::types::CheckpointSyncState::RefreshResync),
         };
         vault::save_event_checkpoint_by_account_id(
             service.settings_dir(),

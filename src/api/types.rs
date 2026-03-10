@@ -512,6 +512,47 @@ pub struct LabelsResponse {
     pub labels: Vec<ProtonLabel>,
 }
 
+/// Metadata for a message import request.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImportMetadata {
+    #[serde(rename = "AddressID")]
+    pub address_id: String,
+    #[serde(rename = "LabelIDs")]
+    pub label_ids: Vec<String>,
+    pub unread: bool,
+    pub flags: i64,
+}
+
+/// Proton message flag bitmask constants.
+pub const MESSAGE_FLAG_RECEIVED: i64 = 1 << 0;
+pub const MESSAGE_FLAG_SENT: i64 = 1 << 1;
+pub const MESSAGE_FLAG_IMPORTED: i64 = 1 << 9;
+
+/// Single import result from the Proton API.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImportRes {
+    #[serde(default)]
+    pub code: i32,
+    #[serde(rename = "MessageID", default)]
+    pub message_id: String,
+}
+
+/// Wrapper for the import API response.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct ImportResponse {
+    pub responses: Vec<NamedImportRes>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct NamedImportRes {
+    pub name: String,
+    pub response: ImportRes,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct EventsResponse {

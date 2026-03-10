@@ -15,6 +15,7 @@ use crate::api::messages;
 use crate::api::types::{self, MessageFilter};
 use crate::bridge::accounts::{AccountRuntimeError, RuntimeAccountRegistry, RuntimeAuthMaterial};
 use crate::bridge::auth_router::AuthRouter;
+use crate::crypto::encrypt as crypto_encrypt;
 use crate::crypto::keys::{self, Keyring};
 
 use super::command::{
@@ -2366,11 +2367,60 @@ where
                 .as_secs() as i64
         });
 
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let proton_id = format!("local-append-{ts}");
+        let is_unread = !flags.iter().any(|f| matches!(f, ImapFlag::Seen));
+
+        // Try to import upstream via Proton API
+        let proton_id = if let Some(client) = &self.client {
+            if let Some(addr_keyrings) = &self.addr_keyrings {
+                if let Some((addr_id, keyring)) = addr_keyrings.iter().next() {
+                    match crypto_encrypt::encrypt_rfc822(keyring, &literal) {
+                        Ok(encrypted) => {
+                            let import_flags =
+                                types::MESSAGE_FLAG_RECEIVED | types::MESSAGE_FLAG_IMPORTED;
+                            let metadata = types::ImportMetadata {
+                                address_id: addr_id.clone(),
+                                label_ids: vec![mb.label_id.clone()],
+                                unread: is_unread,
+                                flags: import_flags,
+                            };
+                            match messages::import_message(client, &metadata, encrypted).await {
+                                Ok(res) => {
+                                    info!(
+                                        message_id = %res.message_id,
+                                        mailbox = %mb.name,
+                                        "APPEND imported upstream"
+                                    );
+                                    Some(res.message_id)
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "APPEND upstream import failed; storing locally only");
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "APPEND encryption failed; storing locally only");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let proton_id = proton_id.unwrap_or_else(|| {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("local-append-{ts}")
+        });
+
         let meta = types::MessageMetadata {
             id: proton_id.clone(),
             address_id: String::new(),
@@ -2388,11 +2438,7 @@ where
             flags: 0,
             time,
             size: literal.len() as i64,
-            unread: if flags.iter().any(|f| matches!(f, ImapFlag::Seen)) {
-                0
-            } else {
-                1
-            },
+            unread: if is_unread { 1 } else { 0 },
             is_replied: 0,
             is_replied_all: 0,
             is_forwarded: 0,
@@ -2419,7 +2465,7 @@ where
             mailbox = %mb.name,
             uid,
             size = literal_size,
-            "APPEND stored locally"
+            "APPEND completed"
         );
 
         self.writer

@@ -228,6 +228,68 @@ pub async fn delete_messages(client: &ProtonClient, ids: &[&str]) -> Result<()> 
     Ok(())
 }
 
+/// Import an encrypted RFC822 message into Proton.
+///
+/// The message must be pre-encrypted with `crypto::encrypt::encrypt_rfc822`.
+/// Uses multipart POST to `/mail/v4/messages/import`.
+///
+/// Reference: go-proton-api/message_import.go importMessages
+pub async fn import_message(
+    client: &ProtonClient,
+    metadata: &super::types::ImportMetadata,
+    encrypted_rfc822: Vec<u8>,
+) -> Result<super::types::ImportRes> {
+    use std::collections::HashMap;
+
+    info!("importing message via Proton API");
+
+    let mut meta_map = HashMap::new();
+    meta_map.insert("0".to_string(), metadata);
+    let meta_json = serde_json::to_vec(&meta_map).map_err(|e| super::error::ApiError::Api {
+        code: 0,
+        message: format!("serialize metadata: {}", e),
+        details: None,
+    })?;
+
+    let form = reqwest::multipart::Form::new()
+        .part(
+            "Metadata",
+            reqwest::multipart::Part::bytes(meta_json)
+                .mime_str("application/json")
+                .unwrap(),
+        )
+        .part(
+            "0",
+            reqwest::multipart::Part::bytes(encrypted_rfc822)
+                .file_name("0.eml")
+                .mime_str("message/rfc822")
+                .unwrap(),
+        );
+
+    let resp = send_logged(client.post("/mail/v4/messages/import").multipart(form)).await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let import_resp: super::types::ImportResponse = serde_json::from_value(json)?;
+    let res = import_resp
+        .responses
+        .into_iter()
+        .find(|r| r.name == "0")
+        .map(|r| r.response)
+        .ok_or_else(|| super::error::ApiError::Api {
+            code: 0,
+            message: "no import response for message 0".to_string(),
+            details: None,
+        })?;
+    if res.code != 1000 {
+        return Err(super::error::ApiError::Api {
+            code: res.code as i64,
+            message: format!("import failed with code {}", res.code),
+            details: None,
+        });
+    }
+    Ok(res)
+}
+
 /// Create a draft message with an encrypted body.
 ///
 /// Reference: go-proton-api/message_send.go CreateDraft

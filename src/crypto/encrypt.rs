@@ -337,6 +337,91 @@ fn parse_algorithm(algo: &str) -> Result<openpgp::types::SymmetricAlgorithm> {
     }
 }
 
+/// Encrypt an RFC822 message for Proton import.
+///
+/// Encrypts the entire literal as a PGP/MIME multipart/encrypted message.
+/// This mirrors the Go bridge's `encryptFull` fallback path in `EncryptRFC822`.
+///
+/// The output is a valid RFC822 message with:
+/// - Original headers (From, To, Subject, Date, Cc, Message-Id)
+/// - Content-Type: multipart/encrypted; protocol="application/pgp-encrypted"
+/// - Part 1: PGP version identification
+/// - Part 2: The armored PGP-encrypted original message
+pub fn encrypt_rfc822(keyring: &Keyring, literal: &[u8]) -> Result<Vec<u8>> {
+    // Encrypt the entire literal
+    let encrypted = keyring.encrypt_and_sign(literal)?;
+
+    // Armor the encrypted message
+    let mut armored = Vec::new();
+    let mut armor_writer = openpgp::armor::Writer::new(&mut armored, openpgp::armor::Kind::Message)
+        .map_err(|e| CryptoError::EncryptionFailed(format!("armor writer: {}", e)))?;
+    armor_writer
+        .write_all(&encrypted)
+        .map_err(|e| CryptoError::EncryptionFailed(format!("armor write: {}", e)))?;
+    armor_writer
+        .finalize()
+        .map_err(|e| CryptoError::EncryptionFailed(format!("armor finalize: {}", e)))?;
+    let armored_str = String::from_utf8(armored)
+        .map_err(|e| CryptoError::EncryptionFailed(format!("armor utf8: {}", e)))?;
+
+    // Extract relevant headers from the original message
+    let literal_str = String::from_utf8_lossy(literal);
+    let header_end = literal_str
+        .find("\r\n\r\n")
+        .or_else(|| literal_str.find("\n\n"))
+        .unwrap_or(literal_str.len());
+    let header_section = &literal_str[..header_end];
+
+    let boundary = format!(
+        "{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+
+    let mut output = Vec::new();
+
+    // Write preserved headers
+    let preserve = ["From", "To", "Cc", "Subject", "Date", "Message-Id"];
+    for line in header_section.lines() {
+        for hdr in &preserve {
+            if line.to_lowercase().starts_with(&hdr.to_lowercase()) {
+                output.extend_from_slice(line.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                break;
+            }
+        }
+    }
+
+    // Write MIME headers
+    write!(
+        output,
+        "MIME-Version: 1.0\r\nContent-Type: multipart/encrypted; protocol=\"application/pgp-encrypted\"; boundary=\"{boundary}\"\r\n\r\n"
+    )
+    .map_err(|e| CryptoError::EncryptionFailed(format!("write headers: {}", e)))?;
+
+    // Part 1: PGP version identification
+    write!(
+        output,
+        "--{boundary}\r\nContent-Description: PGP/MIME version identification\r\nContent-Type: application/pgp-encrypted\r\n\r\nVersion: 1\r\n"
+    )
+    .map_err(|e| CryptoError::EncryptionFailed(format!("write part 1: {}", e)))?;
+
+    // Part 2: Encrypted message
+    write!(
+        output,
+        "--{boundary}\r\nContent-Description: OpenPGP encrypted message\r\nContent-Disposition: inline; filename=encrypted.asc\r\nContent-Type: application/octet-stream; name=encrypted.asc\r\n\r\n{armored_str}\r\n"
+    )
+    .map_err(|e| CryptoError::EncryptionFailed(format!("write part 2: {}", e)))?;
+
+    // Close multipart
+    write!(output, "--{boundary}--\r\n")
+        .map_err(|e| CryptoError::EncryptionFailed(format!("write boundary: {}", e)))?;
+
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +580,60 @@ mod tests {
             crate::crypto::decrypt::decrypt_attachment(&keyring, &key_packets_b64, &data_packets)
                 .unwrap();
         assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_encrypt_rfc822_produces_pgp_mime() {
+        let (_, keyring) = make_test_keyring();
+        let literal = b"From: alice@proton.me\r\nTo: bob@example.com\r\nSubject: Test\r\nDate: Mon, 10 Mar 2025 12:00:00 +0000\r\n\r\nHello, world!";
+
+        let encrypted = encrypt_rfc822(&keyring, literal).unwrap();
+        let encrypted_str = String::from_utf8_lossy(&encrypted);
+
+        // Should preserve original headers
+        assert!(
+            encrypted_str.contains("From: alice@proton.me"),
+            "missing From header"
+        );
+        assert!(
+            encrypted_str.contains("Subject: Test"),
+            "missing Subject header"
+        );
+
+        // Should have PGP/MIME structure
+        assert!(
+            encrypted_str.contains("multipart/encrypted"),
+            "missing multipart/encrypted"
+        );
+        assert!(
+            encrypted_str.contains("application/pgp-encrypted"),
+            "missing pgp-encrypted part"
+        );
+        assert!(
+            encrypted_str.contains("BEGIN PGP MESSAGE"),
+            "missing PGP message"
+        );
+        assert!(
+            encrypted_str.contains("END PGP MESSAGE"),
+            "missing PGP message end"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_rfc822_roundtrip() {
+        let (_, keyring) = make_test_keyring();
+        let literal = b"From: alice@proton.me\r\nSubject: Roundtrip\r\n\r\nBody text";
+
+        let encrypted = encrypt_rfc822(&keyring, literal).unwrap();
+        let encrypted_str = String::from_utf8_lossy(&encrypted);
+
+        // Extract the armored PGP block and decrypt it
+        let begin = encrypted_str.find("-----BEGIN PGP MESSAGE-----").unwrap();
+        let end = encrypted_str.find("-----END PGP MESSAGE-----").unwrap()
+            + "-----END PGP MESSAGE-----".len();
+        let armored = &encrypted_str[begin..end];
+
+        let decrypted = keyring.decrypt_armored(armored).unwrap();
+        assert_eq!(decrypted, literal);
     }
 }

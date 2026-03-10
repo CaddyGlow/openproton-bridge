@@ -71,6 +71,8 @@ This project follows test-driven development. The expectation is:
 ```
 # All tests
 cargo test
+# opt in to real system keychain access in tests
+OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN=1 cargo test
 
 # Single module
 cargo test api::srp
@@ -81,6 +83,12 @@ cargo test --test auth_integration
 # With output
 cargo test -- --nocapture
 ```
+
+Credential-store test default:
+
+- Test binaries force credential backend `auto/system` to file mode to avoid macOS/OS keychain authorization prompts.
+- Set `OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN=1` when you explicitly want keychain-backed test behavior.
+- The runtime keychain integration is behind the Cargo feature `system-keychain` (enabled by default). Use `--no-default-features` to disable it.
 
 ### Test dependencies
 

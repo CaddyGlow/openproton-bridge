@@ -201,6 +201,7 @@ Environment variable equivalents:
 - `OPENPROTON_CREDENTIAL_STORE_SYSTEM_SERVICE`
 - `OPENPROTON_CREDENTIAL_STORE_PASS_ENTRY`
 - `OPENPROTON_CREDENTIAL_STORE_FILE_PATH`
+- `OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN` (tests only; opt in to real system keychain)
 
 Precedence:
 
@@ -208,6 +209,12 @@ Precedence:
 2. Environment variables
 3. `<vault-dir>/credential_store.toml`
 4. Built-in defaults
+
+Test behavior:
+
+- `cargo test` defaults to file-backed credential storage for `auto/system` to avoid OS keychain prompts.
+- Set `OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN=1` to re-enable real system keychain access in tests.
+- Build with `--no-default-features` to disable system keychain support entirely (`system-keychain` feature gate).
 
 ## Configuration
 
@@ -230,6 +237,8 @@ level = "info"
 
 ```
 cargo test
+# opt in to real keychain access during tests
+OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN=1 cargo test
 ```
 
 Integration tests use `wiremock` for HTTP mocking and do not require network access or a Proton account.

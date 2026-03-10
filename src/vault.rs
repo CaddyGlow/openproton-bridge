@@ -40,6 +40,7 @@ const KEYCHAIN_NAME: &str = "bridge-v3";
 #[cfg(target_os = "macos")]
 const LEGACY_KEYCHAIN_NAME: &str = "bridge";
 const KEYCHAIN_SECRET: &str = "bridge-vault-key";
+const ENV_OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN: &str = "OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN";
 type ExtraFields = HashMap<String, MsgpackValue>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +137,47 @@ fn parse_store_backend(raw: &str) -> Option<CredentialStoreBackend> {
         "file" => Some(CredentialStoreBackend::File),
         _ => None,
     }
+}
+
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|raw| raw.trim().to_ascii_lowercase())
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn running_in_cargo_test_binary() -> bool {
+    let Ok(exe_path) = std::env::current_exe() else {
+        return false;
+    };
+    exe_path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .is_some_and(|name| name == "deps")
+}
+
+fn system_keychain_runtime_enabled() -> bool {
+    if !cfg!(feature = "system-keychain") {
+        return false;
+    }
+
+    if running_in_cargo_test_binary() && !env_truthy(ENV_OPENPROTON_TEST_ENABLE_SYSTEM_KEYCHAIN) {
+        return false;
+    }
+
+    true
+}
+
+fn effective_credential_store_backend(backend: CredentialStoreBackend) -> CredentialStoreBackend {
+    if !system_keychain_runtime_enabled()
+        && matches!(
+            backend,
+            CredentialStoreBackend::Auto | CredentialStoreBackend::System
+        )
+    {
+        return CredentialStoreBackend::File;
+    }
+    backend
 }
 
 fn normalized_non_empty(value: Option<&str>) -> Option<String> {
@@ -963,7 +1005,7 @@ where
     }
     #[cfg(not(target_os = "linux"))]
     let _ = &mut pass_probe;
-    if keyring_probe() {
+    if system_keychain_runtime_enabled() && keyring_probe() {
         available.push(KEYCHAIN_BACKEND_KEYRING.to_string());
     }
     available.push(KEYCHAIN_BACKEND_FILE.to_string());
@@ -971,6 +1013,10 @@ where
 }
 
 fn keyring_backend_available() -> bool {
+    if !system_keychain_runtime_enabled() {
+        return false;
+    }
+
     let probe_account = format!("{}-probe-{}", KEYCHAIN_SECRET, rand::random::<u64>());
     let probe_service = keychain_services()
         .into_iter()
@@ -1057,6 +1103,7 @@ fn decrypt(data: &[u8], key: &[u8; KEY_LEN]) -> Result<Vec<u8>> {
 /// and stores it in both keychain (if available) and file.
 fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     let store_config = resolve_credential_store_config(dir);
+    let backend = effective_credential_store_backend(store_config.backend);
     let key_path = store_config.file_path.clone();
 
     if let Some(key) = get_cached_vault_key(&key_path) {
@@ -1078,7 +1125,7 @@ fn get_or_create_vault_key(dir: &Path) -> Result<[u8; KEY_LEN]> {
     let vault_exists = dir.join(VAULT_FILE).exists();
 
     // 2. Try secure backend, unless forced to file-only mode.
-    if !matches!(store_config.backend, CredentialStoreBackend::File) {
+    if !matches!(backend, CredentialStoreBackend::File) {
         if let Some(key) =
             resolve_keychain_key(try_secure_backend_get(&store_config), vault_exists)?
         {
@@ -1351,14 +1398,16 @@ fn decode_vault_key_string(encoded: String) -> std::result::Result<[u8; KEY_LEN]
 fn try_secure_backend_get(
     config: &CredentialStoreConfig,
 ) -> std::result::Result<Option<[u8; KEY_LEN]>, keyring::Error> {
+    let backend = effective_credential_store_backend(config.backend);
     let mut first_non_missing_error: Option<keyring::Error> = None;
     tracing::debug!(
-        backend = ?config.backend,
+        configured_backend = ?config.backend,
+        effective_backend = ?backend,
         "attempting vault key lookup via secure backends"
     );
 
     if matches!(
-        config.backend,
+        backend,
         CredentialStoreBackend::Auto | CredentialStoreBackend::System
     ) {
         match try_keychain_get_with_config(config) {
@@ -1382,7 +1431,7 @@ fn try_secure_backend_get(
     #[cfg(target_os = "linux")]
     {
         if matches!(
-            config.backend,
+            backend,
             CredentialStoreBackend::Auto | CredentialStoreBackend::Pass
         ) {
             match try_pass_get_with_config(config) {
@@ -1420,7 +1469,7 @@ fn try_secure_backend_set(
     config: &CredentialStoreConfig,
     key: &[u8; KEY_LEN],
 ) -> std::result::Result<(), keyring::Error> {
-    match config.backend {
+    match effective_credential_store_backend(config.backend) {
         CredentialStoreBackend::Auto | CredentialStoreBackend::System => {
             try_keychain_set_with_config(config, key)
         }
@@ -2668,10 +2717,14 @@ path = "custom-vault.key"
     fn test_discover_available_keychains_is_deterministic_with_keyring_first() {
         let available_first = discover_available_keychains_with_probes(|| true, || false);
         let available_second = discover_available_keychains_with_probes(|| true, || false);
-        let expected = vec![
-            KEYCHAIN_BACKEND_KEYRING.to_string(),
-            KEYCHAIN_BACKEND_FILE.to_string(),
-        ];
+        let expected = if system_keychain_runtime_enabled() {
+            vec![
+                KEYCHAIN_BACKEND_KEYRING.to_string(),
+                KEYCHAIN_BACKEND_FILE.to_string(),
+            ]
+        } else {
+            vec![KEYCHAIN_BACKEND_FILE.to_string()]
+        };
         assert_eq!(available_first, expected);
         assert_eq!(available_second, expected);
     }
@@ -2680,12 +2733,33 @@ path = "custom-vault.key"
     #[test]
     fn test_discover_available_keychains_prefers_pass_on_linux() {
         let available = discover_available_keychains_with_probes(|| true, || true);
-        let expected = vec![
-            KEYCHAIN_BACKEND_PASS_APP.to_string(),
-            KEYCHAIN_BACKEND_KEYRING.to_string(),
-            KEYCHAIN_BACKEND_FILE.to_string(),
-        ];
+        let expected = if system_keychain_runtime_enabled() {
+            vec![
+                KEYCHAIN_BACKEND_PASS_APP.to_string(),
+                KEYCHAIN_BACKEND_KEYRING.to_string(),
+                KEYCHAIN_BACKEND_FILE.to_string(),
+            ]
+        } else {
+            vec![
+                KEYCHAIN_BACKEND_PASS_APP.to_string(),
+                KEYCHAIN_BACKEND_FILE.to_string(),
+            ]
+        };
         assert_eq!(available, expected);
+    }
+
+    #[test]
+    fn test_effective_backend_defaults_to_file_in_test_binaries_without_opt_in() {
+        if running_in_cargo_test_binary() {
+            assert_eq!(
+                effective_credential_store_backend(CredentialStoreBackend::Auto),
+                CredentialStoreBackend::File
+            );
+            assert_eq!(
+                effective_credential_store_backend(CredentialStoreBackend::System),
+                CredentialStoreBackend::File
+            );
+        }
     }
 
     #[test]

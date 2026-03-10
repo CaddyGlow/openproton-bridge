@@ -13,7 +13,9 @@ use crate::api::client::ProtonClient;
 use crate::api::error::{is_auth_error, ApiError};
 use crate::api::events as api_events;
 use crate::api::messages;
-use crate::api::types::{ApiMode, MessageFilter, MessageMetadata, Session};
+use crate::api::types::{
+    ApiMode, MessageFilter, MessageMetadata, Session, LABEL_TYPE_FOLDER, LABEL_TYPE_LABEL,
+};
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
 use crate::imap::mailbox;
@@ -379,6 +381,7 @@ pub struct EventWorkerConfig {
     pub pim_store: Option<Arc<PimStore>>,
     pub checkpoint_store: SharedCheckpointStore,
     pub sync_progress_callback: Option<SyncProgressCallback>,
+    pub user_labels: Arc<RwLock<Vec<mailbox::ResolvedMailbox>>>,
 }
 
 impl EventWorkerConfig {
@@ -402,6 +405,7 @@ impl EventWorkerConfig {
             pim_store: None,
             checkpoint_store,
             sync_progress_callback: None,
+            user_labels: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -931,7 +935,62 @@ async fn apply_metadata_to_store(
         }
     }
 
+    let user_labels: Vec<mailbox::ResolvedMailbox> = config
+        .user_labels
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for ul in &user_labels {
+        let scoped = scoped_mailbox_name(&config.account_id, &ul.name);
+        let in_mailbox = metadata.label_ids.iter().any(|label| label == &ul.label_id);
+        if in_mailbox {
+            config
+                .store
+                .store_metadata(&scoped, &metadata.id, metadata.clone())
+                .await
+                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        } else if let Some(uid) = config
+            .store
+            .get_uid(&scoped, &metadata.id)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
+        {
+            config
+                .store
+                .remove_message(&scoped, uid)
+                .await
+                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        }
+    }
+
     Ok(())
+}
+
+async fn fetch_and_update_user_labels(config: &EventWorkerConfig, client: &ProtonClient) {
+    match messages::get_labels(client, &[LABEL_TYPE_LABEL, LABEL_TYPE_FOLDER]).await {
+        Ok(resp) => {
+            let resolved = mailbox::labels_to_mailboxes(&resp.labels);
+            info!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                user_labels = resolved.len(),
+                "refreshed user labels for event sync"
+            );
+            let mut guard = config
+                .user_labels
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = resolved;
+        }
+        Err(err) => {
+            warn!(
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                error = %err,
+                "failed to fetch user labels during event sync"
+            );
+        }
+    }
 }
 
 struct SyncProgressRunGuard<'a> {
@@ -1515,7 +1574,9 @@ async fn poll_account_once_for_generation(
                     EventDelta::MessageDelete(id) => {
                         apply_message_delete(config, &id, expected_generation).await?;
                     }
-                    EventDelta::LabelsChanged => {}
+                    EventDelta::LabelsChanged => {
+                        fetch_and_update_user_labels(config, &client).await;
+                    }
                     EventDelta::AddressesChanged => {
                         address_changed = true;
                     }

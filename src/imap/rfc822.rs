@@ -225,17 +225,21 @@ pub fn build_bodystructure(data: &[u8]) -> String {
             charset,
         } => {
             let encoding = extract_content_transfer_encoding(&header_section);
+            let content_id = extract_content_id(&header_section);
+            let disposition = extract_content_disposition(&header_section);
             let size = data.len();
             let lines = text.lines().count();
 
             format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {} NIL NIL NIL)",
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL)",
                 type_main.to_uppercase(),
                 subtype.to_uppercase(),
                 charset,
+                content_id,
                 encoding.to_uppercase(),
                 size,
-                lines
+                lines,
+                disposition
             )
         }
     }
@@ -326,6 +330,52 @@ fn extract_param(value: &str, param_name: &str) -> Option<String> {
     None
 }
 
+fn extract_content_id(header: &str) -> String {
+    extract_header(header, "Content-ID")
+        .or_else(|| extract_header(header, "Content-Id"))
+        .map(|v| imap_quote(&v))
+        .unwrap_or_else(|| "NIL".to_string())
+}
+
+fn extract_content_disposition(header: &str) -> String {
+    let raw = extract_header(header, "Content-Disposition");
+    let raw = match raw {
+        Some(v) => v,
+        None => return "NIL".to_string(),
+    };
+
+    let mut parts = raw.splitn(2, ';');
+    let disp_type = parts.next().unwrap_or("").trim().to_lowercase();
+    if disp_type.is_empty() {
+        return "NIL".to_string();
+    }
+
+    let params_str = parts.next().unwrap_or("").trim();
+    if params_str.is_empty() {
+        return format!("(\"{}\" NIL)", disp_type.to_uppercase());
+    }
+
+    let mut param_pairs = Vec::new();
+    for param in params_str.split(';') {
+        let param = param.trim();
+        if let Some((key, val)) = param.split_once('=') {
+            let key = key.trim().to_uppercase();
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            param_pairs.push(format!("\"{}\" \"{}\"", key, val));
+        }
+    }
+
+    if param_pairs.is_empty() {
+        format!("(\"{}\" NIL)", disp_type.to_uppercase())
+    } else {
+        format!(
+            "(\"{}\" ({}))",
+            disp_type.to_uppercase(),
+            param_pairs.join(" ")
+        )
+    }
+}
+
 fn extract_content_transfer_encoding(header: &str) -> String {
     header
         .lines()
@@ -379,17 +429,21 @@ fn build_part_structure(part: &str) -> String {
             charset,
         } => {
             let encoding = extract_content_transfer_encoding(&header);
+            let content_id = extract_content_id(&header);
+            let disposition = extract_content_disposition(&header);
             let size = part.len();
             let lines = body.lines().count();
 
             format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {} NIL NIL NIL)",
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL)",
                 type_main.to_uppercase(),
                 subtype.to_uppercase(),
                 charset,
+                content_id,
                 encoding.to_uppercase(),
                 size,
-                lines
+                lines,
+                disposition
             )
         }
         ContentType::Multipart { subtype, boundary } => {
@@ -953,5 +1007,47 @@ mod tests {
 
         // Part 2 doesn't exist
         assert!(extract_mime_part(msg, "2").is_none());
+    }
+
+    #[test]
+    fn test_extract_content_id() {
+        let header = "Content-ID: <abc123@proton.me>";
+        assert_eq!(extract_content_id(header), "\"<abc123@proton.me>\"");
+    }
+
+    #[test]
+    fn test_extract_content_id_missing() {
+        let header = "Content-Type: text/plain";
+        assert_eq!(extract_content_id(header), "NIL");
+    }
+
+    #[test]
+    fn test_extract_content_disposition_attachment() {
+        let header = "Content-Disposition: attachment; filename=\"test.pdf\"";
+        let disp = extract_content_disposition(header);
+        assert!(disp.contains("\"ATTACHMENT\""), "disp={disp}");
+        assert!(disp.contains("\"FILENAME\""), "disp={disp}");
+        assert!(disp.contains("\"test.pdf\""), "disp={disp}");
+    }
+
+    #[test]
+    fn test_extract_content_disposition_inline() {
+        let header = "Content-Disposition: inline";
+        let disp = extract_content_disposition(header);
+        assert!(disp.contains("\"INLINE\""), "disp={disp}");
+    }
+
+    #[test]
+    fn test_extract_content_disposition_missing() {
+        let header = "Content-Type: text/plain";
+        assert_eq!(extract_content_disposition(header), "NIL");
+    }
+
+    #[test]
+    fn test_bodystructure_includes_content_id_and_disposition() {
+        let msg = b"Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sep\r\nContent-Type: image/png\r\nContent-ID: <img1@proton.me>\r\nContent-Disposition: inline\r\n\r\nPNGDATA\r\n--sep--";
+        let bs = build_bodystructure(msg);
+        assert!(bs.contains("\"<img1@proton.me>\""), "bs={bs}");
+        assert!(bs.contains("\"INLINE\""), "bs={bs}");
     }
 }

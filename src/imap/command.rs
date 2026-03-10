@@ -107,6 +107,9 @@ pub enum Command {
         date: Option<String>,
         literal_size: u32,
     },
+    Unselect {
+        tag: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,6 +306,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "MOVE" => parse_move(&tag, args, false),
         "EXAMINE" => parse_examine(&tag, args),
         "APPEND" => parse_append(&tag, args),
+        "UNSELECT" => Ok(Command::Unselect { tag }),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
             cmd_word
@@ -1667,5 +1671,14 @@ mod tests {
     #[test]
     fn test_parse_uid_expunge_rejects_extra_args() {
         assert!(parse_command("a001 UID EXPUNGE 1:5 extra").is_err());
+    }
+
+    #[test]
+    fn test_parse_unselect() {
+        let cmd = parse_command("a001 UNSELECT").unwrap();
+        match cmd {
+            Command::Unselect { tag } => assert_eq!(tag, "a001"),
+            _ => panic!("expected Unselect"),
+        }
     }
 }

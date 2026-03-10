@@ -27,6 +27,9 @@ use super::rfc822;
 use super::store::MessageStore;
 use super::Result;
 
+/// RFC 2177 recommends servers terminate IDLE after 30 minutes.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 #[derive(Debug, Clone, PartialEq)]
 enum State {
     NotAuthenticated,
@@ -260,6 +263,7 @@ where
                 ref tag,
                 ref sequence,
             } => self.cmd_uid_expunge(tag, sequence).await?,
+            Command::Unselect { ref tag } => self.cmd_unselect(tag).await?,
             Command::Append {
                 ref tag,
                 ref mailbox,
@@ -278,12 +282,12 @@ where
     async fn cmd_capability(&mut self, tag: &str) -> Result<()> {
         let caps = if self.state == State::NotAuthenticated {
             if self.starttls_available {
-                "CAPABILITY IMAP4rev1 STARTTLS IDLE UIDPLUS MOVE"
+                "CAPABILITY IMAP4rev1 STARTTLS IDLE UIDPLUS MOVE UNSELECT"
             } else {
-                "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE"
+                "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE UNSELECT"
             }
         } else {
-            "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE"
+            "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE UNSELECT"
         };
         self.writer.untagged(caps).await?;
         self.writer
@@ -614,6 +618,7 @@ where
         self.writer.continuation("idling").await?;
         self.emit_selected_mailbox_exists_update().await?;
 
+        let idle_start = tokio::time::Instant::now();
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -621,6 +626,10 @@ where
             let mut line = String::new();
             tokio::select! {
                 _ = ticker.tick() => {
+                    if idle_start.elapsed() > IDLE_TIMEOUT {
+                        debug!("IDLE timeout after 30 minutes");
+                        break;
+                    }
                     self.emit_selected_mailbox_exists_update().await?;
                 }
                 read = self.reader.read_line(&mut line) => {
@@ -1074,6 +1083,18 @@ where
         self.selected_read_only = false;
         self.state = State::Authenticated;
         self.writer.tagged_ok(tag, None, "CLOSE completed").await
+    }
+
+    async fn cmd_unselect(&mut self, tag: &str) -> Result<()> {
+        if self.state != State::Selected {
+            return self.writer.tagged_no(tag, "no mailbox selected").await;
+        }
+        // Unlike CLOSE, do NOT expunge deleted messages
+        self.selected_mailbox = None;
+        self.selected_mailbox_mod_seq = None;
+        self.selected_read_only = false;
+        self.state = State::Authenticated;
+        self.writer.tagged_ok(tag, None, "UNSELECT completed").await
     }
 
     async fn cmd_check(&mut self, tag: &str) -> Result<()> {
@@ -1743,6 +1764,10 @@ where
                             }
                         }
                     }
+
+                    // \Answered is stored locally but not synced upstream. The Proton
+                    // API has no endpoint for toggling the replied flag on existing
+                    // messages. The Go bridge also omits this in its STORE handler.
 
                     if had_flagged != has_flagged {
                         if has_flagged {
@@ -4820,5 +4845,49 @@ mod tests {
             1,
             None
         ));
+    }
+
+    #[tokio::test]
+    async fn test_unselect_does_not_expunge() {
+        let config = test_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        config
+            .store
+            .add_flags("test-uid::INBOX", uid, &["\\Deleted".to_string()])
+            .await
+            .unwrap();
+
+        session.handle_line("a001 UNSELECT").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("a001 OK UNSELECT completed"),
+            "response={response}"
+        );
+        assert!(
+            !response.contains("EXPUNGE"),
+            "UNSELECT must not expunge: {response}"
+        );
+
+        assert_eq!(session.state, State::Authenticated);
+        assert!(session.selected_mailbox.is_none());
+
+        // Message should still exist in the store
+        let uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        assert_eq!(uids.len(), 1, "message must not be expunged");
     }
 }

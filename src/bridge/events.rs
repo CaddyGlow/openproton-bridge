@@ -381,7 +381,6 @@ pub struct EventWorkerConfig {
     pub pim_store: Option<Arc<PimStore>>,
     pub checkpoint_store: SharedCheckpointStore,
     pub sync_progress_callback: Option<SyncProgressCallback>,
-    pub user_labels: Arc<RwLock<Vec<mailbox::ResolvedMailbox>>>,
 }
 
 impl EventWorkerConfig {
@@ -405,7 +404,6 @@ impl EventWorkerConfig {
             pim_store: None,
             checkpoint_store,
             sync_progress_callback: None,
-            user_labels: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -935,11 +933,7 @@ async fn apply_metadata_to_store(
         }
     }
 
-    let user_labels: Vec<mailbox::ResolvedMailbox> = config
-        .user_labels
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
+    let user_labels = config.runtime_accounts.get_user_labels(&config.account_id);
     for ul in &user_labels {
         let scoped = scoped_mailbox_name(&config.account_id, &ul.name);
         let in_mailbox = metadata.label_ids.iter().any(|label| label == &ul.label_id);
@@ -976,11 +970,9 @@ async fn fetch_and_update_user_labels(config: &EventWorkerConfig, client: &Proto
                 user_labels = resolved.len(),
                 "refreshed user labels for event sync"
             );
-            let mut guard = config
-                .user_labels
-                .write()
-                .unwrap_or_else(|e| e.into_inner());
-            *guard = resolved;
+            config
+                .runtime_accounts
+                .set_user_labels(&config.account_id, resolved);
         }
         Err(err) => {
             warn!(

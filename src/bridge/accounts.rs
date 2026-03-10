@@ -9,6 +9,7 @@ use crate::api::auth;
 use crate::api::client::ProtonClient;
 use crate::api::error::{is_auth_error, is_invalid_refresh_token_error, ApiError};
 use crate::api::types::{Address, Session, UserKey};
+use crate::imap::mailbox::ResolvedMailbox;
 
 use super::types::{AccountId, AccountResolver};
 
@@ -54,6 +55,7 @@ pub struct RuntimeAccountRegistry {
     auth_material: RwLock<HashMap<AccountId, Arc<RuntimeAuthMaterial>>>,
     runtime_generations: RwLock<HashMap<AccountId, u64>>,
     generation_watchers: Mutex<HashMap<AccountId, watch::Sender<u64>>>,
+    user_labels: std::sync::RwLock<HashMap<AccountId, Vec<ResolvedMailbox>>>,
     vault_dir: Option<PathBuf>,
 }
 
@@ -267,6 +269,7 @@ impl RuntimeAccountRegistry {
             auth_material: RwLock::new(HashMap::new()),
             runtime_generations: RwLock::new(runtime_generations),
             generation_watchers: Mutex::new(generation_watchers),
+            user_labels: std::sync::RwLock::new(HashMap::new()),
             vault_dir,
         }
     }
@@ -303,6 +306,20 @@ impl RuntimeAccountRegistry {
         let mut auth_material = self.auth_material.write().await;
         auth_material.insert(account_id.clone(), material);
         Ok(())
+    }
+
+    pub fn get_user_labels(&self, account_id: &AccountId) -> Vec<ResolvedMailbox> {
+        self.user_labels
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(account_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set_user_labels(&self, account_id: &AccountId, labels: Vec<ResolvedMailbox>) {
+        let mut guard = self.user_labels.write().unwrap_or_else(|e| e.into_inner());
+        guard.insert(account_id.clone(), labels);
     }
 
     pub async fn get_health(&self, account_id: &AccountId) -> Option<AccountHealth> {

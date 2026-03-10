@@ -520,8 +520,16 @@ pub struct ImportMetadata {
     pub address_id: String,
     #[serde(rename = "LabelIDs")]
     pub label_ids: Vec<String>,
+    #[serde(serialize_with = "serialize_bool_as_int")]
     pub unread: bool,
     pub flags: i64,
+}
+
+fn serialize_bool_as_int<S: serde::Serializer>(
+    val: &bool,
+    s: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_i32(if *val { 1 } else { 0 })
 }
 
 /// Proton message flag bitmask constants.

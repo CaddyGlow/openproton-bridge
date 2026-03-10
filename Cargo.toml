@@ -63,6 +63,7 @@ prost-types = "0.13"
 tokio-stream = { version = "0.1", features = ["net"] }
 async-stream = "0.3"
 hmac = "0.12"
+uuid = { version = "1", features = ["v4"] }
 sha1 = "0.10"
 base32 = "0.5"
 

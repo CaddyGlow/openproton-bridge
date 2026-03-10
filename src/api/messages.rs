@@ -236,7 +236,7 @@ pub async fn delete_messages(client: &ProtonClient, ids: &[&str]) -> Result<()> 
 /// Reference: go-proton-api/message_import.go importMessages
 pub async fn import_message(
     client: &ProtonClient,
-    metadata: &super::types::ImportMetadata,
+    metadata: &crate::api::types::ImportMetadata,
     encrypted_rfc822: Vec<u8>,
 ) -> Result<super::types::ImportRes> {
     use std::collections::HashMap;
@@ -801,5 +801,110 @@ mod tests {
 
         let err = send_draft(&client, "draft-bad", &req).await.unwrap_err();
         assert!(err.to_string().contains("Draft not found"));
+    }
+
+    #[tokio::test]
+    async fn test_import_message_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages/import"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Responses": [
+                    {
+                        "Name": "0",
+                        "Response": {
+                            "Code": 1000,
+                            "MessageID": "imported-msg-123"
+                        }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ProtonClient::authenticated_with_mode(
+            &server.uri(),
+            crate::api::types::ApiMode::Bridge,
+            "test-uid",
+            "test-token",
+        )
+        .unwrap();
+
+        let metadata = crate::api::types::ImportMetadata {
+            address_id: "addr-1".to_string(),
+            label_ids: vec!["0".to_string()],
+            unread: true,
+            flags: 1 | (1 << 9), // RECEIVED | IMPORTED
+        };
+
+        let result = import_message(&client, &metadata, b"From: a@b.com\r\n\r\nHello".to_vec())
+            .await
+            .unwrap();
+        assert_eq!(result.message_id, "imported-msg-123");
+        assert_eq!(result.code, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_import_message_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages/import"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Responses": [
+                    {
+                        "Name": "0",
+                        "Response": {
+                            "Code": 2500,
+                            "MessageID": ""
+                        }
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = ProtonClient::authenticated_with_mode(
+            &server.uri(),
+            crate::api::types::ApiMode::Bridge,
+            "test-uid",
+            "test-token",
+        )
+        .unwrap();
+
+        let metadata = crate::api::types::ImportMetadata {
+            address_id: "addr-1".to_string(),
+            label_ids: vec!["0".to_string()],
+            unread: false,
+            flags: 1,
+        };
+
+        let err = import_message(&client, &metadata, b"From: a@b.com\r\n\r\nHello".to_vec())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("import failed with code 2500"));
+    }
+
+    #[test]
+    fn test_import_metadata_unread_serializes_as_int() {
+        let meta = crate::api::types::ImportMetadata {
+            address_id: "addr-1".to_string(),
+            label_ids: vec!["0".to_string()],
+            unread: true,
+            flags: 1,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        // Should serialize unread as 1, not true
+        assert!(json.contains("\"Unread\":1"), "json={json}");
+
+        let meta_false = crate::api::types::ImportMetadata {
+            address_id: "addr-1".to_string(),
+            label_ids: vec!["0".to_string()],
+            unread: false,
+            flags: 1,
+        };
+        let json = serde_json::to_string(&meta_false).unwrap();
+        assert!(json.contains("\"Unread\":0"), "json={json}");
     }
 }

@@ -72,6 +72,7 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     client: Option<ProtonClient>,
     user_keyring: Option<Keyring>,
     addr_keyrings: Option<HashMap<String, Keyring>>,
+    primary_address_id: Option<String>,
     selected_mailbox: Option<String>,
     selected_mailbox_mod_seq: Option<u64>,
     selected_read_only: bool,
@@ -104,6 +105,7 @@ where
             client: None,
             user_keyring: None,
             addr_keyrings: None,
+            primary_address_id: None,
             selected_mailbox: None,
             selected_mailbox_mod_seq: None,
             selected_read_only: false,
@@ -572,20 +574,33 @@ where
         .await
         {
             Ok(resp) => {
-                self.user_labels = mailbox::labels_to_mailboxes(&resp.labels);
-                info!(
-                    user_labels = self.user_labels.len(),
-                    "loaded user labels/folders"
+                let labels = mailbox::labels_to_mailboxes(&resp.labels);
+                info!(user_labels = labels.len(), "loaded user labels/folders");
+                // Store in shared per-account registry so event worker and other
+                // sessions for this account see the same labels.
+                self.config.runtime_accounts.set_user_labels(
+                    &crate::bridge::types::AccountId(auth_route.account_id.0.clone()),
+                    labels.clone(),
                 );
+                self.user_labels = labels;
             }
             Err(e) => {
                 warn!(error = %e, "failed to fetch user labels; continuing with system mailboxes only");
             }
         }
 
+        // Determine primary address: lowest order among enabled addresses with keys
+        let primary_addr_id = auth_material
+            .addresses
+            .iter()
+            .filter(|a| a.status == 1 && addr_keyrings.contains_key(&a.id))
+            .min_by_key(|a| a.order)
+            .map(|a| a.id.clone());
+
         self.client = Some(client);
         self.user_keyring = Some(user_keyring);
         self.addr_keyrings = Some(addr_keyrings);
+        self.primary_address_id = primary_addr_id;
         self.authenticated_account_id = Some(auth_route.account_id.0.clone());
         self.state = State::Authenticated;
 
@@ -684,10 +699,9 @@ where
         if let Some(m) = mailbox::find_mailbox(name) {
             return Some(m.into());
         }
-        self.user_labels
-            .iter()
+        self.current_user_labels()
+            .into_iter()
             .find(|m| m.name.eq_ignore_ascii_case(name))
-            .cloned()
     }
 
     fn all_mailboxes(&self) -> Vec<mailbox::ResolvedMailbox> {
@@ -695,8 +709,19 @@ where
             .iter()
             .map(|m| mailbox::ResolvedMailbox::from(*m))
             .collect();
-        all.extend(self.user_labels.iter().cloned());
+        all.extend(self.current_user_labels());
         all
+    }
+
+    /// Read user labels from the shared per-account store in RuntimeAccountRegistry.
+    /// Falls back to the session-local cache if no account is authenticated.
+    fn current_user_labels(&self) -> Vec<mailbox::ResolvedMailbox> {
+        if let Some(account_id) = &self.authenticated_account_id {
+            let aid = crate::bridge::types::AccountId(account_id.clone());
+            self.config.runtime_accounts.get_user_labels(&aid)
+        } else {
+            self.user_labels.clone()
+        }
     }
 
     fn resolve_target_uids(
@@ -2369,49 +2394,11 @@ where
 
         let is_unread = !flags.iter().any(|f| matches!(f, ImapFlag::Seen));
 
-        // Try to import upstream via Proton API
-        let proton_id = if let Some(client) = &self.client {
-            if let Some(addr_keyrings) = &self.addr_keyrings {
-                if let Some((addr_id, keyring)) = addr_keyrings.iter().next() {
-                    match crypto_encrypt::encrypt_rfc822(keyring, &literal) {
-                        Ok(encrypted) => {
-                            let import_flags =
-                                types::MESSAGE_FLAG_RECEIVED | types::MESSAGE_FLAG_IMPORTED;
-                            let metadata = types::ImportMetadata {
-                                address_id: addr_id.clone(),
-                                label_ids: vec![mb.label_id.clone()],
-                                unread: is_unread,
-                                flags: import_flags,
-                            };
-                            match messages::import_message(client, &metadata, encrypted).await {
-                                Ok(res) => {
-                                    info!(
-                                        message_id = %res.message_id,
-                                        mailbox = %mb.name,
-                                        "APPEND imported upstream"
-                                    );
-                                    Some(res.message_id)
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "APPEND upstream import failed; storing locally only");
-                                    None
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "APPEND encryption failed; storing locally only");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Try to import upstream via Proton API.
+        // Use primary address, fall back to first available address with keys.
+        let proton_id = self
+            .try_import_upstream(&literal, &mb.label_id, is_unread, &mb.name)
+            .await;
 
         let proton_id = proton_id.unwrap_or_else(|| {
             let ts = std::time::SystemTime::now()
@@ -2471,6 +2458,57 @@ where
         self.writer
             .tagged_ok(tag, Some(&appenduid_code), "APPEND completed")
             .await
+    }
+
+    /// Attempt upstream import of an APPEND message. Returns the Proton
+    /// message ID on success, or None if import is unavailable or fails.
+    async fn try_import_upstream(
+        &self,
+        literal: &[u8],
+        label_id: &str,
+        is_unread: bool,
+        mailbox_name: &str,
+    ) -> Option<String> {
+        let client = self.client.as_ref()?;
+        let keyrings = self.addr_keyrings.as_ref()?;
+
+        // Use primary address; fall back to first available keyring
+        let (addr_id, keyring) = self
+            .primary_address_id
+            .as_ref()
+            .and_then(|id| keyrings.get(id).map(|kr| (id.as_str(), kr)))
+            .or_else(|| keyrings.iter().next().map(|(id, kr)| (id.as_str(), kr)))?;
+
+        let encrypted = match crypto_encrypt::encrypt_rfc822(keyring, literal) {
+            Ok(enc) => enc,
+            Err(e) => {
+                warn!(error = %e, "APPEND encryption failed; storing locally only");
+                return None;
+            }
+        };
+
+        let import_flags = types::MESSAGE_FLAG_RECEIVED | types::MESSAGE_FLAG_IMPORTED;
+        let metadata = types::ImportMetadata {
+            address_id: addr_id.to_string(),
+            label_ids: vec![label_id.to_string()],
+            unread: is_unread,
+            flags: import_flags,
+        };
+
+        match messages::import_message(client, &metadata, encrypted).await {
+            Ok(res) => {
+                info!(
+                    message_id = %res.message_id,
+                    mailbox = %mailbox_name,
+                    "APPEND imported upstream"
+                );
+                Some(res.message_id)
+            }
+            Err(e) => {
+                warn!(error = %e, "APPEND upstream import failed; storing locally only");
+                None
+            }
+        }
     }
 
     /// Get stream halves for TLS upgrade.
@@ -4891,6 +4929,51 @@ mod tests {
             1,
             None
         ));
+    }
+
+    #[test]
+    fn test_idle_timeout_is_30_minutes() {
+        assert_eq!(IDLE_TIMEOUT, Duration::from_secs(30 * 60));
+    }
+
+    #[tokio::test]
+    async fn test_idle_exits_on_done() {
+        let config = test_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        // Start IDLE in a spawned task, send DONE after reading continuation
+        let handle = tokio::spawn(async move {
+            session.handle_line("a001 IDLE").await.unwrap();
+            session
+        });
+
+        // Read the continuation response
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"), "response={response}");
+
+        // Send DONE to exit IDLE
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
+
+        let _session = handle.await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("a001 OK IDLE terminated"),
+            "response={response}"
+        );
     }
 
     #[tokio::test]

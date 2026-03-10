@@ -364,7 +364,8 @@ pub fn encrypt_rfc822(keyring: &Keyring, literal: &[u8]) -> Result<Vec<u8>> {
     let armored_str = String::from_utf8(armored)
         .map_err(|e| CryptoError::EncryptionFailed(format!("armor utf8: {}", e)))?;
 
-    // Extract relevant headers from the original message
+    // Parse headers from the original message, handling folded (continuation) lines.
+    // Folded headers start with whitespace and continue the previous header line.
     let literal_str = String::from_utf8_lossy(literal);
     let header_end = literal_str
         .find("\r\n\r\n")
@@ -372,25 +373,40 @@ pub fn encrypt_rfc822(keyring: &Keyring, literal: &[u8]) -> Result<Vec<u8>> {
         .unwrap_or(literal_str.len());
     let header_section = &literal_str[..header_end];
 
-    let boundary = format!(
-        "{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
+    let mut parsed_headers: Vec<(String, String)> = Vec::new();
+    for line in header_section.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation of previous header
+            if let Some(last) = parsed_headers.last_mut() {
+                last.1.push_str("\r\n");
+                last.1.push_str(line);
+            }
+        } else if let Some(colon) = line.find(':') {
+            let name = line[..colon].to_string();
+            let value = line[colon + 1..].trim_start().to_string();
+            parsed_headers.push((name, value));
+        }
+    }
+
+    let boundary = uuid::Uuid::new_v4().to_string().replace('-', "");
 
     let mut output = Vec::new();
 
-    // Write preserved headers
-    let preserve = ["From", "To", "Cc", "Subject", "Date", "Message-Id"];
-    for line in header_section.lines() {
-        for hdr in &preserve {
-            if line.to_lowercase().starts_with(&hdr.to_lowercase()) {
-                output.extend_from_slice(line.as_bytes());
-                output.extend_from_slice(b"\r\n");
-                break;
-            }
+    // Write preserved headers (with their folded continuations)
+    let preserve = [
+        "From",
+        "To",
+        "Cc",
+        "Subject",
+        "Date",
+        "Message-Id",
+        "Received",
+    ];
+    for (name, value) in &parsed_headers {
+        if preserve.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+            write!(output, "{}: {}\r\n", name, value)
+                .map_err(|e| CryptoError::EncryptionFailed(format!("write header: {}", e)))?;
         }
     }
 
@@ -635,5 +651,40 @@ mod tests {
 
         let decrypted = keyring.decrypt_armored(armored).unwrap();
         assert_eq!(decrypted, literal);
+    }
+
+    #[test]
+    fn test_encrypt_rfc822_preserves_folded_headers() {
+        let (_, keyring) = make_test_keyring();
+        let literal = b"From: alice@proton.me\r\nSubject: This is a very long\r\n subject that spans multiple lines\r\nTo: bob@example.com\r\n\r\nBody";
+
+        let encrypted = encrypt_rfc822(&keyring, literal).unwrap();
+        let encrypted_str = String::from_utf8_lossy(&encrypted);
+
+        // The full folded subject should be preserved
+        assert!(
+            encrypted_str
+                .contains("Subject: This is a very long\r\n subject that spans multiple lines"),
+            "folded Subject header not preserved: {encrypted_str}"
+        );
+    }
+
+    #[test]
+    fn test_encrypt_rfc822_uses_uuid_boundary() {
+        let (_, keyring) = make_test_keyring();
+        let literal = b"From: alice@proton.me\r\n\r\nBody";
+
+        let encrypted = encrypt_rfc822(&keyring, literal).unwrap();
+        let encrypted_str = String::from_utf8_lossy(&encrypted);
+
+        // boundary should be a 32-char hex string (uuid v4 without dashes)
+        let boundary_start = encrypted_str.find("boundary=\"").unwrap() + 10;
+        let boundary_end = encrypted_str[boundary_start..].find('"').unwrap() + boundary_start;
+        let boundary = &encrypted_str[boundary_start..boundary_end];
+        assert_eq!(boundary.len(), 32, "boundary={boundary}");
+        assert!(
+            boundary.chars().all(|c| c.is_ascii_hexdigit()),
+            "boundary should be hex: {boundary}"
+        );
     }
 }

@@ -230,8 +230,10 @@ pub fn build_bodystructure(data: &[u8]) -> String {
             let size = data.len();
             let lines = text.lines().count();
 
+            // RFC 3501 Section 7.4.2 BODYSTRUCTURE field order for text:
+            // type subtype params id desc enc octets lines md5 dsp lang loc
             format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL)",
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
                 type_main.to_uppercase(),
                 subtype.to_uppercase(),
                 charset,
@@ -435,7 +437,7 @@ fn build_part_structure(part: &str) -> String {
             let lines = body.lines().count();
 
             format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL)",
+                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
                 type_main.to_uppercase(),
                 subtype.to_uppercase(),
                 charset,

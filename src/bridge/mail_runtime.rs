@@ -162,6 +162,7 @@ pub struct MailRuntimeHandle {
     join_handle: tokio::task::JoinHandle<anyhow::Result<()>>,
     config: MailRuntimeConfig,
     active_sessions: Vec<Session>,
+    runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
     runtime_snapshot: Vec<super::accounts::RuntimeAccountInfo>,
     pim_reconcile_metrics: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
 }
@@ -177,6 +178,10 @@ impl MailRuntimeHandle {
 
     pub fn active_sessions(&self) -> &[Session] {
         &self.active_sessions
+    }
+
+    pub fn runtime_accounts(&self) -> Arc<super::accounts::RuntimeAccountRegistry> {
+        self.runtime_accounts.clone()
     }
 
     pub fn runtime_snapshot(&self) -> &[super::accounts::RuntimeAccountInfo] {
@@ -207,11 +212,12 @@ impl MailRuntimeHandle {
 
 pub async fn start(
     runtime_paths: RuntimePaths,
+    session_manager: Arc<super::session_manager::SessionManager>,
     config: MailRuntimeConfig,
     transition: MailRuntimeTransition,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
 ) -> Result<MailRuntimeHandle, MailRuntimeStartError> {
-    let prepared = prepare_runtime_context(&runtime_paths, &config).await?;
+    let prepared = prepare_runtime_context(&runtime_paths, session_manager, &config).await?;
 
     let imap_addr = format!("{}:{}", config.bind_host, config.imap_port);
     let smtp_addr = format!("{}:{}", config.bind_host, config.smtp_port);
@@ -276,6 +282,7 @@ pub async fn start(
     log_implicit_tls_start(&config, transition);
 
     let active_sessions = prepared.active_sessions.clone();
+    let runtime_accounts = prepared.runtime_accounts.clone();
     let runtime_snapshot = prepared.runtime_snapshot.clone();
     let pim_reconcile_metrics = Arc::new(std::sync::RwLock::new(
         PimReconcileMetricsSnapshot::default(),
@@ -301,6 +308,7 @@ pub async fn start(
         join_handle,
         config,
         active_sessions,
+        runtime_accounts,
         runtime_snapshot,
         pim_reconcile_metrics,
     })
@@ -326,6 +334,7 @@ struct PreparedMailRuntime {
 
 async fn prepare_runtime_context(
     runtime_paths: &RuntimePaths,
+    session_manager: Arc<super::session_manager::SessionManager>,
     config: &MailRuntimeConfig,
 ) -> anyhow::Result<PreparedMailRuntime> {
     if config.disable_tls {
@@ -340,17 +349,21 @@ async fn prepare_runtime_context(
     }
 
     let settings_dir = runtime_paths.settings_dir();
-    let sessions = vault::list_sessions(settings_dir).context("failed to load sessions")?;
+    let sessions = session_manager
+        .load_sessions_from_vault()
+        .await
+        .context("failed to load sessions")?;
     if sessions.is_empty() {
         anyhow::bail!("not logged in -- run `openproton-bridge login` first");
     }
 
     let mut active_sessions = Vec::new();
-    for mut session in sessions {
-        if session.access_token.is_empty() {
+    for session in sessions {
+        let account_id = super::types::AccountId(session.uid.clone());
+        let mut session = if session.access_token.is_empty() {
             let email = session.email.clone();
-            match refresh_session(session, settings_dir).await {
-                Ok(refreshed) => session = refreshed,
+            match session_manager.with_valid_access_token(&account_id).await {
+                Ok(refreshed) => refreshed,
                 Err(err) => {
                     tracing::warn!(
                         email = %email,
@@ -360,12 +373,17 @@ async fn prepare_runtime_context(
                     continue;
                 }
             }
-        }
+        } else {
+            session
+        };
 
         if session.bridge_password.is_none() {
             let bridge_password = generate_bridge_password();
             session.bridge_password = Some(bridge_password);
-            vault::save_session(&session, settings_dir)?;
+            session_manager
+                .persist_session(session.clone(), None)
+                .await
+                .context("failed to persist generated bridge password")?;
         }
 
         active_sessions.push(session);
@@ -451,10 +469,7 @@ async fn prepare_runtime_context(
     }
 
     let auth_router = super::auth_router::AuthRouter::new(account_registry);
-    let runtime_accounts = Arc::new(super::accounts::RuntimeAccountRegistry::new(
-        active_sessions.clone(),
-        settings_dir.to_path_buf(),
-    ));
+    let runtime_accounts = session_manager.runtime_accounts();
     for (account_id, material) in prefetched_auth_material {
         let _ = runtime_accounts
             .set_auth_material(&account_id, material)
@@ -1000,82 +1015,13 @@ pub fn log_bridge_start_failure(protocol: MailProtocol, config: &MailRuntimeConf
     }
 }
 
-async fn refresh_session(
-    session: Session,
-    settings_dir: &std::path::Path,
-) -> anyhow::Result<Session> {
-    let refresh_lock = super::token_refresh::lock_for_account(&session.uid);
-    let _refresh_guard = refresh_lock.lock().await;
-    tracing::info!(
-        pkg = "bridge/token",
-        user_id = %session.uid,
-        email = %session.email,
-        "access token missing, refreshing via stored refresh token"
-    );
-    let (auth, refreshed_api_mode) = api::auth::refresh_auth_with_mode_fallback(
-        session.api_mode,
-        &session.uid,
-        &session.refresh_token,
-        None,
-    )
-    .await
-    .map_err(|err| {
-        handle_startup_refresh_failure(&session, &err);
-        tracing::warn!(
-            pkg = "bridge/token",
-            user_id = %session.uid,
-            email = %session.email,
-            error = %err,
-            "stored refresh token exchange failed"
-        );
-        err
-    })?;
-    tracing::info!(
-        pkg = "bridge/token",
-        user_id = %auth.uid,
-        "stored refresh token exchange completed"
-    );
-
-    let mut refreshed = Session {
-        uid: auth.uid,
-        access_token: auth.access_token,
-        refresh_token: auth.refresh_token,
-        api_mode: refreshed_api_mode,
-        ..session
-    };
-
-    let mut canonical_user_id = None;
-    let client = api::client::ProtonClient::authenticated_with_mode(
-        refreshed.api_mode.base_url(),
-        refreshed.api_mode,
-        &refreshed.uid,
-        &refreshed.access_token,
-    )?;
-    match api::users::get_user(&client).await {
-        Ok(user_resp) => {
-            canonical_user_id = Some(user_resp.user.id.clone());
-            if !user_resp.user.email.trim().is_empty() {
-                refreshed.email = user_resp.user.email.clone();
-            }
-            if !user_resp.user.display_name.trim().is_empty() {
-                refreshed.display_name = user_resp.user.display_name.clone();
-            }
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to refresh canonical user context after token refresh");
-        }
-    }
-
-    vault::save_session_with_user_id(&refreshed, canonical_user_id.as_deref(), settings_dir)?;
-    tracing::info!(
-        pkg = "bridge/token",
-        user_id = %refreshed.uid,
-        email = %refreshed.email,
-        "session token refresh persisted"
-    );
-    Ok(refreshed)
+fn generate_bridge_password() -> String {
+    let mut token = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut token);
+    BASE64_URL_NO_PAD.encode(token)
 }
 
+#[cfg(test)]
 fn handle_startup_refresh_failure(session: &Session, err: &api::error::ApiError) {
     if !api::error::is_invalid_refresh_token_error(err) {
         return;
@@ -1087,12 +1033,6 @@ fn handle_startup_refresh_failure(session: &Session, err: &api::error::ApiError)
         email = %session.email,
         "stored refresh token is invalid; keeping account session in vault"
     );
-}
-
-fn generate_bridge_password() -> String {
-    let mut token = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut token);
-    BASE64_URL_NO_PAD.encode(token)
 }
 
 #[allow(clippy::too_many_arguments)]

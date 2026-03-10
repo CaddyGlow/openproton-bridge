@@ -233,6 +233,11 @@ fn is_session_runtime_usable(session: &Session) -> bool {
 }
 
 impl RuntimeAccountRegistry {
+    pub fn from_vault(vault_dir: PathBuf) -> crate::vault::Result<Self> {
+        let sessions = crate::vault::list_sessions(&vault_dir)?;
+        Ok(Self::new(sessions, vault_dir))
+    }
+
     pub fn new(sessions: Vec<Session>, vault_dir: PathBuf) -> Self {
         Self::with_optional_vault_dir(sessions, Some(vault_dir))
     }
@@ -285,6 +290,55 @@ impl RuntimeAccountRegistry {
     pub async fn get_session(&self, account_id: &AccountId) -> Option<Session> {
         let sessions = self.sessions.read().await;
         sessions.get(account_id).cloned()
+    }
+
+    pub async fn active_sessions(&self) -> Vec<Session> {
+        let sessions = self.sessions.read().await;
+        let mut active = sessions.values().cloned().collect::<Vec<_>>();
+        active.sort_by(|left, right| left.uid.cmp(&right.uid));
+        active
+    }
+
+    pub async fn has_sessions(&self) -> bool {
+        let sessions = self.sessions.read().await;
+        !sessions.is_empty()
+    }
+
+    pub async fn upsert_session(&self, session: Session) -> Result<(), AccountRuntimeError> {
+        if !is_session_runtime_usable(&session) {
+            warn!(
+                email = %session.email,
+                uid = %session.uid,
+                has_refresh_token = !session.refresh_token.trim().is_empty(),
+                "skipping invalid account session while updating runtime registry"
+            );
+            return Ok(());
+        }
+
+        let account_id = AccountId(session.uid.clone());
+        {
+            let mut sessions = self.sessions.write().await;
+            sessions.insert(account_id.clone(), session);
+        }
+        {
+            let mut health = self.health.write().await;
+            health.insert(account_id.clone(), AccountHealth::Healthy);
+        }
+        {
+            let mut generations = self.runtime_generations.write().await;
+            generations.entry(account_id.clone()).or_insert(0);
+        }
+        {
+            let mut watchers = self
+                .generation_watchers
+                .lock()
+                .expect("generation watcher lock poisoned");
+            watchers.entry(account_id).or_insert_with(|| {
+                let (generation_tx, _generation_rx) = watch::channel(0);
+                generation_tx
+            });
+        }
+        Ok(())
     }
 
     pub async fn get_auth_material(
@@ -451,6 +505,59 @@ impl RuntimeAccountRegistry {
         out
     }
 
+    pub async fn persist_session(
+        &self,
+        session: Session,
+        canonical_user_id: Option<&str>,
+    ) -> Result<(), AccountRuntimeError> {
+        if let Some(vault_dir) = &self.vault_dir {
+            crate::vault::save_session_with_user_id(&session, canonical_user_id, vault_dir)?;
+        }
+        self.upsert_session(session).await?;
+        Ok(())
+    }
+
+    pub async fn remove_session(&self, account_id: &AccountId) -> Result<(), AccountRuntimeError> {
+        let existed = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(account_id).is_some()
+        };
+        if !existed {
+            return Err(AccountRuntimeError::AccountNotFound(account_id.0.clone()));
+        }
+        {
+            let mut health = self.health.write().await;
+            health.remove(account_id);
+        }
+        {
+            let mut auth_material = self.auth_material.write().await;
+            auth_material.remove(account_id);
+        }
+        {
+            let mut generations = self.runtime_generations.write().await;
+            generations.remove(account_id);
+        }
+        {
+            let mut watchers = self
+                .generation_watchers
+                .lock()
+                .expect("generation watcher lock poisoned");
+            watchers.remove(account_id);
+        }
+        Ok(())
+    }
+
+    pub async fn remove_all_sessions(&self) {
+        self.sessions.write().await.clear();
+        self.health.write().await.clear();
+        self.auth_material.write().await.clear();
+        self.runtime_generations.write().await.clear();
+        self.generation_watchers
+            .lock()
+            .expect("generation watcher lock poisoned")
+            .clear();
+    }
+
     pub async fn with_valid_access_token(
         &self,
         account_id: &AccountId,
@@ -549,10 +656,7 @@ impl RuntimeAccountRegistry {
             )?;
         }
 
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.insert(account_id.clone(), updated.clone());
-        }
+        self.upsert_session(updated.clone()).await?;
         let _ = self.set_health(account_id, AccountHealth::Healthy).await;
         Ok(updated)
     }

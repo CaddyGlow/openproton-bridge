@@ -1177,6 +1177,11 @@ impl pb::bridge_server::Bridge for BridgeService {
         self.stop_mail_runtime_for_transition("trigger_reset").await;
         vault::remove_session(self.settings_dir())
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        self.state
+            .runtime_supervisor
+            .session_manager()
+            .remove_all_sessions()
+            .await;
         let _ = tokio::fs::remove_file(self.grpc_mail_settings_path()).await;
         let _ = tokio::fs::remove_file(self.grpc_app_settings_path()).await;
         self.clear_session_access_tokens().await;
@@ -2092,6 +2097,12 @@ impl pb::bridge_server::Bridge for BridgeService {
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        let _ = self
+            .state
+            .runtime_supervisor
+            .session_manager()
+            .remove_session(&crate::bridge::types::AccountId(session.uid.clone()))
+            .await;
         self.remove_session_access_token(&session.uid).await;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("send_bad_event_user_feedback_logout")
@@ -2116,6 +2127,12 @@ impl pb::bridge_server::Bridge for BridgeService {
             email = %session.email,
             "logout requested"
         );
+        let _ = self
+            .state
+            .runtime_supervisor
+            .session_manager()
+            .remove_session(&crate::bridge::types::AccountId(session.uid.clone()))
+            .await;
         self.remove_session_access_token(&session.uid).await;
         self.emit_user_disconnected(&session.email);
         self.refresh_sync_workers_for_transition("logout_user")

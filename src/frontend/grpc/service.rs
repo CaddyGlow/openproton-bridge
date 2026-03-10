@@ -288,14 +288,15 @@ impl BridgeService {
             return;
         }
 
-        let has_sessions = match vault::list_sessions(self.settings_dir()) {
-            Ok(sessions) => !sessions.is_empty(),
+        let has_sessions = match self.state.runtime_supervisor.session_manager().has_sessions().await
+        {
+            Ok(has_sessions) => has_sessions,
             Err(err) => {
                 warn!(
                     pkg = "grpc/bridge",
                     transition = "startup",
                     error = %err,
-                    "failed to load sessions while deciding grpc mail runtime startup"
+                    "failed to load managed sessions while deciding grpc mail runtime startup"
                 );
                 false
             }
@@ -375,8 +376,12 @@ impl BridgeService {
             return Ok(());
         }
 
-        let has_sessions = vault::list_sessions(self.settings_dir())
-            .map(|sessions| !sessions.is_empty())
+        let has_sessions = self
+            .state
+            .runtime_supervisor
+            .session_manager()
+            .has_sessions()
+            .await
             .unwrap_or(false);
         if !has_sessions {
             info!(
@@ -509,13 +514,14 @@ impl BridgeService {
 
         let _guard = self.state.mail_runtime_transition_lock.lock().await;
         let settings = self.state.mail_settings.lock().await.clone();
-        let has_sessions = match vault::list_sessions(self.settings_dir()) {
-            Ok(sessions) => !sessions.is_empty(),
+        let has_sessions = match self.state.runtime_supervisor.session_manager().has_sessions().await
+        {
+            Ok(has_sessions) => has_sessions,
             Err(err) => {
                 warn!(
                     pkg = "grpc/sync",
                     error = %err,
-                    "failed to load sessions while refreshing grpc sync owner"
+                    "failed to load managed sessions while refreshing grpc sync owner"
                 );
                 false
             }
@@ -1053,6 +1059,20 @@ impl BridgeService {
         if !session.access_token.trim().is_empty() {
             return Some(session.access_token.clone());
         }
+        let account_id = bridge::types::AccountId(session.uid.clone());
+        if let Some(managed) = self
+            .state
+            .runtime_supervisor
+            .session_manager()
+            .runtime_accounts()
+            .get_session(&account_id)
+            .await
+        {
+            if !managed.access_token.trim().is_empty() {
+                self.cache_session_access_token(&managed).await;
+                return Some(managed.access_token);
+            }
+        }
         self.state
             .session_access_tokens
             .lock()
@@ -1066,83 +1086,39 @@ impl BridgeService {
             return None;
         }
 
-        let lock = crate::bridge::token_refresh::lock_for_account(&session.uid);
-        let _guard = lock.lock().await;
-
-        let mut latest_session =
-            vault::load_session_by_account_id(self.settings_dir(), &session.uid)
-                .or_else(|_| vault::load_session_by_email(self.settings_dir(), &session.email))
-                .unwrap_or_else(|_| session.clone());
-
-        if !latest_session.access_token.trim().is_empty() {
-            self.cache_session_access_token(&latest_session).await;
-            return Some(latest_session.access_token.clone());
-        }
-        if latest_session.refresh_token.trim().is_empty() {
+        let account_id = bridge::types::AccountId(session.uid.clone());
+        let session_manager = self.state.runtime_supervisor.session_manager();
+        if let Err(err) = session_manager.load_or_seed_session(session).await {
+            warn!(
+                user_id = %session.uid,
+                error = %err,
+                "failed to hydrate grpc session manager before metadata refresh"
+            );
             return None;
         }
+        let refreshed = if session.access_token.trim().is_empty() {
+            session_manager.with_valid_access_token(&account_id).await
+        } else {
+            session_manager
+                .refresh_session_if_stale(&account_id, Some(session.access_token.as_str()))
+                .await
+        };
 
-        let mut client = ProtonClient::with_api_mode(latest_session.api_mode).ok()?;
-        let refreshed = match api::auth::refresh_auth(
-            &mut client,
-            &latest_session.uid,
-            &latest_session.refresh_token,
-            None,
-        )
-        .await
-        {
-            Ok(refreshed) => refreshed,
+        match refreshed {
+            Ok(updated) if !updated.access_token.trim().is_empty() => {
+                self.cache_session_access_token(&updated).await;
+                Some(updated.access_token)
+            }
+            Ok(_) => None,
             Err(err) => {
-                if let Ok(recovered) =
-                    vault::load_session_by_account_id(self.settings_dir(), &latest_session.uid)
-                {
-                    if !recovered.access_token.trim().is_empty() {
-                        self.cache_session_access_token(&recovered).await;
-                        return Some(recovered.access_token);
-                    }
-                }
                 warn!(
                     user_id = %session.uid,
                     error = %err,
                     "failed to refresh access token for grpc user metadata"
                 );
-                return None;
-            }
-        };
-
-        if refreshed.access_token.trim().is_empty() {
-            return None;
-        }
-
-        latest_session.access_token = refreshed.access_token.clone();
-        latest_session.refresh_token = refreshed.refresh_token;
-        let updated = latest_session;
-        let canonical_user_id = match api::users::get_user(&client).await {
-            Ok(user_resp) => Some(user_resp.user.id),
-            Err(err) => {
-                warn!(
-                    user_id = %session.uid,
-                    error = %err,
-                    "failed to fetch canonical user id after token refresh"
-                );
                 None
             }
-        };
-
-        if let Err(err) = vault::save_session_with_user_id(
-            &updated,
-            canonical_user_id.as_deref(),
-            self.settings_dir(),
-        ) {
-            warn!(
-                user_id = %session.uid,
-                error = %err,
-                "failed to persist refreshed session context"
-            );
         }
-
-        self.cache_session_access_token(&updated).await;
-        Some(updated.access_token)
     }
 
     async fn fetch_user_api_data(&self, session: &Session) -> Option<UserApiData> {
@@ -1327,6 +1303,19 @@ impl BridgeService {
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
         vault::set_default_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        if let Err(err) = self
+            .state
+            .runtime_supervisor
+            .session_manager()
+            .upsert_session(session.clone())
+            .await
+        {
+            warn!(
+                user_id = %session.uid,
+                error = %err,
+                "failed to update session manager after grpc login"
+            );
+        }
 
         client.set_auth(&session.uid, &session.access_token);
         self.cache_session_access_token(&session).await;

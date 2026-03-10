@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use tokio::sync::{mpsc, Mutex};
 
 use super::mail_runtime::{
@@ -14,6 +16,7 @@ pub struct RuntimeStartSnapshot {
 
 pub struct RuntimeSupervisor {
     runtime_paths: RuntimePaths,
+    session_manager: Arc<super::session_manager::SessionManager>,
     handle: Mutex<Option<SupervisorRuntimeHandle>>,
     start_snapshot: Mutex<Option<RuntimeStartSnapshot>>,
     transition_lock: Mutex<()>,
@@ -21,12 +24,20 @@ pub struct RuntimeSupervisor {
 
 impl RuntimeSupervisor {
     pub fn new(runtime_paths: RuntimePaths) -> Self {
+        let session_manager = Arc::new(super::session_manager::SessionManager::new(
+            runtime_paths.settings_dir().to_path_buf(),
+        ));
         Self {
             runtime_paths,
+            session_manager,
             handle: Mutex::new(None),
             start_snapshot: Mutex::new(None),
             transition_lock: Mutex::new(()),
         }
+    }
+
+    pub fn session_manager(&self) -> Arc<super::session_manager::SessionManager> {
+        self.session_manager.clone()
     }
 
     pub async fn start(
@@ -130,8 +141,14 @@ impl RuntimeSupervisor {
             return Ok(());
         }
 
-        let handle =
-            mail_runtime::start(self.runtime_paths.clone(), config, transition, notify_tx).await?;
+        let handle = mail_runtime::start(
+            self.runtime_paths.clone(),
+            self.session_manager.clone(),
+            config,
+            transition,
+            notify_tx,
+        )
+        .await?;
         let start_snapshot = RuntimeStartSnapshot {
             active_sessions: handle.active_sessions().to_vec(),
             runtime_snapshot: handle.runtime_snapshot().to_vec(),

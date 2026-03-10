@@ -350,12 +350,13 @@ async fn maybe_start_grpc_sync_workers(
         "grpc sync worker keychain context"
     );
 
-    let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
+    let session_manager = service.state.runtime_supervisor.session_manager();
+    let sessions = match session_manager.load_sessions_from_vault().await {
         Ok(sessions) => sessions,
         Err(err) => {
             warn!(
                 error = %err,
-                "failed to load sessions for grpc sync workers; skipping startup"
+                "failed to load managed sessions for grpc sync workers; skipping startup"
             );
             return Ok(None);
         }
@@ -376,10 +377,7 @@ async fn maybe_start_grpc_sync_workers(
     }
 
     let auth_router = bridge::auth_router::AuthRouter::new(account_registry);
-    let runtime_accounts = Arc::new(bridge::accounts::RuntimeAccountRegistry::new(
-        sessions,
-        runtime_paths.settings_dir().to_path_buf(),
-    ));
+    let runtime_accounts = session_manager.runtime_accounts();
     repair_vault_user_ids_for_compatibility(runtime_paths.settings_dir(), &runtime_accounts).await;
 
     let runtime_snapshot = runtime_accounts.snapshot().await;

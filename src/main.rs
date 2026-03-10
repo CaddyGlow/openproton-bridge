@@ -5032,65 +5032,9 @@ async fn refresh_session(
     session: api::types::Session,
     dir: &std::path::Path,
 ) -> anyhow::Result<api::types::Session> {
-    tracing::info!(
-        pkg = "bridge/token",
-        user_id = %session.uid,
-        email = %session.email,
-        "access token missing, refreshing via stored refresh token"
-    );
-    let mut client = api::client::ProtonClient::with_api_mode(session.api_mode)?;
-    let auth = api::auth::refresh_auth(&mut client, &session.uid, &session.refresh_token, None)
+    bridge::session_manager::SessionManager::refresh_and_persist_session(session, dir)
         .await
-        .map_err(|err| {
-            tracing::warn!(
-                pkg = "bridge/token",
-                user_id = %session.uid,
-                email = %session.email,
-                error = %err,
-                "stored refresh token exchange failed"
-            );
-            err
-        })?;
-    tracing::info!(
-        pkg = "bridge/token",
-        user_id = %auth.uid,
-        "stored refresh token exchange completed"
-    );
-
-    let mut refreshed = api::types::Session {
-        uid: auth.uid,
-        access_token: auth.access_token,
-        refresh_token: auth.refresh_token,
-        ..session
-    };
-
-    let mut canonical_user_id = None;
-    match api::users::get_user(&client).await {
-        Ok(user_resp) => {
-            canonical_user_id = Some(user_resp.user.id.clone());
-            if !user_resp.user.email.trim().is_empty() {
-                refreshed.email = user_resp.user.email.clone();
-            }
-            if !user_resp.user.display_name.trim().is_empty() {
-                refreshed.display_name = user_resp.user.display_name.clone();
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "failed to refresh canonical user context after token refresh"
-            );
-        }
-    }
-
-    vault::save_session_with_user_id(&refreshed, canonical_user_id.as_deref(), dir)?;
-    tracing::info!(
-        pkg = "bridge/token",
-        user_id = %refreshed.uid,
-        email = %refreshed.email,
-        "session token refresh persisted"
-    );
-    Ok(refreshed)
+        .map_err(anyhow::Error::from)
 }
 
 fn runtime_paths(override_dir: Option<&std::path::Path>) -> anyhow::Result<paths::RuntimePaths> {

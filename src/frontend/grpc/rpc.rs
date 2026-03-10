@@ -235,52 +235,29 @@ fn to_api_calendar_event(event: pb::PimCalendarEvent) -> crate::api::calendar::C
     }
 }
 
-#[allow(clippy::result_large_err)]
-fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Session, Status> {
-    let selector = selector.trim();
-    if selector.is_empty() {
-        return vault::load_session(settings_dir).map_err(|err| match err {
-            vault::VaultError::NotLoggedIn => Status::failed_precondition(
-                "no active account found; pass account_selector or login first",
-            ),
-            other => status_from_vault_error(other),
-        });
-    }
-
-    let sessions = vault::list_sessions(settings_dir).map_err(status_from_vault_error)?;
-    if sessions.is_empty() {
-        return Err(Status::failed_precondition("no accounts are configured"));
-    }
-
-    if let Ok(index) = selector.parse::<usize>() {
-        if let Some(session) = sessions.get(index) {
-            return Ok(session.clone());
-        }
-        return Err(Status::invalid_argument(format!(
-            "account index {index} is out of range (max {})",
-            sessions.len().saturating_sub(1)
-        )));
-    }
-
-    sessions
-        .into_iter()
-        .find(|session| {
-            session.uid == selector
-                || session.email.eq_ignore_ascii_case(selector)
-                || session.display_name.eq_ignore_ascii_case(selector)
-        })
-        .ok_or_else(|| Status::not_found(format!("unknown account selector: {selector}")))
-}
-
 impl BridgeService {
     #[allow(clippy::result_large_err)]
     async fn managed_sessions(&self) -> Result<Vec<Session>, Status> {
-        self.state
+        match self
+            .state
             .runtime_supervisor
             .session_manager()
             .load_sessions_from_vault()
             .await
-            .map_err(|err| Status::internal(format!("failed to load managed sessions: {err}")))
+        {
+            Ok(sessions) => Ok(sessions),
+            Err(err) => {
+                debug!(
+                    error = %err,
+                    "falling back to raw persisted sessions for non-runtime grpc selector"
+                );
+                vault::list_sessions(self.settings_dir()).map_err(|vault_err| {
+                    Status::internal(format!(
+                        "failed to load managed sessions: {err}; fallback failed: {vault_err}"
+                    ))
+                })
+            }
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -298,7 +275,7 @@ impl BridgeService {
     }
 
     #[allow(clippy::result_large_err)]
-    fn resolve_pim_store_for_account_selector(
+    async fn resolve_pim_store_for_account_selector(
         &self,
         account_selector: &str,
     ) -> Result<crate::pim::store::PimStore, Status> {
@@ -307,8 +284,7 @@ impl BridgeService {
             return Err(Status::invalid_argument("accountID is required"));
         }
 
-        let sessions =
-            vault::list_sessions(self.settings_dir()).map_err(status_from_vault_error)?;
+        let sessions = self.managed_sessions().await?;
         let Some(session) = sessions.into_iter().find(|session| {
             session.uid == selector || session.email.eq_ignore_ascii_case(selector)
         }) else {
@@ -2150,7 +2126,42 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::RenderMuttConfigRequest>,
     ) -> Result<Response<pb::RenderMuttConfigResponse>, Status> {
         let req = request.into_inner();
-        let session = resolve_mutt_config_session(self.settings_dir(), &req.account_selector)?;
+        let session = if req.account_selector.trim().is_empty() {
+            self.managed_sessions()
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Status::failed_precondition(
+                        "no active account found; pass account_selector or login first",
+                    )
+                })?
+        } else {
+            let selector = req.account_selector.trim();
+            let sessions = self.managed_sessions().await?;
+            if sessions.is_empty() {
+                return Err(Status::failed_precondition("no accounts are configured"));
+            }
+            if let Ok(index) = selector.parse::<usize>() {
+                sessions.get(index).cloned().ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "account index {index} is out of range (max {})",
+                        sessions.len().saturating_sub(1)
+                    ))
+                })?
+            } else {
+                sessions
+                    .into_iter()
+                    .find(|session| {
+                        session.uid == selector
+                            || session.email.eq_ignore_ascii_case(selector)
+                            || session.display_name.eq_ignore_ascii_case(selector)
+                    })
+                    .ok_or_else(|| {
+                        Status::not_found(format!("unknown account selector: {selector}"))
+                    })?
+            }
+        };
         let settings = self.state.mail_settings.lock().await.clone();
 
         let account_address = if req.address_override.trim().is_empty() {
@@ -2390,7 +2401,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::PimListContactsRequest>,
     ) -> Result<Response<pb::PimContactListResponse>, Status> {
         let req = request.into_inner();
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         let contacts = store
             .list_contacts(req.include_deleted, to_pim_page(req.page))
             .map_err(|err| Status::internal(format!("failed to list contacts: {err}")))?;
@@ -2408,7 +2419,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("contactID is required"));
         }
 
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         let contact = store
             .get_contact(req.contact_id.as_str(), req.include_deleted)
             .map_err(|err| Status::internal(format!("failed to get contact: {err}")))?;
@@ -2430,7 +2441,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("emailLike is required"));
         }
 
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         let contacts = store
             .search_contacts_by_email(req.email_like.as_str(), to_pim_page(req.page))
             .map_err(|err| Status::internal(format!("failed to search contacts: {err}")))?;
@@ -2444,7 +2455,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::PimListCalendarsRequest>,
     ) -> Result<Response<pb::PimCalendarListResponse>, Status> {
         let req = request.into_inner();
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         let calendars = store
             .list_calendars(req.include_deleted, to_pim_page(req.page))
             .map_err(|err| Status::internal(format!("failed to list calendars: {err}")))?;
@@ -2462,7 +2473,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("calendarID is required"));
         }
 
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         let calendar = store
             .get_calendar(req.calendar_id.as_str(), req.include_deleted)
             .map_err(|err| Status::internal(format!("failed to get calendar: {err}")))?;
@@ -2491,7 +2502,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             }
         }
 
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         let events = store
             .list_calendar_events(
                 req.calendar_id.as_str(),
@@ -2520,7 +2531,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("contact.id is required"));
         }
         let api_contact = to_api_contact(contact, req.emails, req.cards);
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         self.ensure_expected_contact_updated_at(
             &store,
             api_contact.metadata.id.as_str(),
@@ -2540,7 +2551,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         if req.contact_id.trim().is_empty() {
             return Err(Status::invalid_argument("contactID is required"));
         }
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         self.ensure_expected_contact_updated_at(
             &store,
             req.contact_id.as_str(),
@@ -2567,7 +2578,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("calendar.id is required"));
         }
         let api_calendar = to_api_calendar(calendar);
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         self.ensure_expected_calendar_updated_at(
             &store,
             api_calendar.id.as_str(),
@@ -2587,7 +2598,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         if req.calendar_id.trim().is_empty() {
             return Err(Status::invalid_argument("calendarID is required"));
         }
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         self.ensure_expected_calendar_updated_at(
             &store,
             req.calendar_id.as_str(),
@@ -2617,7 +2628,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             return Err(Status::invalid_argument("event.calendarID is required"));
         }
         let api_event = to_api_calendar_event(event);
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         self.ensure_expected_calendar_event_updated_at(
             &store,
             api_event.id.as_str(),
@@ -2637,7 +2648,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         if req.event_id.trim().is_empty() {
             return Err(Status::invalid_argument("eventID is required"));
         }
-        let store = self.resolve_pim_store_for_account_selector(&req.account_id)?;
+        let store = self.resolve_pim_store_for_account_selector(&req.account_id).await?;
         self.ensure_expected_calendar_event_updated_at(
             &store,
             req.event_id.as_str(),

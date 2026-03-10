@@ -908,13 +908,16 @@ fn effective_disk_cache_path(
     PathBuf::from(configured)
 }
 
-fn resolve_live_gluon_cache_root(runtime_paths: &RuntimePaths) -> Option<PathBuf> {
-    let sessions = match vault::list_sessions(runtime_paths.settings_dir()) {
+async fn resolve_live_gluon_cache_root(
+    runtime_paths: &RuntimePaths,
+    session_manager: &bridge::session_manager::SessionManager,
+) -> Option<PathBuf> {
+    let sessions = match session_manager.load_sessions_from_vault().await {
         Ok(sessions) => sessions,
         Err(err) => {
             warn!(
                 error = %err,
-                "failed to load sessions while resolving live gluon cache root"
+                "failed to load managed sessions while resolving live gluon cache root"
             );
             return None;
         }

@@ -274,6 +274,30 @@ fn resolve_mutt_config_session(settings_dir: &Path, selector: &str) -> Result<Se
 
 impl BridgeService {
     #[allow(clippy::result_large_err)]
+    async fn managed_sessions(&self) -> Result<Vec<Session>, Status> {
+        self.state
+            .runtime_supervisor
+            .session_manager()
+            .load_sessions_from_vault()
+            .await
+            .map_err(|err| Status::internal(format!("failed to load managed sessions: {err}")))
+    }
+
+    #[allow(clippy::result_large_err)]
+    async fn managed_session_by_lookup(&self, lookup: &str) -> Result<Session, Status> {
+        let lookup = lookup.trim();
+        if lookup.is_empty() {
+            return Err(Status::invalid_argument("user id is required"));
+        }
+
+        self.managed_sessions()
+            .await?
+            .into_iter()
+            .find(|session| session.uid == lookup || session.email.eq_ignore_ascii_case(lookup))
+            .ok_or_else(|| Status::not_found("user not found"))
+    }
+
+    #[allow(clippy::result_large_err)]
     fn resolve_pim_store_for_account_selector(
         &self,
         account_selector: &str,
@@ -1124,15 +1148,11 @@ impl pb::bridge_server::Bridge for BridgeService {
             "OptimizeCache"
         );
 
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| status_from_vault_error(err))?;
+        let sessions = self.managed_sessions().await?;
         let accounts = resolve_optimize_cache_accounts(&sessions, selector)?;
         let mailboxes = resolve_optimize_cache_mailboxes(&req.mailboxes)?;
 
-        let runtime_accounts = Arc::new(bridge::accounts::RuntimeAccountRegistry::new(
-            accounts.clone(),
-            self.settings_dir().to_path_buf(),
-        ));
+        let runtime_accounts = self.state.runtime_supervisor.session_manager().runtime_accounts();
 
         let account_ids = accounts
             .iter()
@@ -1284,7 +1304,8 @@ impl pb::bridge_server::Bridge for BridgeService {
         }
 
         let target = PathBuf::from(path.trim());
-        let current = match resolve_live_gluon_cache_root(&self.state.runtime_paths) {
+        let session_manager = self.state.runtime_supervisor.session_manager();
+        let current = match resolve_live_gluon_cache_root(&self.state.runtime_paths, &session_manager).await {
             Some(path) => path,
             None => self.state.active_disk_cache_path.lock().await.clone(),
         };
@@ -2007,8 +2028,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         _request: Request<()>,
     ) -> Result<Response<pb::UserListResponse>, Status> {
         debug!(pkg = "grpc", "GetUserList");
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| self.status_from_vault_error_with_events(err))?;
+        let sessions = self.managed_sessions().await?;
         let mut users = Vec::with_capacity(sessions.len());
         for session in &sessions {
             let split_mode =
@@ -2025,19 +2045,14 @@ impl pb::bridge_server::Bridge for BridgeService {
     async fn get_user(&self, request: Request<String>) -> Result<Response<pb::User>, Status> {
         let lookup = request.into_inner();
         debug!(pkg = "grpc", userID = %lookup, "GetUser");
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| self.status_from_vault_error_with_events(err))?;
-        let session = sessions
-            .iter()
-            .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(&lookup))
-            .ok_or_else(|| Status::not_found("user not found"))?;
+        let session = self.managed_session_by_lookup(&lookup).await?;
         let split_mode = vault::load_split_mode_by_account_id(self.settings_dir(), &session.uid)
             .ok()
             .flatten()
             .unwrap_or(false);
-        let api_data = self.fetch_user_api_data(session).await;
+        let api_data = self.fetch_user_api_data(&session).await;
         Ok(Response::new(session_to_user(
-            session,
+            &session,
             split_mode,
             api_data.as_ref(),
         )))
@@ -2048,13 +2063,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::UserSplitModeRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| self.status_from_vault_error_with_events(err))?;
-        let account_id = sessions
-            .iter()
-            .find(|s| s.uid == req.user_id || s.email.eq_ignore_ascii_case(&req.user_id))
-            .map(|s| s.uid.clone())
-            .ok_or_else(|| Status::not_found("user not found"))?;
+        let account_id = self.managed_session_by_lookup(&req.user_id).await?.uid;
 
         vault::save_split_mode_by_account_id(self.settings_dir(), &account_id, req.active)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
@@ -2072,16 +2081,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::UserBadEventFeedbackRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let lookup = req.user_id.trim();
-        if lookup.is_empty() {
-            return Err(Status::invalid_argument("user id is required"));
-        }
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| self.status_from_vault_error_with_events(err))?;
-        let session = sessions
-            .into_iter()
-            .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(lookup))
-            .ok_or_else(|| Status::not_found("user not found"))?;
+        let session = self.managed_session_by_lookup(&req.user_id).await?;
         tracing::warn!(
             user_id = %session.uid,
             do_resync = req.do_resync,
@@ -2112,12 +2112,7 @@ impl pb::bridge_server::Bridge for BridgeService {
 
     async fn logout_user(&self, request: Request<String>) -> Result<Response<()>, Status> {
         let value = request.into_inner();
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| self.status_from_vault_error_with_events(err))?;
-        let session = sessions
-            .into_iter()
-            .find(|s| s.uid == value || s.email.eq_ignore_ascii_case(&value))
-            .ok_or_else(|| Status::not_found("user not found"))?;
+        let session = self.managed_session_by_lookup(&value).await?;
 
         vault::remove_session_by_email(self.settings_dir(), &session.email)
             .map_err(|err| self.status_from_vault_error_with_events(err))?;
@@ -2217,16 +2212,7 @@ impl pb::bridge_server::Bridge for BridgeService {
         request: Request<pb::ConfigureAppleMailRequest>,
     ) -> Result<Response<()>, Status> {
         let req = request.into_inner();
-        let lookup = req.user_id.trim();
-        if lookup.is_empty() {
-            return Err(Status::invalid_argument("user id is required"));
-        }
-        let sessions = vault::list_sessions(self.settings_dir())
-            .map_err(|err| self.status_from_vault_error_with_events(err))?;
-        let session = sessions
-            .into_iter()
-            .find(|s| s.uid == lookup || s.email.eq_ignore_ascii_case(lookup))
-            .ok_or_else(|| Status::not_found("user not found"))?;
+        let session = self.managed_session_by_lookup(&req.user_id).await?;
         let requested_address = req.address.trim();
         if !requested_address.is_empty() && !session.email.eq_ignore_ascii_case(requested_address) {
             return Err(Status::invalid_argument(

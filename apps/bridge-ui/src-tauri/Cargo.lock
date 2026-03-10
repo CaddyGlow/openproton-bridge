@@ -276,6 +276,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
 
 [[package]]
+name = "base32"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "022dfe9eb35f19ebbcb51e0b40a5ab759f46ad60cadf7297e0bd085afb50e076"
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3296,12 +3302,14 @@ dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "base32",
  "base64 0.22.1",
  "bcrypt",
  "clap",
  "dirs 5.0.1",
  "flate2",
  "fs2",
+ "hmac",
  "keyring",
  "mailparse",
  "num-bigint",
@@ -3312,6 +3320,7 @@ dependencies = [
  "protoc-bin-vendored",
  "rand 0.8.5",
  "rcgen",
+ "regex",
  "reqwest 0.12.28",
  "rmp-serde",
  "rmpv",
@@ -3323,6 +3332,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "sha1",
  "sha2",
  "subtle",
  "tar",
@@ -4923,6 +4933,17 @@ checksum = "d52aa42f8fdf0fed91e5ce7f23d8138441002fa31dca008acf47e6fd4721f741"
 dependencies = [
  "nodrop",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "sha1"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
 ]
 
 [[package]]

@@ -238,26 +238,12 @@ fn to_api_calendar_event(event: pb::PimCalendarEvent) -> crate::api::calendar::C
 impl BridgeService {
     #[allow(clippy::result_large_err)]
     async fn managed_sessions(&self) -> Result<Vec<Session>, Status> {
-        match self
-            .state
+        self.state
             .runtime_supervisor
             .session_manager()
             .load_sessions_from_vault()
             .await
-        {
-            Ok(sessions) => Ok(sessions),
-            Err(err) => {
-                debug!(
-                    error = %err,
-                    "falling back to raw persisted sessions for non-runtime grpc selector"
-                );
-                vault::list_sessions(self.settings_dir()).map_err(|vault_err| {
-                    Status::internal(format!(
-                        "failed to load managed sessions: {err}; fallback failed: {vault_err}"
-                    ))
-                })
-            }
-        }
+            .map_err(|err| Status::internal(format!("failed to load managed sessions: {err}")))
     }
 
     #[allow(clippy::result_large_err)]

@@ -3059,16 +3059,10 @@ async fn run_interactive_reset(
 
 async fn cli_managed_sessions(dir: &std::path::Path) -> anyhow::Result<Vec<api::types::Session>> {
     let manager = bridge::session_manager::SessionManager::new(dir.to_path_buf());
-    match manager.load_sessions_from_vault().await {
-        Ok(sessions) => Ok(sessions),
-        Err(err) => {
-            tracing::debug!(
-                error = %err,
-                "falling back to raw persisted cli sessions for selector compatibility"
-            );
-            vault::list_sessions(dir).context("failed to load sessions")
-        }
-    }
+    manager
+        .load_sessions_from_vault()
+        .await
+        .map_err(anyhow::Error::from)
 }
 
 async fn resolve_account_selector_session(

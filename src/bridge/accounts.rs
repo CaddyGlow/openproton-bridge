@@ -233,11 +233,6 @@ fn is_session_runtime_usable(session: &Session) -> bool {
 }
 
 impl RuntimeAccountRegistry {
-    pub fn from_vault(vault_dir: PathBuf) -> crate::vault::Result<Self> {
-        let sessions = crate::vault::list_sessions(&vault_dir)?;
-        Ok(Self::new(sessions, vault_dir))
-    }
-
     pub fn new(sessions: Vec<Session>, vault_dir: PathBuf) -> Self {
         Self::with_optional_vault_dir(sessions, Some(vault_dir))
     }

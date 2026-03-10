@@ -1522,7 +1522,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-1".to_string(),
             email: "pim@example.com".to_string(),
             display_name: "Pim User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,
@@ -1609,7 +1609,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-contact-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-contact-1".to_string(),
             email: "pim-contacts@example.com".to_string(),
             display_name: "Pim Contacts User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,
@@ -1714,7 +1714,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-events-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-events-1".to_string(),
             email: "pim-events@example.com".to_string(),
             display_name: "Pim Events User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,
@@ -1800,7 +1800,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-write-contact-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-write-contact-1".to_string(),
             email: "pim-write-contact@example.com".to_string(),
             display_name: "Pim Write Contact User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,
@@ -1914,7 +1914,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-write-calendar-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-write-calendar-1".to_string(),
             email: "pim-write-calendar@example.com".to_string(),
             display_name: "Pim Write Calendar User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,
@@ -2099,7 +2099,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-stale-contact-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-stale-contact-1".to_string(),
             email: "pim-stale-contact@example.com".to_string(),
             display_name: "Pim Stale Contact User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,
@@ -2185,7 +2185,7 @@ mod tests {
         let session = Session {
             uid: "uid-pim-stale-event-1".to_string(),
             access_token: String::new(),
-            refresh_token: String::new(),
+            refresh_token: "refresh-pim-stale-event-1".to_string(),
             email: "pim-stale-event@example.com".to_string(),
             display_name: "Pim Stale Event User".to_string(),
             api_mode: crate::api::types::ApiMode::Bridge,

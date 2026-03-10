@@ -66,10 +66,7 @@ impl SessionManager {
     }
 
     pub async fn active_sessions(&self) -> Vec<Session> {
-        match self.load_sessions_from_vault().await {
-            Ok(sessions) => sessions,
-            Err(_) => self.runtime_accounts.active_sessions().await,
-        }
+        self.load_sessions_from_vault().await.unwrap_or_default()
     }
 
     pub async fn session(&self, account_id: &AccountId) -> Option<Session> {
@@ -126,27 +123,6 @@ impl SessionManager {
                 .map_err(SessionError::Persistence)?;
         }
         self.seed_session(session).await
-    }
-
-    pub async fn load_or_seed_session(&self, fallback: &Session) -> Result<Session, SessionError> {
-        if fallback.uid.trim().is_empty() {
-            return Err(SessionError::InvalidState("session uid is empty"));
-        }
-
-        let account_id = AccountId(fallback.uid.clone());
-        if let Some(existing) = self.runtime_accounts.get_session(&account_id).await {
-            return Ok(existing);
-        }
-
-        if let Some(vault_dir) = self.vault_dir.as_deref() {
-            let persisted = crate::vault::load_session_by_account_id(vault_dir, &fallback.uid)
-                .or_else(|_| crate::vault::load_session_by_email(vault_dir, &fallback.email));
-            if let Ok(session) = persisted {
-                return self.seed_session(session).await;
-            }
-        }
-
-        self.seed_session(fallback.clone()).await
     }
 
     pub async fn snapshot(&self) -> Vec<RuntimeAccountInfo> {

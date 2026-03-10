@@ -1,0 +1,92 @@
+{
+  "cases": [
+    {
+      "name": "typed_numeric_actions",
+      "payload": {
+        "Messages": [
+          {"ID": "msg-delete", "Action": 0},
+          {"ID": "msg-upsert", "Action": 2}
+        ]
+      },
+      "expected": {
+        "message_upserts": ["msg-upsert"],
+        "message_deletes": ["msg-delete"],
+        "labels_changed": false,
+        "addresses_changed": false
+      }
+    },
+    {
+      "name": "typed_deleted_boolean",
+      "payload": {
+        "Messages": [
+          {"ID": "msg-delete", "Deleted": true},
+          {"ID": "msg-upsert"}
+        ]
+      },
+      "expected": {
+        "message_upserts": ["msg-upsert"],
+        "message_deletes": ["msg-delete"],
+        "labels_changed": false,
+        "addresses_changed": false
+      }
+    },
+    {
+      "name": "typed_parent_message_fallback",
+      "payload": {
+        "ID": "msg-parent",
+        "Action": "0",
+        "Message": {
+          "Subject": "hello"
+        }
+      },
+      "expected": {
+        "message_upserts": [],
+        "message_deletes": ["msg-parent"],
+        "labels_changed": false,
+        "addresses_changed": false
+      }
+    },
+    {
+      "name": "heuristic_scalar_map_actions",
+      "payload": {
+        "Messages": {
+          "msg-del": 0,
+          "msg-upsert-a": 2,
+          "msg-upsert-b": "update"
+        }
+      },
+      "expected": {
+        "message_upserts": ["msg-upsert-a", "msg-upsert-b"],
+        "message_deletes": ["msg-del"],
+        "labels_changed": false,
+        "addresses_changed": false
+      }
+    },
+    {
+      "name": "heuristic_scalar_array_remove",
+      "payload": {
+        "Action": "remove",
+        "Messages": ["msg-a", "msg-b"]
+      },
+      "expected": {
+        "message_upserts": [],
+        "message_deletes": ["msg-a", "msg-b"],
+        "labels_changed": false,
+        "addresses_changed": false
+      }
+    },
+    {
+      "name": "typed_label_and_address_markers",
+      "payload": {
+        "Labels": [{"ID": "label-1", "Action": 2}],
+        "Addresses": [{"ID": "addr-1", "Action": 2}]
+      },
+      "expected": {
+        "message_upserts": [],
+        "message_deletes": [],
+        "labels_changed": true,
+        "addresses_changed": true
+      }
+    }
+  ]
+}

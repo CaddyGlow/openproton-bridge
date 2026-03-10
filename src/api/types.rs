@@ -412,6 +412,8 @@ pub struct MessageResponse {
 pub struct MessagesMetadataResponse {
     pub messages: Vec<MessageMetadata>,
     pub total: i64,
+    #[serde(default, deserialize_with = "deserialize_boolish_i32")]
+    pub stale: i32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -530,6 +532,35 @@ fn serialize_bool_as_int<S: serde::Serializer>(
     s: S,
 ) -> std::result::Result<S::Ok, S::Error> {
     s.serialize_i32(if *val { 1 } else { 0 })
+}
+
+fn deserialize_boolish_i32<'de, D>(deserializer: D) -> std::result::Result<i32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Null => Ok(0),
+        Value::Bool(flag) => Ok(i32::from(flag)),
+        Value::Number(number) => number
+            .as_i64()
+            .and_then(|v| i32::try_from(v).ok())
+            .ok_or_else(|| serde::de::Error::custom("invalid integer bool-like value")),
+        Value::String(text) => {
+            let normalized = text.trim().to_ascii_lowercase();
+            if normalized.is_empty() {
+                return Ok(0);
+            }
+            match normalized.as_str() {
+                "true" => Ok(1),
+                "false" => Ok(0),
+                _ => normalized
+                    .parse::<i32>()
+                    .map_err(|_| serde::de::Error::custom("invalid string bool-like value")),
+            }
+        }
+        _ => Err(serde::de::Error::custom("invalid bool-like type")),
+    }
 }
 
 /// Proton message flag bitmask constants.
@@ -1377,6 +1408,34 @@ mod tests {
         assert_eq!(att.disposition.as_deref(), Some("inline"));
         assert_eq!(att.signature.as_deref(), Some("sig"));
         assert!(att.headers.is_some());
+    }
+
+    #[test]
+    fn test_messages_metadata_response_deserializes_stale_boolish_values() {
+        let numeric = serde_json::json!({
+            "Messages": [],
+            "Total": 0,
+            "Stale": 1
+        });
+        let parsed_numeric: MessagesMetadataResponse = serde_json::from_value(numeric).unwrap();
+        assert_eq!(parsed_numeric.stale, 1);
+
+        let boolean = serde_json::json!({
+            "Messages": [],
+            "Total": 0,
+            "Stale": true
+        });
+        let parsed_boolean: MessagesMetadataResponse = serde_json::from_value(boolean).unwrap();
+        assert_eq!(parsed_boolean.stale, 1);
+
+        let string_zero = serde_json::json!({
+            "Messages": [],
+            "Total": 0,
+            "Stale": "0"
+        });
+        let parsed_string_zero: MessagesMetadataResponse =
+            serde_json::from_value(string_zero).unwrap();
+        assert_eq!(parsed_string_zero.stale, 0);
     }
 
     #[test]

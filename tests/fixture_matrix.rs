@@ -74,6 +74,37 @@ fn fixture_matrix_event_fixtures_cover_single_and_array_shapes() {
         events.iter().all(|event| event.get("ID").is_some()),
         "each event entry should have ID"
     );
+
+    let matrix = read_json("tests/parity/fixtures/events_delta_matrix.json");
+    let cases = matrix
+        .get("cases")
+        .and_then(Value::as_array)
+        .expect("event delta matrix fixture must contain cases array");
+    assert!(
+        !cases.is_empty(),
+        "event delta matrix fixture should define at least one case"
+    );
+    for case in cases {
+        assert!(
+            case.get("name").and_then(Value::as_str).is_some(),
+            "event delta matrix case should include name"
+        );
+        assert!(
+            case.get("payload").is_some(),
+            "event delta matrix case should include payload"
+        );
+        let expected = case
+            .get("expected")
+            .and_then(Value::as_object)
+            .expect("event delta matrix case should include expected object");
+        assert!(
+            expected.contains_key("message_upserts")
+                && expected.contains_key("message_deletes")
+                && expected.contains_key("labels_changed")
+                && expected.contains_key("addresses_changed"),
+            "event delta matrix expected object should include all expectation fields"
+        );
+    }
 }
 
 #[test]

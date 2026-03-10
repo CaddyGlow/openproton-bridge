@@ -205,6 +205,8 @@ pub enum EventWorkerError {
 
 pub type SharedCheckpointStore = Arc<dyn EventCheckpointStore<Error = ()> + Send + Sync>;
 const RESYNC_PAGE_SIZE: i32 = 150;
+const MAX_EVENT_PAGES_PER_POLL: usize = 50;
+const REFRESH_MAIL_FLAG: i32 = 1;
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_STATS_LOG_EVERY_ATTEMPTS: u64 = 20;
 const MAX_INITIAL_POLL_STAGGER_MS: u64 = 2_000;
@@ -443,6 +445,10 @@ fn redacted_subject_for_log(subject: &str) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     subject.hash(&mut hasher);
     format!("******** ({:08x})", (hasher.finish() & 0xffff_ffff) as u32)
+}
+
+fn has_mail_refresh_flag(refresh: i32) -> bool {
+    refresh & REFRESH_MAIL_FLAG != 0
 }
 
 fn format_ids_for_update(ids: &[String]) -> String {
@@ -1480,7 +1486,7 @@ async fn poll_account_once_for_generation(
     loop {
         ensure_account_generation(config, expected_generation, "poll_loop").await?;
         pages += 1;
-        if pages > 32 {
+        if pages > MAX_EVENT_PAGES_PER_POLL {
             warn!(
                 account_id = %config.account_id.0,
                 account_email = %config.account_email,
@@ -1528,9 +1534,10 @@ async fn poll_account_once_for_generation(
             };
         ensure_account_generation(config, expected_generation, "poll_after_fetch").await?;
 
-        let mut address_changed = response.refresh != 0;
+        let refresh_requires_resync = has_mail_refresh_flag(response.refresh);
+        let mut address_changed = refresh_requires_resync;
         let mut resync_state: Option<&str> = None;
-        if response.refresh != 0 && forced_sync_state.is_none() {
+        if refresh_requires_resync && forced_sync_state.is_none() {
             info!(
                 service = "user-events",
                 user = %config.account_id.0,
@@ -1641,7 +1648,7 @@ async fn poll_account_once_for_generation(
                     state.to_string()
                 } else if let Some(state) = resync_state {
                     state.to_string()
-                } else if response.refresh != 0 {
+                } else if refresh_requires_resync {
                     "refresh".to_string()
                 } else if response.more != 0 {
                     "more".to_string()
@@ -2203,6 +2210,7 @@ pub fn start_event_workers_with_sync_progress_and_pim(
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::path::Path;
     use std::sync::Mutex as StdMutex;
 
     use super::*;
@@ -2212,6 +2220,7 @@ mod tests {
     use crate::imap::store::InMemoryStore;
     use crate::pim::store::PimStore;
     use rusqlite::Connection;
+    use serde::Deserialize;
     use tempfile::tempdir;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2276,6 +2285,33 @@ mod tests {
         let db_path = tmp.path().join("account.db");
         Box::leak(Box::new(tmp));
         Arc::new(PimStore::new(db_path).unwrap())
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EventDeltaMatrixFixture {
+        cases: Vec<EventDeltaMatrixCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EventDeltaMatrixCase {
+        name: String,
+        payload: serde_json::Value,
+        expected: EventDeltaMatrixExpected,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct EventDeltaMatrixExpected {
+        message_upserts: Vec<String>,
+        message_deletes: Vec<String>,
+        labels_changed: bool,
+        addresses_changed: bool,
+    }
+
+    fn read_event_delta_matrix_fixture() -> EventDeltaMatrixFixture {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/parity/fixtures/events_delta_matrix.json");
+        let bytes = std::fs::read(&path).expect("event delta matrix fixture should be readable");
+        serde_json::from_slice(&bytes).expect("event delta matrix fixture should parse")
     }
 
     #[test]
@@ -2523,6 +2559,53 @@ mod tests {
             deltas,
             vec![EventDelta::MessageDelete("msg-a".to_string()),]
         );
+    }
+
+    #[test]
+    fn parse_event_deltas_matches_fixture_matrix_cases() {
+        let fixture = read_event_delta_matrix_fixture();
+        assert!(
+            !fixture.cases.is_empty(),
+            "fixture matrix should not be empty"
+        );
+
+        for case in fixture.cases {
+            let deltas = parse_event_deltas(&case.payload);
+            let mut upserts = Vec::new();
+            let mut deletes = Vec::new();
+            let mut labels_changed = false;
+            let mut addresses_changed = false;
+
+            for delta in deltas {
+                match delta {
+                    EventDelta::MessageUpsert(id) => upserts.push(id),
+                    EventDelta::MessageDelete(id) => deletes.push(id),
+                    EventDelta::LabelsChanged => labels_changed = true,
+                    EventDelta::AddressesChanged => addresses_changed = true,
+                }
+            }
+
+            assert_eq!(
+                upserts, case.expected.message_upserts,
+                "fixture case {} upserts mismatch",
+                case.name
+            );
+            assert_eq!(
+                deletes, case.expected.message_deletes,
+                "fixture case {} deletes mismatch",
+                case.name
+            );
+            assert_eq!(
+                labels_changed, case.expected.labels_changed,
+                "fixture case {} labels_changed mismatch",
+                case.name
+            );
+            assert_eq!(
+                addresses_changed, case.expected.addresses_changed,
+                "fixture case {} addresses_changed mismatch",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -3013,6 +3096,87 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(checkpoint.sync_state.as_deref(), Some("refresh_resync"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_non_mail_refresh_bit_does_not_trigger_resync() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 2,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            store.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_more_chain_honors_upstream_page_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-0",
+                "More": 1,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .expect(MAX_EVENT_PAGES_PER_POLL as u64)
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(&server.uri(), runtime, auth_router, store, checkpoints);
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-0");
     }
 
     #[tokio::test]

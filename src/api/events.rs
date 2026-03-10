@@ -7,7 +7,7 @@ use super::client::{
 use super::error::{ApiError, Result};
 use super::types::{EventsResponse, TypedEventPayload};
 
-const MAX_TRANSIENT_ATTEMPTS: usize = 2;
+const MAX_TRANSIENT_ATTEMPTS: usize = 3;
 
 /// Fetch incremental user events from Proton.
 ///
@@ -167,6 +167,60 @@ mod tests {
         let resp = get_events(&client, "event-1").await.unwrap();
         assert_eq!(resp.event_id, "event-2");
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_events_retries_twice_before_success() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_task = calls.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf).await.unwrap();
+                let current = calls_task.fetch_add(1, Ordering::SeqCst);
+                let (body, status) = if current < 2 {
+                    (
+                        serde_json::json!({
+                            "Code": 503,
+                            "Error": "temporary unavailable"
+                        }),
+                        "503 Service Unavailable",
+                    )
+                } else {
+                    (
+                        serde_json::json!({
+                            "Code": 1000,
+                            "EventID": "event-3",
+                            "Events": [{"ID": "evt-final"}]
+                        }),
+                        "200 OK",
+                    )
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\nRetry-After: 0\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+
+        let client =
+            ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
+        let resp = get_events(&client, "event-1").await.unwrap();
+        assert_eq!(resp.event_id, "event-3");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         server.await.unwrap();
     }
 

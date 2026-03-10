@@ -28,6 +28,11 @@ Primary files:
 - Done: fixture-driven typed-vs-heuristic payload matrix coverage:
   - `tests/parity/fixtures/events_delta_matrix.json`
   - `parse_event_deltas_matches_fixture_matrix_cases`
+- Done: non-mail refresh bit fixture coverage broadened:
+  - `tests/parity/fixtures/events_refresh_bits.json`
+  - `poll_account_once_multiple_non_mail_refresh_bits_do_not_trigger_resync`
+- Done: transient fetch retry budget increased to `3` attempts with regression coverage.
+  - `get_events_retries_twice_before_success`
 - Done (intentional deviation): stale-cursor telemetry parity reviewed.
   - Upstream emits user bad-event signals via dedicated event bus.
   - OpenProton records `cursor_reset_resync` checkpoint state and account health transitions.
@@ -63,7 +68,7 @@ Risk:
 
 Validation tasks:
 
-- Extend fixture matrix as additional upstream refresh bits appear.
+- Keep refresh-bit fixture matrix updated as additional upstream bits appear.
 
 ### 3) Cursor reset flow diverges from upstream style (medium)
 
@@ -95,20 +100,20 @@ Validation tasks:
 
 - Build fixture matrix for mixed payload shapes and compare message/label/address deltas produced.
 
-### 5) Transient retry policy is stricter/smaller (low)
+### 5) Transient retry policy (resolved, still intentionally bounded)
 
 Observed:
 
-- OpenProton `get_events` retries transient failures with `MAX_TRANSIENT_ATTEMPTS = 2`.
+- OpenProton `get_events` retries transient failures with `MAX_TRANSIENT_ATTEMPTS = 3`.
 - Upstream behavior is primarily stream-driven and may smooth retries differently in higher layers.
 
 Risk:
 
-- Slightly higher sensitivity to transient API failures.
+- Residual risk is low; retries remain intentionally bounded per poll cycle.
 
 Validation tasks:
 
-- Simulate 429/5xx bursts and compare recovery time + skipped work across both stacks.
+- Keep burst simulations (`429/5xx`) in API event tests and runtime e2e scenarios.
 
 ## Proposed implementation plan (step 3 execution)
 

@@ -3299,6 +3299,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_multiple_non_mail_refresh_bits_do_not_trigger_resync() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 2,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-2",
+                "More": 0,
+                "Refresh": 4,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-3",
+                "More": 0,
+                "Refresh": 8,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime,
+            auth_router,
+            store.clone(),
+            checkpoints.clone(),
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        let next = poll_account_once(&config, &next).await.unwrap();
+        assert_eq!(next, "event-2");
+        let next = poll_account_once(&config, &next).await.unwrap();
+        assert_eq!(next, "event-3");
+
+        assert_eq!(
+            store.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
+        );
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-3");
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
     async fn poll_account_once_more_chain_honors_upstream_page_limit() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

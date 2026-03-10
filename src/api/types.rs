@@ -838,14 +838,19 @@ pub struct DraftTemplate {
 #[serde(rename_all = "PascalCase")]
 pub struct CreateDraftReq {
     pub message: DraftTemplate,
-    #[serde(
-        rename = "AttachmentKeyPackets",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub attachment_key_packets: Option<Vec<String>>,
+    #[serde(rename = "AttachmentKeyPackets")]
+    pub attachment_key_packets: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     pub action: i32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct UpdateDraftReq {
+    pub message: DraftTemplate,
+    #[serde(rename = "AttachmentKeyPackets")]
+    pub attachment_key_packets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1515,7 +1520,7 @@ mod tests {
                 unread: 0,
                 external_id: None,
             },
-            attachment_key_packets: Some(vec!["packet-a".to_string(), "packet-b".to_string()]),
+            attachment_key_packets: vec!["packet-a".to_string(), "packet-b".to_string()],
             parent_id: None,
             action: 0,
         };
@@ -1527,6 +1532,58 @@ mod tests {
         );
         assert_eq!(json["Action"], 0);
         assert!(json.get("ParentID").is_none());
+    }
+
+    #[test]
+    fn test_create_draft_req_serializes_empty_attachment_key_packets() {
+        let req = CreateDraftReq {
+            message: DraftTemplate {
+                subject: "Hello".to_string(),
+                sender: EmailAddress {
+                    name: "Me".to_string(),
+                    address: "me@proton.me".to_string(),
+                },
+                to_list: vec![],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "body".to_string(),
+                mime_type: "text/html".to_string(),
+                unread: 0,
+                external_id: None,
+            },
+            attachment_key_packets: vec![],
+            parent_id: None,
+            action: 0,
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["AttachmentKeyPackets"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn test_update_draft_req_serialize() {
+        let req = UpdateDraftReq {
+            message: DraftTemplate {
+                subject: "Updated".to_string(),
+                sender: EmailAddress {
+                    name: "Me".to_string(),
+                    address: "me@proton.me".to_string(),
+                },
+                to_list: vec![],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "updated-body".to_string(),
+                mime_type: "text/plain".to_string(),
+                unread: 0,
+                external_id: Some("external-1".to_string()),
+            },
+            attachment_key_packets: vec!["packet-1".to_string()],
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["Message"]["Subject"], "Updated");
+        assert_eq!(
+            json["AttachmentKeyPackets"],
+            serde_json::json!(["packet-1"])
+        );
     }
 
     #[test]

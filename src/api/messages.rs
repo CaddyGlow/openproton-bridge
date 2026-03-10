@@ -10,7 +10,7 @@ use super::client::{
 use super::error::{ApiError, Result};
 use super::types::{
     AttachmentResponse, CreateDraftReq, MessageFilter, MessageResponse, MessagesMetadataResponse,
-    SendDraftReq, SendDraftResponse,
+    SendDraftReq, SendDraftResponse, UpdateDraftReq,
 };
 
 const API_SUCCESS_CODE: i64 = 1000;
@@ -528,6 +528,23 @@ pub async fn create_draft(client: &ProtonClient, req: &CreateDraftReq) -> Result
     Ok(msg_resp)
 }
 
+/// Update an existing draft message.
+///
+/// Reference: go-proton-api/message_send.go UpdateDraft
+pub async fn update_draft(
+    client: &ProtonClient,
+    draft_id: &str,
+    req: &UpdateDraftReq,
+) -> Result<MessageResponse> {
+    info!(draft_id = %draft_id, "updating draft");
+    let path = format!("/mail/v4/messages/{}", draft_id);
+    let resp = send_logged(client.put(&path).json(req)).await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let msg_resp: MessageResponse = serde_json::from_value(json)?;
+    Ok(msg_resp)
+}
+
 /// Parameters for uploading an encrypted attachment.
 pub struct UploadAttachmentReq {
     pub message_id: String,
@@ -623,7 +640,7 @@ pub async fn get_labels(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn setup_authenticated_client(server: &MockServer) -> ProtonClient {
@@ -1227,8 +1244,45 @@ mod tests {
         let server = MockServer::start().await;
         let client = setup_authenticated_client(&server).await;
 
+        let req = CreateDraftReq {
+            message: DraftTemplate {
+                subject: "Test Draft".to_string(),
+                sender: EmailAddress {
+                    name: "Alice".to_string(),
+                    address: "alice@proton.me".to_string(),
+                },
+                to_list: vec![EmailAddress {
+                    name: "Bob".to_string(),
+                    address: "bob@proton.me".to_string(),
+                }],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "encrypted body".to_string(),
+                mime_type: "text/plain".to_string(),
+                unread: 0,
+                external_id: None,
+            },
+            attachment_key_packets: vec![],
+            parent_id: None,
+            action: 0,
+        };
+
         Mock::given(method("POST"))
             .and(path("/mail/v4/messages"))
+            .and(body_json(serde_json::json!({
+                "Message": {
+                    "Subject": "Test Draft",
+                    "Sender": { "Name": "Alice", "Address": "alice@proton.me" },
+                    "ToList": [{ "Name": "Bob", "Address": "bob@proton.me" }],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Body": "encrypted body",
+                    "MIMEType": "text/plain",
+                    "Unread": 0
+                },
+                "AttachmentKeyPackets": [],
+                "Action": 0
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "Message": {
@@ -1253,29 +1307,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        let req = CreateDraftReq {
-            message: DraftTemplate {
-                subject: "Test Draft".to_string(),
-                sender: EmailAddress {
-                    name: "Alice".to_string(),
-                    address: "alice@proton.me".to_string(),
-                },
-                to_list: vec![EmailAddress {
-                    name: "Bob".to_string(),
-                    address: "bob@proton.me".to_string(),
-                }],
-                cc_list: vec![],
-                bcc_list: vec![],
-                body: "encrypted body".to_string(),
-                mime_type: "text/plain".to_string(),
-                unread: 0,
-                external_id: None,
-            },
-            attachment_key_packets: None,
-            parent_id: None,
-            action: 0,
-        };
-
         let resp = create_draft(&client, &req).await.unwrap();
         assert_eq!(resp.message.metadata.id, "draft-1");
         assert_eq!(resp.message.metadata.subject, "Test Draft");
@@ -1287,15 +1318,6 @@ mod tests {
 
         let server = MockServer::start().await;
         let client = setup_authenticated_client(&server).await;
-
-        Mock::given(method("POST"))
-            .and(path("/mail/v4/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 2500,
-                "Error": "Draft creation failed"
-            })))
-            .mount(&server)
-            .await;
 
         let req = CreateDraftReq {
             message: DraftTemplate {
@@ -1312,10 +1334,33 @@ mod tests {
                 unread: 0,
                 external_id: None,
             },
-            attachment_key_packets: None,
+            attachment_key_packets: vec![],
             parent_id: None,
             action: 0,
         };
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(body_json(serde_json::json!({
+                "Message": {
+                    "Subject": "Bad",
+                    "Sender": { "Name": "", "Address": "bad" },
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Body": "",
+                    "MIMEType": "text/plain",
+                    "Unread": 0
+                },
+                "AttachmentKeyPackets": [],
+                "Action": 0
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 2500,
+                "Error": "Draft creation failed"
+            })))
+            .mount(&server)
+            .await;
 
         let err = create_draft(&client, &req).await.unwrap_err();
         assert!(err.to_string().contains("Draft creation failed"));
@@ -1323,13 +1368,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_draft() {
-        use super::super::types::SendDraftReq;
+        use super::super::types::{MessagePackage, SendDraftReq};
 
         let server = MockServer::start().await;
         let client = setup_authenticated_client(&server).await;
 
+        let req = SendDraftReq {
+            packages: vec![MessagePackage {
+                addresses: std::collections::HashMap::new(),
+                mime_type: "text/plain".to_string(),
+                package_type: crate::api::types::CLEAR_SCHEME,
+                body: "body64".to_string(),
+                body_key: None,
+                attachment_keys: None,
+            }],
+        };
+
         Mock::given(method("POST"))
             .and(path("/mail/v4/messages/draft-1"))
+            .and(body_json(serde_json::json!({
+                "Packages": [{
+                    "Addresses": {},
+                    "MIMEType": "text/plain",
+                    "Type": crate::api::types::CLEAR_SCHEME,
+                    "Body": "body64"
+                }]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "Sent": {
@@ -1354,8 +1418,6 @@ mod tests {
             .mount(&server)
             .await;
 
-        let req = SendDraftReq { packages: vec![] };
-
         let resp = send_draft(&client, "draft-1", &req).await.unwrap();
         assert_eq!(resp.sent.metadata.id, "sent-1");
         assert_eq!(resp.sent.metadata.subject, "Sent Email");
@@ -1363,13 +1425,32 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_draft_api_error() {
-        use super::super::types::SendDraftReq;
+        use super::super::types::{MessagePackage, SendDraftReq};
 
         let server = MockServer::start().await;
         let client = setup_authenticated_client(&server).await;
 
+        let req = SendDraftReq {
+            packages: vec![MessagePackage {
+                addresses: std::collections::HashMap::new(),
+                mime_type: "text/plain".to_string(),
+                package_type: crate::api::types::CLEAR_SCHEME,
+                body: "body64".to_string(),
+                body_key: None,
+                attachment_keys: None,
+            }],
+        };
+
         Mock::given(method("POST"))
             .and(path("/mail/v4/messages/draft-bad"))
+            .and(body_json(serde_json::json!({
+                "Packages": [{
+                    "Addresses": {},
+                    "MIMEType": "text/plain",
+                    "Type": crate::api::types::CLEAR_SCHEME,
+                    "Body": "body64"
+                }]
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 2501,
                 "Error": "Draft not found"
@@ -1377,10 +1458,80 @@ mod tests {
             .mount(&server)
             .await;
 
-        let req = SendDraftReq { packages: vec![] };
-
         let err = send_draft(&client, "draft-bad", &req).await.unwrap_err();
         assert!(err.to_string().contains("Draft not found"));
+    }
+
+    #[tokio::test]
+    async fn test_update_draft() {
+        use super::super::types::{DraftTemplate, EmailAddress, UpdateDraftReq};
+
+        let server = MockServer::start().await;
+        let client = setup_authenticated_client(&server).await;
+
+        let req = UpdateDraftReq {
+            message: DraftTemplate {
+                subject: "Updated Draft".to_string(),
+                sender: EmailAddress {
+                    name: "Alice".to_string(),
+                    address: "alice@proton.me".to_string(),
+                },
+                to_list: vec![EmailAddress {
+                    name: "Bob".to_string(),
+                    address: "bob@proton.me".to_string(),
+                }],
+                cc_list: vec![],
+                bcc_list: vec![],
+                body: "updated encrypted body".to_string(),
+                mime_type: "text/plain".to_string(),
+                unread: 0,
+                external_id: None,
+            },
+            attachment_key_packets: vec![],
+        };
+
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/draft-1"))
+            .and(body_json(serde_json::json!({
+                "Message": {
+                    "Subject": "Updated Draft",
+                    "Sender": { "Name": "Alice", "Address": "alice@proton.me" },
+                    "ToList": [{ "Name": "Bob", "Address": "bob@proton.me" }],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Body": "updated encrypted body",
+                    "MIMEType": "text/plain",
+                    "Unread": 0
+                },
+                "AttachmentKeyPackets": []
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Message": {
+                    "ID": "draft-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["1", "8"],
+                    "Subject": "Updated Draft",
+                    "Sender": { "Name": "Alice", "Address": "alice@proton.me" },
+                    "ToList": [{ "Name": "Bob", "Address": "bob@proton.me" }],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 256,
+                    "Unread": 0,
+                    "NumAttachments": 0,
+                    "Header": "",
+                    "Body": "updated encrypted body",
+                    "MIMEType": "text/plain",
+                    "Attachments": []
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = update_draft(&client, "draft-1", &req).await.unwrap();
+        assert_eq!(resp.message.metadata.id, "draft-1");
+        assert_eq!(resp.message.metadata.subject, "Updated Draft");
     }
 
     #[tokio::test]

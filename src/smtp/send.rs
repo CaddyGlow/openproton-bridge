@@ -311,11 +311,7 @@ pub async fn send_message(
             unread: 0,
             external_id: None,
         },
-        attachment_key_packets: if draft_attachment_key_packets.is_empty() {
-            None
-        } else {
-            Some(draft_attachment_key_packets)
-        },
+        attachment_key_packets: draft_attachment_key_packets,
         parent_id: None,
         action: 0,
     };

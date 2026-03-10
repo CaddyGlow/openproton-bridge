@@ -105,6 +105,32 @@ fn fixture_matrix_event_fixtures_cover_single_and_array_shapes() {
             "event delta matrix expected object should include all expectation fields"
         );
     }
+
+    let refresh_matrix = read_json("tests/parity/fixtures/events_refresh_bits.json");
+    let refresh_cases = refresh_matrix
+        .get("cases")
+        .and_then(Value::as_array)
+        .expect("refresh bit matrix fixture must contain cases array");
+    assert!(
+        !refresh_cases.is_empty(),
+        "refresh bit matrix fixture should define at least one case"
+    );
+
+    for case in refresh_cases {
+        let refresh = case
+            .get("refresh")
+            .and_then(Value::as_i64)
+            .expect("refresh bit case should include numeric refresh");
+        let expect_mail_resync = case
+            .get("expect_mail_resync")
+            .and_then(Value::as_bool)
+            .expect("refresh bit case should include expect_mail_resync bool");
+        let has_mail_refresh = refresh & 1 != 0;
+        assert_eq!(
+            has_mail_refresh, expect_mail_resync,
+            "mail refresh expectation mismatch for case {case}"
+        );
+    }
 }
 
 #[test]

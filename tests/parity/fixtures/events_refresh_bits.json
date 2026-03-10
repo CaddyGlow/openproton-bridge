@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "name": "no_refresh",
+      "refresh": 0,
+      "expect_mail_resync": false
+    },
+    {
+      "name": "mail_refresh",
+      "refresh": 1,
+      "expect_mail_resync": true
+    },
+    {
+      "name": "non_mail_refresh_bit_2",
+      "refresh": 2,
+      "expect_mail_resync": false
+    },
+    {
+      "name": "non_mail_refresh_bit_4",
+      "refresh": 4,
+      "expect_mail_resync": false
+    },
+    {
+      "name": "non_mail_refresh_bit_8",
+      "refresh": 8,
+      "expect_mail_resync": false
+    },
+    {
+      "name": "mail_plus_other_bits",
+      "refresh": 3,
+      "expect_mail_resync": true
+    }
+  ]
+}

@@ -19,7 +19,7 @@
 3. Refresh bitmask semantics audit
    - Area: event loop resync trigger
    - Status: resolved in current pass for mail refresh handling (`RefreshMail` bit semantics).
-   - Remaining: broaden fixture coverage for non-mail refresh values.
+   - Coverage: non-mail refresh matrix fixtures + regressions added (`2/4/8` bits).
    - Target files: `src/bridge/events.rs`, `src/api/types.rs`
 
 ## Medium
@@ -43,13 +43,13 @@
 ## Low
 
 1. Transient retry strategy differences in event fetch path
+   - Status: resolved in current pass (retry budget raised to `3`, burst regressions added).
+   - Target files: `src/api/events.rs`, `docs/parity/02-event-loop-parity.md`
 2. Recovery telemetry/event-emission shape differences (intentional runtime-model divergence)
+   - Status: accepted intentional deviation (documented).
+   - Target files: `docs/parity/02-event-loop-parity.md`, `docs/parity/05-checkpoint-recovery.md`
 
 ## Suggested execution order
 
-1. High-1 (`Stale` handling)
-2. High-2 (label/unlabel partial failure)
-3. High-3 (refresh bit semantics)
-4. Medium-1 (`More` cap and backlog convergence)
-5. Medium-2 (IDLE granularity parity)
-6. Remaining medium/low items
+1. Keep parity fixtures current as upstream payload/refresh shapes evolve.
+2. Extend runtime replay tests for restart and cursor-reset scenarios.

@@ -7,7 +7,8 @@
   "event_payloads": {
     "single_event": "tests/parity/fixtures/events_single_object.json",
     "events_array": "tests/parity/fixtures/events_array.json",
-    "event_delta_matrix": "tests/parity/fixtures/events_delta_matrix.json"
+    "event_delta_matrix": "tests/parity/fixtures/events_delta_matrix.json",
+    "refresh_bits_matrix": "tests/parity/fixtures/events_refresh_bits.json"
   },
   "grpc_login_payloads": {
     "base64_password": "tests/parity/fixtures/grpc_login_base64.json",

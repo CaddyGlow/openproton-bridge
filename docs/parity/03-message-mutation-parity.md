@@ -29,6 +29,10 @@ Primary files:
   - `test_mark_messages_read_chunks_large_batches`
   - `test_mark_messages_unread_chunks_large_batches`
   - `test_delete_messages_chunks_large_batches`
+- Done: draft/send endpoint contract parity pass completed.
+  - `CreateDraftReq.AttachmentKeyPackets` now always serializes (including empty list), matching GPA request shape.
+  - Added `UpdateDraftReq` + `update_draft` endpoint wrapper (GPA parity for draft update flow).
+  - Added wire-level request-body assertions for `create_draft`, `update_draft`, and `send_draft`.
 
 ## Current findings
 
@@ -96,20 +100,20 @@ Validation tasks:
 
 - Document command-by-command policy and expected client-visible responses.
 
-### 5) Draft/send parity still needs endpoint-contract pass (medium)
+### 5) Draft/send endpoint-contract parity (resolved)
 
 Observed:
 
-- OpenProton has `create_draft` and `send_draft` wrappers.
-- GPA draft/send semantics live across additional message send/import types; parity not yet verified in this step.
+- OpenProton now has `create_draft`, `update_draft`, and `send_draft` wrappers with GPA-aligned request field shapes.
+- Request body tests now validate serialized draft/send payloads against expected API contracts.
 
 Risk:
 
-- Draft/package behaviors may differ in edge cases (attachments, encrypted packages, per-recipient statuses).
+- Residual risk is low and mostly limited to higher-level package assembly choices in SMTP flow.
 
 Validation tasks:
 
-- Map OpenProton request/response fields against GPA draft/send types and add fixture tests.
+- Keep fixture coverage for package edge cases (mixed internal/external recipients + attachments).
 
 ## Proposed implementation plan (step 4 execution)
 
@@ -120,7 +124,7 @@ Validation tasks:
    - partial label/unlabel failures
    - stale metadata pages
    - large mutation batches
-5. Update docs with strict vs compat policy table.
+5. Keep docs and fixture matrix in sync with any future mutation-contract changes.
 
 ## Acceptance gates for message mutation parity
 

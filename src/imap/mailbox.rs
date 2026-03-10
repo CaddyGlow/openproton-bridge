@@ -54,11 +54,68 @@ impl ResolvedMailbox {
 }
 
 pub fn labels_to_mailboxes(labels: &[ProtonLabel]) -> Vec<ResolvedMailbox> {
+    let mut used_names = std::collections::HashSet::new();
+    let reserved_names: std::collections::HashSet<String> = system_mailboxes()
+        .iter()
+        .map(|mailbox| mailbox.name.to_ascii_lowercase())
+        .collect();
+
     labels
         .iter()
         .filter(|l| l.label_type == LABEL_TYPE_LABEL || l.label_type == LABEL_TYPE_FOLDER)
         .map(ResolvedMailbox::from_proton_label)
+        .map(|mut mailbox| {
+            let base_name = mailbox.name.trim();
+            let base_name = if base_name.is_empty() {
+                format!("Label/{}", mailbox.label_id)
+            } else {
+                base_name.to_string()
+            };
+
+            let mut candidate = base_name.clone();
+            let mut suffix_round = 0usize;
+
+            loop {
+                let candidate_key = candidate.to_ascii_lowercase();
+                let conflicts_reserved = reserved_names.contains(&candidate_key);
+                let conflicts_used = used_names.contains(&candidate_key);
+
+                if !conflicts_reserved && !conflicts_used {
+                    used_names.insert(candidate_key);
+                    mailbox.name = candidate;
+                    break;
+                }
+
+                suffix_round += 1;
+                if suffix_round == 1 {
+                    candidate =
+                        format!("{} ({})", base_name, short_label_suffix(&mailbox.label_id));
+                } else {
+                    candidate = format!(
+                        "{} ({}-{})",
+                        base_name,
+                        short_label_suffix(&mailbox.label_id),
+                        suffix_round
+                    );
+                }
+            }
+
+            mailbox
+        })
         .collect()
+}
+
+fn short_label_suffix(label_id: &str) -> String {
+    let trimmed = label_id.trim();
+    if trimmed.is_empty() {
+        return "custom".to_string();
+    }
+
+    if trimmed.len() <= 8 {
+        return trimmed.to_string();
+    }
+
+    trimmed[trimmed.len() - 8..].to_string()
 }
 
 const SYSTEM_MAILBOXES: [ImapMailbox; 8] = [
@@ -361,6 +418,49 @@ mod tests {
         let mailboxes = labels_to_mailboxes(&labels);
         assert_eq!(mailboxes.len(), 1);
         assert_eq!(mailboxes[0].name, "Labels/Work");
+    }
+
+    #[test]
+    fn test_labels_to_mailboxes_avoids_system_name_conflicts() {
+        let labels = vec![ProtonLabel {
+            id: "lbl-inbox".to_string(),
+            name: "INBOX".to_string(),
+            path: "INBOX".to_string(),
+            label_type: LABEL_TYPE_LABEL,
+            parent_id: None,
+            color: None,
+        }];
+
+        let mailboxes = labels_to_mailboxes(&labels);
+        assert_eq!(mailboxes.len(), 1);
+        assert_eq!(mailboxes[0].name, "Labels/INBOX");
+    }
+
+    #[test]
+    fn test_labels_to_mailboxes_deduplicates_case_insensitive_collisions() {
+        let labels = vec![
+            ProtonLabel {
+                id: "lbl-dup-a".to_string(),
+                name: "Projects".to_string(),
+                path: "Projects".to_string(),
+                label_type: LABEL_TYPE_LABEL,
+                parent_id: None,
+                color: None,
+            },
+            ProtonLabel {
+                id: "lbl-dup-b".to_string(),
+                name: "projects".to_string(),
+                path: "projects".to_string(),
+                label_type: LABEL_TYPE_LABEL,
+                parent_id: None,
+                color: None,
+            },
+        ];
+
+        let mailboxes = labels_to_mailboxes(&labels);
+        assert_eq!(mailboxes.len(), 2);
+        assert_eq!(mailboxes[0].name, "Labels/Projects");
+        assert_eq!(mailboxes[1].name, "Labels/projects (bl-dup-b)");
     }
 
     #[test]

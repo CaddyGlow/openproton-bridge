@@ -966,29 +966,154 @@ async fn apply_metadata_to_store(
     Ok(())
 }
 
-async fn fetch_and_update_user_labels(config: &EventWorkerConfig, client: &ProtonClient) {
-    match messages::get_labels(client, &[LABEL_TYPE_LABEL, LABEL_TYPE_FOLDER]).await {
-        Ok(resp) => {
-            let resolved = mailbox::labels_to_mailboxes(&resp.labels);
-            info!(
-                account_id = %config.account_id.0,
-                account_email = %config.account_email,
-                user_labels = resolved.len(),
-                "refreshed user labels for event sync"
-            );
+async fn migrate_label_mailbox_data(
+    config: &EventWorkerConfig,
+    from_mailbox: &str,
+    to_mailbox: &str,
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "migrate_label_mailbox_data").await?;
+
+    if from_mailbox.eq_ignore_ascii_case(to_mailbox) {
+        return Ok(());
+    }
+
+    let from_scoped = scoped_mailbox_name(&config.account_id, from_mailbox);
+    let to_scoped = scoped_mailbox_name(&config.account_id, to_mailbox);
+    let uids = config
+        .store
+        .list_uids(&from_scoped)
+        .await
+        .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+
+    for uid in &uids {
+        let Some(proton_id) = config
+            .store
+            .get_proton_id(&from_scoped, *uid)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
+        else {
+            continue;
+        };
+        let Some(metadata) = config
+            .store
+            .get_metadata(&from_scoped, *uid)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
+        else {
+            continue;
+        };
+
+        let new_uid = config
+            .store
+            .store_metadata(&to_scoped, &proton_id, metadata)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        let flags = config
+            .store
+            .get_flags(&from_scoped, *uid)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        config
+            .store
+            .set_flags(&to_scoped, new_uid, flags)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        if let Some(rfc822) = config
+            .store
+            .get_rfc822(&from_scoped, *uid)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
+        {
             config
-                .runtime_accounts
-                .set_user_labels(&config.account_id, resolved);
-        }
-        Err(err) => {
-            warn!(
-                account_id = %config.account_id.0,
-                account_email = %config.account_email,
-                error = %err,
-                "failed to fetch user labels during event sync"
-            );
+                .store
+                .store_rfc822(&to_scoped, new_uid, rfc822)
+                .await
+                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
     }
+
+    for uid in uids {
+        config
+            .store
+            .remove_message(&from_scoped, uid)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+    }
+
+    Ok(())
+}
+
+async fn clear_label_mailbox_data(
+    config: &EventWorkerConfig,
+    mailbox_name: &str,
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "clear_label_mailbox_data").await?;
+    let scoped = scoped_mailbox_name(&config.account_id, mailbox_name);
+    let uids = config
+        .store
+        .list_uids(&scoped)
+        .await
+        .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+    for uid in uids {
+        config
+            .store
+            .remove_message(&scoped, uid)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn reconcile_user_label_topology(
+    config: &EventWorkerConfig,
+    previous_labels: &[mailbox::ResolvedMailbox],
+    next_labels: &[mailbox::ResolvedMailbox],
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    let previous_by_id: HashMap<&str, &mailbox::ResolvedMailbox> = previous_labels
+        .iter()
+        .map(|label| (label.label_id.as_str(), label))
+        .collect();
+    let next_by_id: HashMap<&str, &mailbox::ResolvedMailbox> = next_labels
+        .iter()
+        .map(|label| (label.label_id.as_str(), label))
+        .collect();
+
+    for (label_id, previous) in &previous_by_id {
+        if let Some(next) = next_by_id.get(label_id) {
+            if !previous.name.eq_ignore_ascii_case(&next.name) {
+                migrate_label_mailbox_data(config, &previous.name, &next.name, expected_generation)
+                    .await?;
+            }
+        } else {
+            clear_label_mailbox_data(config, &previous.name, expected_generation).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_and_update_user_labels(
+    config: &EventWorkerConfig,
+    client: &ProtonClient,
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    let resp = messages::get_labels(client, &[LABEL_TYPE_LABEL, LABEL_TYPE_FOLDER]).await?;
+    let resolved = mailbox::labels_to_mailboxes(&resp.labels);
+    let previous = config.runtime_accounts.get_user_labels(&config.account_id);
+    reconcile_user_label_topology(config, &previous, &resolved, expected_generation).await?;
+    info!(
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        user_labels = resolved.len(),
+        "refreshed user labels for event sync"
+    );
+    config
+        .runtime_accounts
+        .set_user_labels(&config.account_id, resolved);
+    Ok(())
 }
 
 struct SyncProgressRunGuard<'a> {
@@ -1346,6 +1471,21 @@ async fn apply_message_delete(
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
     }
+    for label_mailbox in config.runtime_accounts.get_user_labels(&config.account_id) {
+        let scoped = scoped_mailbox_name(&config.account_id, &label_mailbox.name);
+        if let Some(uid) = config
+            .store
+            .get_uid(&scoped, message_id)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
+        {
+            config
+                .store
+                .remove_message(&scoped, uid)
+                .await
+                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        }
+    }
     Ok(())
 }
 
@@ -1574,7 +1714,16 @@ async fn poll_account_once_for_generation(
                         apply_message_delete(config, &id, expected_generation).await?;
                     }
                     EventDelta::LabelsChanged => {
-                        fetch_and_update_user_labels(config, &client).await;
+                        if let Err(err) =
+                            fetch_and_update_user_labels(config, &client, expected_generation).await
+                        {
+                            warn!(
+                                account_id = %config.account_id.0,
+                                account_email = %config.account_email,
+                                error = %err,
+                                "failed to refresh/reconcile user labels during event sync"
+                            );
+                        }
                     }
                     EventDelta::AddressesChanged => {
                         address_changed = true;
@@ -3570,6 +3719,220 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(checkpoint.sync_state.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_label_event_reconciles_renamed_mailbox_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 2
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/labels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Labels": [{
+                    "ID": "label-custom-1",
+                    "Name": "New Projects",
+                    "Path": "New Projects",
+                    "Type": 1
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        runtime.set_user_labels(
+            &AccountId("uid-1".to_string()),
+            vec![crate::imap::mailbox::ResolvedMailbox {
+                name: "Labels/Old Projects".to_string(),
+                label_id: "label-custom-1".to_string(),
+                special_use: None,
+                selectable: true,
+            }],
+        );
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        store
+            .store_metadata(
+                "uid-1::Labels/Old Projects",
+                "msg-label-1",
+                MessageMetadata {
+                    id: "msg-label-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["label-custom-1".to_string()],
+                    external_id: None,
+                    subject: "Project note".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: Vec::new(),
+                    cc_list: Vec::new(),
+                    bcc_list: Vec::new(),
+                    reply_tos: Vec::new(),
+                    flags: 0,
+                    time: 1_700_000_000,
+                    size: 120,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime.clone(),
+            auth_router,
+            store.clone(),
+            checkpoints,
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        let labels = runtime.get_user_labels(&AccountId("uid-1".to_string()));
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].name, "Labels/New Projects");
+        assert_eq!(labels[0].label_id, "label-custom-1");
+
+        assert_eq!(
+            store
+                .get_uid("uid-1::Labels/New Projects", "msg-label-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(store
+            .list_uids("uid-1::Labels/Old Projects")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_label_event_clears_deleted_mailbox_state() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 0
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/labels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Labels": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        runtime.set_user_labels(
+            &AccountId("uid-1".to_string()),
+            vec![crate::imap::mailbox::ResolvedMailbox {
+                name: "Labels/Obsolete".to_string(),
+                label_id: "label-custom-1".to_string(),
+                special_use: None,
+                selectable: true,
+            }],
+        );
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let store = InMemoryStore::new();
+
+        store
+            .store_metadata(
+                "uid-1::Labels/Obsolete",
+                "msg-obsolete-1",
+                MessageMetadata {
+                    id: "msg-obsolete-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["label-custom-1".to_string()],
+                    external_id: None,
+                    subject: "Obsolete note".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: Vec::new(),
+                    cc_list: Vec::new(),
+                    bcc_list: Vec::new(),
+                    reply_tos: Vec::new(),
+                    flags: 0,
+                    time: 1_700_000_000,
+                    size: 64,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let config = event_worker_config(
+            &server.uri(),
+            runtime.clone(),
+            auth_router,
+            store.clone(),
+            checkpoints,
+        );
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        assert!(runtime
+            .get_user_labels(&AccountId("uid-1".to_string()))
+            .is_empty());
+        assert!(store
+            .list_uids("uid-1::Labels/Obsolete")
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

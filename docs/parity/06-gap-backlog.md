@@ -25,8 +25,14 @@
 ## Medium
 
 1. `More` pagination cap divergence (`32` vs GPA collection cap `50`)
+   - Status: resolved in current pass (event-loop page cap aligned to `50` with regression coverage).
+   - Target files: `src/bridge/events.rs`, `docs/parity/02-event-loop-parity.md`
 2. IDLE granularity differences (EXISTS-focused vs granular update stream)
+   - Status: resolved in current pass (`EXPUNGE`/`FETCH FLAGS`/`EXISTS` diff emission for selected mailbox).
+   - Target files: `src/imap/session.rs`, `docs/parity/04-imap-sync-propagation.md`
 3. Label topology conflict-resolution path differences
+   - Status: resolved in current pass (label rename/delete reconciliation + collision-safe label mailbox naming).
+   - Target files: `src/bridge/events.rs`, `src/imap/mailbox.rs`, `docs/parity/04-imap-sync-propagation.md`
 4. Checkpoint state representation as free-form strings
 5. Large batch mutation chunking behavior
    - Status: resolved in current pass (`150` chunking across label/unlabel/read/unread/delete + parallel delete chunks).

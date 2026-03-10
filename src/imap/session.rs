@@ -74,6 +74,8 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     primary_address_id: Option<String>,
     selected_mailbox: Option<String>,
     selected_mailbox_mod_seq: Option<u64>,
+    selected_mailbox_uids: Vec<u32>,
+    selected_mailbox_flags: HashMap<u32, Vec<String>>,
     selected_read_only: bool,
     authenticated_account_id: Option<String>,
     user_labels: Vec<mailbox::ResolvedMailbox>,
@@ -107,6 +109,8 @@ where
             primary_address_id: None,
             selected_mailbox: None,
             selected_mailbox_mod_seq: None,
+            selected_mailbox_uids: Vec::new(),
+            selected_mailbox_flags: HashMap::new(),
             selected_read_only: false,
             authenticated_account_id: None,
             user_labels: Vec::new(),
@@ -617,6 +621,10 @@ where
         self.writer.untagged("BYE server logging out").await?;
         self.state = State::Logout;
         self.authenticated_account_id = None;
+        self.selected_mailbox = None;
+        self.selected_mailbox_mod_seq = None;
+        self.selected_mailbox_uids.clear();
+        self.selected_mailbox_flags.clear();
         self.writer.tagged_ok(tag, None, "LOGOUT completed").await
     }
 
@@ -796,9 +804,53 @@ where
         let snapshot = self.config.store.mailbox_snapshot(&scoped_mailbox).await?;
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
         if snapshot.mod_seq > previous_mod_seq {
-            self.writer
-                .untagged(&format!("{} EXISTS", snapshot.exists))
-                .await?;
+            let current_uids = self.config.store.list_uids(&scoped_mailbox).await?;
+            let mut current_flags: HashMap<u32, Vec<String>> = HashMap::new();
+            for uid in &current_uids {
+                current_flags.insert(
+                    *uid,
+                    self.config.store.get_flags(&scoped_mailbox, *uid).await?,
+                );
+            }
+
+            if self.selected_mailbox_mod_seq.is_some() {
+                let current_uid_set: HashSet<u32> = current_uids.iter().copied().collect();
+                let mut removed_count = 0u32;
+                for (idx, uid) in self.selected_mailbox_uids.iter().enumerate() {
+                    if !current_uid_set.contains(uid) {
+                        let seq = idx as u32 + 1 - removed_count;
+                        self.writer.untagged(&format!("{seq} EXPUNGE")).await?;
+                        removed_count = removed_count.saturating_add(1);
+                    }
+                }
+
+                let previous_exists = self.selected_mailbox_uids.len() as u32;
+                if snapshot.exists != previous_exists {
+                    self.writer
+                        .untagged(&format!("{} EXISTS", snapshot.exists))
+                        .await?;
+                }
+
+                for (idx, uid) in current_uids.iter().enumerate() {
+                    let Some(new_flags) = current_flags.get(uid) else {
+                        continue;
+                    };
+                    let old_flags = self.selected_mailbox_flags.get(uid);
+                    if old_flags.is_none() || old_flags != Some(new_flags) {
+                        let flag_str = new_flags.join(" ");
+                        self.writer
+                            .untagged(&format!("{} FETCH (FLAGS ({}))", idx + 1, flag_str))
+                            .await?;
+                    }
+                }
+            } else {
+                self.writer
+                    .untagged(&format!("{} EXISTS", snapshot.exists))
+                    .await?;
+            }
+
+            self.selected_mailbox_uids = current_uids;
+            self.selected_mailbox_flags = current_flags;
             self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
         }
         Ok(())
@@ -1040,6 +1092,12 @@ where
 
         self.selected_mailbox = Some(mb.name.to_string());
         self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        self.selected_mailbox_uids = selected_uids.clone();
+        self.selected_mailbox_flags.clear();
+        for uid in &selected_uids {
+            self.selected_mailbox_flags
+                .insert(*uid, store.get_flags(&scoped_mailbox, *uid).await?);
+        }
         self.selected_read_only = false;
         self.state = State::Selected;
 
@@ -1109,6 +1167,8 @@ where
 
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
+        self.selected_mailbox_uids.clear();
+        self.selected_mailbox_flags.clear();
         self.selected_read_only = false;
         self.state = State::Authenticated;
         self.writer.tagged_ok(tag, None, "CLOSE completed").await
@@ -1121,6 +1181,8 @@ where
         // Unlike CLOSE, do NOT expunge deleted messages
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
+        self.selected_mailbox_uids.clear();
+        self.selected_mailbox_flags.clear();
         self.selected_read_only = false;
         self.state = State::Authenticated;
         self.writer.tagged_ok(tag, None, "UNSELECT completed").await
@@ -1236,6 +1298,12 @@ where
 
         self.selected_mailbox = Some(mb.name.to_string());
         self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        self.selected_mailbox_uids = selected_uids.clone();
+        self.selected_mailbox_flags.clear();
+        for uid in &selected_uids {
+            self.selected_mailbox_flags
+                .insert(*uid, store.get_flags(&scoped_mailbox, *uid).await?);
+        }
         self.selected_read_only = true;
         self.state = State::Selected;
 
@@ -3280,6 +3348,149 @@ mod tests {
             .await
             .unwrap();
 
+        let _ = tokio::time::timeout(Duration::from_secs(1), idle_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_idle_emits_expunge_and_exists_on_delete() {
+        let config = test_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid1 = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let _uid2 = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .await
+            .unwrap();
+        let snapshot = config
+            .store
+            .mailbox_snapshot("test-uid::INBOX")
+            .await
+            .unwrap();
+        session.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        session.selected_mailbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        for uid in &session.selected_mailbox_uids {
+            let flags = config
+                .store
+                .get_flags("test-uid::INBOX", *uid)
+                .await
+                .unwrap();
+            session.selected_mailbox_flags.insert(*uid, flags);
+        }
+
+        let idle_task =
+            tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"), "response={response}");
+
+        config
+            .store
+            .remove_message("test-uid::INBOX", uid1)
+            .await
+            .unwrap();
+
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("EXPUNGE"), "response={response}");
+        assert!(response.contains("1 EXISTS"), "response={response}");
+
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), idle_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_idle_emits_flag_fetch_on_flag_only_change() {
+        let config = test_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = config
+            .store
+            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let snapshot = config
+            .store
+            .mailbox_snapshot("test-uid::INBOX")
+            .await
+            .unwrap();
+        session.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        session.selected_mailbox_uids = vec![uid];
+        session.selected_mailbox_flags.insert(uid, Vec::new());
+
+        let idle_task =
+            tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"), "response={response}");
+
+        config
+            .store
+            .set_flags("test-uid::INBOX", uid, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("FETCH (FLAGS (\\Seen))"),
+            "response={response}"
+        );
+        assert!(!response.contains("EXISTS"), "response={response}");
+
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
         let _ = tokio::time::timeout(Duration::from_secs(1), idle_task)
             .await
             .unwrap()

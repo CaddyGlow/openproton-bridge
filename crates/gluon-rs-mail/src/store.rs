@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use gluon_rs_core::{
     decode_blob, encode_blob, AccountBootstrap, AccountPaths, DeferredDeleteManager, GluonCoreError,
 };
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::{
     db::SchemaProbe,
@@ -260,6 +260,33 @@ impl CompatibleStore {
             })
     }
 
+    pub fn replace_message_content(
+        &self,
+        storage_user_id: &str,
+        internal_message_id: &str,
+        blob: &[u8],
+        body: &str,
+        body_structure: &str,
+        envelope: &str,
+        size: i64,
+    ) -> Result<()> {
+        self.initialize_upstream_schema(storage_user_id)?;
+        let account_paths = self.account_paths(storage_user_id)?;
+        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
+        let blob_path = account_paths.blob_path(internal_message_id)?;
+        let encoded = encode_blob(&self.account(storage_user_id)?.key, blob)?;
+        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+
+        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        conn.execute(
+            "UPDATE messages_v2
+             SET size = ?2, body = ?3, body_structure = ?4, envelope = ?5
+             WHERE id = ?1",
+            (internal_message_id, size, body, body_structure, envelope),
+        )?;
+        Ok(())
+    }
+
     pub fn delete_account_database_files(&self, storage_user_id: &str) -> Result<usize> {
         Ok(DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?
             .delete_db_files(storage_user_id)?)
@@ -388,6 +415,50 @@ impl CompatibleStore {
             .ok_or_else(|| GluonError::MissingRequiredTable {
                 table: format!("mailbox_message_{mailbox_internal_id}"),
             })
+    }
+
+    pub fn find_message_internal_id_by_remote_id(
+        &self,
+        storage_user_id: &str,
+        remote_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.open_upstream_db(storage_user_id)?;
+        conn.query_row(
+            "SELECT id FROM messages_v2 WHERE remote_id = ?1 LIMIT 1",
+            (remote_id,),
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn update_message_content(
+        &self,
+        storage_user_id: &str,
+        internal_message_id: &str,
+        message: &NewMessage,
+    ) -> Result<()> {
+        let account_paths = self.account_paths(storage_user_id)?;
+        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
+        let blob_path = account_paths.blob_path(internal_message_id)?;
+        let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
+        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+
+        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        conn.execute(
+            "UPDATE messages_v2
+             SET remote_id = ?1, size = ?2, body = ?3, body_structure = ?4, envelope = ?5
+             WHERE id = ?6",
+            (
+                &message.remote_id,
+                message.size,
+                &message.body,
+                &message.body_structure,
+                &message.envelope,
+                internal_message_id,
+            ),
+        )?;
+        Ok(())
     }
 
     pub fn remove_message_from_mailbox(
@@ -1212,6 +1283,82 @@ mod tests {
     }
 
     #[test]
+    fn replaces_message_content_without_changing_uid() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[4u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+
+        let mailbox = store
+            .create_mailbox(
+                "user-1",
+                &NewMailbox {
+                    remote_id: "mbox-1".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 999,
+                    subscribed: true,
+                    attributes: vec![],
+                    flags: vec![],
+                    permanent_flags: vec!["\\Seen".to_string()],
+                },
+            )
+            .expect("create mailbox");
+
+        let summary = store
+            .append_message(
+                "user-1",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "aaaaaaa1-2222-3333-4444-555555555555".to_string(),
+                    remote_id: "msg-4".to_string(),
+                    flags: vec![],
+                    blob: b"placeholder".to_vec(),
+                    body: "placeholder".to_string(),
+                    body_structure: "placeholder-structure".to_string(),
+                    envelope: "placeholder-envelope".to_string(),
+                    size: 11,
+                    recent: false,
+                },
+            )
+            .expect("append message");
+        assert_eq!(summary.uid, 1);
+
+        store
+            .replace_message_content(
+                "user-1",
+                "aaaaaaa1-2222-3333-4444-555555555555",
+                b"updated body",
+                "updated",
+                "updated-structure",
+                "updated-envelope",
+                12,
+            )
+            .expect("replace message content");
+
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
+        assert_eq!(snapshot.messages[0].summary.uid, 1);
+        assert_eq!(snapshot.messages[0].summary.size, 12);
+        assert_eq!(snapshot.messages[0].body, "updated");
+        assert_eq!(snapshot.messages[0].body_structure, "updated-structure");
+        assert_eq!(snapshot.messages[0].envelope, "updated-envelope");
+        assert_eq!(
+            store
+                .read_message_blob("user-1", "aaaaaaa1-2222-3333-4444-555555555555")
+                .expect("blob"),
+            b"updated body"
+        );
+    }
+
+    #[test]
     fn defers_account_database_deletion_like_upstream() {
         let temp = tempdir().expect("tempdir");
         let store = CompatibleStore::open(StoreBootstrap::new(
@@ -1639,6 +1786,89 @@ mod tests {
                 name: "Archive".to_string(),
                 remote_id: "mbox-archive".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn finds_message_by_remote_id_and_updates_message_content() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[9u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+
+        let mailbox = store
+            .create_mailbox(
+                "user-1",
+                &NewMailbox {
+                    remote_id: "0".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 4001,
+                    subscribed: true,
+                    attributes: vec![],
+                    flags: vec![],
+                    permanent_flags: vec![],
+                },
+            )
+            .expect("create mailbox");
+
+        store
+            .append_message(
+                "user-1",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "77777777-7777-7777-7777-777777777777".to_string(),
+                    remote_id: "msg-remote".to_string(),
+                    flags: vec![],
+                    blob: b"Subject: old\r\n\r\nold-body".to_vec(),
+                    body: "old-body".to_string(),
+                    body_structure: "old-structure".to_string(),
+                    envelope: "old-envelope".to_string(),
+                    size: 21,
+                    recent: false,
+                },
+            )
+            .expect("append");
+
+        assert_eq!(
+            store
+                .find_message_internal_id_by_remote_id("user-1", "msg-remote")
+                .expect("find"),
+            Some("77777777-7777-7777-7777-777777777777".to_string())
+        );
+
+        let updated = NewMessage {
+            internal_id: "77777777-7777-7777-7777-777777777777".to_string(),
+            remote_id: "msg-remote".to_string(),
+            flags: vec![],
+            blob: b"Subject: new\r\n\r\nnew-body".to_vec(),
+            body: "new-body".to_string(),
+            body_structure: "new-structure".to_string(),
+            envelope: "new-envelope".to_string(),
+            size: 24,
+            recent: false,
+        };
+        store
+            .update_message_content("user-1", &updated.internal_id, &updated)
+            .expect("update");
+
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
+        assert_eq!(snapshot.messages[0].body, "new-body");
+        assert_eq!(snapshot.messages[0].body_structure, "new-structure");
+        assert_eq!(snapshot.messages[0].envelope, "new-envelope");
+        assert_eq!(
+            store
+                .read_message_blob("user-1", &updated.internal_id)
+                .expect("blob"),
+            b"Subject: new\r\n\r\nnew-body"
         );
     }
 }

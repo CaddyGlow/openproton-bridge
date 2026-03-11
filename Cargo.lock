@@ -2106,6 +2106,7 @@ dependencies = [
  "dirs",
  "flate2",
  "fs2",
+ "gluon-rs-mail",
  "hmac",
  "keyring",
  "lettre",

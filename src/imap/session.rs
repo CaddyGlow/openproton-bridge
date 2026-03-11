@@ -3111,11 +3111,12 @@ mod tests {
     use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
     use crate::bridge::auth_router::AuthRouter;
     use crate::imap::gluon_connector::StoreBackedConnector;
+    use crate::imap::gluon_mailbox_mutation::GluonMailMailboxMutation;
     use crate::imap::gluon_mailbox_view::GluonMailMailboxView;
     use crate::imap::mailbox;
     use crate::imap::mailbox_catalog::RuntimeMailboxCatalog;
-    use crate::imap::mailbox_mutation::StoreBackedMailboxMutation;
-    use crate::imap::mailbox_view::StoreBackedMailboxView;
+    use crate::imap::mailbox_mutation::{GluonMailboxMutation, StoreBackedMailboxMutation};
+    use crate::imap::mailbox_view::{GluonMailboxView, StoreBackedMailboxView};
     use crate::imap::rfc822;
     use crate::imap::store::InMemoryStore;
     use gluon_rs_mail::{
@@ -3166,6 +3167,16 @@ mod tests {
     }
 
     fn test_gluon_mail_view_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
+        test_gluon_mail_config(false)
+    }
+
+    fn test_gluon_mail_backend_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
+        test_gluon_mail_config(true)
+    }
+
+    fn test_gluon_mail_config(
+        use_gluon_mutation_backend: bool,
+    ) -> (Arc<SessionConfig>, TestGluonMailFixture) {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
         let store = InMemoryStore::new();
@@ -3231,14 +3242,21 @@ mod tests {
             )
             .expect("append message");
 
+        let mailbox_mutation: Arc<dyn GluonMailboxMutation> = if use_gluon_mutation_backend {
+            GluonMailMailboxMutation::new(gluon_store.clone())
+        } else {
+            StoreBackedMailboxMutation::new(store.clone())
+        };
+        let mailbox_view: Arc<dyn GluonMailboxView> = GluonMailMailboxView::new(gluon_store);
+
         let config = Arc::new(SessionConfig {
             api_base_url: "https://mail-api.proton.me".to_string(),
             auth_router: AuthRouter::new(accounts),
             runtime_accounts: runtime_accounts.clone(),
             gluon_connector: StoreBackedConnector::new(store.clone()),
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
-            mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
-            mailbox_view: GluonMailMailboxView::new(gluon_store),
+            mailbox_mutation,
+            mailbox_view,
             store,
             mutation_mode: MutationMode::Compat,
         });
@@ -3291,6 +3309,30 @@ mod tests {
             "Messages": messages,
             "Total": total
         })
+    }
+
+    async fn seed_gluon_backend_message(
+        config: &Arc<SessionConfig>,
+        mailbox_name: &str,
+        proton_id: &str,
+        unread: i32,
+        body: &[u8],
+    ) -> u32 {
+        let mut meta = make_meta(proton_id, unread);
+        meta.external_id = Some(format!("{proton_id}@example.test"));
+        meta.size = body.len() as i64;
+        let scoped_mailbox = format!("test-uid::{mailbox_name}");
+        let uid = config
+            .mailbox_mutation
+            .store_metadata(&scoped_mailbox, proton_id, meta)
+            .await
+            .unwrap();
+        config
+            .mailbox_mutation
+            .store_rfc822(&scoped_mailbox, uid, body.to_vec())
+            .await
+            .unwrap();
+        uid
     }
 
     async fn create_session_pair(
@@ -4236,6 +4278,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_copy_copies_local_message_without_api_client_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-copy",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-copy\r\n\r\ncopy-body",
+        )
+        .await;
+        assert_eq!(uid, 2);
+
+        session.handle_line("a001 COPY 2 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("COPY completed"), "response={response}");
+
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
+        assert_eq!(inbox_uids, vec![1, 2]);
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_proton_id("test-uid::INBOX", 2)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("msg-copy")
+        );
+
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
+        assert_eq!(archive_uids, vec![1]);
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_proton_id("test-uid::Archive", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("msg-copy")
+        );
+    }
+
+    #[tokio::test]
     async fn test_copy_compat_mode_succeeds_when_upstream_fails() {
         let config = test_config_with_mode(MutationMode::Compat);
         let (mut session, mut client_read, _client_write) =
@@ -4428,6 +4532,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(archive_proton_id.as_deref(), Some("msg-1"));
+    }
+
+    #[tokio::test]
+    async fn test_move_moves_local_message_without_api_client_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-move",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-move\r\n\r\nmove-body",
+        )
+        .await;
+        assert_eq!(uid, 2);
+
+        session.handle_line("a001 MOVE 2 Archive").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 2 EXPUNGE"), "response={response}");
+        assert!(response.contains("MOVE completed"), "response={response}");
+
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
+        assert_eq!(inbox_uids, vec![1]);
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_proton_id("test-uid::INBOX", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("msg-1")
+        );
+
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
+        assert_eq!(archive_uids, vec![1]);
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_proton_id("test-uid::Archive", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("msg-move")
+        );
     }
 
     #[tokio::test]
@@ -4667,6 +4834,61 @@ mod tests {
         assert!(inbox_uids.is_empty());
 
         server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_expunge_without_api_client_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-expunge",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-expunge\r\n\r\nexpunge-body",
+        )
+        .await;
+        config
+            .mailbox_mutation
+            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .await
+            .unwrap();
+
+        session.handle_line("a001 EXPUNGE").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* 2 EXPUNGE"), "response={response}");
+        assert!(
+            response.contains("a001 OK EXPUNGE completed"),
+            "response={response}"
+        );
+        assert_eq!(
+            config
+                .mailbox_view
+                .list_uids("test-uid::INBOX")
+                .await
+                .unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_proton_id("test-uid::INBOX", 1)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("msg-1")
+        );
     }
 
     #[tokio::test]
@@ -5109,6 +5331,48 @@ mod tests {
         assert!(response.contains(&format!("* 1 FETCH (UID {uid} FLAGS (")));
         assert!(response.contains("\\Seen"));
         assert!(response.contains("a001 OK STORE completed"));
+    }
+
+    #[tokio::test]
+    async fn test_uid_store_flags_response_includes_uid_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-2",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-2\r\n\r\nbody",
+        )
+        .await;
+
+        session
+            .handle_line(&format!("a001 UID STORE {uid} +FLAGS (\\Seen)"))
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains(&format!("* 2 FETCH (UID {uid} FLAGS (")));
+        assert!(response.contains("\\Seen"));
+        assert!(response.contains("a001 OK STORE completed"));
+        assert_eq!(
+            config
+                .mailbox_mutation
+                .get_flags("test-uid::INBOX", uid)
+                .await
+                .unwrap(),
+            vec!["\\Seen".to_string()]
+        );
     }
 
     #[tokio::test]

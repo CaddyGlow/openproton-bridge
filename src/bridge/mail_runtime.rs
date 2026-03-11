@@ -43,6 +43,14 @@ pub enum ImapReadBackend {
     GluonMailReadOnly,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ImapMutationBackend {
+    #[default]
+    Compat,
+    GluonMail,
+}
+
 #[derive(Debug, Clone)]
 pub struct MailRuntimeConfig {
     pub bind_host: String,
@@ -55,6 +63,7 @@ pub struct MailRuntimeConfig {
     pub use_ssl_for_imap: bool,
     pub use_ssl_for_smtp: bool,
     pub imap_read_backend: ImapReadBackend,
+    pub imap_mutation_backend: ImapMutationBackend,
     pub event_poll_interval: Duration,
     pub pim_reconcile_tick_interval: Duration,
     pub pim_contacts_reconcile_interval: Duration,
@@ -513,7 +522,6 @@ async fn prepare_runtime_context(
     let gluon_connector = imap::gluon_connector::StoreBackedConnector::new(store.clone());
     let mailbox_catalog =
         imap::mailbox_catalog::RuntimeMailboxCatalog::new(runtime_accounts.clone());
-    let mailbox_mutation = imap::mailbox_mutation::StoreBackedMailboxMutation::new(store.clone());
     let mailbox_view = build_mailbox_view(
         config.imap_read_backend,
         store.clone(),
@@ -521,6 +529,13 @@ async fn prepare_runtime_context(
         gluon_paths.root(),
     )
     .context("failed to initialize IMAP mailbox view backend")?;
+    let mailbox_mutation = build_mailbox_mutation(
+        config.imap_mutation_backend,
+        store.clone(),
+        &gluon_bootstrap,
+        gluon_paths.root(),
+    )
+    .context("failed to initialize IMAP mailbox mutation backend")?;
     let event_store = store.clone();
     let mut pim_stores = HashMap::new();
     for account in &gluon_bootstrap.accounts {
@@ -596,8 +611,27 @@ fn build_mailbox_view(
     match backend {
         ImapReadBackend::Compat => Ok(imap::mailbox_view::StoreBackedMailboxView::new(store)),
         ImapReadBackend::GluonMailReadOnly => {
-            let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root)?;
+            let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, true)?;
             Ok(imap::gluon_mailbox_view::GluonMailMailboxView::new(
+                Arc::new(store),
+            ))
+        }
+    }
+}
+
+fn build_mailbox_mutation(
+    backend: ImapMutationBackend,
+    store: Arc<dyn imap::store::MessageStore>,
+    gluon_bootstrap: &vault::GluonStoreBootstrap,
+    gluon_root: &std::path::Path,
+) -> anyhow::Result<Arc<dyn imap::mailbox_mutation::GluonMailboxMutation>> {
+    match backend {
+        ImapMutationBackend::Compat => Ok(imap::mailbox_mutation::StoreBackedMailboxMutation::new(
+            store,
+        )),
+        ImapMutationBackend::GluonMail => {
+            let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, false)?;
+            Ok(imap::gluon_mailbox_mutation::GluonMailMailboxMutation::new(
                 Arc::new(store),
             ))
         }
@@ -607,6 +641,7 @@ fn build_mailbox_view(
 fn build_gluon_mail_compatible_store(
     gluon_bootstrap: &vault::GluonStoreBootstrap,
     gluon_root: &std::path::Path,
+    read_only: bool,
 ) -> anyhow::Result<gluon_rs_mail::CompatibleStore> {
     let accounts = gluon_bootstrap
         .accounts
@@ -622,11 +657,16 @@ fn build_gluon_mail_compatible_store(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
 
-    gluon_rs_mail::CompatibleStore::open_read_only(gluon_rs_mail::StoreBootstrap::new(
+    let bootstrap = gluon_rs_mail::StoreBootstrap::new(
         gluon_rs_mail::CacheLayout::new(gluon_root),
         gluon_rs_mail::CompatibilityTarget::default(),
         accounts,
-    ))
+    );
+    if read_only {
+        gluon_rs_mail::CompatibleStore::open_read_only(bootstrap)
+    } else {
+        gluon_rs_mail::CompatibleStore::open(bootstrap)
+    }
     .context("open gluon-rs-mail compatible store")
 }
 
@@ -1629,7 +1669,7 @@ mod tests {
 
     use super::{
         build_gluon_mail_compatible_store, handle_startup_refresh_failure, is_sync_scope_due,
-        ImapReadBackend, Session,
+        ImapMutationBackend, ImapReadBackend, Session,
     };
     use crate::api::error::ApiError;
     use crate::api::types::ApiMode;
@@ -1777,7 +1817,7 @@ mod tests {
             }],
         };
 
-        let store = build_gluon_mail_compatible_store(&bootstrap, &gluon_root).unwrap();
+        let store = build_gluon_mail_compatible_store(&bootstrap, &gluon_root, true).unwrap();
         assert_eq!(store.bootstrap().accounts.len(), 1);
         assert_eq!(store.bootstrap().accounts[0].account_id, "account-1");
         assert_eq!(store.bootstrap().accounts[0].storage_user_id, "user-1");
@@ -1788,6 +1828,13 @@ mod tests {
         let decoded: ImapReadBackend = serde_json::from_str("\"compat\"").unwrap();
         assert_eq!(decoded, ImapReadBackend::Compat);
         assert_eq!(ImapReadBackend::default(), ImapReadBackend::Compat);
+    }
+
+    #[test]
+    fn imap_mutation_backend_defaults_to_compat() {
+        let decoded: ImapMutationBackend = serde_json::from_str("\"compat\"").unwrap();
+        assert_eq!(decoded, ImapMutationBackend::Compat);
+        assert_eq!(ImapMutationBackend::default(), ImapMutationBackend::Compat);
     }
 
     #[tokio::test]

@@ -94,6 +94,8 @@ struct StoredMailSettings {
     use_ssl_for_smtp: bool,
     #[serde(default)]
     imap_read_backend: crate::bridge::mail_runtime::ImapReadBackend,
+    #[serde(default)]
+    imap_mutation_backend: crate::bridge::mail_runtime::ImapMutationBackend,
     #[serde(default = "default_pim_reconcile_tick_secs")]
     pim_reconcile_tick_secs: i32,
     #[serde(default = "default_pim_contacts_reconcile_secs")]
@@ -112,6 +114,7 @@ impl Default for StoredMailSettings {
             use_ssl_for_imap: true,
             use_ssl_for_smtp: true,
             imap_read_backend: crate::bridge::mail_runtime::ImapReadBackend::Compat,
+            imap_mutation_backend: crate::bridge::mail_runtime::ImapMutationBackend::Compat,
             pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
             pim_contacts_reconcile_secs: default_pim_contacts_reconcile_secs(),
             pim_calendar_reconcile_secs: default_pim_calendar_reconcile_secs(),
@@ -1458,6 +1461,7 @@ mod tests {
             use_ssl_for_imap: true,
             use_ssl_for_smtp: true,
             imap_read_backend: crate::bridge::mail_runtime::ImapReadBackend::GluonMailReadOnly,
+            imap_mutation_backend: crate::bridge::mail_runtime::ImapMutationBackend::GluonMail,
             pim_reconcile_tick_secs: 600,
             pim_contacts_reconcile_secs: 86400,
             pim_calendar_reconcile_secs: 86400,
@@ -1472,6 +1476,10 @@ mod tests {
         assert_eq!(
             loaded.imap_read_backend,
             crate::bridge::mail_runtime::ImapReadBackend::GluonMailReadOnly
+        );
+        assert_eq!(
+            loaded.imap_mutation_backend,
+            crate::bridge::mail_runtime::ImapMutationBackend::GluonMail
         );
         assert_eq!(loaded.pim_reconcile_tick_secs, 600);
         assert_eq!(loaded.pim_contacts_reconcile_secs, 86400);

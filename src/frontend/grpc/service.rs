@@ -51,6 +51,7 @@ impl BridgeService {
             use_ssl_for_imap: settings.use_ssl_for_imap,
             use_ssl_for_smtp: settings.use_ssl_for_smtp,
             imap_read_backend: settings.imap_read_backend,
+            imap_mutation_backend: settings.imap_mutation_backend,
             event_poll_interval: std::time::Duration::from_secs(30),
             pim_reconcile_tick_interval: std::time::Duration::from_secs(
                 settings.pim_reconcile_tick_secs as u64,

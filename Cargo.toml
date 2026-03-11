@@ -81,3 +81,9 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 [build-dependencies]
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
+
+[workspace]
+members = [
+    "crates/gluon-rs-core",
+    "crates/gluon-rs-mail",
+]

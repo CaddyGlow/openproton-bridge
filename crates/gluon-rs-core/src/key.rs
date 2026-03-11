@@ -2,7 +2,7 @@ use std::fmt;
 
 use zeroize::Zeroize;
 
-use crate::error::{GluonError, Result};
+use crate::error::{GluonCoreError, Result};
 
 #[derive(Clone, Zeroize)]
 #[zeroize(drop)]
@@ -13,7 +13,7 @@ impl GluonKey {
 
     pub fn try_from_slice(bytes: &[u8]) -> Result<Self> {
         if bytes.len() != Self::LEN {
-            return Err(GluonError::InvalidKeyLength {
+            return Err(GluonCoreError::InvalidKeyLength {
                 length: bytes.len(),
             });
         }
@@ -29,7 +29,7 @@ impl GluonKey {
 }
 
 impl TryFrom<Vec<u8>> for GluonKey {
-    type Error = GluonError;
+    type Error = GluonCoreError;
 
     fn try_from(value: Vec<u8>) -> Result<Self> {
         Self::try_from_slice(&value)

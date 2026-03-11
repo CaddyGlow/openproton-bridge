@@ -1,11 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::{
-    error::Result,
-    layout::CacheLayout,
-};
 use uuid::Uuid;
+
+use crate::{error::Result, layout::CacheLayout};
 
 const TXN_DIR_NAME: &str = ".gluon-txn";
 
@@ -105,7 +103,10 @@ mod tests {
             txn.pending_journal_path(),
             Path::new("/tmp/gluon/.gluon-txn/user-1.json")
         );
-        assert_eq!(txn.lock_path(), Path::new("/tmp/gluon/.gluon-locks/user-1.lock"));
+        assert_eq!(
+            txn.lock_path(),
+            Path::new("/tmp/gluon/.gluon-locks/user-1.lock")
+        );
     }
 
     #[test]

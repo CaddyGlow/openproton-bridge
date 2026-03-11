@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::error::{GluonError, Result};
+use crate::error::{GluonCoreError, Result};
 
 pub const BACKEND_DIR: &str = "backend";
 pub const DB_DIR: &str = "db";
@@ -114,7 +114,7 @@ fn validate_component(component: &str) -> Result<()> {
         || component.contains('/')
         || component.contains('\\');
     if invalid {
-        return Err(GluonError::InvalidPathComponent {
+        return Err(GluonCoreError::InvalidPathComponent {
             component: component.to_string(),
         });
     }
@@ -133,7 +133,10 @@ mod tests {
         let layout = CacheLayout::new("/tmp/gluon-cache");
         let account = layout.account_paths("user-42").expect("account paths");
 
-        assert_eq!(layout.store_dir(), Path::new("/tmp/gluon-cache/backend/store"));
+        assert_eq!(
+            layout.store_dir(),
+            Path::new("/tmp/gluon-cache/backend/store")
+        );
         assert_eq!(layout.db_dir(), Path::new("/tmp/gluon-cache/backend/db"));
         assert_eq!(
             account.store_dir(),

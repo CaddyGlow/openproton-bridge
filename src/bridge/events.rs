@@ -2159,7 +2159,7 @@ pub fn start_event_worker_group_with_sync_progress_and_pim(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
+fn build_event_worker_configs(
     runtime_accounts: Arc<RuntimeAccountRegistry>,
     accounts: Vec<RuntimeAccountInfo>,
     api_base_url: String,
@@ -2169,10 +2169,8 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
     checkpoint_store: SharedCheckpointStore,
     pim_stores: HashMap<String, Arc<PimStore>>,
     sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let handles = accounts
+) -> Vec<EventWorkerConfig> {
+    accounts
         .into_iter()
         .map(|account| {
             let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
@@ -2193,14 +2191,46 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
             if let Some(callback) = sync_progress_callback.as_ref() {
                 config = config.with_sync_progress_callback(callback.clone());
             }
-            let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(run_event_worker_with_shutdown(
-                config,
-                poll_interval,
-                shutdown_rx,
-            ))
+            config
         })
-        .collect();
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    connector: Arc<dyn GluonImapConnector>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> EventWorkerGroup {
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let handles = build_event_worker_configs(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        connector,
+        checkpoint_store,
+        pim_stores,
+        sync_progress_callback,
+    )
+    .into_iter()
+    .map(|account| {
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(run_event_worker_with_shutdown(
+            account,
+            poll_interval,
+            shutdown_rx,
+        ))
+    })
+    .collect();
 
     EventWorkerGroup {
         shutdown_tx,
@@ -2266,30 +2296,47 @@ pub fn start_event_workers_with_sync_progress_and_pim(
     poll_interval: Duration,
 ) -> Vec<JoinHandle<()>> {
     let connector = StoreBackedConnector::new(store.clone());
-    accounts
-        .into_iter()
-        .map(|account| {
-            let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
-            let account_id_key = account.account_id.0.clone();
-            let mut config = EventWorkerConfig::new(
-                account.account_id,
-                account.email,
-                account_base_url,
-                runtime_accounts.clone(),
-                auth_router.clone(),
-                store.clone(),
-                connector.clone(),
-                checkpoint_store.clone(),
-            );
-            if let Some(pim_store) = pim_stores.get(&account_id_key) {
-                config = config.with_pim_store(pim_store.clone());
-            }
-            if let Some(callback) = sync_progress_callback.as_ref() {
-                config = config.with_sync_progress_callback(callback.clone());
-            }
-            tokio::spawn(run_event_worker(config, poll_interval))
-        })
-        .collect()
+    start_event_workers_with_sync_progress_and_pim_and_connector(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        connector,
+        checkpoint_store,
+        pim_stores,
+        sync_progress_callback,
+        poll_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_workers_with_sync_progress_and_pim_and_connector(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    connector: Arc<dyn GluonImapConnector>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> Vec<JoinHandle<()>> {
+    build_event_worker_configs(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        connector,
+        checkpoint_store,
+        pim_stores,
+        sync_progress_callback,
+    )
+    .into_iter()
+    .map(|config| tokio::spawn(run_event_worker(config, poll_interval)))
+    .collect()
 }
 
 #[cfg(test)]
@@ -2390,6 +2437,91 @@ mod tests {
         );
 
         assert!(Arc::ptr_eq(&config.connector, &connector));
+    }
+
+    fn runtime_account_info(uid: &str, email: &str) -> RuntimeAccountInfo {
+        RuntimeAccountInfo {
+            account_id: AccountId(uid.to_string()),
+            email: email.to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            health: AccountHealth::Healthy,
+        }
+    }
+
+    #[test]
+    fn build_event_worker_configs_reuses_shared_connector_for_every_account() {
+        let tmp = tempdir().unwrap();
+        let runtime = Arc::new(RuntimeAccountRegistry::new(
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        ));
+        let auth_router = AuthRouter::new(AccountRegistry::default());
+        let store: Arc<dyn MessageStore> = InMemoryStore::new();
+        let connector: Arc<dyn GluonImapConnector> = StoreBackedConnector::new(store.clone());
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let accounts = vec![
+            runtime_account_info("uid-1", "alice@proton.me"),
+            runtime_account_info("uid-2", "bob@proton.me"),
+        ];
+
+        let configs = build_event_worker_configs(
+            runtime,
+            accounts,
+            "https://mail-api.proton.me".to_string(),
+            auth_router,
+            store,
+            connector.clone(),
+            checkpoints,
+            HashMap::new(),
+            None,
+        );
+
+        assert_eq!(configs.len(), 2);
+        assert!(configs
+            .iter()
+            .all(|config| Arc::ptr_eq(&config.connector, &connector)));
+    }
+
+    #[test]
+    fn build_event_worker_configs_preserves_pim_and_progress_callbacks_on_shared_connector() {
+        let tmp = tempdir().unwrap();
+        let runtime = Arc::new(RuntimeAccountRegistry::new(
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        ));
+        let auth_router = AuthRouter::new(AccountRegistry::default());
+        let store: Arc<dyn MessageStore> = InMemoryStore::new();
+        let connector: Arc<dyn GluonImapConnector> = StoreBackedConnector::new(store.clone());
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let progress_events = Arc::new(StdMutex::new(Vec::new()));
+        let progress_events_sink = progress_events.clone();
+        let callback: SyncProgressCallback = Arc::new(move |event| {
+            progress_events_sink.lock().unwrap().push(event);
+        });
+        let pim_store = setup_pim_store();
+        let accounts = vec![runtime_account_info("uid-1", "alice@proton.me")];
+        let pim_stores = HashMap::from([(String::from("uid-1"), pim_store.clone())]);
+
+        let configs = build_event_worker_configs(
+            runtime,
+            accounts,
+            "https://mail-api.proton.me".to_string(),
+            auth_router,
+            store,
+            connector.clone(),
+            checkpoints,
+            pim_stores,
+            Some(callback),
+        );
+
+        assert_eq!(configs.len(), 1);
+        assert!(Arc::ptr_eq(&configs[0].connector, &connector));
+        assert!(configs[0].pim_store.is_some());
+        assert!(configs[0].sync_progress_callback.is_some());
+        assert!(Arc::ptr_eq(
+            configs[0].pim_store.as_ref().unwrap(),
+            &pim_store
+        ));
     }
 
     fn setup_pim_store() -> Arc<PimStore> {

@@ -7,7 +7,10 @@ use aes_gcm::{
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use sha2::{Digest, Sha256};
 
-use crate::{error::Result, key::GluonKey};
+use crate::{
+    error::{GluonCoreError, Result},
+    key::GluonKey,
+};
 
 const BLOCK_SIZE: usize = 64 * 4096;
 const NONCE_SIZE: usize = 12;
@@ -48,7 +51,7 @@ pub fn is_gluon_store_blob(data: &[u8]) -> bool {
 
 fn new_cipher(key: &GluonKey) -> Result<Aes256Gcm> {
     let hashed = Sha256::digest(key.as_bytes());
-    Aes256Gcm::new_from_slice(&hashed).map_err(|_| crate::GluonError::Crypto)
+    Aes256Gcm::new_from_slice(&hashed).map_err(|_| GluonCoreError::Crypto)
 }
 
 fn compress(data: &[u8]) -> Result<Vec<u8>> {
@@ -74,14 +77,14 @@ fn make_header_bytes() -> Vec<u8> {
 
 fn parse_nonce(data: &[u8], header: &[u8]) -> Result<[u8; NONCE_SIZE]> {
     if !data.starts_with(header) {
-        return Err(crate::GluonError::InvalidBlob {
+        return Err(GluonCoreError::InvalidBlob {
             reason: "missing gluon store header".to_string(),
         });
     }
 
     let minimum_len = header.len() + NONCE_SIZE;
     if data.len() < minimum_len {
-        return Err(crate::GluonError::InvalidBlob {
+        return Err(GluonCoreError::InvalidBlob {
             reason: format!(
                 "blob shorter than header+nonce (have {}, need at least {})",
                 data.len(),
@@ -103,13 +106,17 @@ fn nonce_for_chunk(base_nonce: &[u8; NONCE_SIZE], chunk_index: usize) -> [u8; NO
     nonce
 }
 
-fn decrypt_blocks(cipher: &Aes256Gcm, nonce: &[u8; NONCE_SIZE], encrypted: &[u8]) -> Result<Vec<u8>> {
+fn decrypt_blocks(
+    cipher: &Aes256Gcm,
+    nonce: &[u8; NONCE_SIZE],
+    encrypted: &[u8],
+) -> Result<Vec<u8>> {
     let encrypted_block_size = BLOCK_SIZE + ENCRYPTION_OVERHEAD;
     let mut decrypted = Vec::new();
 
     for (chunk_index, chunk) in encrypted.chunks(encrypted_block_size).enumerate() {
         if chunk.len() < ENCRYPTION_OVERHEAD {
-            return Err(crate::GluonError::InvalidBlob {
+            return Err(GluonCoreError::InvalidBlob {
                 reason: format!(
                     "encrypted chunk {} shorter than authentication tag",
                     chunk_index
@@ -126,7 +133,7 @@ fn decrypt_blocks(cipher: &Aes256Gcm, nonce: &[u8; NONCE_SIZE], encrypted: &[u8]
 
 #[cfg(test)]
 mod tests {
-    use crate::key::GluonKey;
+    use crate::{key::GluonKey, GluonCoreError};
 
     use super::{decode_blob, encode_blob, is_gluon_store_blob, make_header_bytes, NONCE_SIZE};
 
@@ -147,6 +154,6 @@ mod tests {
         encoded.truncate(make_header_bytes().len() + NONCE_SIZE - 1);
 
         let err = decode_blob(&key, &encoded).unwrap_err();
-        assert!(matches!(err, crate::GluonError::InvalidBlob { .. }));
+        assert!(matches!(err, GluonCoreError::InvalidBlob { .. }));
     }
 }

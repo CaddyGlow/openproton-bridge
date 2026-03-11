@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum GluonError {
+pub enum GluonCoreError {
     #[error("invalid path component: {component}")]
     InvalidPathComponent { component: String },
 
@@ -22,12 +22,6 @@ pub enum GluonError {
     #[error("cryptography error")]
     Crypto,
 
-    #[error("sqlite database is missing required table: {table}")]
-    MissingRequiredTable { table: String },
-
-    #[error("schema is not upstream-compatible: {family}")]
-    IncompatibleSchema { family: String },
-
     #[error("invalid blob: {reason}")]
     InvalidBlob { reason: String },
 
@@ -41,9 +35,9 @@ pub enum GluonError {
     Io(#[from] std::io::Error),
 }
 
-pub type Result<T> = std::result::Result<T, GluonError>;
+pub type Result<T> = std::result::Result<T, GluonCoreError>;
 
-impl From<aes_gcm::Error> for GluonError {
+impl From<aes_gcm::Error> for GluonCoreError {
     fn from(_: aes_gcm::Error) -> Self {
         Self::Crypto
     }

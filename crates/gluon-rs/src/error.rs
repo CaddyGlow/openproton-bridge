@@ -28,6 +28,9 @@ pub enum GluonError {
     #[error("schema is not upstream-compatible: {family}")]
     IncompatibleSchema { family: String },
 
+    #[error("invalid blob: {reason}")]
+    InvalidBlob { reason: String },
+
     #[error("cache root does not exist: {path}")]
     MissingCacheRoot { path: PathBuf },
 

@@ -100,3 +100,30 @@ fn be023_dropping_uncommitted_transaction_discards_staged_files() {
         0
     );
 }
+
+#[test]
+fn be023_recovery_replays_exact_file_deletes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(temp.path().join("backend/db")).expect("create db dir");
+    fs::write(temp.path().join("backend/db/user-recover.db"), b"db").expect("seed db");
+    fs::write(temp.path().join("backend/db/user-recover.db-wal"), b"wal").expect("seed wal");
+
+    let manager = GluonTxnManager::new(temp.path()).expect("txn manager");
+    let mut txn = manager.begin("user-recover").expect("begin txn");
+
+    txn.stage_delete("backend/db/user-recover.db-wal")
+        .expect("stage wal delete");
+    txn.stage_delete("backend/db/user-recover.db-shm")
+        .expect("stage shm delete");
+
+    let err = txn.commit_with_injected_failure(1).unwrap_err();
+    assert!(matches!(err, GluonTxnError::InjectedFailure { applied } if applied == 1));
+    assert!(!temp.path().join("backend/db/user-recover.db-wal").exists());
+
+    let report = manager.recover_pending("user-recover").expect("recover");
+    assert_eq!(report.transactions_recovered, 1);
+    assert_eq!(report.operations_recovered, 1);
+    assert!(!temp.path().join("backend/db/user-recover.db-wal").exists());
+    assert!(!temp.path().join("backend/db/user-recover.db-shm").exists());
+    assert!(temp.path().join("backend/db/user-recover.db").exists());
+}

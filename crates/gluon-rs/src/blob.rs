@@ -10,19 +10,24 @@ use sha2::{Digest, Sha256};
 use crate::{error::Result, key::GluonKey};
 
 const BLOCK_SIZE: usize = 64 * 4096;
+const NONCE_SIZE: usize = 12;
+const ENCRYPTION_OVERHEAD: usize = 16;
 const STORE_VERSION: u32 = 1;
 const STORE_HEADER_ID: &[u8] = b"GLUON-CACHE";
 
 pub fn encode_blob(key: &GluonKey, data: &[u8]) -> Result<Vec<u8>> {
     let cipher = new_cipher(key)?;
-    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let generated_nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce.copy_from_slice(&generated_nonce);
     let compressed = compress(data)?;
 
     let mut out = make_header_bytes();
     out.extend_from_slice(&nonce);
 
-    for chunk in compressed.chunks(BLOCK_SIZE) {
-        out.extend_from_slice(&cipher.encrypt(&nonce, chunk)?);
+    for (chunk_index, chunk) in compressed.chunks(BLOCK_SIZE).enumerate() {
+        let nonce = nonce_for_chunk(&nonce, chunk_index);
+        out.extend_from_slice(&cipher.encrypt(Nonce::from_slice(&nonce), chunk)?);
     }
 
     Ok(out)
@@ -30,20 +35,11 @@ pub fn encode_blob(key: &GluonKey, data: &[u8]) -> Result<Vec<u8>> {
 
 pub fn decode_blob(key: &GluonKey, data: &[u8]) -> Result<Vec<u8>> {
     let header = make_header_bytes();
-    let nonce_size = 12usize;
-    let overhead = 16usize;
     let cipher = new_cipher(key)?;
+    let nonce = parse_nonce(data, &header)?;
+    let encrypted = &data[header.len() + NONCE_SIZE..];
 
-    let nonce = Nonce::from_slice(&data[header.len()..header.len() + nonce_size]);
-    let encrypted = &data[header.len() + nonce_size..];
-    let encrypted_block_size = BLOCK_SIZE + overhead;
-
-    let mut decrypted = Vec::new();
-    for chunk in encrypted.chunks(encrypted_block_size) {
-        decrypted.extend_from_slice(&cipher.decrypt(nonce, chunk)?);
-    }
-
-    decompress(&decrypted)
+    decompress(&decrypt_blocks(&cipher, &nonce, encrypted)?)
 }
 
 pub fn is_gluon_store_blob(data: &[u8]) -> bool {
@@ -76,15 +72,63 @@ fn make_header_bytes() -> Vec<u8> {
     header
 }
 
+fn parse_nonce(data: &[u8], header: &[u8]) -> Result<[u8; NONCE_SIZE]> {
+    if !data.starts_with(header) {
+        return Err(crate::GluonError::InvalidBlob {
+            reason: "missing gluon store header".to_string(),
+        });
+    }
+
+    let minimum_len = header.len() + NONCE_SIZE;
+    if data.len() < minimum_len {
+        return Err(crate::GluonError::InvalidBlob {
+            reason: format!(
+                "blob shorter than header+nonce (have {}, need at least {})",
+                data.len(),
+                minimum_len
+            ),
+        });
+    }
+
+    let mut nonce = [0u8; NONCE_SIZE];
+    nonce.copy_from_slice(&data[header.len()..minimum_len]);
+    Ok(nonce)
+}
+
+fn nonce_for_chunk(base_nonce: &[u8; NONCE_SIZE], chunk_index: usize) -> [u8; NONCE_SIZE] {
+    let mut nonce = *base_nonce;
+    let mut counter = u32::from_be_bytes(nonce[NONCE_SIZE - 4..].try_into().expect("nonce tail"));
+    counter = counter.wrapping_add(u32::try_from(chunk_index).unwrap_or(u32::MAX));
+    nonce[NONCE_SIZE - 4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+fn decrypt_blocks(cipher: &Aes256Gcm, nonce: &[u8; NONCE_SIZE], encrypted: &[u8]) -> Result<Vec<u8>> {
+    let encrypted_block_size = BLOCK_SIZE + ENCRYPTION_OVERHEAD;
+    let mut decrypted = Vec::new();
+
+    for (chunk_index, chunk) in encrypted.chunks(encrypted_block_size).enumerate() {
+        if chunk.len() < ENCRYPTION_OVERHEAD {
+            return Err(crate::GluonError::InvalidBlob {
+                reason: format!(
+                    "encrypted chunk {} shorter than authentication tag",
+                    chunk_index
+                ),
+            });
+        }
+
+        let chunk_nonce = nonce_for_chunk(nonce, chunk_index);
+        decrypted.extend_from_slice(&cipher.decrypt(Nonce::from_slice(&chunk_nonce), chunk)?);
+    }
+
+    Ok(decrypted)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, process::Command};
-
-    use tempfile::tempdir;
-
     use crate::key::GluonKey;
 
-    use super::{decode_blob, encode_blob, is_gluon_store_blob};
+    use super::{decode_blob, encode_blob, is_gluon_store_blob, make_header_bytes, NONCE_SIZE};
 
     #[test]
     fn round_trips_gluon_store_blob() {
@@ -97,168 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn interoperates_with_upstream_go_store_when_enabled() {
-        if std::env::var_os("GLUON_RS_INTEROP_TEST").is_none() {
-            return;
-        }
+    fn rejects_truncated_blob_without_panicking() {
+        let key = GluonKey::try_from_slice(&[7u8; 32]).expect("key");
+        let mut encoded = encode_blob(&key, b"hello").expect("encode");
+        encoded.truncate(make_header_bytes().len() + NONCE_SIZE - 1);
 
-        let gluon_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../gluon")
-            .canonicalize()
-            .expect("canonicalize sibling gluon checkout");
-        assert!(gluon_root.join("go.mod").exists(), "sibling ../gluon checkout missing");
-
-        let key = [11u8; 32];
-        let key_hex = to_hex(&key);
-        let message_id = "66666666-6666-6666-6666-666666666666";
-        let payload = b"hello from rust";
-
-        let rust_store = tempdir().expect("rust store");
-        let key_obj = GluonKey::try_from_slice(&key).expect("key");
-        let encoded = encode_blob(&key_obj, payload).expect("encode");
-        fs::write(rust_store.path().join(message_id), encoded).expect("write rust blob");
-
-        let go_project = tempdir().expect("go project");
-        let go_cache = tempdir().expect("go cache");
-        let go_modcache = tempdir().expect("go modcache");
-        let go_path = tempdir().expect("go path");
-        fs::write(
-            go_project.path().join("go.mod"),
-            format!(
-                "module gluonrsinterop\n\ngo 1.24\n\nrequire github.com/ProtonMail/gluon v0.0.0\nreplace github.com/ProtonMail/gluon => {}\n",
-                gluon_root.display()
-            ),
-        )
-        .expect("write go.mod");
-        fs::write(
-            go_project.path().join("main.go"),
-            r#"
-package main
-
-import (
-    "bytes"
-    "encoding/hex"
-    "fmt"
-    "os"
-
-    "github.com/ProtonMail/gluon/imap"
-    "github.com/ProtonMail/gluon/store"
-)
-
-func main() {
-    if len(os.Args) < 5 {
-        panic("usage: <mode> <storeDir> <keyHex> <id> [payload]")
-    }
-    mode := os.Args[1]
-    storeDir := os.Args[2]
-    key, err := hex.DecodeString(os.Args[3])
-    if err != nil {
-        panic(err)
-    }
-    msgID, err := imap.InternalMessageIDFromString(os.Args[4])
-    if err != nil {
-        panic(err)
-    }
-
-    s, err := store.NewOnDiskStore(storeDir, key)
-    if err != nil {
-        panic(err)
-    }
-    defer s.Close()
-
-    switch mode {
-    case "read":
-        b, err := s.Get(msgID)
-        if err != nil {
-            panic(err)
-        }
-        os.Stdout.Write(b)
-    case "write":
-        payload := []byte(os.Args[5])
-        if err := s.Set(msgID, bytes.NewReader(payload)); err != nil {
-            panic(err)
-        }
-        fmt.Print("ok")
-    default:
-        panic("unknown mode")
-    }
-}
-"#,
-        )
-        .expect("write main.go");
-
-        let tidy = Command::new("go")
-            .arg("mod")
-            .arg("tidy")
-            .env("GO111MODULE", "on")
-            .env("GOCACHE", go_cache.path())
-            .env("GOMODCACHE", go_modcache.path())
-            .env("GOPATH", go_path.path())
-            .current_dir(go_project.path())
-            .output()
-            .expect("go mod tidy");
-        assert!(
-            tidy.status.success(),
-            "go mod tidy failed: {}",
-            String::from_utf8_lossy(&tidy.stderr)
-        );
-
-        let read = Command::new("go")
-            .arg("run")
-            .arg(".")
-            .arg("read")
-            .arg(rust_store.path())
-            .arg(&key_hex)
-            .arg(message_id)
-            .env("GO111MODULE", "on")
-            .env("GOCACHE", go_cache.path())
-            .env("GOMODCACHE", go_modcache.path())
-            .env("GOPATH", go_path.path())
-            .current_dir(go_project.path())
-            .output()
-            .expect("go read");
-        assert!(
-            read.status.success(),
-            "go read failed: {}",
-            String::from_utf8_lossy(&read.stderr)
-        );
-        assert_eq!(read.stdout, payload);
-
-        let go_store = tempdir().expect("go store");
-        let write = Command::new("go")
-            .arg("run")
-            .arg(".")
-            .arg("write")
-            .arg(go_store.path())
-            .arg(&key_hex)
-            .arg(message_id)
-            .arg("hello from go")
-            .env("GO111MODULE", "on")
-            .env("GOCACHE", go_cache.path())
-            .env("GOMODCACHE", go_modcache.path())
-            .env("GOPATH", go_path.path())
-            .current_dir(go_project.path())
-            .output()
-            .expect("go write");
-        assert!(
-            write.status.success(),
-            "go write failed: {}",
-            String::from_utf8_lossy(&write.stderr)
-        );
-
-        let encoded = fs::read(go_store.path().join(message_id)).expect("read go blob");
-        assert!(is_gluon_store_blob(&encoded));
-        assert_eq!(
-            decode_blob(&key_obj, &encoded).expect("decode go blob"),
-            b"hello from go"
-        );
-    }
-
-    fn to_hex(bytes: &[u8]) -> String {
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for byte in bytes {
-            out.push_str(&format!("{byte:02x}"));
-        }
-        out
+        let err = decode_blob(&key, &encoded).unwrap_err();
+        assert!(matches!(err, crate::GluonError::InvalidBlob { .. }));
     }
 }

@@ -60,12 +60,14 @@ impl DeferredDeleteManager {
     pub fn delete_db_files(&self, user_id: &str) -> Result<usize> {
         fs::create_dir_all(self.deferred_delete_dir())?;
         let mut moved = 0usize;
-        let pattern = format!("{}/{}*", self.db_dir.display(), user_id);
-
-        for file in glob::glob(&pattern)
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.msg))?
-        {
-            let file = file.map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        for file in [
+            self.db_dir.join(format!("{user_id}.db")),
+            self.db_dir.join(format!("{user_id}.db-wal")),
+            self.db_dir.join(format!("{user_id}.db-shm")),
+        ] {
+            if !file.exists() {
+                continue;
+            }
             let target = self.deferred_delete_dir().join(Uuid::new_v4().to_string());
             fs::rename(file, target)?;
             moved += 1;
@@ -142,5 +144,25 @@ mod tests {
             .cleanup_deferred_delete_dir()
             .expect("cleanup deferred delete");
         assert!(!manager.deferred_delete_dir().exists());
+    }
+
+    #[test]
+    fn only_moves_exact_account_database_files() {
+        let temp = tempdir().expect("tempdir");
+        let db_dir = temp.path().join("backend/db");
+        std::fs::create_dir_all(&db_dir).expect("db dir");
+        std::fs::write(db_dir.join("user-1.db"), b"db").expect("db");
+        std::fs::write(db_dir.join("user-1.db-wal"), b"wal").expect("wal");
+        std::fs::write(db_dir.join("user-10.db"), b"other-db").expect("other db");
+        std::fs::write(db_dir.join("user-100.db-shm"), b"other-shm").expect("other shm");
+
+        let manager = DeferredDeleteManager::new(&db_dir).expect("manager");
+        let moved = manager.delete_db_files("user-1").expect("move");
+
+        assert_eq!(moved, 2);
+        assert!(!db_dir.join("user-1.db").exists());
+        assert!(!db_dir.join("user-1.db-wal").exists());
+        assert!(db_dir.join("user-10.db").exists());
+        assert!(db_dir.join("user-100.db-shm").exists());
     }
 }

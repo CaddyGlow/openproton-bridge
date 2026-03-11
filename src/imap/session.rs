@@ -3203,7 +3203,7 @@ mod tests {
 
         let mut meta = make_meta("msg-1", 1);
         meta.external_id = Some("msg-1@example.test".to_string());
-        let blob = b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nFrom: Alice <alice@proton.me>\r\nTo: Bob <bob@proton.me>\r\nSubject: Subject msg-1\r\nMessage-ID: <msg-1@example.test>\r\n\r\nbody".to_vec();
+        let blob = b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nFrom: Alice <alice@proton.me>\r\nTo: Bob <bob@proton.me>\r\nSubject: Subject msg-1\r\nMessage-ID: <msg-1@example.test>\r\n\r\nsearch-hit-body".to_vec();
         meta.size = blob.len() as i64;
         let header = String::from_utf8_lossy(&blob)
             .split("\r\n\r\n")
@@ -3222,7 +3222,7 @@ mod tests {
                         .map(str::to_string)
                         .collect(),
                     blob: blob.clone(),
-                    body: "body".to_string(),
+                    body: "search-hit-body".to_string(),
                     body_structure: rfc822::build_bodystructure(&blob),
                     envelope: rfc822::build_envelope(&meta, &header),
                     size: meta.size,
@@ -5136,6 +5136,45 @@ mod tests {
             )
             .await
             .unwrap();
+
+        session
+            .handle_line("a001 SEARCH TEXT \"search-hit-body\"")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(
+            response.contains("a001 OK SEARCH completed"),
+            "response={response}"
+        );
+
+        session
+            .handle_line("a002 SEARCH HEADER Subject \"Subject msg-1\"")
+            .await
+            .unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(
+            response.contains("a002 OK SEARCH completed"),
+            "response={response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_and_header_use_gluon_mail_rfc822() {
+        let (config, _fixture) = test_gluon_mail_view_config();
+        let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
 
         session
             .handle_line("a001 SEARCH TEXT \"search-hit-body\"")

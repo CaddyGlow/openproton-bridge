@@ -282,6 +282,7 @@ mod tests {
             disable_tls: true,
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
+            imap_read_backend: crate::bridge::mail_runtime::ImapReadBackend::Compat,
             event_poll_interval: Duration::from_secs(30),
             pim_reconcile_tick_interval:
                 crate::bridge::mail_runtime::DEFAULT_PIM_RECONCILE_TICK_INTERVAL,

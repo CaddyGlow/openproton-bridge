@@ -2340,6 +2340,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             smtp_port: incoming.smtp_port,
             use_ssl_for_imap: incoming.use_ssl_for_imap,
             use_ssl_for_smtp: incoming.use_ssl_for_smtp,
+            imap_read_backend: previous.imap_read_backend,
             pim_reconcile_tick_secs: previous.pim_reconcile_tick_secs,
             pim_contacts_reconcile_secs: previous.pim_contacts_reconcile_secs,
             pim_calendar_reconcile_secs: previous.pim_calendar_reconcile_secs,

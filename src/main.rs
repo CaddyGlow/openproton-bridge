@@ -816,6 +816,8 @@ struct CliStoredMailSettings {
     dav_tls_mode: String,
     use_ssl_for_imap: bool,
     use_ssl_for_smtp: bool,
+    #[serde(default)]
+    imap_read_backend: bridge::mail_runtime::ImapReadBackend,
     #[serde(default = "default_pim_reconcile_tick_secs")]
     pim_reconcile_tick_secs: i32,
     #[serde(default = "default_pim_contacts_reconcile_secs")]
@@ -836,6 +838,7 @@ impl Default for CliStoredMailSettings {
             dav_tls_mode: default_dav_tls_mode(),
             use_ssl_for_imap: true,
             use_ssl_for_smtp: true,
+            imap_read_backend: bridge::mail_runtime::ImapReadBackend::Compat,
             pim_reconcile_tick_secs: default_pim_reconcile_tick_secs(),
             pim_contacts_reconcile_secs: default_pim_contacts_reconcile_secs(),
             pim_calendar_reconcile_secs: default_pim_calendar_reconcile_secs(),
@@ -4734,6 +4737,7 @@ async fn cmd_serve(
         disable_tls: no_tls,
         use_ssl_for_imap: true,
         use_ssl_for_smtp: true,
+        imap_read_backend: bridge::mail_runtime::ImapReadBackend::Compat,
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(
@@ -4864,6 +4868,7 @@ async fn start_interactive_runtime(
         disable_tls: config.no_tls,
         use_ssl_for_imap: true,
         use_ssl_for_smtp: true,
+        imap_read_backend: bridge::mail_runtime::ImapReadBackend::Compat,
         event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(config.pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(

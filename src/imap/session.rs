@@ -3111,10 +3111,18 @@ mod tests {
     use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
     use crate::bridge::auth_router::AuthRouter;
     use crate::imap::gluon_connector::StoreBackedConnector;
+    use crate::imap::gluon_mailbox_view::GluonMailMailboxView;
+    use crate::imap::mailbox;
     use crate::imap::mailbox_catalog::RuntimeMailboxCatalog;
     use crate::imap::mailbox_mutation::StoreBackedMailboxMutation;
     use crate::imap::mailbox_view::StoreBackedMailboxView;
+    use crate::imap::rfc822;
     use crate::imap::store::InMemoryStore;
+    use gluon_rs_mail::{
+        AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, NewMailbox,
+        NewMessage, StoreBootstrap,
+    };
+    use tempfile::{tempdir, TempDir};
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3151,6 +3159,91 @@ mod tests {
 
     fn test_config() -> Arc<SessionConfig> {
         test_config_with_mode(MutationMode::Compat)
+    }
+
+    struct TestGluonMailFixture {
+        _tempdir: TempDir,
+    }
+
+    fn test_gluon_mail_view_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
+        let session = test_session();
+        let accounts = AccountRegistry::from_single_session(session.clone());
+        let store = InMemoryStore::new();
+        let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+
+        let tempdir = tempdir().expect("tempdir");
+        let layout = CacheLayout::new(tempdir.path().join("gluon"));
+        let gluon_store = Arc::new(
+            CompatibleStore::open(StoreBootstrap::new(
+                layout,
+                CompatibilityTarget::pinned("2046c95ca745"),
+                vec![AccountBootstrap::new(
+                    "test-uid",
+                    "test-uid",
+                    GluonKey::try_from_slice(&[7u8; 32]).expect("key"),
+                )],
+            ))
+            .expect("open store"),
+        );
+
+        let mailbox = gluon_store
+            .create_mailbox(
+                "test-uid",
+                &NewMailbox {
+                    remote_id: "0".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 42,
+                    subscribed: true,
+                    attributes: Vec::new(),
+                    flags: Vec::new(),
+                    permanent_flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+                },
+            )
+            .expect("create mailbox");
+
+        let mut meta = make_meta("msg-1", 1);
+        meta.external_id = Some("msg-1@example.test".to_string());
+        let blob = b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nFrom: Alice <alice@proton.me>\r\nTo: Bob <bob@proton.me>\r\nSubject: Subject msg-1\r\nMessage-ID: <msg-1@example.test>\r\n\r\nbody".to_vec();
+        meta.size = blob.len() as i64;
+        let header = String::from_utf8_lossy(&blob)
+            .split("\r\n\r\n")
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        gluon_store
+            .append_message(
+                "test-uid",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "internal-1".to_string(),
+                    remote_id: meta.id.clone(),
+                    flags: mailbox::message_flags(&meta)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect(),
+                    blob: blob.clone(),
+                    body: "body".to_string(),
+                    body_structure: rfc822::build_bodystructure(&blob),
+                    envelope: rfc822::build_envelope(&meta, &header),
+                    size: meta.size,
+                    recent: false,
+                },
+            )
+            .expect("append message");
+
+        let config = Arc::new(SessionConfig {
+            api_base_url: "https://mail-api.proton.me".to_string(),
+            auth_router: AuthRouter::new(accounts),
+            runtime_accounts: runtime_accounts.clone(),
+            gluon_connector: StoreBackedConnector::new(store.clone()),
+            mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
+            mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
+            mailbox_view: GluonMailMailboxView::new(gluon_store),
+            store,
+            mutation_mode: MutationMode::Compat,
+        });
+
+        (config, TestGluonMailFixture { _tempdir: tempdir })
     }
 
     fn failing_client() -> ProtonClient {
@@ -3741,6 +3834,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_status_authenticated_with_gluon_mail_view() {
+        let (config, _fixture) = test_gluon_mail_view_config();
+        let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        session
+            .handle_line("a001 STATUS \"INBOX\" (UIDNEXT UIDVALIDITY UNSEEN RECENT MESSAGES)")
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("* STATUS \"INBOX\" ("),
+            "response={response}"
+        );
+        assert!(response.contains("UIDNEXT 2"), "response={response}");
+        assert!(response.contains("UIDVALIDITY 42"), "response={response}");
+        assert!(response.contains("UNSEEN 1"), "response={response}");
+        assert!(response.contains("RECENT 0"), "response={response}");
+        assert!(response.contains("MESSAGES 1"), "response={response}");
+        assert!(
+            response.contains("a001 OK STATUS completed"),
+            "response={response}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_check_selected_mailbox() {
         let config = test_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
@@ -3886,6 +4012,30 @@ mod tests {
         assert!(response.contains(" FETCH (BODY ("), "response={response}");
         assert!(!response.contains("BODYSTRUCTURE"), "response={response}");
         assert!(response.contains("a001 OK FETCH completed"));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_body_returns_body_item_not_bodystructure_with_gluon_mail_view() {
+        let (config, _fixture) = test_gluon_mail_view_config();
+        let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        session.handle_line("a001 FETCH 1 BODY").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains(" FETCH (BODY ("), "response={response}");
+        assert!(!response.contains("BODYSTRUCTURE"), "response={response}");
+        assert!(
+            response.contains("a001 OK FETCH completed"),
+            "response={response}"
+        );
     }
 
     #[tokio::test]
@@ -5004,6 +5154,45 @@ mod tests {
 
         session
             .handle_line("a002 SEARCH HEADER Subject \"Subject msg-1\"")
+            .await
+            .unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(
+            response.contains("a002 OK SEARCH completed"),
+            "response={response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_text_and_header_use_gluon_mail_view() {
+        let (config, _fixture) = test_gluon_mail_view_config();
+        let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        session
+            .handle_line("a001 SEARCH TEXT \"body\"")
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("* SEARCH 1"), "response={response}");
+        assert!(
+            response.contains("a001 OK SEARCH completed"),
+            "response={response}"
+        );
+
+        session
+            .handle_line("a002 UID SEARCH HEADER Subject \"Subject msg-1\"")
             .await
             .unwrap();
         let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)

@@ -396,6 +396,7 @@ impl EventWorkerConfig {
         runtime_accounts: Arc<RuntimeAccountRegistry>,
         auth_router: AuthRouter,
         store: Arc<dyn MessageStore>,
+        connector: Arc<dyn GluonImapConnector>,
         checkpoint_store: SharedCheckpointStore,
     ) -> Self {
         Self {
@@ -404,7 +405,7 @@ impl EventWorkerConfig {
             api_base_url,
             runtime_accounts,
             auth_router,
-            connector: StoreBackedConnector::new(store.clone()),
+            connector,
             store,
             pim_store: None,
             checkpoint_store,
@@ -2142,6 +2143,34 @@ pub fn start_event_worker_group_with_sync_progress_and_pim(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
 ) -> EventWorkerGroup {
+    let connector = StoreBackedConnector::new(store.clone());
+    start_event_worker_group_with_sync_progress_and_pim_and_connector(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        store,
+        connector,
+        checkpoint_store,
+        pim_stores,
+        sync_progress_callback,
+        poll_interval,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    store: Arc<dyn MessageStore>,
+    connector: Arc<dyn GluonImapConnector>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> EventWorkerGroup {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let handles = accounts
         .into_iter()
@@ -2155,6 +2184,7 @@ pub fn start_event_worker_group_with_sync_progress_and_pim(
                 runtime_accounts.clone(),
                 auth_router.clone(),
                 store.clone(),
+                connector.clone(),
                 checkpoint_store.clone(),
             );
             if let Some(pim_store) = pim_stores.get(&account_id_key) {
@@ -2235,6 +2265,7 @@ pub fn start_event_workers_with_sync_progress_and_pim(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
 ) -> Vec<JoinHandle<()>> {
+    let connector = StoreBackedConnector::new(store.clone());
     accounts
         .into_iter()
         .map(|account| {
@@ -2247,6 +2278,7 @@ pub fn start_event_workers_with_sync_progress_and_pim(
                 runtime_accounts.clone(),
                 auth_router.clone(),
                 store.clone(),
+                connector.clone(),
                 checkpoint_store.clone(),
             );
             if let Some(pim_store) = pim_stores.get(&account_id_key) {
@@ -2328,9 +2360,36 @@ mod tests {
             server_uri.to_string(),
             runtime,
             auth_router,
-            store,
+            store.clone(),
+            StoreBackedConnector::new(store),
             checkpoints,
         )
+    }
+
+    #[test]
+    fn event_worker_config_reuses_supplied_connector() {
+        let tmp = tempdir().unwrap();
+        let runtime = Arc::new(RuntimeAccountRegistry::new(
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        ));
+        let auth_router = AuthRouter::new(AccountRegistry::default());
+        let store: Arc<dyn MessageStore> = InMemoryStore::new();
+        let connector: Arc<dyn GluonImapConnector> = StoreBackedConnector::new(store.clone());
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+
+        let config = EventWorkerConfig::new(
+            AccountId("uid-1".to_string()),
+            "alice@proton.me".to_string(),
+            "https://mail-api.proton.me".to_string(),
+            runtime,
+            auth_router,
+            store,
+            connector.clone(),
+            checkpoints,
+        );
+
+        assert!(Arc::ptr_eq(&config.connector, &connector));
     }
 
     fn setup_pim_store() -> Arc<PimStore> {

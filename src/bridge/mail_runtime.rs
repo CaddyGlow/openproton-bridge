@@ -654,17 +654,19 @@ async fn run_runtime(
     let pim_stores_for_reconcile = pim_stores.clone();
     let dav_pim_stores = pim_stores.clone();
     let dav_auth_router = auth_router.clone();
-    let event_workers = super::events::start_event_worker_group_with_sync_progress_and_pim(
-        runtime_accounts.clone(),
-        runtime_snapshot,
-        api_base_url,
-        auth_router,
-        event_store,
-        checkpoint_store,
-        pim_stores,
-        Some(sync_progress_callback),
-        poll_interval,
-    );
+    let event_workers =
+        super::events::start_event_worker_group_with_sync_progress_and_pim_and_connector(
+            runtime_accounts.clone(),
+            runtime_snapshot,
+            api_base_url,
+            auth_router,
+            event_store,
+            imap_config.gluon_connector.clone(),
+            checkpoint_store,
+            pim_stores,
+            Some(sync_progress_callback),
+            poll_interval,
+        );
 
     let pim_reconcile_task = tokio::spawn(run_pim_reconcile_periodically(
         runtime_accounts.clone(),

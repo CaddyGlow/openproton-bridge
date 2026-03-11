@@ -3,9 +3,11 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OpenFlags};
 
 use crate::{
+    blob::{decode_blob, encode_blob},
     db::SchemaProbe,
     error::{GluonError, Result},
     layout::AccountPaths,
+    txn::DeferredDeleteManager,
     types::{AccountBootstrap, StoreBootstrap},
 };
 
@@ -101,6 +103,7 @@ impl CompatibleStore {
         bootstrap.validate()?;
         if create_dirs {
             bootstrap.layout.ensure_base_dirs()?;
+            DeferredDeleteManager::new(bootstrap.layout.db_dir())?.cleanup_deferred_delete_dir()?;
         } else if !bootstrap.layout.root().exists() {
             return Err(GluonError::MissingCacheRoot {
                 path: bootstrap.layout.root().to_path_buf(),
@@ -151,6 +154,7 @@ impl CompatibleStore {
     pub fn initialize_upstream_schema(&self, storage_user_id: &str) -> Result<()> {
         let account_paths = self.account_paths(storage_user_id)?;
         let conn = Connection::open(account_paths.primary_db_path())?;
+        configure_upstream_db_connection(&conn)?;
         conn.execute_batch(UPSTREAM_BASE_SCHEMA)?;
         conn.execute(
             "INSERT INTO connector_settings(id, value) VALUES(0, NULL)
@@ -211,11 +215,12 @@ impl CompatibleStore {
         self.initialize_upstream_schema(storage_user_id)?;
         let account_paths = self.account_paths(storage_user_id)?;
         std::fs::create_dir_all(account_paths.store_dir())?;
-
         let blob_path = account_paths.blob_path(&message.internal_id)?;
-        std::fs::write(&blob_path, &message.blob)?;
+        let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
+        std::fs::write(&blob_path, encoded)?;
 
         let conn = Connection::open(account_paths.primary_db_path())?;
+        configure_upstream_db_connection(&conn)?;
         let tx = conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO messages_v2(id, remote_id, date, size, body, body_structure, envelope, deleted)
@@ -249,6 +254,14 @@ impl CompatibleStore {
             .ok_or_else(|| GluonError::MissingRequiredTable {
                 table: format!("mailbox_message_{mailbox_internal_id}"),
             })
+    }
+
+    pub fn delete_account_database_files(&self, storage_user_id: &str) -> Result<usize> {
+        DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?.delete_db_files(storage_user_id)
+    }
+
+    pub fn cleanup_deferred_database_files(&self) -> Result<()> {
+        DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?.cleanup_deferred_delete_dir()
     }
 
     pub fn add_message_flags(
@@ -607,7 +620,8 @@ impl CompatibleStore {
         internal_message_id: &str,
     ) -> Result<Vec<u8>> {
         let account_paths = self.account_paths(storage_user_id)?;
-        Ok(std::fs::read(account_paths.blob_path(internal_message_id)?)?)
+        let encoded = std::fs::read(account_paths.blob_path(internal_message_id)?)?;
+        decode_blob(&self.account(storage_user_id)?.key, &encoded)
     }
 
     pub fn mailbox_snapshot(
@@ -699,7 +713,9 @@ impl CompatibleStore {
             });
         }
 
-        Ok(Connection::open(account_paths.primary_db_path())?)
+        let conn = Connection::open(account_paths.primary_db_path())?;
+        configure_upstream_db_connection(&conn)?;
+        Ok(conn)
     }
 
     fn get_upstream_mailbox(&self, conn: &Connection, mailbox_internal_id: u64) -> Result<UpstreamMailbox> {
@@ -759,6 +775,11 @@ where
 
 fn query_count(conn: &Connection, sql: &str) -> Result<u32> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, u32>(0))?)
+}
+
+fn configure_upstream_db_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+    Ok(())
 }
 
 fn next_uid_for_mailbox(conn: &Connection, table_name: &str) -> Result<u32> {
@@ -895,6 +916,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::{
+        encode_blob,
         key::GluonKey,
         layout::CacheLayout,
         target::CompatibilityTarget,
@@ -902,6 +924,7 @@ mod tests {
     };
 
     use super::{CompatibleStore, DeletedSubscription, NewMailbox, NewMessage};
+    use crate::DeferredDeleteManager;
 
     #[test]
     fn opens_store_and_creates_layout() {
@@ -941,7 +964,11 @@ mod tests {
             account_paths
                 .blob_path("11111111-1111-1111-1111-111111111111")
                 .expect("blob path"),
-            b"blob payload",
+            encode_blob(
+                &GluonKey::try_from_slice(&[4u8; 32]).expect("key"),
+                b"blob payload",
+            )
+            .expect("encode blob"),
         )
         .expect("blob");
 
@@ -1172,6 +1199,45 @@ mod tests {
                 .read_message_blob("user-1", "22222222-2222-2222-2222-222222222222")
                 .expect("blob"),
             b"hello world"
+        );
+        assert_eq!(
+            store.cleanup_deferred_database_files().map(|_| ()).is_ok(),
+            true
+        );
+    }
+
+    #[test]
+    fn defers_account_database_deletion_like_upstream() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[2u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+        let account_paths = store.account_paths("user-1").expect("account paths");
+        std::fs::create_dir_all(account_paths.primary_db_path().parent().expect("db parent"))
+            .expect("db dir");
+        std::fs::write(account_paths.primary_db_path(), b"db").expect("db");
+        std::fs::write(account_paths.wal_path(), b"wal").expect("wal");
+        std::fs::write(account_paths.shm_path(), b"shm").expect("shm");
+
+        let moved = store
+            .delete_account_database_files("user-1")
+            .expect("defer db delete");
+        assert_eq!(moved, 3);
+        assert!(!account_paths.primary_db_path().exists());
+        assert!(!account_paths.wal_path().exists());
+        assert!(!account_paths.shm_path().exists());
+        assert_eq!(
+            std::fs::read_dir(DeferredDeleteManager::new(store.bootstrap.layout.db_dir()).expect("manager").deferred_delete_dir())
+                .expect("read deferred")
+                .count(),
+            3
         );
     }
 

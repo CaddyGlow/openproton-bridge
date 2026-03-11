@@ -23,6 +23,7 @@ mod crypto;
 mod dav;
 mod frontend;
 mod imap;
+mod jmap;
 mod observability;
 mod paths;
 mod pim;

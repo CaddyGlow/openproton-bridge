@@ -5,6 +5,9 @@ use openproton_bridge::imap::store::{GluonStore, MessageStore};
 use openproton_bridge::imap::ImapError;
 use serde_json::json;
 
+#[path = "gluon_db_support.rs"]
+mod gluon_db_support;
+
 fn make_account_map(account_id: &str, storage_user_id: &str) -> HashMap<String, String> {
     HashMap::from([(account_id.to_string(), storage_user_id.to_string())])
 }
@@ -141,24 +144,7 @@ async fn be029_repairs_missing_blob_references_deterministically() {
             }
         }
     });
-    let conn = rusqlite::Connection::open(&account_db).expect("open sqlite db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            payload BLOB NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );",
-    )
-    .expect("create sqlite index table");
-    conn.execute(
-        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
-         VALUES (1, ?1, ?2)",
-        rusqlite::params![
-            serde_json::to_vec_pretty(&index_payload).expect("serialize index"),
-            1_700_000_000_000_i64
-        ],
-    )
-    .expect("insert sqlite index row");
+    gluon_db_support::write_legacy_index_payload(&account_db, &index_payload);
 
     let store = GluonStore::new(
         temp.path().to_path_buf(),

@@ -64,12 +64,10 @@ async fn be034_gluon_store_persists_mailbox_index_to_sqlite_db() {
 
     let conn = rusqlite::Connection::open(&db_path).expect("open sqlite db");
     let row_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM openproton_mailbox_index WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("query sqlite index row count");
+        .query_row("SELECT COUNT(*) FROM openproton_mailboxes", [], |row| {
+            row.get(0)
+        })
+        .expect("query sqlite mailbox row count");
     assert_eq!(row_count, 1);
 }
 

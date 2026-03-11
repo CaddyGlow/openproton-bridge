@@ -501,6 +501,11 @@ async fn prepare_runtime_context(
         account_storage_ids,
     )
     .context("failed to initialize runtime IMAP store")?;
+    let gluon_connector = imap::gluon_connector::StoreBackedConnector::new(store.clone());
+    let mailbox_catalog =
+        imap::mailbox_catalog::RuntimeMailboxCatalog::new(runtime_accounts.clone());
+    let mailbox_mutation = imap::mailbox_mutation::StoreBackedMailboxMutation::new(store.clone());
+    let mailbox_view = imap::mailbox_view::StoreBackedMailboxView::new(store.clone());
     let event_store = store.clone();
     let mut pim_stores = HashMap::new();
     for account in &gluon_bootstrap.accounts {
@@ -518,6 +523,10 @@ async fn prepare_runtime_context(
         api_base_url: api_base_url.clone(),
         auth_router: auth_router.clone(),
         runtime_accounts: runtime_accounts.clone(),
+        gluon_connector,
+        mailbox_catalog,
+        mailbox_mutation,
+        mailbox_view,
         store,
         mutation_mode: imap::session::MutationMode::Compat,
     });

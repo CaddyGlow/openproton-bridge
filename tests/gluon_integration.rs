@@ -9,8 +9,10 @@ use openproton_bridge::bridge::types::{
 };
 use openproton_bridge::imap::store::{GluonStore, MessageStore};
 use openproton_bridge::vault;
-use rusqlite::OptionalExtension;
 use serde_json::Value;
+
+#[path = "gluon_db_support.rs"]
+mod gluon_db_support;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -83,18 +85,7 @@ fn load_index_payload_from_db(root: &Path, storage_user_id: &str) -> Value {
         .join("backend")
         .join("db")
         .join(format!("{storage_user_id}.db"));
-    let conn = rusqlite::Connection::open(&db_path)
-        .unwrap_or_else(|err| panic!("open sqlite db {} failed: {err}", db_path.display()));
-    let payload: Vec<u8> = conn
-        .query_row(
-            "SELECT payload FROM openproton_mailbox_index WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()
-        .expect("query sqlite index row")
-        .expect("sqlite index row should exist");
-    serde_json::from_slice(&payload).expect("parse sqlite index payload")
+    gluon_db_support::read_legacy_index_payload(&db_path)
 }
 
 #[tokio::test]

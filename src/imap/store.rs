@@ -11,7 +11,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use base64::Engine;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::api::types::MessageMetadata;
@@ -28,6 +28,25 @@ pub struct MailboxStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxSnapshot {
     pub exists: u32,
+    pub mod_seq: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StoreEventKind {
+    MailboxCreated,
+    MessageAdded,
+    MessageUpdated,
+    MessageBodyUpdated,
+    MessageFlagsUpdated,
+    MessageRemoved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreEvent {
+    pub mailbox: String,
+    pub uid: Option<u32>,
+    pub proton_id: Option<String>,
+    pub kind: StoreEventKind,
     pub mod_seq: u64,
 }
 
@@ -55,6 +74,7 @@ pub trait MessageStore: Send + Sync {
     async fn seq_to_uid(&self, mailbox: &str, seq: u32) -> Result<Option<u32>>;
     async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>>;
     fn subscribe_changes(&self) -> watch::Receiver<u64>;
+    fn subscribe_events(&self) -> broadcast::Receiver<StoreEvent>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,15 +121,18 @@ pub struct InMemoryStore {
     mailboxes: RwLock<HashMap<String, MailboxData>>,
     change_seq: AtomicU64,
     change_tx: watch::Sender<u64>,
+    event_tx: broadcast::Sender<StoreEvent>,
 }
 
 impl InMemoryStore {
     pub fn new() -> Arc<Self> {
         let (change_tx, _change_rx) = watch::channel(0);
+        let (event_tx, _event_rx) = broadcast::channel(256);
         Arc::new(Self {
             mailboxes: RwLock::new(HashMap::new()),
             change_seq: AtomicU64::new(0),
             change_tx,
+            event_tx,
         })
     }
 
@@ -119,6 +142,16 @@ impl InMemoryStore {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let _ = self.change_tx.send(next);
+    }
+
+    fn publish_events<I>(&self, events: I)
+    where
+        I: IntoIterator<Item = StoreEvent>,
+    {
+        self.publish_change();
+        for event in events {
+            let _ = self.event_tx.send(event);
+        }
     }
 }
 
@@ -139,6 +172,7 @@ impl PersistentStore {
                 mailboxes: RwLock::new(loaded),
                 change_seq: AtomicU64::new(0),
                 change_tx: watch::channel(0).0,
+                event_tx: broadcast::channel(256).0,
             },
         }))
     }
@@ -235,10 +269,15 @@ pub fn new_runtime_message_store(
 const GLUON_BACKEND_DIR: &str = "backend";
 const GLUON_DB_DIR: &str = "db";
 const GLUON_STORE_DIR: &str = "store";
-const GLUON_SQLITE_INDEX_TABLE: &str = "openproton_mailbox_index";
+const GLUON_SQLITE_META_TABLE: &str = "openproton_account_meta";
+const GLUON_SQLITE_MAILBOX_TABLE: &str = "openproton_mailboxes";
+const GLUON_SQLITE_MESSAGE_TABLE: &str = "openproton_messages";
+const GLUON_SQLITE_LABEL_TABLE: &str = "openproton_message_labels";
+const GLUON_SQLITE_ADDRESS_TABLE: &str = "openproton_message_addresses";
+const GLUON_SQLITE_FLAG_TABLE: &str = "openproton_message_flags";
+const GLUON_SQLITE_META_NEXT_BLOB_ID_KEY: &str = "next_blob_id";
 const GLUON_DEFAULT_ACCOUNT_SCOPE: &str = "__default__";
 const GLUON_DEFAULT_MAILBOX: &str = "INBOX";
-const GLUON_INDEX_VERSION: u32 = 1;
 const GLUON_COMPAT_MIGRATION_TABLES: &[&str] = &[
     "deleted_subscriptions",
     "mailboxes",
@@ -345,45 +384,60 @@ impl GluonMailboxData {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct GluonAccountIndexFile {
-    #[serde(default)]
-    version: u32,
-    #[serde(default)]
-    next_blob_id: u64,
-    #[serde(default)]
-    updated_at_ms: u64,
-    #[serde(default)]
-    mailboxes: HashMap<String, GluonMailboxData>,
-}
-
-impl GluonAccountIndexFile {
-    fn new() -> Self {
-        Self {
-            version: GLUON_INDEX_VERSION,
-            next_blob_id: 1,
-            updated_at_ms: 0,
-            mailboxes: HashMap::new(),
-        }
-    }
-
-    fn sanitize(&mut self) {
-        if self.version == 0 {
-            self.version = GLUON_INDEX_VERSION;
-        }
-        if self.next_blob_id == 0 {
-            self.next_blob_id = 1;
-        }
-        for mailbox in self.mailboxes.values_mut() {
-            mailbox.sanitize();
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 struct GluonAccountState {
     next_blob_id: u64,
     mailboxes: HashMap<String, GluonMailboxData>,
+}
+
+#[derive(Debug)]
+struct SqliteMessageRow {
+    mailbox_name: String,
+    uid: u32,
+    proton_id: Option<String>,
+    blob_name: Option<String>,
+    address_id: Option<String>,
+    external_id: Option<String>,
+    subject: Option<String>,
+    sender_name: Option<String>,
+    sender_address: Option<String>,
+    flags: Option<i64>,
+    time: Option<i64>,
+    size: Option<i64>,
+    unread: Option<i32>,
+    is_replied: Option<i32>,
+    is_replied_all: Option<i32>,
+    is_forwarded: Option<i32>,
+    num_attachments: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AddressFieldKind {
+    To,
+    Cc,
+    Bcc,
+    ReplyTo,
+}
+
+impl AddressFieldKind {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::To => "to",
+            Self::Cc => "cc",
+            Self::Bcc => "bcc",
+            Self::ReplyTo => "reply_to",
+        }
+    }
+
+    fn from_sql(value: &str) -> Option<Self> {
+        match value {
+            "to" => Some(Self::To),
+            "cc" => Some(Self::Cc),
+            "bcc" => Some(Self::Bcc),
+            "reply_to" => Some(Self::ReplyTo),
+            _ => None,
+        }
+    }
 }
 
 pub struct GluonStore {
@@ -393,6 +447,7 @@ pub struct GluonStore {
     txn_manager: super::gluon_txn::GluonTxnManager,
     change_seq: AtomicU64,
     change_tx: watch::Sender<u64>,
+    event_tx: broadcast::Sender<StoreEvent>,
 }
 
 impl GluonStore {
@@ -427,6 +482,7 @@ impl GluonStore {
                 reason: format!("failed to recover pending gluon transactions: {err}"),
             })?;
         let (change_tx, _change_rx) = watch::channel(0);
+        let (event_tx, _event_rx) = broadcast::channel(256);
         Ok(Arc::new(Self {
             root,
             account_storage_ids,
@@ -434,6 +490,7 @@ impl GluonStore {
             txn_manager,
             change_seq: AtomicU64::new(0),
             change_tx,
+            event_tx,
         }))
     }
 
@@ -443,6 +500,16 @@ impl GluonStore {
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         let _ = self.change_tx.send(next);
+    }
+
+    fn publish_events<I>(&self, events: I)
+    where
+        I: IntoIterator<Item = StoreEvent>,
+    {
+        self.publish_change();
+        for event in events {
+            let _ = self.event_tx.send(event);
+        }
     }
 
     fn split_scoped_mailbox(mailbox: &str) -> (String, String) {
@@ -497,19 +564,72 @@ impl GluonStore {
         }
     }
 
-    fn to_index_file(account: &GluonAccountState) -> GluonAccountIndexFile {
-        GluonAccountIndexFile {
-            version: GLUON_INDEX_VERSION,
-            next_blob_id: account.next_blob_id,
-            updated_at_ms: current_epoch_millis(),
-            mailboxes: account.mailboxes.clone(),
-        }
+    fn sqlite_schema() -> String {
+        format!(
+            "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_META_TABLE} (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_MAILBOX_TABLE} (
+                mailbox_name TEXT PRIMARY KEY,
+                uid_validity INTEGER NOT NULL,
+                next_uid INTEGER NOT NULL,
+                mod_seq INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_MESSAGE_TABLE} (
+                mailbox_name TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                proton_id TEXT,
+                blob_name TEXT,
+                address_id TEXT,
+                external_id TEXT,
+                subject TEXT,
+                sender_name TEXT,
+                sender_address TEXT,
+                flags INTEGER,
+                time INTEGER,
+                size INTEGER,
+                unread INTEGER,
+                is_replied INTEGER,
+                is_replied_all INTEGER,
+                is_forwarded INTEGER,
+                num_attachments INTEGER,
+                PRIMARY KEY (mailbox_name, uid)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS openproton_messages_mailbox_proton_idx
+                ON {GLUON_SQLITE_MESSAGE_TABLE}(mailbox_name, proton_id)
+                WHERE proton_id IS NOT NULL;
+            CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_LABEL_TABLE} (
+                mailbox_name TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                label_id TEXT NOT NULL,
+                PRIMARY KEY (mailbox_name, uid, ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_ADDRESS_TABLE} (
+                mailbox_name TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                field_kind TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                address TEXT NOT NULL,
+                PRIMARY KEY (mailbox_name, uid, field_kind, ordinal)
+            );
+            CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_FLAG_TABLE} (
+                mailbox_name TEXT NOT NULL,
+                uid INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                flag TEXT NOT NULL,
+                PRIMARY KEY (mailbox_name, uid, ordinal)
+            );"
+        )
     }
 
-    fn load_index_from_sqlite(
-        &self,
-        storage_user_id: &str,
-    ) -> Result<Option<GluonAccountIndexFile>> {
+    fn initialize_sqlite_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+        conn.execute_batch(&Self::sqlite_schema())
+    }
+
+    fn load_account_from_sqlite(&self, storage_user_id: &str) -> Result<Option<GluonAccountState>> {
         let db_path = self.account_db_path(storage_user_id);
         if !db_path.exists() {
             return Ok(None);
@@ -527,13 +647,7 @@ impl GluonStore {
             }
         };
 
-        if let Err(err) = conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_INDEX_TABLE} (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                payload BLOB NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );"
-        )) {
+        if let Err(err) = Self::initialize_sqlite_schema(&conn) {
             warn!(
                 path = %db_path.display(),
                 error = %err,
@@ -542,92 +656,475 @@ impl GluonStore {
             return Ok(None);
         }
 
-        let row = match conn
+        let next_blob_id = match conn
             .query_row(
-                &format!(
-                    "SELECT payload, updated_at_ms FROM {GLUON_SQLITE_INDEX_TABLE} WHERE id = 1"
-                ),
-                [],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                &format!("SELECT value FROM {GLUON_SQLITE_META_TABLE} WHERE key = ?1"),
+                [GLUON_SQLITE_META_NEXT_BLOB_ID_KEY],
+                |row| row.get::<_, String>(0),
             )
             .optional()
         {
-            Ok(row) => row,
+            Ok(Some(value)) => value.parse::<u64>().unwrap_or(1).max(1),
+            Ok(None) => 1,
             Err(err) => {
                 warn!(
                     path = %db_path.display(),
                     error = %err,
-                    "failed to read sqlite index row, falling back to empty index"
+                    "failed to read sqlite next_blob_id metadata, falling back to empty index"
                 );
                 return Ok(None);
             }
         };
 
-        let Some((payload, updated_at_ms)) = row else {
+        let mut mailbox_rows = match conn
+            .prepare(&format!(
+                "SELECT mailbox_name, uid_validity, next_uid, mod_seq
+                 FROM {GLUON_SQLITE_MAILBOX_TABLE}
+                 ORDER BY mailbox_name"
+            ))
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to read sqlite mailbox rows, falling back to empty index"
+                );
+                return Ok(None);
+            }
+        };
+
+        if mailbox_rows.is_empty() {
             return Ok(None);
+        }
+
+        let mut state = GluonAccountState {
+            next_blob_id,
+            mailboxes: HashMap::new(),
         };
 
-        let mut parsed = match serde_json::from_slice::<GluonAccountIndexFile>(&payload) {
-            Ok(parsed) => parsed,
+        for (mailbox_name, uid_validity, next_uid, mod_seq) in mailbox_rows.drain(..) {
+            state.mailboxes.insert(
+                mailbox_name,
+                GluonMailboxData {
+                    uid_validity,
+                    next_uid,
+                    proton_to_uid: HashMap::new(),
+                    uid_to_proton: HashMap::new(),
+                    metadata: HashMap::new(),
+                    flags: HashMap::new(),
+                    uid_order: Vec::new(),
+                    mod_seq,
+                    uid_to_blob: HashMap::new(),
+                },
+            );
+        }
+
+        let label_rows = match conn
+            .prepare(&format!(
+                "SELECT mailbox_name, uid, label_id
+                 FROM {GLUON_SQLITE_LABEL_TABLE}
+                 ORDER BY mailbox_name, uid, ordinal"
+            ))
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows,
             Err(err) => {
                 warn!(
                     path = %db_path.display(),
                     error = %err,
-                    "failed to parse sqlite index payload, falling back to empty index"
+                    "failed to read sqlite message labels, falling back to empty index"
                 );
                 return Ok(None);
             }
         };
-        if parsed.updated_at_ms == 0 && updated_at_ms > 0 {
-            parsed.updated_at_ms = updated_at_ms as u64;
+        let mut labels_by_message: HashMap<(String, u32), Vec<String>> = HashMap::new();
+        for (mailbox_name, uid, label_id) in label_rows {
+            labels_by_message
+                .entry((mailbox_name, uid))
+                .or_default()
+                .push(label_id);
         }
-        Ok(Some(parsed))
+
+        let address_rows = match conn
+            .prepare(&format!(
+                "SELECT mailbox_name, uid, field_kind, name, address
+                 FROM {GLUON_SQLITE_ADDRESS_TABLE}
+                 ORDER BY mailbox_name, uid, field_kind, ordinal"
+            ))
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to read sqlite message addresses, falling back to empty index"
+                );
+                return Ok(None);
+            }
+        };
+        let mut addresses_by_message: HashMap<
+            (String, u32, AddressFieldKind),
+            Vec<crate::api::types::EmailAddress>,
+        > = HashMap::new();
+        for (mailbox_name, uid, field_kind, name, address) in address_rows {
+            let Some(field_kind) = AddressFieldKind::from_sql(&field_kind) else {
+                continue;
+            };
+            addresses_by_message
+                .entry((mailbox_name, uid, field_kind))
+                .or_default()
+                .push(crate::api::types::EmailAddress { name, address });
+        }
+
+        let flag_rows = match conn
+            .prepare(&format!(
+                "SELECT mailbox_name, uid, flag
+                 FROM {GLUON_SQLITE_FLAG_TABLE}
+                 ORDER BY mailbox_name, uid, ordinal"
+            ))
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to read sqlite message flags, falling back to empty index"
+                );
+                return Ok(None);
+            }
+        };
+        let mut flags_by_message: HashMap<(String, u32), Vec<String>> = HashMap::new();
+        for (mailbox_name, uid, flag) in flag_rows {
+            flags_by_message
+                .entry((mailbox_name, uid))
+                .or_default()
+                .push(flag);
+        }
+
+        let message_rows = match conn
+            .prepare(&format!(
+                "SELECT mailbox_name, uid, proton_id, blob_name, address_id, external_id,
+                        subject, sender_name, sender_address, flags, time, size, unread,
+                        is_replied, is_replied_all, is_forwarded, num_attachments
+                 FROM {GLUON_SQLITE_MESSAGE_TABLE}
+                 ORDER BY mailbox_name, uid"
+            ))
+            .and_then(|mut stmt| {
+                let rows = stmt.query_map([], |row| {
+                    Ok(SqliteMessageRow {
+                        mailbox_name: row.get(0)?,
+                        uid: row.get(1)?,
+                        proton_id: row.get(2)?,
+                        blob_name: row.get(3)?,
+                        address_id: row.get(4)?,
+                        external_id: row.get(5)?,
+                        subject: row.get(6)?,
+                        sender_name: row.get(7)?,
+                        sender_address: row.get(8)?,
+                        flags: row.get(9)?,
+                        time: row.get(10)?,
+                        size: row.get(11)?,
+                        unread: row.get(12)?,
+                        is_replied: row.get(13)?,
+                        is_replied_all: row.get(14)?,
+                        is_forwarded: row.get(15)?,
+                        num_attachments: row.get(16)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(
+                    path = %db_path.display(),
+                    error = %err,
+                    "failed to read sqlite message rows, falling back to empty index"
+                );
+                return Ok(None);
+            }
+        };
+
+        for row in message_rows {
+            let Some(mailbox) = state.mailboxes.get_mut(&row.mailbox_name) else {
+                continue;
+            };
+
+            mailbox.uid_order.push(row.uid);
+
+            if let Some(ref proton_id) = row.proton_id {
+                mailbox.proton_to_uid.insert(proton_id.clone(), row.uid);
+                mailbox.uid_to_proton.insert(row.uid, proton_id.clone());
+            }
+
+            if let Some(ref blob_name) = row.blob_name {
+                mailbox.uid_to_blob.insert(row.uid, blob_name.clone());
+            }
+
+            if let (
+                Some(address_id),
+                Some(subject),
+                Some(sender_name),
+                Some(sender_address),
+                Some(flags),
+                Some(time),
+                Some(size),
+                Some(unread),
+                Some(is_replied),
+                Some(is_replied_all),
+                Some(is_forwarded),
+                Some(num_attachments),
+            ) = (
+                row.address_id,
+                row.subject,
+                row.sender_name,
+                row.sender_address,
+                row.flags,
+                row.time,
+                row.size,
+                row.unread,
+                row.is_replied,
+                row.is_replied_all,
+                row.is_forwarded,
+                row.num_attachments,
+            ) {
+                let key = (row.mailbox_name.clone(), row.uid);
+                let meta = MessageMetadata {
+                    id: row.proton_id.clone().unwrap_or_default(),
+                    address_id,
+                    label_ids: labels_by_message.remove(&key).unwrap_or_default(),
+                    external_id: row.external_id,
+                    subject,
+                    sender: crate::api::types::EmailAddress {
+                        name: sender_name,
+                        address: sender_address,
+                    },
+                    to_list: addresses_by_message
+                        .remove(&(row.mailbox_name.clone(), row.uid, AddressFieldKind::To))
+                        .unwrap_or_default(),
+                    cc_list: addresses_by_message
+                        .remove(&(row.mailbox_name.clone(), row.uid, AddressFieldKind::Cc))
+                        .unwrap_or_default(),
+                    bcc_list: addresses_by_message
+                        .remove(&(row.mailbox_name.clone(), row.uid, AddressFieldKind::Bcc))
+                        .unwrap_or_default(),
+                    reply_tos: addresses_by_message
+                        .remove(&(row.mailbox_name.clone(), row.uid, AddressFieldKind::ReplyTo))
+                        .unwrap_or_default(),
+                    flags,
+                    time,
+                    size,
+                    unread,
+                    is_replied,
+                    is_replied_all,
+                    is_forwarded,
+                    num_attachments,
+                };
+                mailbox.metadata.insert(row.uid, meta);
+            }
+
+            if let Some(flags) = flags_by_message.remove(&(row.mailbox_name.clone(), row.uid)) {
+                mailbox.flags.insert(row.uid, flags);
+            }
+        }
+
+        Ok(Some(state))
     }
 
-    fn persist_index_to_sqlite_once(
+    fn persist_account_to_sqlite_once(
         db_path: &Path,
-        payload: &[u8],
-        updated_at_ms: i64,
+        account: &GluonAccountState,
     ) -> rusqlite::Result<()> {
         let conn = rusqlite::Connection::open(db_path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(&format!(
-            "CREATE TABLE IF NOT EXISTS {GLUON_SQLITE_INDEX_TABLE} (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                payload BLOB NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );"
-        ))?;
-        conn.execute(
-            &format!(
-                "INSERT OR REPLACE INTO {GLUON_SQLITE_INDEX_TABLE} (id, payload, updated_at_ms)
-                 VALUES (1, ?1, ?2)"
-            ),
-            rusqlite::params![payload, updated_at_ms],
+        Self::initialize_sqlite_schema(&conn)?;
+
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(&format!("DELETE FROM {GLUON_SQLITE_META_TABLE}"), [])?;
+        tx.execute(&format!("DELETE FROM {GLUON_SQLITE_MAILBOX_TABLE}"), [])?;
+        tx.execute(&format!("DELETE FROM {GLUON_SQLITE_MESSAGE_TABLE}"), [])?;
+        tx.execute(&format!("DELETE FROM {GLUON_SQLITE_LABEL_TABLE}"), [])?;
+        tx.execute(&format!("DELETE FROM {GLUON_SQLITE_ADDRESS_TABLE}"), [])?;
+        tx.execute(&format!("DELETE FROM {GLUON_SQLITE_FLAG_TABLE}"), [])?;
+
+        tx.execute(
+            &format!("INSERT INTO {GLUON_SQLITE_META_TABLE} (key, value) VALUES (?1, ?2)"),
+            rusqlite::params![
+                GLUON_SQLITE_META_NEXT_BLOB_ID_KEY,
+                account.next_blob_id.to_string()
+            ],
         )?;
+
+        for (mailbox_name, mailbox) in &account.mailboxes {
+            tx.execute(
+                &format!(
+                    "INSERT INTO {GLUON_SQLITE_MAILBOX_TABLE} (mailbox_name, uid_validity, next_uid, mod_seq)
+                     VALUES (?1, ?2, ?3, ?4)"
+                ),
+                rusqlite::params![
+                    mailbox_name,
+                    mailbox.uid_validity,
+                    mailbox.next_uid,
+                    mailbox.mod_seq
+                ],
+            )?;
+
+            let mut persisted_uids = mailbox.uid_order.clone();
+            let mut known_uids = persisted_uids.iter().copied().collect::<HashSet<_>>();
+            for uid in mailbox
+                .uid_to_proton
+                .keys()
+                .chain(mailbox.metadata.keys())
+                .chain(mailbox.flags.keys())
+                .chain(mailbox.uid_to_blob.keys())
+                .copied()
+            {
+                if known_uids.insert(uid) {
+                    persisted_uids.push(uid);
+                }
+            }
+            persisted_uids.sort_unstable();
+
+            for uid in persisted_uids {
+                let proton_id = mailbox.uid_to_proton.get(&uid).cloned();
+                let blob_name = mailbox.uid_to_blob.get(&uid).cloned();
+                let metadata = mailbox.metadata.get(&uid);
+
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {GLUON_SQLITE_MESSAGE_TABLE} (
+                            mailbox_name, uid, proton_id, blob_name, address_id, external_id,
+                            subject, sender_name, sender_address, flags, time, size, unread,
+                            is_replied, is_replied_all, is_forwarded, num_attachments
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                    ),
+                    rusqlite::params![
+                        mailbox_name,
+                        uid,
+                        proton_id,
+                        blob_name,
+                        metadata.map(|meta| meta.address_id.clone()),
+                        metadata.and_then(|meta| meta.external_id.clone()),
+                        metadata.map(|meta| meta.subject.clone()),
+                        metadata.map(|meta| meta.sender.name.clone()),
+                        metadata.map(|meta| meta.sender.address.clone()),
+                        metadata.map(|meta| meta.flags),
+                        metadata.map(|meta| meta.time),
+                        metadata.map(|meta| meta.size),
+                        metadata.map(|meta| meta.unread),
+                        metadata.map(|meta| meta.is_replied),
+                        metadata.map(|meta| meta.is_replied_all),
+                        metadata.map(|meta| meta.is_forwarded),
+                        metadata.map(|meta| meta.num_attachments),
+                    ],
+                )?;
+
+                if let Some(meta) = metadata {
+                    for (ordinal, label_id) in meta.label_ids.iter().enumerate() {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO {GLUON_SQLITE_LABEL_TABLE} (mailbox_name, uid, ordinal, label_id)
+                                 VALUES (?1, ?2, ?3, ?4)"
+                            ),
+                            rusqlite::params![mailbox_name, uid, ordinal as i64, label_id],
+                        )?;
+                    }
+
+                    for (field_kind, entries) in [
+                        (AddressFieldKind::To, &meta.to_list),
+                        (AddressFieldKind::Cc, &meta.cc_list),
+                        (AddressFieldKind::Bcc, &meta.bcc_list),
+                        (AddressFieldKind::ReplyTo, &meta.reply_tos),
+                    ] {
+                        for (ordinal, entry) in entries.iter().enumerate() {
+                            tx.execute(
+                                &format!(
+                                    "INSERT INTO {GLUON_SQLITE_ADDRESS_TABLE} (
+                                        mailbox_name, uid, field_kind, ordinal, name, address
+                                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                                ),
+                                rusqlite::params![
+                                    mailbox_name,
+                                    uid,
+                                    field_kind.as_sql(),
+                                    ordinal as i64,
+                                    entry.name,
+                                    entry.address
+                                ],
+                            )?;
+                        }
+                    }
+                }
+
+                if let Some(flags) = mailbox.flags.get(&uid) {
+                    for (ordinal, flag) in flags.iter().enumerate() {
+                        tx.execute(
+                            &format!(
+                                "INSERT INTO {GLUON_SQLITE_FLAG_TABLE} (mailbox_name, uid, ordinal, flag)
+                                 VALUES (?1, ?2, ?3, ?4)"
+                            ),
+                            rusqlite::params![mailbox_name, uid, ordinal as i64, flag],
+                        )?;
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
         Ok(())
     }
 
-    fn persist_index_to_sqlite(
+    fn persist_account_to_sqlite(
         &self,
         storage_user_id: &str,
-        index: &GluonAccountIndexFile,
+        account: &GluonAccountState,
     ) -> Result<()> {
         let db_path = self.account_db_path(storage_user_id);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let payload = serde_json::to_vec(index).map_err(|err| {
-            super::ImapError::Protocol(format!(
-                "failed to serialize sqlite index payload for account {storage_user_id}: {err}"
-            ))
-        })?;
-
         let mut retried_with_recreate = false;
         loop {
-            match Self::persist_index_to_sqlite_once(&db_path, &payload, index.updated_at_ms as i64)
-            {
+            match Self::persist_account_to_sqlite_once(&db_path, account) {
                 Ok(()) => return Ok(()),
                 Err(err) if !retried_with_recreate && db_path.exists() => {
                     warn!(
@@ -645,7 +1142,7 @@ impl GluonStore {
                 }
                 Err(err) => {
                     return Err(super::ImapError::Protocol(format!(
-                        "failed to persist sqlite index payload {}: {err}",
+                        "failed to persist sqlite account state {}: {err}",
                         db_path.display()
                     )))
                 }
@@ -659,7 +1156,6 @@ impl GluonStore {
         account: &GluonAccountState,
         message_writes: &[(PathBuf, Vec<u8>)],
     ) -> Result<()> {
-        let index = Self::to_index_file(account);
         let mut txn = self.txn_manager.begin(storage_user_id).map_err(|err| {
             super::ImapError::Protocol(format!("failed to begin gluon txn: {err}"))
         })?;
@@ -677,7 +1173,7 @@ impl GluonStore {
             super::ImapError::Protocol(format!("failed to commit gluon txn: {err}"))
         })?;
 
-        self.persist_index_to_sqlite(storage_user_id, &index)
+        self.persist_account_to_sqlite(storage_user_id, account)
     }
 
     fn blob_counter_from_name(name: &str) -> Option<u64> {
@@ -760,21 +1256,24 @@ impl GluonStore {
         std::fs::create_dir_all(&account_dir)?;
 
         let db_path = self.account_db_path(storage_user_id);
-        let mut index = self
-            .load_index_from_sqlite(storage_user_id)?
-            .unwrap_or_else(GluonAccountIndexFile::new);
-        let is_new_index = index.mailboxes.is_empty() && !db_path.exists();
+        let mut account = self
+            .load_account_from_sqlite(storage_user_id)?
+            .unwrap_or_else(Self::empty_account_state);
+        let is_new_index = account.mailboxes.is_empty() && !db_path.exists();
         if is_new_index {
             Self::emit_bootstrap_migration_logs(storage_user_id, &db_path);
         }
         let mut repaired = false;
 
-        index.sanitize();
-        for mailbox in index.mailboxes.values_mut() {
+        if account.next_blob_id == 0 {
+            account.next_blob_id = 1;
+        }
+        for mailbox in account.mailboxes.values_mut() {
+            mailbox.sanitize();
             repaired |= mailbox.prune_missing_blob_refs(&account_dir) > 0;
         }
 
-        if index.mailboxes.is_empty() {
+        if account.mailboxes.is_empty() {
             let discovered = Self::discover_blob_uid_pairs(&account_dir)?;
             if !discovered.is_empty() {
                 let mut inbox = GluonMailboxData::new();
@@ -785,7 +1284,7 @@ impl GluonStore {
                 if let Some(last_uid) = inbox.uid_order.last().copied() {
                     inbox.next_uid = last_uid.saturating_add(1);
                 }
-                index
+                account
                     .mailboxes
                     .insert(GLUON_DEFAULT_MAILBOX.to_string(), inbox);
                 repaired = true;
@@ -796,10 +1295,10 @@ impl GluonStore {
             // Any index/blob repair can change effective UID->blob mapping.
             // Force new UIDVALIDITY so IMAP clients drop stale UID caches.
             let new_uid_validity = current_uid_validity();
-            for mailbox in index.mailboxes.values_mut() {
+            for mailbox in account.mailboxes.values_mut() {
                 mailbox.uid_validity = new_uid_validity;
             }
-            self.persist_index_to_sqlite(storage_user_id, &index)?;
+            self.persist_account_to_sqlite(storage_user_id, &account)?;
             warn!(
                 account = %storage_user_id,
                 uid_validity = new_uid_validity,
@@ -807,8 +1306,8 @@ impl GluonStore {
             );
         }
 
-        let mut max_blob_id = index.next_blob_id;
-        for mailbox in index.mailboxes.values() {
+        let mut max_blob_id = account.next_blob_id;
+        for mailbox in account.mailboxes.values() {
             for name in mailbox.uid_to_blob.values() {
                 if let Some(blob_id) = Self::blob_counter_from_name(name) {
                     max_blob_id = max_blob_id.max(blob_id.saturating_add(1));
@@ -821,7 +1320,7 @@ impl GluonStore {
 
         Ok(GluonAccountState {
             next_blob_id: max_blob_id,
-            mailboxes: index.mailboxes,
+            mailboxes: account.mailboxes,
         })
     }
 
@@ -856,13 +1355,6 @@ fn current_uid_validity() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32
-}
-
-fn current_epoch_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 fn unseen_count(mailbox: &GluonMailboxData) -> u32 {
@@ -926,6 +1418,7 @@ impl MessageStore for InMemoryStore {
         meta: MessageMetadata,
     ) -> Result<u32> {
         let mut mailboxes = self.mailboxes.write().await;
+        let mailbox_was_missing = !mailboxes.contains_key(mailbox);
         let mb = mailboxes
             .entry(mailbox.to_string())
             .or_insert_with(MailboxData::new);
@@ -935,7 +1428,15 @@ impl MessageStore for InMemoryStore {
             mb.metadata.insert(uid, meta);
             mb.flags.insert(uid, merged_flags);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
-            self.publish_change();
+            let mod_seq = mb.mod_seq;
+            drop(mailboxes);
+            self.publish_events([StoreEvent {
+                mailbox: mailbox.to_string(),
+                uid: Some(uid),
+                proton_id: Some(proton_id.to_string()),
+                kind: StoreEventKind::MessageUpdated,
+                mod_seq,
+            }]);
             return Ok(uid);
         }
 
@@ -950,7 +1451,26 @@ impl MessageStore for InMemoryStore {
             merge_metadata_flags(None, mb.metadata.get(&uid).unwrap()),
         );
         mb.mod_seq = mb.mod_seq.saturating_add(1);
-        self.publish_change();
+        let mod_seq = mb.mod_seq;
+        drop(mailboxes);
+        let mut events = Vec::with_capacity(if mailbox_was_missing { 2 } else { 1 });
+        if mailbox_was_missing {
+            events.push(StoreEvent {
+                mailbox: mailbox.to_string(),
+                uid: None,
+                proton_id: None,
+                kind: StoreEventKind::MailboxCreated,
+                mod_seq,
+            });
+        }
+        events.push(StoreEvent {
+            mailbox: mailbox.to_string(),
+            uid: Some(uid),
+            proton_id: Some(proton_id.to_string()),
+            kind: StoreEventKind::MessageAdded,
+            mod_seq,
+        });
+        self.publish_events(events);
         Ok(uid)
     }
 
@@ -977,12 +1497,33 @@ impl MessageStore for InMemoryStore {
 
     async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
         let mut mailboxes = self.mailboxes.write().await;
+        let mailbox_was_missing = !mailboxes.contains_key(mailbox);
         let mb = mailboxes
             .entry(mailbox.to_string())
             .or_insert_with(MailboxData::new);
         mb.rfc822.insert(uid, data);
         mb.mod_seq = mb.mod_seq.saturating_add(1);
-        self.publish_change();
+        let mod_seq = mb.mod_seq;
+        let proton_id = mb.uid_to_proton.get(&uid).cloned();
+        drop(mailboxes);
+        let mut events = Vec::with_capacity(if mailbox_was_missing { 2 } else { 1 });
+        if mailbox_was_missing {
+            events.push(StoreEvent {
+                mailbox: mailbox.to_string(),
+                uid: None,
+                proton_id: None,
+                kind: StoreEventKind::MailboxCreated,
+                mod_seq,
+            });
+        }
+        events.push(StoreEvent {
+            mailbox: mailbox.to_string(),
+            uid: Some(uid),
+            proton_id,
+            kind: StoreEventKind::MessageBodyUpdated,
+            mod_seq,
+        });
+        self.publish_events(events);
         Ok(())
     }
 
@@ -1053,9 +1594,18 @@ impl MessageStore for InMemoryStore {
     async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()> {
         let mut mailboxes = self.mailboxes.write().await;
         if let Some(mb) = mailboxes.get_mut(mailbox) {
+            let proton_id = mb.uid_to_proton.get(&uid).cloned();
             mb.flags.insert(uid, flags);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
-            self.publish_change();
+            let mod_seq = mb.mod_seq;
+            drop(mailboxes);
+            self.publish_events([StoreEvent {
+                mailbox: mailbox.to_string(),
+                uid: Some(uid),
+                proton_id,
+                kind: StoreEventKind::MessageFlagsUpdated,
+                mod_seq,
+            }]);
         }
         Ok(())
     }
@@ -1072,7 +1622,16 @@ impl MessageStore for InMemoryStore {
             }
             if entry.len() != before {
                 mb.mod_seq = mb.mod_seq.saturating_add(1);
-                self.publish_change();
+                let mod_seq = mb.mod_seq;
+                let proton_id = mb.uid_to_proton.get(&uid).cloned();
+                drop(mailboxes);
+                self.publish_events([StoreEvent {
+                    mailbox: mailbox.to_string(),
+                    uid: Some(uid),
+                    proton_id,
+                    kind: StoreEventKind::MessageFlagsUpdated,
+                    mod_seq,
+                }]);
             }
         }
         Ok(())
@@ -1086,7 +1645,16 @@ impl MessageStore for InMemoryStore {
                 current.retain(|f| !flags.contains(f));
                 if current.len() != before {
                     mb.mod_seq = mb.mod_seq.saturating_add(1);
-                    self.publish_change();
+                    let mod_seq = mb.mod_seq;
+                    let proton_id = mb.uid_to_proton.get(&uid).cloned();
+                    drop(mailboxes);
+                    self.publish_events([StoreEvent {
+                        mailbox: mailbox.to_string(),
+                        uid: Some(uid),
+                        proton_id,
+                        kind: StoreEventKind::MessageFlagsUpdated,
+                        mod_seq,
+                    }]);
                 }
             }
         }
@@ -1111,15 +1679,26 @@ impl MessageStore for InMemoryStore {
     async fn remove_message(&self, mailbox: &str, uid: u32) -> Result<()> {
         let mut mailboxes = self.mailboxes.write().await;
         if let Some(mb) = mailboxes.get_mut(mailbox) {
-            if let Some(proton_id) = mb.uid_to_proton.remove(&uid) {
+            let proton_id = if let Some(proton_id) = mb.uid_to_proton.remove(&uid) {
                 mb.proton_to_uid.remove(&proton_id);
-            }
+                Some(proton_id)
+            } else {
+                None
+            };
             mb.metadata.remove(&uid);
             mb.rfc822.remove(&uid);
             mb.flags.remove(&uid);
             mb.uid_order.retain(|&u| u != uid);
             mb.mod_seq = mb.mod_seq.saturating_add(1);
-            self.publish_change();
+            let mod_seq = mb.mod_seq;
+            drop(mailboxes);
+            self.publish_events([StoreEvent {
+                mailbox: mailbox.to_string(),
+                uid: Some(uid),
+                proton_id,
+                kind: StoreEventKind::MessageRemoved,
+                mod_seq,
+            }]);
         }
         Ok(())
     }
@@ -1143,6 +1722,10 @@ impl MessageStore for InMemoryStore {
 
     fn subscribe_changes(&self) -> watch::Receiver<u64> {
         self.change_tx.subscribe()
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<StoreEvent> {
+        self.event_tx.subscribe()
     }
 }
 
@@ -1228,6 +1811,10 @@ impl MessageStore for PersistentStore {
     fn subscribe_changes(&self) -> watch::Receiver<u64> {
         self.inner.subscribe_changes()
     }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<StoreEvent> {
+        self.inner.subscribe_events()
+    }
 }
 
 #[async_trait]
@@ -1238,6 +1825,7 @@ impl MessageStore for GluonStore {
         proton_id: &str,
         meta: MessageMetadata,
     ) -> Result<u32> {
+        let scoped_mailbox = mailbox.to_string();
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
         // Reload account state from disk before mutating so concurrent store instances
         // do not clobber each other's UID assignment/index updates.
@@ -1268,7 +1856,8 @@ impl MessageStore for GluonStore {
             );
         }
 
-        let uid = if let Some(existing_uid) = mailbox.proton_to_uid.get(proton_id).copied() {
+        let existing_uid = mailbox.proton_to_uid.get(proton_id).copied();
+        let uid = if let Some(existing_uid) = existing_uid {
             let merged_flags = merge_metadata_flags(mailbox.flags.get(&existing_uid), &meta);
             mailbox.metadata.insert(existing_uid, meta);
             mailbox.flags.insert(existing_uid, merged_flags);
@@ -1293,9 +1882,32 @@ impl MessageStore for GluonStore {
             assigned_uid
         };
 
+        let mod_seq = mailbox.mod_seq;
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
-        self.publish_change();
+        drop(accounts);
+        let mut events = Vec::with_capacity(if mailbox_was_missing { 2 } else { 1 });
+        if mailbox_was_missing {
+            events.push(StoreEvent {
+                mailbox: scoped_mailbox.clone(),
+                uid: None,
+                proton_id: None,
+                kind: StoreEventKind::MailboxCreated,
+                mod_seq,
+            });
+        }
+        events.push(StoreEvent {
+            mailbox: scoped_mailbox,
+            uid: Some(uid),
+            proton_id: Some(proton_id.to_string()),
+            kind: if existing_uid.is_some() {
+                StoreEventKind::MessageUpdated
+            } else {
+                StoreEventKind::MessageAdded
+            },
+            mod_seq,
+        });
+        self.publish_events(events);
         Ok(uid)
     }
 
@@ -1327,6 +1939,7 @@ impl MessageStore for GluonStore {
     }
 
     async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+        let scoped_mailbox = mailbox.to_string();
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
         let mut accounts = self.accounts.write().await;
         let mut next_state = accounts
@@ -1334,6 +1947,7 @@ impl MessageStore for GluonStore {
             .cloned()
             .unwrap_or_else(Self::empty_account_state);
         let mut writes = Vec::new();
+        let mailbox_was_missing = !next_state.mailboxes.contains_key(&mailbox_name);
 
         let mailbox = next_state
             .mailboxes
@@ -1355,11 +1969,31 @@ impl MessageStore for GluonStore {
             name
         };
         mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        let mod_seq = mailbox.mod_seq;
+        let proton_id = mailbox.uid_to_proton.get(&uid).cloned();
         writes.push((Self::message_rel_path(&storage_user_id, &blob_name), data));
 
         self.persist_account(&storage_user_id, &next_state, &writes)?;
         accounts.insert(storage_user_id, next_state);
-        self.publish_change();
+        drop(accounts);
+        let mut events = Vec::with_capacity(if mailbox_was_missing { 2 } else { 1 });
+        if mailbox_was_missing {
+            events.push(StoreEvent {
+                mailbox: scoped_mailbox.clone(),
+                uid: None,
+                proton_id: None,
+                kind: StoreEventKind::MailboxCreated,
+                mod_seq,
+            });
+        }
+        events.push(StoreEvent {
+            mailbox: scoped_mailbox,
+            uid: Some(uid),
+            proton_id,
+            kind: StoreEventKind::MessageBodyUpdated,
+            mod_seq,
+        });
+        self.publish_events(events);
         Ok(())
     }
 
@@ -1445,26 +2079,38 @@ impl MessageStore for GluonStore {
     }
 
     async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()> {
+        let scoped_mailbox = mailbox.to_string();
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
         let mut accounts = self.accounts.write().await;
         let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
             return Ok(());
         };
         let mut next_state = current_state;
-        if let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) {
-            mailbox.flags.insert(uid, flags);
-            mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
-        } else {
-            return Ok(());
-        }
+        let (mod_seq, proton_id) =
+            if let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) {
+                let proton_id = mailbox.uid_to_proton.get(&uid).cloned();
+                mailbox.flags.insert(uid, flags);
+                mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+                (mailbox.mod_seq, proton_id)
+            } else {
+                return Ok(());
+            };
 
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
-        self.publish_change();
+        drop(accounts);
+        self.publish_events([StoreEvent {
+            mailbox: scoped_mailbox,
+            uid: Some(uid),
+            proton_id,
+            kind: StoreEventKind::MessageFlagsUpdated,
+            mod_seq,
+        }]);
         Ok(())
     }
 
     async fn add_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+        let scoped_mailbox = mailbox.to_string();
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
         let mut accounts = self.accounts.write().await;
         let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
@@ -1474,6 +2120,7 @@ impl MessageStore for GluonStore {
         let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) else {
             return Ok(());
         };
+        let proton_id = mailbox.uid_to_proton.get(&uid).cloned();
 
         let entry = mailbox.flags.entry(uid).or_default();
         let before = entry.len();
@@ -1487,13 +2134,22 @@ impl MessageStore for GluonStore {
         }
 
         mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        let mod_seq = mailbox.mod_seq;
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
-        self.publish_change();
+        drop(accounts);
+        self.publish_events([StoreEvent {
+            mailbox: scoped_mailbox,
+            uid: Some(uid),
+            proton_id,
+            kind: StoreEventKind::MessageFlagsUpdated,
+            mod_seq,
+        }]);
         Ok(())
     }
 
     async fn remove_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+        let scoped_mailbox = mailbox.to_string();
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
         let mut accounts = self.accounts.write().await;
         let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
@@ -1503,6 +2159,7 @@ impl MessageStore for GluonStore {
         let Some(mailbox) = next_state.mailboxes.get_mut(&mailbox_name) else {
             return Ok(());
         };
+        let proton_id = mailbox.uid_to_proton.get(&uid).cloned();
 
         let Some(current_flags) = mailbox.flags.get_mut(&uid) else {
             return Ok(());
@@ -1514,9 +2171,17 @@ impl MessageStore for GluonStore {
         }
 
         mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        let mod_seq = mailbox.mod_seq;
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id, next_state);
-        self.publish_change();
+        drop(accounts);
+        self.publish_events([StoreEvent {
+            mailbox: scoped_mailbox,
+            uid: Some(uid),
+            proton_id,
+            kind: StoreEventKind::MessageFlagsUpdated,
+            mod_seq,
+        }]);
         Ok(())
     }
 
@@ -1542,6 +2207,7 @@ impl MessageStore for GluonStore {
     }
 
     async fn remove_message(&self, mailbox: &str, uid: u32) -> Result<()> {
+        let scoped_mailbox = mailbox.to_string();
         let (storage_user_id, mailbox_name) = self.resolve_scope(mailbox).await?;
         let mut accounts = self.accounts.write().await;
         let Some(current_state) = accounts.get(&storage_user_id).cloned() else {
@@ -1552,18 +2218,29 @@ impl MessageStore for GluonStore {
             return Ok(());
         };
 
-        if let Some(proton_id) = mailbox.uid_to_proton.remove(&uid) {
+        let proton_id = if let Some(proton_id) = mailbox.uid_to_proton.remove(&uid) {
             mailbox.proton_to_uid.remove(&proton_id);
-        }
+            Some(proton_id)
+        } else {
+            None
+        };
         mailbox.metadata.remove(&uid);
         mailbox.flags.remove(&uid);
         let removed_blob = mailbox.uid_to_blob.remove(&uid);
         mailbox.uid_order.retain(|known_uid| *known_uid != uid);
         mailbox.mod_seq = mailbox.mod_seq.saturating_add(1);
+        let mod_seq = mailbox.mod_seq;
 
         self.persist_account(&storage_user_id, &next_state, &[])?;
         accounts.insert(storage_user_id.clone(), next_state);
-        self.publish_change();
+        drop(accounts);
+        self.publish_events([StoreEvent {
+            mailbox: scoped_mailbox,
+            uid: Some(uid),
+            proton_id,
+            kind: StoreEventKind::MessageRemoved,
+            mod_seq,
+        }]);
 
         if let Some(blob_name) = removed_blob {
             let blob_path = self.account_store_dir(&storage_user_id).join(blob_name);
@@ -1609,6 +2286,10 @@ impl MessageStore for GluonStore {
 
     fn subscribe_changes(&self) -> watch::Receiver<u64> {
         self.change_tx.subscribe()
+    }
+
+    fn subscribe_events(&self) -> broadcast::Receiver<StoreEvent> {
+        self.event_tx.subscribe()
     }
 }
 
@@ -1996,5 +2677,36 @@ mod tests {
 
         let reloaded = PersistentStore::new(dir.path().to_path_buf()).unwrap();
         assert_eq!(reloaded.get_uid(mailbox, "msg-1").await.unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn store_emits_semantic_events_for_jmap_and_idle_consumers() {
+        let store = InMemoryStore::new();
+        let mut events = store.subscribe_events();
+
+        let uid = store
+            .store_metadata("uid-1::INBOX", "msg-1", make_meta("msg-1", 1))
+            .await
+            .unwrap();
+        let created = events.recv().await.unwrap();
+        let added = events.recv().await.unwrap();
+        assert_eq!(created.kind, StoreEventKind::MailboxCreated);
+        assert_eq!(created.mailbox, "uid-1::INBOX");
+        assert_eq!(added.kind, StoreEventKind::MessageAdded);
+        assert_eq!(added.uid, Some(uid));
+        assert_eq!(added.proton_id.as_deref(), Some("msg-1"));
+
+        store
+            .set_flags("uid-1::INBOX", uid, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+        let flags = events.recv().await.unwrap();
+        assert_eq!(flags.kind, StoreEventKind::MessageFlagsUpdated);
+        assert_eq!(flags.uid, Some(uid));
+
+        store.remove_message("uid-1::INBOX", uid).await.unwrap();
+        let removed = events.recv().await.unwrap();
+        assert_eq!(removed.kind, StoreEventKind::MessageRemoved);
+        assert_eq!(removed.uid, Some(uid));
     }
 }

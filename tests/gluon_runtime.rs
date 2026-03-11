@@ -60,12 +60,10 @@ async fn be026_runtime_store_writes_gluon_layout_without_json_mailbox_files() {
     );
     let conn = rusqlite::Connection::open(&account_db_path).expect("open sqlite db");
     let row_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM openproton_mailbox_index WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("query sqlite index row count");
+        .query_row("SELECT COUNT(*) FROM openproton_mailboxes", [], |row| {
+            row.get(0)
+        })
+        .expect("query sqlite mailbox row count");
     assert_eq!(row_count, 1);
 
     let root_json_files = fs::read_dir(temp.path())

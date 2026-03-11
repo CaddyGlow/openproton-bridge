@@ -18,6 +18,7 @@ use crate::api::types::{
 };
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
+use crate::imap::gluon_connector::{GluonImapConnector, StoreBackedConnector};
 use crate::imap::mailbox;
 use crate::imap::store::MessageStore;
 use crate::pim::incremental as pim_incremental;
@@ -380,6 +381,7 @@ pub struct EventWorkerConfig {
     pub runtime_accounts: Arc<RuntimeAccountRegistry>,
     pub auth_router: AuthRouter,
     pub store: Arc<dyn MessageStore>,
+    pub connector: Arc<dyn GluonImapConnector>,
     pub pim_store: Option<Arc<PimStore>>,
     pub checkpoint_store: SharedCheckpointStore,
     pub sync_progress_callback: Option<SyncProgressCallback>,
@@ -402,6 +404,7 @@ impl EventWorkerConfig {
             api_base_url,
             runtime_accounts,
             auth_router,
+            connector: StoreBackedConnector::new(store.clone()),
             store,
             pim_store: None,
             checkpoint_store,
@@ -921,19 +924,14 @@ async fn apply_metadata_to_store(
         let in_mailbox = metadata.label_ids.iter().any(|label| label == mb.label_id);
         if in_mailbox {
             config
-                .store
-                .store_metadata(&scoped, &metadata.id, metadata.clone())
+                .connector
+                .upsert_metadata(&scoped, &metadata.id, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        } else if let Some(uid) = config
-            .store
-            .get_uid(&scoped, &metadata.id)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        {
+        } else {
             config
-                .store
-                .remove_message(&scoped, uid)
+                .connector
+                .remove_message_by_proton_id(&scoped, &metadata.id)
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
@@ -945,124 +943,19 @@ async fn apply_metadata_to_store(
         let in_mailbox = metadata.label_ids.iter().any(|label| label == &ul.label_id);
         if in_mailbox {
             config
-                .store
-                .store_metadata(&scoped, &metadata.id, metadata.clone())
+                .connector
+                .upsert_metadata(&scoped, &metadata.id, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        } else if let Some(uid) = config
-            .store
-            .get_uid(&scoped, &metadata.id)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        {
+        } else {
             config
-                .store
-                .remove_message(&scoped, uid)
+                .connector
+                .remove_message_by_proton_id(&scoped, &metadata.id)
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
     }
 
-    Ok(())
-}
-
-async fn migrate_label_mailbox_data(
-    config: &EventWorkerConfig,
-    from_mailbox: &str,
-    to_mailbox: &str,
-    expected_generation: u64,
-) -> Result<(), EventWorkerError> {
-    ensure_account_generation(config, expected_generation, "migrate_label_mailbox_data").await?;
-
-    if from_mailbox.eq_ignore_ascii_case(to_mailbox) {
-        return Ok(());
-    }
-
-    let from_scoped = scoped_mailbox_name(&config.account_id, from_mailbox);
-    let to_scoped = scoped_mailbox_name(&config.account_id, to_mailbox);
-    let uids = config
-        .store
-        .list_uids(&from_scoped)
-        .await
-        .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-
-    for uid in &uids {
-        let Some(proton_id) = config
-            .store
-            .get_proton_id(&from_scoped, *uid)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        else {
-            continue;
-        };
-        let Some(metadata) = config
-            .store
-            .get_metadata(&from_scoped, *uid)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        else {
-            continue;
-        };
-
-        let new_uid = config
-            .store
-            .store_metadata(&to_scoped, &proton_id, metadata)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        let flags = config
-            .store
-            .get_flags(&from_scoped, *uid)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        config
-            .store
-            .set_flags(&to_scoped, new_uid, flags)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        if let Some(rfc822) = config
-            .store
-            .get_rfc822(&from_scoped, *uid)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        {
-            config
-                .store
-                .store_rfc822(&to_scoped, new_uid, rfc822)
-                .await
-                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        }
-    }
-
-    for uid in uids {
-        config
-            .store
-            .remove_message(&from_scoped, uid)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-    }
-
-    Ok(())
-}
-
-async fn clear_label_mailbox_data(
-    config: &EventWorkerConfig,
-    mailbox_name: &str,
-    expected_generation: u64,
-) -> Result<(), EventWorkerError> {
-    ensure_account_generation(config, expected_generation, "clear_label_mailbox_data").await?;
-    let scoped = scoped_mailbox_name(&config.account_id, mailbox_name);
-    let uids = config
-        .store
-        .list_uids(&scoped)
-        .await
-        .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-    for uid in uids {
-        config
-            .store
-            .remove_message(&scoped, uid)
-            .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-    }
     Ok(())
 }
 
@@ -1084,11 +977,36 @@ async fn reconcile_user_label_topology(
     for (label_id, previous) in &previous_by_id {
         if let Some(next) = next_by_id.get(label_id) {
             if !previous.name.eq_ignore_ascii_case(&next.name) {
-                migrate_label_mailbox_data(config, &previous.name, &next.name, expected_generation)
+                ensure_account_generation(config, expected_generation, "rename_label_mailbox")
                     .await?;
+                config
+                    .connector
+                    .rename_mailbox(
+                        &scoped_mailbox_name(&config.account_id, &previous.name),
+                        &scoped_mailbox_name(&config.account_id, &next.name),
+                    )
+                    .await
+                    .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
             }
         } else {
-            clear_label_mailbox_data(config, &previous.name, expected_generation).await?;
+            ensure_account_generation(config, expected_generation, "delete_label_mailbox").await?;
+            config
+                .connector
+                .delete_mailbox(
+                    &scoped_mailbox_name(&config.account_id, &previous.name),
+                    true,
+                )
+                .await
+                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        }
+    }
+
+    for (label_id, next) in &next_by_id {
+        if !previous_by_id.contains_key(label_id) {
+            config
+                .connector
+                .create_mailbox(&scoped_mailbox_name(&config.account_id, &next.name))
+                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
     }
 
@@ -1458,33 +1376,19 @@ async fn apply_message_delete(
     ensure_account_generation(config, expected_generation, "apply_message_delete").await?;
     for mb in mailbox::system_mailboxes() {
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
-        if let Some(uid) = config
-            .store
-            .get_uid(&scoped, message_id)
+        config
+            .connector
+            .remove_message_by_proton_id(&scoped, message_id)
             .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        {
-            config
-                .store
-                .remove_message(&scoped, uid)
-                .await
-                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        }
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
     }
     for label_mailbox in config.runtime_accounts.get_user_labels(&config.account_id) {
         let scoped = scoped_mailbox_name(&config.account_id, &label_mailbox.name);
-        if let Some(uid) = config
-            .store
-            .get_uid(&scoped, message_id)
+        config
+            .connector
+            .remove_message_by_proton_id(&scoped, message_id)
             .await
-            .map_err(|e| EventWorkerError::Payload(e.to_string()))?
-        {
-            config
-                .store
-                .remove_message(&scoped, uid)
-                .await
-                .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
-        }
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
     }
     Ok(())
 }

@@ -5,6 +5,9 @@ use std::path::PathBuf;
 use openproton_bridge::imap::store::{GluonStore, MessageStore};
 use serde_json::json;
 
+#[path = "gluon_db_support.rs"]
+mod gluon_db_support;
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -96,24 +99,7 @@ async fn be024_reads_uid_maps_metadata_flags_and_snapshot_from_index() {
             }
         }
     });
-    let conn = rusqlite::Connection::open(&account_db).expect("open sqlite db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            payload BLOB NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );",
-    )
-    .expect("create sqlite index table");
-    conn.execute(
-        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
-         VALUES (1, ?1, ?2)",
-        rusqlite::params![
-            serde_json::to_vec_pretty(&index_payload).expect("serialize index"),
-            1_700_000_000_000_i64
-        ],
-    )
-    .expect("insert sqlite index row");
+    gluon_db_support::write_legacy_index_payload(&account_db, &index_payload);
 
     let store = GluonStore::new(
         temp.path().to_path_buf(),
@@ -253,38 +239,7 @@ async fn be024_invalid_uid_keys_in_index_fall_back_to_blob_discovery() {
     let expected_blob = b"From: invalid@example.invalid\r\nSubject: fallback\r\n\r\nbody".to_vec();
     fs::write(account_store.join("bridge-blob-fallback"), &expected_blob).expect("write blob");
 
-    let invalid_index_payload = json!({
-        "version": 1,
-        "next_blob_id": 2,
-        "mailboxes": {
-            "INBOX": {
-                "uid_validity": 1,
-                "next_uid": 2,
-                "uid_order": [1],
-                "uid_to_blob": {
-                    "not-a-uid": "bridge-blob-fallback"
-                }
-            }
-        }
-    });
-    let conn = rusqlite::Connection::open(&account_db).expect("open sqlite db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            payload BLOB NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );",
-    )
-    .expect("create sqlite index table");
-    conn.execute(
-        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
-         VALUES (1, ?1, ?2)",
-        rusqlite::params![
-            serde_json::to_vec_pretty(&invalid_index_payload).expect("serialize invalid index"),
-            1_700_000_000_000_i64
-        ],
-    )
-    .expect("insert sqlite index row");
+    fs::write(&account_db, b"not-a-sqlite-db").expect("write invalid sqlite artifact");
 
     let store = GluonStore::new(
         temp.path().to_path_buf(),

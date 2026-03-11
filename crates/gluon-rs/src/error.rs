@@ -19,6 +19,9 @@ pub enum GluonError {
     #[error("invalid gluon key length {length}; expected 32 bytes")]
     InvalidKeyLength { length: usize },
 
+    #[error("cryptography error")]
+    Crypto,
+
     #[error("sqlite database is missing required table: {table}")]
     MissingRequiredTable { table: String },
 
@@ -36,3 +39,9 @@ pub enum GluonError {
 }
 
 pub type Result<T> = std::result::Result<T, GluonError>;
+
+impl From<aes_gcm::Error> for GluonError {
+    fn from(_: aes_gcm::Error) -> Self {
+        Self::Crypto
+    }
+}

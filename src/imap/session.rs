@@ -21,7 +21,11 @@ use super::command::{
     parse_command, Command, FetchItem, ImapFlag, SearchKey, SequenceSet, StatusDataItem,
     StoreAction,
 };
+use super::gluon_connector::GluonImapConnector;
 use super::mailbox;
+use super::mailbox_catalog::GluonMailboxCatalog;
+use super::mailbox_mutation::GluonMailboxMutation;
+use super::mailbox_view::GluonMailboxView;
 use super::response::ResponseWriter;
 use super::rfc822;
 use super::store::MessageStore;
@@ -50,6 +54,10 @@ pub struct SessionConfig {
     pub auth_router: AuthRouter,
     pub runtime_accounts: Arc<RuntimeAccountRegistry>,
     pub store: Arc<dyn MessageStore>,
+    pub gluon_connector: Arc<dyn GluonImapConnector>,
+    pub mailbox_catalog: Arc<dyn GluonMailboxCatalog>,
+    pub mailbox_mutation: Arc<dyn GluonMailboxMutation>,
+    pub mailbox_view: Arc<dyn GluonMailboxView>,
     pub mutation_mode: MutationMode,
 }
 
@@ -638,7 +646,12 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
-        let mut change_rx = self.config.store.subscribe_changes();
+        let scoped_mailbox = self
+            .selected_mailbox
+            .as_ref()
+            .map(|mailbox| self.scoped_mailbox_name(mailbox))
+            .ok_or_else(|| super::ImapError::Protocol("no mailbox selected".to_string()))?;
+        let mut update_rx = self.config.gluon_connector.subscribe_updates();
         self.writer.continuation("idling").await?;
         self.emit_selected_mailbox_exists_update().await?;
 
@@ -653,11 +666,19 @@ where
                     debug!("IDLE timeout after 30 minutes");
                     break;
                 }
-                changed = change_rx.changed() => {
-                    if changed.is_err() {
-                        break;
+                update = update_rx.recv() => {
+                    match update {
+                        Ok(update) if update.affects_scoped_mailbox(&scoped_mailbox) => {
+                            self.emit_selected_mailbox_exists_update().await?;
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            self.emit_selected_mailbox_exists_update().await?;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            break;
+                        }
                     }
-                    self.emit_selected_mailbox_exists_update().await?;
                 }
                 read = self.reader.read_line(&mut line) => {
                     let n = read?;
@@ -707,32 +728,17 @@ where
     }
 
     fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
-        if let Some(m) = mailbox::find_mailbox(name) {
-            return Some(m.into());
-        }
-        self.current_user_labels()
-            .into_iter()
-            .find(|m| m.name.eq_ignore_ascii_case(name))
+        self.config.mailbox_catalog.resolve_mailbox(
+            self.authenticated_account_id.as_deref(),
+            &self.user_labels,
+            name,
+        )
     }
 
     fn all_mailboxes(&self) -> Vec<mailbox::ResolvedMailbox> {
-        let mut all: Vec<mailbox::ResolvedMailbox> = mailbox::system_mailboxes()
-            .iter()
-            .map(|m| mailbox::ResolvedMailbox::from(*m))
-            .collect();
-        all.extend(self.current_user_labels());
-        all
-    }
-
-    /// Read user labels from the shared per-account store in RuntimeAccountRegistry.
-    /// Falls back to the session-local cache if no account is authenticated.
-    fn current_user_labels(&self) -> Vec<mailbox::ResolvedMailbox> {
-        if let Some(account_id) = &self.authenticated_account_id {
-            let aid = crate::bridge::types::AccountId(account_id.clone());
-            self.config.runtime_accounts.get_user_labels(&aid)
-        } else {
-            self.user_labels.clone()
-        }
+        self.config
+            .mailbox_catalog
+            .all_mailboxes(self.authenticated_account_id.as_deref(), &self.user_labels)
     }
 
     fn resolve_target_uids(
@@ -770,23 +776,25 @@ where
         dest_mailbox: &str,
         source_uid: u32,
     ) -> Result<Option<u32>> {
-        let store = self.config.store.clone();
-        let Some(proton_id) = store.get_proton_id(source_mailbox, source_uid).await? else {
+        let mutation = self.config.mailbox_mutation.clone();
+        let Some(proton_id) = mutation.get_proton_id(source_mailbox, source_uid).await? else {
             return Ok(None);
         };
-        let Some(metadata) = store.get_metadata(source_mailbox, source_uid).await? else {
+        let Some(metadata) = mutation.get_metadata(source_mailbox, source_uid).await? else {
             return Ok(None);
         };
 
-        let dest_uid = store
+        let dest_uid = mutation
             .store_metadata(dest_mailbox, &proton_id, metadata)
             .await?;
 
-        let flags = store.get_flags(source_mailbox, source_uid).await?;
-        store.set_flags(dest_mailbox, dest_uid, flags).await?;
+        let flags = mutation.get_flags(source_mailbox, source_uid).await?;
+        mutation.set_flags(dest_mailbox, dest_uid, flags).await?;
 
-        if let Some(rfc822) = store.get_rfc822(source_mailbox, source_uid).await? {
-            store.store_rfc822(dest_mailbox, dest_uid, rfc822).await?;
+        if let Some(rfc822) = mutation.get_rfc822(source_mailbox, source_uid).await? {
+            mutation
+                .store_rfc822(dest_mailbox, dest_uid, rfc822)
+                .await?;
         }
 
         Ok(Some(dest_uid))
@@ -801,15 +809,22 @@ where
         };
 
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let snapshot = self.config.store.mailbox_snapshot(&scoped_mailbox).await?;
+        let snapshot = self
+            .config
+            .mailbox_view
+            .mailbox_snapshot(&scoped_mailbox)
+            .await?;
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
         if snapshot.mod_seq > previous_mod_seq {
-            let current_uids = self.config.store.list_uids(&scoped_mailbox).await?;
+            let current_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
             let mut current_flags: HashMap<u32, Vec<String>> = HashMap::new();
             for uid in &current_uids {
                 current_flags.insert(
                     *uid,
-                    self.config.store.get_flags(&scoped_mailbox, *uid).await?,
+                    self.config
+                        .mailbox_view
+                        .get_flags(&scoped_mailbox, *uid)
+                        .await?,
                 );
             }
 
@@ -998,9 +1013,9 @@ where
                 .await;
         }
 
-        let store = self.config.store.clone();
+        let mutation = self.config.mailbox_mutation.clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
-        let cached_uids = store.list_uids(&scoped_mailbox).await?;
+        let cached_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         if cached_uids.is_empty() {
             let client = self.client.as_ref().unwrap();
@@ -1030,7 +1045,7 @@ where
 
                 // Populate store with message metadata
                 for meta in &meta_resp.messages {
-                    store
+                    mutation
                         .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
                         .await?;
                 }
@@ -1053,13 +1068,21 @@ where
             );
         }
 
-        let status = store.mailbox_status(&scoped_mailbox).await?;
-        let snapshot = store.mailbox_snapshot(&scoped_mailbox).await?;
-        let selected_uids = store.list_uids(&scoped_mailbox).await?;
+        let status = mutation.mailbox_status(&scoped_mailbox).await?;
+        let snapshot = self
+            .config
+            .mailbox_view
+            .mailbox_snapshot(&scoped_mailbox)
+            .await?;
+        let selected_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
         let first_unseen_seq = {
             let mut first = None;
             for (index, uid) in selected_uids.iter().enumerate() {
-                let flags = store.get_flags(&scoped_mailbox, *uid).await?;
+                let flags = self
+                    .config
+                    .mailbox_view
+                    .get_flags(&scoped_mailbox, *uid)
+                    .await?;
                 if !flags.iter().any(|flag| flag == "\\Seen") {
                     first = Some(index as u32 + 1);
                     break;
@@ -1095,8 +1118,13 @@ where
         self.selected_mailbox_uids = selected_uids.clone();
         self.selected_mailbox_flags.clear();
         for uid in &selected_uids {
-            self.selected_mailbox_flags
-                .insert(*uid, store.get_flags(&scoped_mailbox, *uid).await?);
+            self.selected_mailbox_flags.insert(
+                *uid,
+                self.config
+                    .mailbox_view
+                    .get_flags(&scoped_mailbox, *uid)
+                    .await?,
+            );
         }
         self.selected_read_only = false;
         self.state = State::Selected;
@@ -1135,7 +1163,11 @@ where
         };
 
         let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
-        let status = self.config.store.mailbox_status(&scoped_mailbox).await?;
+        let status = self
+            .config
+            .mailbox_view
+            .mailbox_status(&scoped_mailbox)
+            .await?;
 
         let mut attrs = Vec::new();
         for item in items {
@@ -1218,9 +1250,9 @@ where
                 .await;
         }
 
-        let store = self.config.store.clone();
+        let mutation = self.config.mailbox_mutation.clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
-        let cached_uids = store.list_uids(&scoped_mailbox).await?;
+        let cached_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         if cached_uids.is_empty() {
             let client = self.client.as_ref().unwrap();
@@ -1248,7 +1280,7 @@ where
                 }
 
                 for meta in &meta_resp.messages {
-                    store
+                    mutation
                         .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
                         .await?;
                 }
@@ -1262,13 +1294,21 @@ where
             }
         }
 
-        let status = store.mailbox_status(&scoped_mailbox).await?;
-        let snapshot = store.mailbox_snapshot(&scoped_mailbox).await?;
-        let selected_uids = store.list_uids(&scoped_mailbox).await?;
+        let status = mutation.mailbox_status(&scoped_mailbox).await?;
+        let snapshot = self
+            .config
+            .mailbox_view
+            .mailbox_snapshot(&scoped_mailbox)
+            .await?;
+        let selected_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
         let first_unseen_seq = {
             let mut first = None;
             for (index, uid) in selected_uids.iter().enumerate() {
-                let flags = store.get_flags(&scoped_mailbox, *uid).await?;
+                let flags = self
+                    .config
+                    .mailbox_view
+                    .get_flags(&scoped_mailbox, *uid)
+                    .await?;
                 if !flags.iter().any(|flag| flag == "\\Seen") {
                     first = Some(index as u32 + 1);
                     break;
@@ -1301,8 +1341,13 @@ where
         self.selected_mailbox_uids = selected_uids.clone();
         self.selected_mailbox_flags.clear();
         for uid in &selected_uids {
-            self.selected_mailbox_flags
-                .insert(*uid, store.get_flags(&scoped_mailbox, *uid).await?);
+            self.selected_mailbox_flags.insert(
+                *uid,
+                self.config
+                    .mailbox_view
+                    .get_flags(&scoped_mailbox, *uid)
+                    .await?,
+            );
         }
         self.selected_read_only = true;
         self.state = State::Selected;
@@ -1333,8 +1378,8 @@ where
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let store = self.config.store.clone();
-        let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let mailbox_view = self.config.mailbox_view.clone();
+        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "FETCH completed").await;
@@ -1385,8 +1430,8 @@ where
         let mut cache_misses = 0u32;
 
         for (uid, seq) in target_messages {
-            let meta = store.get_metadata(&scoped_mailbox, uid).await?;
-            let flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let meta = mailbox_view.get_metadata(&scoped_mailbox, uid).await?;
+            let flags = mailbox_view.get_flags(&scoped_mailbox, uid).await?;
             let mut has_seen = flags.iter().any(|flag| flag == &seen_flag);
 
             if needs_body_sections {
@@ -1409,7 +1454,7 @@ where
             let needs_rfc822_load =
                 (needs_body_sections && !header_only_body_fetch) || needs_full_rfc822;
             if needs_rfc822_load {
-                rfc822_data = store.get_rfc822(&scoped_mailbox, uid).await?;
+                rfc822_data = mailbox_view.get_rfc822(&scoped_mailbox, uid).await?;
                 if rfc822_data.is_some() {
                     cache_hits = cache_hits.saturating_add(1);
                 } else {
@@ -1560,7 +1605,8 @@ where
                         if !peek && !self.selected_read_only {
                             // Set \Seen flag
                             if !has_seen {
-                                store
+                                self.config
+                                    .mailbox_mutation
                                     .add_flags(
                                         &scoped_mailbox,
                                         uid,
@@ -1752,7 +1798,7 @@ where
         };
 
         self.config
-            .store
+            .mailbox_mutation
             .store_rfc822(mailbox, uid, data.clone())
             .await?;
 
@@ -1777,8 +1823,8 @@ where
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let store = &self.config.store;
-        let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let mutation = &self.config.mailbox_mutation;
+        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "STORE completed").await;
@@ -1795,21 +1841,23 @@ where
         );
 
         for &uid in &target_uids {
-            let previous_flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let previous_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
             let had_seen = previous_flags.iter().any(|flag| flag == "\\Seen");
             let had_flagged = previous_flags.iter().any(|flag| flag == "\\Flagged");
 
             match action {
                 StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
-                    store
+                    mutation
                         .set_flags(&scoped_mailbox, uid, flag_strings.clone())
                         .await?;
                 }
                 StoreAction::AddFlags | StoreAction::AddFlagsSilent => {
-                    store.add_flags(&scoped_mailbox, uid, &flag_strings).await?;
+                    mutation
+                        .add_flags(&scoped_mailbox, uid, &flag_strings)
+                        .await?;
                 }
                 StoreAction::RemoveFlags | StoreAction::RemoveFlagsSilent => {
-                    store
+                    mutation
                         .remove_flags(&scoped_mailbox, uid, &flag_strings)
                         .await?;
                 }
@@ -1817,9 +1865,9 @@ where
 
             // Sync flag changes to Proton API
             if let Some(ref client) = self.client {
-                if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
+                if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
                     let id_ref = proton_id.as_str();
-                    let current_flags = store.get_flags(&scoped_mailbox, uid).await?;
+                    let current_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
                     let has_seen = current_flags.iter().any(|flag| flag == "\\Seen");
                     let has_flagged = current_flags.iter().any(|flag| flag == "\\Flagged");
 
@@ -1911,8 +1959,11 @@ where
             }
 
             if !silent {
-                let seq = store.uid_to_seq(&scoped_mailbox, uid).await?.unwrap_or(0);
-                let current_flags = store.get_flags(&scoped_mailbox, uid).await?;
+                let seq = mutation
+                    .uid_to_seq(&scoped_mailbox, uid)
+                    .await?
+                    .unwrap_or(0);
+                let current_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
                 let flag_str = current_flags.join(" ");
                 let fetch_items = if uid_mode {
                     format!("UID {uid} FLAGS ({flag_str})")
@@ -1940,8 +1991,8 @@ where
 
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let store = self.config.store.clone();
-        let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let mailbox_view = self.config.mailbox_view.clone();
+        let all_uids = mailbox_view.list_uids(&scoped_mailbox).await?;
         let needs_rfc822 = criteria.iter().any(search_key_needs_rfc822);
 
         let mut results = Vec::new();
@@ -1949,11 +2000,22 @@ where
 
         for (i, &uid) in all_uids.iter().enumerate() {
             let seq = i as u32 + 1;
-            let meta = store.get_metadata(&scoped_mailbox, uid).await?;
-            let flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let meta = self
+                .config
+                .mailbox_view
+                .get_metadata(&scoped_mailbox, uid)
+                .await?;
+            let flags = self
+                .config
+                .mailbox_view
+                .get_flags(&scoped_mailbox, uid)
+                .await?;
 
             let mut rfc822_data = if needs_rfc822 {
-                store.get_rfc822(&scoped_mailbox, uid).await?
+                self.config
+                    .mailbox_view
+                    .get_rfc822(&scoped_mailbox, uid)
+                    .await?
             } else {
                 None
             };
@@ -2011,20 +2073,20 @@ where
             None => return Ok(true),
         };
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let store = &self.config.store;
-        let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let mutation = &self.config.mailbox_mutation;
+        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         let mut expunged_seqs = Vec::new();
         let mut offset = 0u32;
 
         for (i, &uid) in all_uids.iter().enumerate() {
-            let flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let flags = mutation.get_flags(&scoped_mailbox, uid).await?;
             if flags.iter().any(|f| f == "\\Deleted") {
                 let seq = i as u32 + 1 - offset;
 
                 // Permanently delete if already in Trash or Spam, otherwise move to Trash
                 if let Some(ref client) = self.client {
-                    if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
+                    if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
                         let is_trash_or_spam = self
                             .resolve_mailbox(&mailbox)
                             .map(|mb| {
@@ -2065,7 +2127,7 @@ where
                     }
                 }
 
-                store.remove_message(&scoped_mailbox, uid).await?;
+                mutation.remove_message(&scoped_mailbox, uid).await?;
                 expunged_seqs.push(seq);
                 offset += 1;
             }
@@ -2094,8 +2156,8 @@ where
             None => return self.writer.tagged_no(tag, "no mailbox selected").await,
         };
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let store = &self.config.store;
-        let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let mutation = &self.config.mailbox_mutation;
+        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self
@@ -2114,13 +2176,13 @@ where
                 continue;
             }
 
-            let flags = store.get_flags(&scoped_mailbox, uid).await?;
+            let flags = mutation.get_flags(&scoped_mailbox, uid).await?;
             if flags.iter().any(|f| f == "\\Deleted") {
                 let seq = i as u32 + 1 - offset;
 
                 // Permanently delete if in Trash or Spam, otherwise move to Trash
                 if let Some(ref client) = self.client {
-                    if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
+                    if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
                         let is_trash_or_spam = self
                             .resolve_mailbox(&mailbox)
                             .map(|mb| {
@@ -2159,7 +2221,7 @@ where
                     }
                 }
 
-                store.remove_message(&scoped_mailbox, uid).await?;
+                mutation.remove_message(&scoped_mailbox, uid).await?;
                 expunged_seqs.push(seq);
                 offset += 1;
             }
@@ -2205,8 +2267,8 @@ where
             return self.writer.tagged_ok(tag, None, "COPY completed").await;
         }
 
-        let store = &self.config.store;
-        let all_uids = store.list_uids(&scoped_mailbox).await?;
+        let mutation = &self.config.mailbox_mutation;
+        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "COPY completed").await;
@@ -2219,7 +2281,7 @@ where
 
         for &uid in &target_uids {
             if let Some(ref client) = self.client {
-                if let Some(proton_id) = store.get_proton_id(&scoped_mailbox, uid).await? {
+                if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
                     if let Err(err) =
                         messages::label_messages(client, &[proton_id.as_str()], &dest_mb.label_id)
                             .await
@@ -2251,7 +2313,7 @@ where
             }
         }
 
-        let dest_status = store.mailbox_status(&scoped_dest_mailbox).await?;
+        let dest_status = mutation.mailbox_status(&scoped_dest_mailbox).await?;
         let copyuid_code = format_copyuid(dest_status.uid_validity, &src_uids, &dst_uids);
         self.writer
             .tagged_ok(tag, Some(&copyuid_code), "COPY completed")
@@ -2296,8 +2358,12 @@ where
             return self.writer.tagged_ok(tag, None, "MOVE completed").await;
         }
 
-        let store = &self.config.store;
-        let all_uids = store.list_uids(&scoped_source_mailbox).await?;
+        let mutation = &self.config.mailbox_mutation;
+        let all_uids = self
+            .config
+            .mailbox_view
+            .list_uids(&scoped_source_mailbox)
+            .await?;
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "MOVE completed").await;
         }
@@ -2318,7 +2384,7 @@ where
                 continue;
             }
 
-            let Some(proton_id) = store.get_proton_id(&scoped_source_mailbox, uid).await? else {
+            let Some(proton_id) = mutation.get_proton_id(&scoped_source_mailbox, uid).await? else {
                 continue;
             };
 
@@ -2376,13 +2442,13 @@ where
             {
                 src_uids.push(uid);
                 dst_uids.push(dest_uid);
-                store.remove_message(&scoped_source_mailbox, uid).await?;
+                mutation.remove_message(&scoped_source_mailbox, uid).await?;
                 expunged_seqs.push(seq);
                 offset += 1;
             }
         }
 
-        let dest_status = store.mailbox_status(&scoped_dest_mailbox).await?;
+        let dest_status = mutation.mailbox_status(&scoped_dest_mailbox).await?;
         let copyuid_code = format_copyuid(dest_status.uid_validity, &src_uids, &dst_uids);
 
         for seq in expunged_seqs {
@@ -2503,20 +2569,20 @@ where
             num_attachments: 0,
         };
 
-        let store = self.config.store.clone();
+        let mutation = self.config.mailbox_mutation.clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
-        let uid = store
+        let uid = mutation
             .store_metadata(&scoped_mailbox, &proton_id, meta)
             .await?;
-        store.store_rfc822(&scoped_mailbox, uid, literal).await?;
+        mutation.store_rfc822(&scoped_mailbox, uid, literal).await?;
 
         // Apply flags
         let flag_strs: Vec<String> = flags.iter().map(|f| f.as_str().to_string()).collect();
         if !flag_strs.is_empty() {
-            store.set_flags(&scoped_mailbox, uid, flag_strs).await?;
+            mutation.set_flags(&scoped_mailbox, uid, flag_strs).await?;
         }
 
-        let status = store.mailbox_status(&scoped_mailbox).await?;
+        let status = mutation.mailbox_status(&scoped_mailbox).await?;
         let appenduid_code = format!("APPENDUID {} {}", status.uid_validity, uid);
 
         info!(
@@ -3044,6 +3110,10 @@ mod tests {
     use crate::bridge::accounts::AccountHealth;
     use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
     use crate::bridge::auth_router::AuthRouter;
+    use crate::imap::gluon_connector::StoreBackedConnector;
+    use crate::imap::mailbox_catalog::RuntimeMailboxCatalog;
+    use crate::imap::mailbox_mutation::StoreBackedMailboxMutation;
+    use crate::imap::mailbox_view::StoreBackedMailboxView;
     use crate::imap::store::InMemoryStore;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3064,11 +3134,17 @@ mod tests {
     fn test_config_with_mode(mutation_mode: MutationMode) -> Arc<SessionConfig> {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
+        let store = InMemoryStore::new();
+        let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
         Arc::new(SessionConfig {
             api_base_url: "https://mail-api.proton.me".to_string(),
             auth_router: AuthRouter::new(accounts),
-            runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
-            store: InMemoryStore::new(),
+            runtime_accounts: runtime_accounts.clone(),
+            gluon_connector: StoreBackedConnector::new(store.clone()),
+            mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
+            mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
+            mailbox_view: StoreBackedMailboxView::new(store.clone()),
+            store,
             mutation_mode,
         })
     }
@@ -3163,11 +3239,16 @@ mod tests {
         let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
             account_a, account_b,
         ]));
+        let store = InMemoryStore::new();
         Arc::new(SessionConfig {
             api_base_url: api_base_url.to_string(),
             auth_router: AuthRouter::new(accounts),
-            runtime_accounts,
-            store: InMemoryStore::new(),
+            runtime_accounts: runtime_accounts.clone(),
+            gluon_connector: StoreBackedConnector::new(store.clone()),
+            mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts.clone()),
+            mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
+            mailbox_view: StoreBackedMailboxView::new(store.clone()),
+            store,
             mutation_mode: MutationMode::Compat,
         })
     }

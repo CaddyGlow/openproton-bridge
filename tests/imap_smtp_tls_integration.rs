@@ -3,6 +3,10 @@ use std::sync::Arc;
 use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
 use openproton_bridge::bridge::auth_router::AuthRouter;
+use openproton_bridge::imap::gluon_connector::StoreBackedConnector;
+use openproton_bridge::imap::mailbox_catalog::RuntimeMailboxCatalog;
+use openproton_bridge::imap::mailbox_mutation::StoreBackedMailboxMutation;
+use openproton_bridge::imap::mailbox_view::StoreBackedMailboxView;
 use openproton_bridge::imap::server::{run_server_with_tls_config as run_imap_server, ImapServer};
 use openproton_bridge::imap::session::{MutationMode, SessionConfig};
 use openproton_bridge::imap::store::InMemoryStore;
@@ -31,11 +35,17 @@ fn test_session() -> Session {
 fn test_imap_config() -> Arc<SessionConfig> {
     let session = test_session();
     let accounts = AccountRegistry::from_single_session(session.clone());
+    let store = InMemoryStore::new();
+    let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
     Arc::new(SessionConfig {
         api_base_url: "https://mail-api.proton.me".to_string(),
         auth_router: AuthRouter::new(accounts),
-        runtime_accounts: Arc::new(RuntimeAccountRegistry::in_memory(vec![session])),
-        store: InMemoryStore::new(),
+        runtime_accounts: runtime_accounts.clone(),
+        gluon_connector: StoreBackedConnector::new(store.clone()),
+        mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
+        mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
+        mailbox_view: StoreBackedMailboxView::new(store.clone()),
+        store,
         mutation_mode: MutationMode::Compat,
     })
 }

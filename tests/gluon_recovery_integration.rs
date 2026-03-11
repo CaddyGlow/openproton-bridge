@@ -7,46 +7,19 @@ use openproton_bridge::imap::store::{GluonStore, MessageStore};
 use openproton_bridge::imap::ImapError;
 use serde_json::json;
 
+#[path = "gluon_db_support.rs"]
+mod gluon_db_support;
+
 fn make_account_map(account_id: &str, storage_user_id: &str) -> HashMap<String, String> {
     HashMap::from([(account_id.to_string(), storage_user_id.to_string())])
 }
 
 fn read_sqlite_index_payload(db_path: &Path) -> serde_json::Value {
-    let conn = rusqlite::Connection::open(db_path)
-        .unwrap_or_else(|err| panic!("open sqlite db {} failed: {err}", db_path.display()));
-    let payload: Vec<u8> = conn
-        .query_row(
-            "SELECT payload FROM openproton_mailbox_index WHERE id = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read sqlite index payload");
-    serde_json::from_slice(&payload).expect("parse sqlite index payload")
+    gluon_db_support::read_legacy_index_payload(db_path)
 }
 
 fn build_sqlite_index_db_bytes(index_payload: &serde_json::Value) -> Vec<u8> {
-    let temp = tempfile::tempdir().expect("temp sqlite dir");
-    let db_path = temp.path().join("index.db");
-    let conn = rusqlite::Connection::open(&db_path).expect("open temp sqlite db");
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS openproton_mailbox_index (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            payload BLOB NOT NULL,
-            updated_at_ms INTEGER NOT NULL
-        );",
-    )
-    .expect("create sqlite index table");
-    conn.execute(
-        "INSERT OR REPLACE INTO openproton_mailbox_index (id, payload, updated_at_ms)
-         VALUES (1, ?1, ?2)",
-        rusqlite::params![
-            serde_json::to_vec(index_payload).expect("serialize index payload"),
-            1_700_000_000_000_i64
-        ],
-    )
-    .expect("write sqlite index row");
-    drop(conn);
-    fs::read(db_path).expect("read sqlite db bytes")
+    gluon_db_support::build_db_bytes_from_legacy_index_payload(index_payload)
 }
 
 #[tokio::test]

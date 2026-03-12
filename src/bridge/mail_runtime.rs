@@ -39,16 +39,16 @@ impl DavTlsMode {
 #[serde(rename_all = "snake_case")]
 pub enum ImapReadBackend {
     #[default]
-    Compat,
     GluonMailReadOnly,
+    Compat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImapMutationBackend {
     #[default]
-    Compat,
     GluonMail,
+    Compat,
 }
 
 #[derive(Debug, Clone)]
@@ -1870,17 +1870,23 @@ mod tests {
     }
 
     #[test]
-    fn imap_read_backend_defaults_to_compat() {
+    fn imap_read_backend_defaults_to_gluon_mail_read_only() {
         let decoded: ImapReadBackend = serde_json::from_str("\"compat\"").unwrap();
         assert_eq!(decoded, ImapReadBackend::Compat);
-        assert_eq!(ImapReadBackend::default(), ImapReadBackend::Compat);
+        assert_eq!(
+            ImapReadBackend::default(),
+            ImapReadBackend::GluonMailReadOnly
+        );
     }
 
     #[test]
-    fn imap_mutation_backend_defaults_to_compat() {
+    fn imap_mutation_backend_defaults_to_gluon_mail() {
         let decoded: ImapMutationBackend = serde_json::from_str("\"compat\"").unwrap();
         assert_eq!(decoded, ImapMutationBackend::Compat);
-        assert_eq!(ImapMutationBackend::default(), ImapMutationBackend::Compat);
+        assert_eq!(
+            ImapMutationBackend::default(),
+            ImapMutationBackend::GluonMail
+        );
     }
 
     #[tokio::test]

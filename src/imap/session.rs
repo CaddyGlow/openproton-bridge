@@ -5700,6 +5700,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_examine_reports_first_unseen_sequence_number_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .mailbox_mutation
+            .set_flags("test-uid::INBOX", 1, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+        seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-2",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-2\r\n\r\nbody",
+        )
+        .await;
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("OK [UNSEEN 2]"), "response={response}");
+        assert!(response.contains("a001 OK [READ-ONLY] EXAMINE completed"));
+    }
+
+    #[tokio::test]
     async fn test_fetch_header_fields_uses_metadata_when_rfc822_missing() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -5857,6 +5891,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_select_after_examine_resets_read_only_mode_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        seed_gluon_backend_message(
+            &config,
+            "Drafts",
+            "msg-2",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Draft msg-2\r\n\r\nbody",
+        )
+        .await;
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(session.selected_read_only);
+
+        session.handle_line("a002 SELECT Drafts").await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("a002 OK [READ-WRITE] SELECT completed"));
+        assert!(!session.selected_read_only);
+    }
+
+    #[tokio::test]
     async fn test_close_after_examine_deselects_mailbox() {
         let config = test_config();
         let (mut session, mut client_read, _client_write) =
@@ -5958,6 +6026,66 @@ mod tests {
         let flags = config
             .store
             .get_flags("test-uid::INBOX", uid)
+            .await
+            .unwrap();
+        assert!(
+            !flags.iter().any(|f| f == "\\Seen"),
+            "flags were mutated in read-only mode: {flags:?}"
+        );
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn test_examine_fetch_body_does_not_mark_read_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/mail/v4/messages/read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000
+            })))
+            .expect(0)
+            .named("read-only gluon fetch must not mark message as read")
+            .mount(&server)
+            .await;
+
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        session.handle_line("a001 EXAMINE INBOX").await.unwrap();
+        let mut buf = vec![0u8; 4096];
+        let _ = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        assert!(session.selected_read_only);
+
+        session.handle_line("a002 FETCH 1 (BODY[])").await.unwrap();
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("BODY[]"), "response={response}");
+        assert!(
+            response.contains("a002 OK FETCH completed"),
+            "response={response}"
+        );
+
+        let flags = config
+            .mailbox_view
+            .get_flags("test-uid::INBOX", 1)
             .await
             .unwrap();
         assert!(
@@ -6252,6 +6380,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_select_warm_cache_skips_metadata_fetch_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .named("no metadata fetch on warm select with gluon backend")
+            .mount(&server)
+            .await;
+
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+        session.client = Some(
+            ProtonClient::authenticated_with_mode(
+                &server.uri(),
+                crate::api::types::ApiMode::Bridge,
+                "test-uid",
+                "test-token",
+            )
+            .unwrap(),
+        );
+
+        session.handle_line("a001 SELECT INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("1 EXISTS"));
+        assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
+
+        server.verify().await;
+    }
+
+    #[tokio::test]
     async fn test_select_reports_first_unseen_sequence_and_permanentflags() {
         let config = test_config();
         let (mut session, mut client_read, _client_write) =
@@ -6270,6 +6438,44 @@ mod tests {
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
+
+        session.handle_line("a001 SELECT INBOX").await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("2 EXISTS"));
+        assert!(response
+            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"));
+        assert!(response.contains("OK [UNSEEN 2]"));
+        assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
+    }
+
+    #[tokio::test]
+    async fn test_select_reports_first_unseen_sequence_and_permanentflags_with_gluon_mail_backend()
+    {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Authenticated;
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .mailbox_mutation
+            .set_flags("test-uid::INBOX", 1, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+        seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-2",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-2\r\n\r\nbody",
+        )
+        .await;
 
         session.handle_line("a001 SELECT INBOX").await.unwrap();
 

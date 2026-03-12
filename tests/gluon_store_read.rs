@@ -261,3 +261,79 @@ async fn be024_invalid_uid_keys_in_index_fall_back_to_blob_discovery() {
         Some(expected_blob)
     );
 }
+
+#[tokio::test]
+async fn be031_partial_sqlite_schema_falls_back_to_blob_discovery() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let account_store = temp.path().join("backend/store/user-partial-index");
+    let account_db = temp.path().join("backend/db/user-partial-index.db");
+    fs::create_dir_all(&account_store).expect("create account store dir");
+    fs::create_dir_all(account_db.parent().expect("db parent")).expect("create db dir");
+
+    let expected_blob = b"From: partial@example.invalid\r\nSubject: recovered\r\n\r\nbody".to_vec();
+    fs::write(account_store.join("00000005.msg"), &expected_blob).expect("write blob");
+
+    let conn = rusqlite::Connection::open(&account_db).expect("open sqlite db");
+    conn.execute_batch(
+        "
+        CREATE TABLE openproton_account_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        ",
+    )
+    .expect("create partial sqlite schema");
+    conn.execute(
+        "INSERT INTO openproton_account_meta (key, value) VALUES (?1, ?2)",
+        rusqlite::params!["next_blob_id", "6"],
+    )
+    .expect("insert next_blob_id");
+
+    let store = GluonStore::new(
+        temp.path().to_path_buf(),
+        make_account_map("account-partial", "user-partial-index"),
+    )
+    .expect("create gluon store");
+
+    let mailbox = "account-partial::INBOX";
+    assert_eq!(
+        store.list_uids(mailbox).await.expect("list uids"),
+        vec![5],
+        "partial sqlite schema should fall back to blob discovery instead of exposing partial state"
+    );
+    assert_eq!(
+        store
+            .get_rfc822(mailbox, 5)
+            .await
+            .expect("read recovered blob"),
+        Some(expected_blob)
+    );
+
+    let status = store.mailbox_status(mailbox).await.expect("status");
+    assert_eq!(status.exists, 1);
+    assert_eq!(status.next_uid, 6);
+
+    let repaired_index = gluon_db_support::read_legacy_index_payload(&account_db);
+    let inbox = repaired_index
+        .get("mailboxes")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|mailboxes| mailboxes.get("INBOX"))
+        .and_then(serde_json::Value::as_object)
+        .expect("repaired inbox");
+    assert_eq!(
+        inbox
+            .get("uid_order")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .expect("uid_order"),
+        vec![json!(5)]
+    );
+    assert_eq!(
+        inbox
+            .get("uid_to_blob")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|uids| uids.get("5"))
+            .and_then(serde_json::Value::as_str),
+        Some("00000005.msg")
+    );
+}

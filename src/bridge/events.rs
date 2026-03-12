@@ -2119,7 +2119,7 @@ pub fn start_event_worker_group_with_sync_progress(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
 ) -> EventWorkerGroup {
-    start_event_worker_group_with_sync_progress_and_pim(
+    start_event_worker_group_with_compat_store_and_sync_progress_and_pim(
         runtime_accounts,
         accounts,
         api_base_url,
@@ -2132,8 +2132,9 @@ pub fn start_event_worker_group_with_sync_progress(
     )
 }
 
+// Compat-only convenience wrapper that still synthesizes store-backed state.
 #[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group_with_sync_progress_and_pim(
+pub fn start_event_worker_group_with_compat_store_and_sync_progress_and_pim(
     runtime_accounts: Arc<RuntimeAccountRegistry>,
     accounts: Vec<RuntimeAccountInfo>,
     api_base_url: String,
@@ -2272,7 +2273,7 @@ pub fn start_event_workers_with_sync_progress(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
 ) -> Vec<JoinHandle<()>> {
-    start_event_workers_with_sync_progress_and_pim(
+    start_event_workers_with_compat_store_and_sync_progress_and_pim(
         runtime_accounts,
         accounts,
         api_base_url,
@@ -2285,8 +2286,9 @@ pub fn start_event_workers_with_sync_progress(
     )
 }
 
+// Compat-only convenience wrapper that still synthesizes store-backed state.
 #[allow(clippy::too_many_arguments)]
-pub fn start_event_workers_with_sync_progress_and_pim(
+pub fn start_event_workers_with_compat_store_and_sync_progress_and_pim(
     runtime_accounts: Arc<RuntimeAccountRegistry>,
     accounts: Vec<RuntimeAccountInfo>,
     api_base_url: String,
@@ -2403,6 +2405,7 @@ mod tests {
         })
     }
 
+    // Rollback/compat helper that still builds the legacy store-backed worker shape.
     fn event_worker_config(
         server_uri: &str,
         runtime: Arc<RuntimeAccountRegistry>,
@@ -2422,6 +2425,7 @@ mod tests {
         )
     }
 
+    // Primary helper for the Gluon-backed worker shape used by current runtime code.
     fn gluon_event_worker_config(
         server_uri: &str,
         runtime: Arc<RuntimeAccountRegistry>,

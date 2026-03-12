@@ -419,5 +419,17 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     assert!(select.contains("1 EXISTS"), "{select}");
     assert!(select.contains("a003 OK"), "{select}");
 
+    write
+        .write_all(b"a004 FETCH 1 (BODY[])\r\n")
+        .await
+        .expect("write fetch");
+    write.flush().await.expect("flush fetch");
+
+    let fetch = read_until_tag(&mut reader, "a004 ").await;
+    assert!(fetch.contains("BODY[]"), "{fetch}");
+    assert!(fetch.contains("Runtime Subject"), "{fetch}");
+    assert!(fetch.contains("runtime-body"), "{fetch}");
+    assert!(fetch.contains("a004 OK FETCH completed"), "{fetch}");
+
     runtime.stop().await.expect("stop runtime");
 }

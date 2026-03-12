@@ -18,8 +18,14 @@ use crate::api::types::{
 };
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
-use crate::imap::gluon_connector::{GluonImapConnector, StoreBackedConnector};
+use crate::imap::gluon_connector::GluonImapConnector;
+#[cfg(test)]
+use crate::imap::gluon_connector::StoreBackedConnector;
 use crate::imap::mailbox;
+use crate::imap::mailbox_view::GluonMailboxView;
+#[cfg(test)]
+use crate::imap::mailbox_view::StoreBackedMailboxView;
+#[cfg(test)]
 use crate::imap::store::MessageStore;
 use crate::pim::incremental as pim_incremental;
 use crate::pim::store::PimStore;
@@ -380,7 +386,7 @@ pub struct EventWorkerConfig {
     pub api_base_url: String,
     pub runtime_accounts: Arc<RuntimeAccountRegistry>,
     pub auth_router: AuthRouter,
-    pub store: Arc<dyn MessageStore>,
+    pub mailbox_view: Arc<dyn GluonMailboxView>,
     pub connector: Arc<dyn GluonImapConnector>,
     pub pim_store: Option<Arc<PimStore>>,
     pub checkpoint_store: SharedCheckpointStore,
@@ -395,7 +401,8 @@ impl EventWorkerConfig {
         api_base_url: String,
         runtime_accounts: Arc<RuntimeAccountRegistry>,
         auth_router: AuthRouter,
-        store: Arc<dyn MessageStore>,
+        mailbox_view: Arc<dyn GluonMailboxView>,
+        connector: Arc<dyn GluonImapConnector>,
         checkpoint_store: SharedCheckpointStore,
     ) -> Self {
         Self {
@@ -404,8 +411,8 @@ impl EventWorkerConfig {
             api_base_url,
             runtime_accounts,
             auth_router,
-            connector: StoreBackedConnector::new(store.clone()),
-            store,
+            connector,
+            mailbox_view,
             pim_store: None,
             checkpoint_store,
             sync_progress_callback: None,
@@ -474,7 +481,7 @@ async fn message_exists_in_store(
         ensure_account_generation(config, expected_generation, "message_exists_in_store").await?;
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         let uid = config
-            .store
+            .mailbox_view
             .get_uid(&scoped, message_id)
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
@@ -1434,7 +1441,7 @@ async fn cached_message_count_for_generation(
 
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         let count = config
-            .store
+            .mailbox_view
             .list_uids(&scoped)
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?
@@ -2085,156 +2092,17 @@ pub async fn run_event_worker(config: EventWorkerConfig, poll_interval: Duration
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group(
+fn build_event_worker_configs(
     runtime_accounts: Arc<RuntimeAccountRegistry>,
     accounts: Vec<RuntimeAccountInfo>,
     api_base_url: String,
     auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    start_event_worker_group_with_sync_progress(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        None,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group_with_sync_progress(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    start_event_worker_group_with_sync_progress_and_pim(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        HashMap::new(),
-        sync_progress_callback,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group_with_sync_progress_and_pim(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
+    mailbox_view: Arc<dyn GluonMailboxView>,
+    connector: Arc<dyn GluonImapConnector>,
     checkpoint_store: SharedCheckpointStore,
     pim_stores: HashMap<String, Arc<PimStore>>,
     sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-    let handles = accounts
-        .into_iter()
-        .map(|account| {
-            let account_base_url = resolve_api_base_url_for_mode(&api_base_url, account.api_mode);
-            let account_id_key = account.account_id.0.clone();
-            let mut config = EventWorkerConfig::new(
-                account.account_id,
-                account.email,
-                account_base_url,
-                runtime_accounts.clone(),
-                auth_router.clone(),
-                store.clone(),
-                checkpoint_store.clone(),
-            );
-            if let Some(pim_store) = pim_stores.get(&account_id_key) {
-                config = config.with_pim_store(pim_store.clone());
-            }
-            if let Some(callback) = sync_progress_callback.as_ref() {
-                config = config.with_sync_progress_callback(callback.clone());
-            }
-            let shutdown_rx = shutdown_tx.subscribe();
-            tokio::spawn(run_event_worker_with_shutdown(
-                config,
-                poll_interval,
-                shutdown_rx,
-            ))
-        })
-        .collect();
-
-    EventWorkerGroup {
-        shutdown_tx,
-        handles,
-    }
-}
-
-pub fn start_event_workers(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    poll_interval: Duration,
-) -> Vec<JoinHandle<()>> {
-    start_event_workers_with_sync_progress(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        None,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_workers_with_sync_progress(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> Vec<JoinHandle<()>> {
-    start_event_workers_with_sync_progress_and_pim(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        HashMap::new(),
-        sync_progress_callback,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_workers_with_sync_progress_and_pim(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    pim_stores: HashMap<String, Arc<PimStore>>,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> Vec<JoinHandle<()>> {
+) -> Vec<EventWorkerConfig> {
     accounts
         .into_iter()
         .map(|account| {
@@ -2246,7 +2114,8 @@ pub fn start_event_workers_with_sync_progress_and_pim(
                 account_base_url,
                 runtime_accounts.clone(),
                 auth_router.clone(),
-                store.clone(),
+                mailbox_view.clone(),
+                connector.clone(),
                 checkpoint_store.clone(),
             );
             if let Some(pim_store) = pim_stores.get(&account_id_key) {
@@ -2255,9 +2124,80 @@ pub fn start_event_workers_with_sync_progress_and_pim(
             if let Some(callback) = sync_progress_callback.as_ref() {
                 config = config.with_sync_progress_callback(callback.clone());
             }
-            tokio::spawn(run_event_worker(config, poll_interval))
+            config
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    mailbox_view: Arc<dyn GluonMailboxView>,
+    connector: Arc<dyn GluonImapConnector>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> EventWorkerGroup {
+    let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+    let handles = build_event_worker_configs(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        mailbox_view,
+        connector,
+        checkpoint_store,
+        pim_stores,
+        sync_progress_callback,
+    )
+    .into_iter()
+    .map(|account| {
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(run_event_worker_with_shutdown(
+            account,
+            poll_interval,
+            shutdown_rx,
+        ))
+    })
+    .collect();
+
+    EventWorkerGroup {
+        shutdown_tx,
+        handles,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_event_workers_with_sync_progress_and_pim_and_connector(
+    runtime_accounts: Arc<RuntimeAccountRegistry>,
+    accounts: Vec<RuntimeAccountInfo>,
+    api_base_url: String,
+    auth_router: AuthRouter,
+    mailbox_view: Arc<dyn GluonMailboxView>,
+    connector: Arc<dyn GluonImapConnector>,
+    checkpoint_store: SharedCheckpointStore,
+    pim_stores: HashMap<String, Arc<PimStore>>,
+    sync_progress_callback: Option<SyncProgressCallback>,
+    poll_interval: Duration,
+) -> Vec<JoinHandle<()>> {
+    build_event_worker_configs(
+        runtime_accounts,
+        accounts,
+        api_base_url,
+        auth_router,
+        mailbox_view,
+        connector,
+        checkpoint_store,
+        pim_stores,
+        sync_progress_callback,
+    )
+    .into_iter()
+    .map(|config| tokio::spawn(run_event_worker(config, poll_interval)))
+    .collect()
 }
 
 #[cfg(test)]
@@ -2270,11 +2210,17 @@ mod tests {
     use crate::api::types::Session;
     use crate::bridge::accounts::AccountHealth;
     use crate::bridge::accounts::AccountRegistry;
+    use crate::imap::gluon_connector::GluonMailConnector;
+    use crate::imap::gluon_mailbox_view::GluonMailMailboxView;
     use crate::imap::store::InMemoryStore;
     use crate::pim::store::PimStore;
+    use gluon_rs_mail::{
+        AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey,
+        StoreBootstrap,
+    };
     use rusqlite::Connection;
     use serde::Deserialize;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2315,6 +2261,7 @@ mod tests {
         })
     }
 
+    // Store-backed helper for targeted tests that do not need a Gluon fixture.
     fn event_worker_config(
         server_uri: &str,
         runtime: Arc<RuntimeAccountRegistry>,
@@ -2328,9 +2275,165 @@ mod tests {
             server_uri.to_string(),
             runtime,
             auth_router,
-            store,
+            StoreBackedMailboxView::new(store.clone()),
+            StoreBackedConnector::new(store),
             checkpoints,
         )
+    }
+
+    // Primary helper for the Gluon-backed worker shape used by current runtime code.
+    fn gluon_event_worker_config(
+        server_uri: &str,
+        runtime: Arc<RuntimeAccountRegistry>,
+        auth_router: AuthRouter,
+        checkpoints: SharedCheckpointStore,
+    ) -> (EventWorkerConfig, TempDir) {
+        let tempdir = tempdir().expect("tempdir");
+        let gluon_store = Arc::new(
+            CompatibleStore::open(StoreBootstrap::new(
+                CacheLayout::new(tempdir.path().join("gluon")),
+                CompatibilityTarget::pinned("2046c95ca745"),
+                vec![AccountBootstrap::new(
+                    "uid-1",
+                    "uid-1",
+                    GluonKey::try_from_slice(&[7u8; 32]).expect("key"),
+                )],
+            ))
+            .expect("open store"),
+        );
+        let mailbox_view = GluonMailMailboxView::new(gluon_store.clone());
+        let connector = GluonMailConnector::new(gluon_store);
+        let config = EventWorkerConfig::new(
+            AccountId("uid-1".to_string()),
+            "alice@proton.me".to_string(),
+            server_uri.to_string(),
+            runtime,
+            auth_router,
+            mailbox_view,
+            connector,
+            checkpoints,
+        );
+        (config, tempdir)
+    }
+
+    fn store_backed_worker_components(
+        store: Arc<dyn MessageStore>,
+    ) -> (Arc<dyn GluonMailboxView>, Arc<dyn GluonImapConnector>) {
+        (
+            StoreBackedMailboxView::new(store.clone()),
+            StoreBackedConnector::new(store),
+        )
+    }
+
+    #[test]
+    fn event_worker_config_reuses_supplied_connector() {
+        let tmp = tempdir().unwrap();
+        let runtime = Arc::new(RuntimeAccountRegistry::new(
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        ));
+        let auth_router = AuthRouter::new(AccountRegistry::default());
+        let store: Arc<dyn MessageStore> = InMemoryStore::new();
+        let connector: Arc<dyn GluonImapConnector> = StoreBackedConnector::new(store.clone());
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+
+        let config = EventWorkerConfig::new(
+            AccountId("uid-1".to_string()),
+            "alice@proton.me".to_string(),
+            "https://mail-api.proton.me".to_string(),
+            runtime,
+            auth_router,
+            StoreBackedMailboxView::new(store),
+            connector.clone(),
+            checkpoints,
+        );
+
+        assert!(Arc::ptr_eq(&config.connector, &connector));
+    }
+
+    fn runtime_account_info(uid: &str, email: &str) -> RuntimeAccountInfo {
+        RuntimeAccountInfo {
+            account_id: AccountId(uid.to_string()),
+            email: email.to_string(),
+            api_mode: crate::api::types::ApiMode::Bridge,
+            health: AccountHealth::Healthy,
+        }
+    }
+
+    #[test]
+    fn build_event_worker_configs_reuses_shared_connector_for_every_account() {
+        let tmp = tempdir().unwrap();
+        let runtime = Arc::new(RuntimeAccountRegistry::new(
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        ));
+        let auth_router = AuthRouter::new(AccountRegistry::default());
+        let store: Arc<dyn MessageStore> = InMemoryStore::new();
+        let connector: Arc<dyn GluonImapConnector> = StoreBackedConnector::new(store.clone());
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let accounts = vec![
+            runtime_account_info("uid-1", "alice@proton.me"),
+            runtime_account_info("uid-2", "bob@proton.me"),
+        ];
+
+        let configs = build_event_worker_configs(
+            runtime,
+            accounts,
+            "https://mail-api.proton.me".to_string(),
+            auth_router,
+            StoreBackedMailboxView::new(store),
+            connector.clone(),
+            checkpoints,
+            HashMap::new(),
+            None,
+        );
+
+        assert_eq!(configs.len(), 2);
+        assert!(configs
+            .iter()
+            .all(|config| Arc::ptr_eq(&config.connector, &connector)));
+    }
+
+    #[test]
+    fn build_event_worker_configs_preserves_pim_and_progress_callbacks_on_shared_connector() {
+        let tmp = tempdir().unwrap();
+        let runtime = Arc::new(RuntimeAccountRegistry::new(
+            Vec::new(),
+            tmp.path().to_path_buf(),
+        ));
+        let auth_router = AuthRouter::new(AccountRegistry::default());
+        let store: Arc<dyn MessageStore> = InMemoryStore::new();
+        let connector: Arc<dyn GluonImapConnector> = StoreBackedConnector::new(store.clone());
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let progress_events = Arc::new(StdMutex::new(Vec::new()));
+        let progress_events_sink = progress_events.clone();
+        let callback: SyncProgressCallback = Arc::new(move |event| {
+            progress_events_sink.lock().unwrap().push(event);
+        });
+        let pim_store = setup_pim_store();
+        let accounts = vec![runtime_account_info("uid-1", "alice@proton.me")];
+        let pim_stores = HashMap::from([(String::from("uid-1"), pim_store.clone())]);
+
+        let configs = build_event_worker_configs(
+            runtime,
+            accounts,
+            "https://mail-api.proton.me".to_string(),
+            auth_router,
+            StoreBackedMailboxView::new(store),
+            connector.clone(),
+            checkpoints,
+            pim_stores,
+            Some(callback),
+        );
+
+        assert_eq!(configs.len(), 1);
+        assert!(Arc::ptr_eq(&configs[0].connector, &connector));
+        assert!(configs[0].pim_store.is_some());
+        assert!(configs[0].sync_progress_callback.is_some());
+        assert!(Arc::ptr_eq(
+            configs[0].pim_store.as_ref().unwrap(),
+            &pim_store
+        ));
     }
 
     fn setup_pim_store() -> Arc<PimStore> {
@@ -2784,6 +2887,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_updates_checkpoint_and_store_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{"Messages": [{"ID": "msg-1", "Action": 1}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mail/v4/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message_json(
+                "msg-1",
+                &["0"],
+                1,
+            )))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-1");
+        assert!(checkpoint.last_event_ts.is_some());
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
     async fn poll_account_once_with_pim_contact_delta_updates_cache_and_checkpoint() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3003,6 +3165,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_handles_delete_delta_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{"Messages": [{"ID": "msg-1", "Action": 0}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints);
+
+        config
+            .connector
+            .upsert_metadata(
+                "uid-1::INBOX",
+                "msg-1",
+                crate::api::types::MessageMetadata {
+                    id: "msg-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["0".to_string()],
+                    external_id: None,
+                    subject: "x".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "A".to_string(),
+                        address: "a@b.com".to_string(),
+                    },
+                    to_list: vec![],
+                    cc_list: vec![],
+                    bcc_list: vec![],
+                    reply_tos: vec![],
+                    flags: 0,
+                    time: 0,
+                    size: 1,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let _ = poll_account_once(&config, "event-0").await.unwrap();
+        assert!(config
+            .mailbox_view
+            .get_uid("uid-1::INBOX", "msg-1")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn poll_account_once_refreshes_address_index_on_address_event() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3155,6 +3385,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_refresh_uses_bounded_resync_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-refresh-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-refresh-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::RefreshResync)
+        );
+    }
+
+    #[tokio::test]
     async fn poll_account_once_non_mail_refresh_bit_does_not_trigger_resync() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3192,6 +3510,48 @@ mod tests {
         assert_eq!(next, "event-1");
         assert_eq!(
             store.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_non_mail_refresh_bit_does_not_trigger_resync_with_gluon_mail_backend(
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 2,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            config.mailbox_view.list_uids("uid-1::INBOX").await.unwrap(),
             Vec::<u32>::new()
         );
 
@@ -3279,6 +3639,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_multiple_non_mail_refresh_bits_do_not_trigger_resync_with_gluon_mail_backend(
+    ) {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 2,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-2",
+                "More": 0,
+                "Refresh": 4,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-3",
+                "More": 0,
+                "Refresh": 8,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        let next = poll_account_once(&config, &next).await.unwrap();
+        assert_eq!(next, "event-2");
+        let next = poll_account_once(&config, &next).await.unwrap();
+        assert_eq!(next, "event-3");
+
+        assert_eq!(
+            config.mailbox_view.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
+        );
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-3");
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
     async fn poll_account_once_more_chain_honors_upstream_page_limit() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3306,6 +3736,38 @@ mod tests {
         let store = InMemoryStore::new();
 
         let config = event_worker_config(&server.uri(), runtime, auth_router, store, checkpoints);
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-0");
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_more_chain_honors_upstream_page_limit_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-0",
+                "More": 1,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .expect(MAX_EVENT_PAGES_PER_POLL as u64)
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints);
 
         let next = poll_account_once(&config, "event-0").await.unwrap();
         assert_eq!(next, "event-0");
@@ -3449,6 +3911,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_refresh_paginates_until_end_id_exhausted_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        let selectable_mailboxes = mailbox::system_mailboxes()
+            .iter()
+            .filter(|mb| mb.selectable)
+            .count();
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let first_page_messages: Vec<serde_json::Value> = (0..RESYNC_PAGE_SIZE)
+            .map(|idx| {
+                let id = format!("msg-page1-{idx}");
+                serde_json::json!({
+                    "ID": id,
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": format!("Recovered message {idx}"),
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000 + idx as i64,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                })
+            })
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .and(body_partial_json(serde_json::json!({
+                "EndID": serde_json::Value::Null
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": RESYNC_PAGE_SIZE,
+                "Messages": first_page_messages
+            })))
+            .expect(selectable_mailboxes as u64)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .and(body_partial_json(serde_json::json!({
+                "EndID": format!("msg-page1-{}", RESYNC_PAGE_SIZE - 1)
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-page2-0",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered page two message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700001000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .expect(selectable_mailboxes as u64)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert!(config
+            .mailbox_view
+            .get_uid("uid-1::INBOX", "msg-page2-0")
+            .await
+            .unwrap()
+            .is_some());
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::RefreshResync)
+        );
+    }
+
+    #[tokio::test]
     async fn poll_account_once_refresh_emits_sync_lifecycle_progress_events() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3521,6 +4114,126 @@ mod tests {
 
         let config = event_worker_config(&server.uri(), runtime, auth_router, store, checkpoints)
             .with_sync_progress_callback(callback);
+
+        let _ = poll_account_once(&config, "event-0").await.unwrap();
+
+        let events = progress_events.lock().unwrap().clone();
+        assert!(matches!(
+            events.first(),
+            Some(SyncProgressUpdate::Started { user_id }) if user_id == "uid-1"
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(SyncProgressUpdate::Finished { user_id }) if user_id == "uid-1"
+        ));
+
+        let progress_values: Vec<(f64, i64, i64)> = events
+            .iter()
+            .filter_map(|event| match event {
+                SyncProgressUpdate::Progress {
+                    progress,
+                    elapsed_ms,
+                    remaining_ms,
+                    ..
+                } => Some((*progress, *elapsed_ms, *remaining_ms)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !progress_values.is_empty(),
+            "expected at least one progress event"
+        );
+        for (progress, elapsed_ms, remaining_ms) in &progress_values {
+            assert!((*progress >= 0.0) && (*progress <= 1.0));
+            assert!(*elapsed_ms >= 0);
+            assert!(*remaining_ms >= 0);
+        }
+        for pair in progress_values.windows(2) {
+            assert!(
+                pair[1].0 >= pair[0].0,
+                "expected non-decreasing progress, got {:?} -> {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        let last_progress = progress_values.last().unwrap().0;
+        assert_eq!(last_progress, 1.0);
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_refresh_emits_sync_lifecycle_progress_events_with_gluon_mail_backend(
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-refresh-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let progress_events = Arc::new(StdMutex::new(Vec::new()));
+        let progress_events_sink = progress_events.clone();
+        let callback: SyncProgressCallback = Arc::new(move |event| {
+            progress_events_sink.lock().unwrap().push(event);
+        });
+
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints);
+        let config = config.with_sync_progress_callback(callback);
 
         let _ = poll_account_once(&config, "event-0").await.unwrap();
 
@@ -3651,6 +4364,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_invalid_cursor_resets_to_baseline_and_resyncs_with_gluon_mail_backend(
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/stale-event"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 2011,
+                "Error": "Invalid event ID"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-resync-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered from stale cursor",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-2",
+                "More": 0,
+                "Refresh": 0,
+                "Events": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "stale-event").await.unwrap();
+        assert_eq!(next, "event-2");
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-resync-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-2");
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::CursorResetResync)
+        );
+    }
+
+    #[tokio::test]
     async fn poll_account_once_label_event_does_not_trigger_resync() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3697,6 +4491,56 @@ mod tests {
         assert_eq!(next, "event-1");
         assert_eq!(
             store.list_uids("uid-1::INBOX").await.unwrap(),
+            Vec::<u32>::new()
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_label_event_does_not_trigger_resync_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 2,
+                        "Label": {
+                            "ID": "label-custom-1",
+                            "Name": "Projects"
+                        }
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            config.mailbox_view.list_uids("uid-1::INBOX").await.unwrap(),
             Vec::<u32>::new()
         );
 
@@ -3822,6 +4666,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_label_event_reconciles_renamed_mailbox_state_with_gluon_mail_backend(
+    ) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 2
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/labels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Labels": [{
+                    "ID": "label-custom-1",
+                    "Name": "New Projects",
+                    "Color": "blue",
+                    "Display": 1,
+                    "Type": 1,
+                    "Path": "New Projects"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        runtime.set_user_labels(
+            &AccountId("uid-1".to_string()),
+            vec![crate::imap::mailbox::ResolvedMailbox {
+                name: "Labels/Old Projects".to_string(),
+                label_id: "label-custom-1".to_string(),
+                special_use: None,
+                selectable: true,
+            }],
+        );
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime.clone(), auth_router, checkpoints);
+
+        config
+            .connector
+            .upsert_metadata(
+                "uid-1::Labels/Old Projects",
+                "msg-label-1",
+                MessageMetadata {
+                    id: "msg-label-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["label-custom-1".to_string()],
+                    external_id: None,
+                    subject: "Project note".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: Vec::new(),
+                    cc_list: Vec::new(),
+                    bcc_list: Vec::new(),
+                    reply_tos: Vec::new(),
+                    flags: 0,
+                    time: 1_700_000_000,
+                    size: 120,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        let labels = runtime.get_user_labels(&AccountId("uid-1".to_string()));
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].name, "Labels/New Projects");
+        assert_eq!(labels[0].label_id, "label-custom-1");
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::Labels/New Projects", "msg-label-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert!(config
+            .mailbox_view
+            .list_uids("uid-1::Labels/Old Projects")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn poll_account_once_label_event_clears_deleted_mailbox_state() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -3915,6 +4871,101 @@ mod tests {
             .get_user_labels(&AccountId("uid-1".to_string()))
             .is_empty());
         assert!(store
+            .list_uids("uid-1::Labels/Obsolete")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_label_event_clears_deleted_mailbox_state_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 0
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/labels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Labels": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        runtime.set_user_labels(
+            &AccountId("uid-1".to_string()),
+            vec![crate::imap::mailbox::ResolvedMailbox {
+                name: "Labels/Obsolete".to_string(),
+                label_id: "label-custom-1".to_string(),
+                special_use: None,
+                selectable: true,
+            }],
+        );
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime.clone(), auth_router, checkpoints);
+
+        config
+            .connector
+            .upsert_metadata(
+                "uid-1::Labels/Obsolete",
+                "msg-obsolete-1",
+                MessageMetadata {
+                    id: "msg-obsolete-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["label-custom-1".to_string()],
+                    external_id: None,
+                    subject: "Obsolete note".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: Vec::new(),
+                    cc_list: Vec::new(),
+                    bcc_list: Vec::new(),
+                    reply_tos: Vec::new(),
+                    flags: 0,
+                    time: 1_700_000_000,
+                    size: 64,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        assert!(runtime
+            .get_user_labels(&AccountId("uid-1".to_string()))
+            .is_empty());
+        assert!(config
+            .mailbox_view
             .list_uids("uid-1::Labels/Obsolete")
             .await
             .unwrap()
@@ -4027,6 +5078,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_refresh_and_label_event_resyncs_once_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        let selectable_mailboxes = mailbox::system_mailboxes()
+            .iter()
+            .filter(|mb| mb.selectable)
+            .count();
+
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 1,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 2
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/mail/v4/messages"))
+            .and(header("x-http-method-override", "GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Total": 1,
+                "Messages": [{
+                    "ID": "msg-refresh-label-1",
+                    "AddressID": "addr-1",
+                    "LabelIDs": ["0"],
+                    "Subject": "Recovered message",
+                    "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+                    "ToList": [],
+                    "CCList": [],
+                    "BCCList": [],
+                    "Time": 1700000000,
+                    "Size": 100,
+                    "Unread": 1,
+                    "NumAttachments": 0
+                }]
+            })))
+            .expect(selectable_mailboxes as u64)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/addresses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Addresses": [{
+                    "ID": "addr-1",
+                    "Email": "alice@proton.me",
+                    "Status": 1,
+                    "Receive": 1,
+                    "Send": 1,
+                    "Type": 1,
+                    "DisplayName": "Alice",
+                    "Keys": []
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-refresh-label-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            checkpoint.sync_state,
+            Some(CheckpointSyncState::RefreshResync)
+        );
+    }
+
+    #[tokio::test]
     async fn poll_account_once_message_and_label_batch_stays_incremental() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4086,6 +5236,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_message_and_label_batch_stays_incremental_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Messages": [{"ID": "msg-1", "Action": 1}],
+                    "Labels": [{"ID": "label-custom-1", "Action": 2}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mail/v4/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message_json(
+                "msg-1",
+                &["0"],
+                1,
+            )))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
     async fn start_event_workers_starts_one_task_per_account() {
         let accounts = vec![
             RuntimeAccountInfo {
@@ -4114,13 +5320,17 @@ mod tests {
             sample_session("uid-2", "b@proton.me", "p2"),
         ]));
 
-        let handles = start_event_workers(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let handles = start_event_workers_with_sync_progress_and_pim_and_connector(
             runtime,
             accounts,
             "http://127.0.0.1:1".to_string(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints,
+            HashMap::new(),
+            None,
             Duration::from_secs(3600),
         );
         assert_eq!(handles.len(), 2);
@@ -4158,13 +5368,17 @@ mod tests {
             sample_session("uid-2", "b@proton.me", "p2"),
         ]));
 
-        let group = start_event_worker_group(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let group = start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime,
             accounts,
             "http://127.0.0.1:1".to_string(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints,
+            HashMap::new(),
+            None,
             Duration::from_secs(3600),
         );
         assert_eq!(group.len(), 2);
@@ -4242,13 +5456,17 @@ mod tests {
             },
         ];
 
-        let group = start_event_worker_group(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let group = start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime.clone(),
             accounts,
             server.uri(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints.clone(),
+            HashMap::new(),
+            None,
             Duration::from_millis(50),
         );
 
@@ -4439,13 +5657,16 @@ mod tests {
             progress_events_sink.lock().unwrap().push(event);
         });
 
-        let group = start_event_worker_group_with_sync_progress(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let group = start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime,
             accounts,
             server.uri(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints,
+            HashMap::new(),
             Some(callback),
             Duration::from_millis(50),
         );

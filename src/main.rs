@@ -4734,6 +4734,7 @@ async fn cmd_serve(
         disable_tls: no_tls,
         use_ssl_for_imap: true,
         use_ssl_for_smtp: true,
+        api_base_url: "https://mail-api.proton.me".to_string(),
         event_poll_interval: std::time::Duration::from_secs(event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(
@@ -4864,6 +4865,7 @@ async fn start_interactive_runtime(
         disable_tls: config.no_tls,
         use_ssl_for_imap: true,
         use_ssl_for_smtp: true,
+        api_base_url: "https://mail-api.proton.me".to_string(),
         event_poll_interval: std::time::Duration::from_secs(config.event_poll_secs),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(config.pim_reconcile_tick_secs),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(

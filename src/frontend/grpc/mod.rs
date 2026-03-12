@@ -408,16 +408,12 @@ async fn maybe_start_grpc_sync_workers(
         );
     }
 
-    let account_storage_ids = gluon_bootstrap
-        .accounts
-        .iter()
-        .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
-        .collect();
-    let store: Arc<dyn crate::imap::store::MessageStore> =
-        crate::imap::store::new_runtime_message_store(
-            gluon_paths.root().to_path_buf(),
-            account_storage_ids,
-        )?;
+    let mailbox_view = crate::imap::gluon_mailbox_view::GluonMailMailboxView::new(Arc::new(
+        open_grpc_gluon_compatible_store(&gluon_bootstrap, gluon_paths.root(), true)?,
+    ));
+    let connector = crate::imap::gluon_connector::GluonMailConnector::new(Arc::new(
+        open_grpc_gluon_compatible_store(&gluon_bootstrap, gluon_paths.root(), false)?,
+    ));
     let checkpoint_store: bridge::events::SharedCheckpointStore = Arc::new(
         bridge::events::VaultCheckpointStore::new(runtime_paths.settings_dir().to_path_buf()),
     );
@@ -448,17 +444,51 @@ async fn maybe_start_grpc_sync_workers(
         });
 
     Ok(Some(
-        bridge::events::start_event_worker_group_with_sync_progress(
+        bridge::events::start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime_accounts,
             runtime_snapshot,
             "https://mail-api.proton.me".to_string(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoint_store,
+            HashMap::new(),
             Some(sync_progress_callback),
             std::time::Duration::from_secs(30),
         ),
     ))
+}
+
+fn open_grpc_gluon_compatible_store(
+    gluon_bootstrap: &vault::GluonStoreBootstrap,
+    gluon_root: &Path,
+    read_only: bool,
+) -> anyhow::Result<gluon_rs_mail::CompatibleStore> {
+    let accounts = gluon_bootstrap
+        .accounts
+        .iter()
+        .map(|account| {
+            let key = gluon_rs_mail::GluonKey::try_from_slice(&account.gluon_key)
+                .with_context(|| format!("invalid Gluon key for account {}", account.account_id))?;
+            Ok(gluon_rs_mail::AccountBootstrap::new(
+                account.account_id.clone(),
+                account.storage_user_id.clone(),
+                key,
+            ))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    let bootstrap = gluon_rs_mail::StoreBootstrap::new(
+        gluon_rs_mail::CacheLayout::new(gluon_root),
+        gluon_rs_mail::CompatibilityTarget::default(),
+        accounts,
+    );
+    if read_only {
+        gluon_rs_mail::CompatibleStore::open_read_only(bootstrap)
+    } else {
+        gluon_rs_mail::CompatibleStore::open(bootstrap)
+    }
+    .context("open grpc gluon compatible store")
 }
 
 #[allow(dead_code)]

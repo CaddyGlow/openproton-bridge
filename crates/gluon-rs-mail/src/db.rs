@@ -82,7 +82,11 @@ impl SchemaProbe {
     pub fn mailbox_message_tables(&self) -> Vec<&str> {
         self.tables
             .iter()
-            .filter_map(|table| table.strip_prefix("mailbox_message_").map(|_| table.as_str()))
+            .filter_map(|table| {
+                table
+                    .strip_prefix("mailbox_message_")
+                    .map(|_| table.as_str())
+            })
             .collect()
     }
 }

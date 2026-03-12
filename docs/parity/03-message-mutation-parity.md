@@ -85,16 +85,17 @@ Validation tasks:
 - Keep stress tests for >150 IDs in parity suite.
 - Monitor rate-limit behavior under large delete bursts.
 
-### 4) Strict/compat policy is explicit in OpenProton IMAP path (informational)
+### 4) Mutation failures now follow Proton Bridge parity
 
 Observed:
 
-- OpenProton `MutationMode::{Compat,Strict}` governs whether upstream mutation errors fail IMAP commands.
-- Tests exist for strict failures (`COPY`, `MOVE`, `EXPUNGE`, `UID EXPUNGE`) and compat success fallback.
+- OpenProton now fails IMAP mutation commands when the upstream Proton mutation fails.
+- This matches Proton Bridge command-level mutation behavior.
+- Tests exist for failure propagation on `COPY`, `MOVE`, `EXPUNGE`, and `UID EXPUNGE`.
 
 Risk:
 
-- Behavior is intentional but should be explicitly documented as divergence if upstream command-level policy differs.
+- Any future attempt to reintroduce local-success-on-upstream-failure behavior would be a parity regression.
 
 Validation tasks:
 

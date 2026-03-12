@@ -182,4 +182,56 @@ async fn be029_repairs_missing_blob_references_deterministically() {
         .await
         .expect("status after repair");
     assert_eq!(status.exists, 1);
+    assert_ne!(
+        status.uid_validity, 123,
+        "repair must bump uid_validity so clients drop stale UID caches"
+    );
+
+    let repaired_index = gluon_db_support::read_legacy_index_payload(&account_db);
+    let inbox = repaired_index
+        .get("mailboxes")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|mailboxes| mailboxes.get("INBOX"))
+        .and_then(serde_json::Value::as_object)
+        .expect("repaired inbox");
+    assert_eq!(
+        inbox
+            .get("uid_validity")
+            .and_then(serde_json::Value::as_u64),
+        Some(status.uid_validity as u64),
+        "repaired sqlite index must persist the bumped uid_validity"
+    );
+    assert_eq!(
+        inbox
+            .get("uid_order")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .expect("uid_order"),
+        vec![json!(1)],
+        "repaired sqlite index must remove missing UIDs from uid_order"
+    );
+    assert_eq!(
+        inbox
+            .get("uid_to_blob")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|uids| uids.get("2")),
+        None,
+        "repaired sqlite index must remove missing UID blob mappings"
+    );
+    assert_eq!(
+        inbox
+            .get("uid_to_proton")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|uids| uids.get("2")),
+        None,
+        "repaired sqlite index must remove missing UID proton mappings"
+    );
+    assert_eq!(
+        inbox
+            .get("proton_to_uid")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|uids| uids.get("msg-2")),
+        None,
+        "repaired sqlite index must remove stale proton-to-uid mappings"
+    );
 }

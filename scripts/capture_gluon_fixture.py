@@ -131,6 +131,9 @@ def main() -> int:
         "source_profile": str(source_profile),
         "compatibility_target_fixture": "tests/fixtures/gluon_compatibility_target.json",
         "output_dir": str(output_dir),
+        "unsupported_cases": [
+            "Sanitized sqlite and deferred-delete artifacts may be placeholder bytes for file-family coverage and are not guaranteed to be cache-openable by CompatibleStore."
+        ],
         "sanitization": {
             "redacted_patterns": [
                 "email addresses",

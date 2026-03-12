@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 
-use rusqlite::{Connection, OpenFlags};
+use gluon_rs_core::{
+    decode_blob, encode_blob, AccountBootstrap, AccountPaths, DeferredDeleteManager, GluonCoreError,
+};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
 use crate::{
-    blob::{decode_blob, encode_blob},
     db::SchemaProbe,
     error::{GluonError, Result},
-    layout::AccountPaths,
-    txn::DeferredDeleteManager,
-    types::{AccountBootstrap, StoreBootstrap},
+    types::StoreBootstrap,
 };
 
 #[derive(Debug, Clone)]
@@ -105,9 +105,10 @@ impl CompatibleStore {
             bootstrap.layout.ensure_base_dirs()?;
             DeferredDeleteManager::new(bootstrap.layout.db_dir())?.cleanup_deferred_delete_dir()?;
         } else if !bootstrap.layout.root().exists() {
-            return Err(GluonError::MissingCacheRoot {
+            return Err(GluonCoreError::MissingCacheRoot {
                 path: bootstrap.layout.root().to_path_buf(),
-            });
+            }
+            .into());
         }
 
         let mut accounts_by_storage_user_id = HashMap::new();
@@ -116,11 +117,10 @@ impl CompatibleStore {
                 .layout
                 .account_paths(account.storage_user_id.clone())?;
             if create_dirs {
-                std::fs::create_dir_all(account_paths.store_dir())?;
+                std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
             }
 
-            accounts_by_storage_user_id
-                .insert(account.storage_user_id.clone(), account.clone());
+            accounts_by_storage_user_id.insert(account.storage_user_id.clone(), account.clone());
         }
 
         Ok(Self {
@@ -136,14 +136,17 @@ impl CompatibleStore {
     pub fn account(&self, storage_user_id: &str) -> Result<&AccountBootstrap> {
         self.accounts_by_storage_user_id
             .get(storage_user_id)
-            .ok_or_else(|| GluonError::UnknownStorageUserId {
-                storage_user_id: storage_user_id.to_string(),
+            .ok_or_else(|| {
+                GluonCoreError::UnknownStorageUserId {
+                    storage_user_id: storage_user_id.to_string(),
+                }
+                .into()
             })
     }
 
     pub fn account_paths(&self, storage_user_id: &str) -> Result<AccountPaths> {
         self.account(storage_user_id)?;
-        self.bootstrap.layout.account_paths(storage_user_id)
+        Ok(self.bootstrap.layout.account_paths(storage_user_id)?)
     }
 
     pub fn schema_probe(&self, storage_user_id: &str) -> Result<SchemaProbe> {
@@ -214,10 +217,10 @@ impl CompatibleStore {
     ) -> Result<UpstreamMessageSummary> {
         self.initialize_upstream_schema(storage_user_id)?;
         let account_paths = self.account_paths(storage_user_id)?;
-        std::fs::create_dir_all(account_paths.store_dir())?;
+        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
         let blob_path = account_paths.blob_path(&message.internal_id)?;
         let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
-        std::fs::write(&blob_path, encoded)?;
+        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
 
         let conn = Connection::open(account_paths.primary_db_path())?;
         configure_upstream_db_connection(&conn)?;
@@ -248,7 +251,8 @@ impl CompatibleStore {
         insert_message_flags(&tx, &message.internal_id, &message.flags)?;
         tx.commit()?;
 
-        let mut listed = self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
+        let mut listed =
+            self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
         listed
             .pop()
             .ok_or_else(|| GluonError::MissingRequiredTable {
@@ -256,12 +260,41 @@ impl CompatibleStore {
             })
     }
 
+    pub fn replace_message_content(
+        &self,
+        storage_user_id: &str,
+        internal_message_id: &str,
+        blob: &[u8],
+        body: &str,
+        body_structure: &str,
+        envelope: &str,
+        size: i64,
+    ) -> Result<()> {
+        self.initialize_upstream_schema(storage_user_id)?;
+        let account_paths = self.account_paths(storage_user_id)?;
+        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
+        let blob_path = account_paths.blob_path(internal_message_id)?;
+        let encoded = encode_blob(&self.account(storage_user_id)?.key, blob)?;
+        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+
+        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        conn.execute(
+            "UPDATE messages_v2
+             SET size = ?2, body = ?3, body_structure = ?4, envelope = ?5
+             WHERE id = ?1",
+            (internal_message_id, size, body, body_structure, envelope),
+        )?;
+        Ok(())
+    }
+
     pub fn delete_account_database_files(&self, storage_user_id: &str) -> Result<usize> {
-        DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?.delete_db_files(storage_user_id)
+        Ok(DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?
+            .delete_db_files(storage_user_id)?)
     }
 
     pub fn cleanup_deferred_database_files(&self) -> Result<()> {
-        DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?.cleanup_deferred_delete_dir()
+        Ok(DeferredDeleteManager::new(self.bootstrap.layout.db_dir())?
+            .cleanup_deferred_delete_dir()?)
     }
 
     pub fn add_message_flags(
@@ -384,6 +417,50 @@ impl CompatibleStore {
             })
     }
 
+    pub fn find_message_internal_id_by_remote_id(
+        &self,
+        storage_user_id: &str,
+        remote_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self.open_upstream_db(storage_user_id)?;
+        conn.query_row(
+            "SELECT id FROM messages_v2 WHERE remote_id = ?1 LIMIT 1",
+            (remote_id,),
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn update_message_content(
+        &self,
+        storage_user_id: &str,
+        internal_message_id: &str,
+        message: &NewMessage,
+    ) -> Result<()> {
+        let account_paths = self.account_paths(storage_user_id)?;
+        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
+        let blob_path = account_paths.blob_path(internal_message_id)?;
+        let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
+        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+
+        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        conn.execute(
+            "UPDATE messages_v2
+             SET remote_id = ?1, size = ?2, body = ?3, body_structure = ?4, envelope = ?5
+             WHERE id = ?6",
+            (
+                &message.remote_id,
+                message.size,
+                &message.body,
+                &message.body_structure,
+                &message.envelope,
+                internal_message_id,
+            ),
+        )?;
+        Ok(())
+    }
+
     pub fn remove_message_from_mailbox(
         &self,
         storage_user_id: &str,
@@ -441,11 +518,7 @@ impl CompatibleStore {
         Ok(())
     }
 
-    pub fn delete_mailbox(
-        &self,
-        storage_user_id: &str,
-        mailbox_internal_id: u64,
-    ) -> Result<()> {
+    pub fn delete_mailbox(&self, storage_user_id: &str, mailbox_internal_id: u64) -> Result<()> {
         let conn = self.open_upstream_db_rw(storage_user_id)?;
         let tx = conn.unchecked_transaction()?;
 
@@ -620,8 +693,9 @@ impl CompatibleStore {
         internal_message_id: &str,
     ) -> Result<Vec<u8>> {
         let account_paths = self.account_paths(storage_user_id)?;
-        let encoded = std::fs::read(account_paths.blob_path(internal_message_id)?)?;
-        decode_blob(&self.account(storage_user_id)?.key, &encoded)
+        let encoded = std::fs::read(account_paths.blob_path(internal_message_id)?)
+            .map_err(GluonCoreError::from)?;
+        Ok(decode_blob(&self.account(storage_user_id)?.key, &encoded)?)
     }
 
     pub fn mailbox_snapshot(
@@ -706,7 +780,9 @@ impl CompatibleStore {
         let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
         if !matches!(
             probe.family,
-            crate::SchemaFamily::UpstreamCore | crate::SchemaFamily::Missing | crate::SchemaFamily::Empty
+            crate::SchemaFamily::UpstreamCore
+                | crate::SchemaFamily::Missing
+                | crate::SchemaFamily::Empty
         ) {
             return Err(GluonError::IncompatibleSchema {
                 family: format!("{:?}", probe.family),
@@ -718,7 +794,11 @@ impl CompatibleStore {
         Ok(conn)
     }
 
-    fn get_upstream_mailbox(&self, conn: &Connection, mailbox_internal_id: u64) -> Result<UpstreamMailbox> {
+    fn get_upstream_mailbox(
+        &self,
+        conn: &Connection,
+        mailbox_internal_id: u64,
+    ) -> Result<UpstreamMailbox> {
         let (internal_id, remote_id, name, uid_validity, subscribed) = conn.query_row(
             "SELECT id, remote_id, name, uid_validity, subscribed
              FROM mailboxes_v2
@@ -912,19 +992,13 @@ const UPSTREAM_BASE_SCHEMA: &str = "
 mod tests {
     use std::fs;
 
+    use gluon_rs_core::{CacheLayout, DeferredDeleteManager, GluonKey};
     use rusqlite::{params, Connection};
     use tempfile::tempdir;
 
-    use crate::{
-        encode_blob,
-        key::GluonKey,
-        layout::CacheLayout,
-        target::CompatibilityTarget,
-        types::{AccountBootstrap, StoreBootstrap},
-    };
+    use crate::{encode_blob, target::CompatibilityTarget, AccountBootstrap, StoreBootstrap};
 
     use super::{CompatibleStore, DeletedSubscription, NewMailbox, NewMessage};
-    use crate::DeferredDeleteManager;
 
     #[test]
     fn opens_store_and_creates_layout() {
@@ -943,10 +1017,7 @@ mod tests {
         let account_paths = store.account_paths("user-1").expect("account paths");
         assert!(account_paths.store_dir().exists());
         assert_eq!(
-            store
-                .schema_probe("user-1")
-                .expect("schema probe")
-                .family,
+            store.schema_probe("user-1").expect("schema probe").family,
             crate::SchemaFamily::Missing
         );
     }
@@ -1080,11 +1151,8 @@ mod tests {
             [],
         )
         .expect("insert connector settings");
-        conn.execute(
-            "INSERT INTO gluon_version(id, version) VALUES(0, 3)",
-            [],
-        )
-        .expect("insert version");
+        conn.execute("INSERT INTO gluon_version(id, version) VALUES(0, 3)", [])
+            .expect("insert version");
         conn.execute(
             "INSERT INTO mailbox_message_1(message_id, message_remote_id, recent, deleted) VALUES(?1, ?2, true, false)",
             params![
@@ -1111,7 +1179,10 @@ mod tests {
             .expect("list mailboxes");
         assert_eq!(mailboxes.len(), 1);
         assert_eq!(mailboxes[0].name, "INBOX");
-        assert_eq!(mailboxes[0].attributes, vec![String::from("\\HasNoChildren")]);
+        assert_eq!(
+            mailboxes[0].attributes,
+            vec![String::from("\\HasNoChildren")]
+        );
         assert_eq!(mailboxes[0].flags, vec![String::from("\\Draft")]);
         assert_eq!(mailboxes[0].permanent_flags, vec![String::from("\\Seen")]);
 
@@ -1129,7 +1200,10 @@ mod tests {
         assert_eq!(snapshot.recent_count, 1);
         assert_eq!(snapshot.messages.len(), 1);
         assert_eq!(snapshot.messages[0].summary.uid, 1);
-        assert_eq!(snapshot.messages[0].summary.flags, vec![String::from("\\Seen")]);
+        assert_eq!(
+            snapshot.messages[0].summary.flags,
+            vec![String::from("\\Seen")]
+        );
         assert!(snapshot.messages[0].blob_exists);
         assert_eq!(snapshot.messages[0].body, "");
         assert_eq!(
@@ -1190,7 +1264,9 @@ mod tests {
         assert_eq!(summary.uid, 1);
         assert_eq!(summary.internal_id, "22222222-2222-2222-2222-222222222222");
 
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert_eq!(snapshot.next_uid, 2);
         assert_eq!(snapshot.message_count, 1);
         assert_eq!(snapshot.messages[0].body, "body");
@@ -1203,6 +1279,82 @@ mod tests {
         assert_eq!(
             store.cleanup_deferred_database_files().map(|_| ()).is_ok(),
             true
+        );
+    }
+
+    #[test]
+    fn replaces_message_content_without_changing_uid() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[4u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+
+        let mailbox = store
+            .create_mailbox(
+                "user-1",
+                &NewMailbox {
+                    remote_id: "mbox-1".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 999,
+                    subscribed: true,
+                    attributes: vec![],
+                    flags: vec![],
+                    permanent_flags: vec!["\\Seen".to_string()],
+                },
+            )
+            .expect("create mailbox");
+
+        let summary = store
+            .append_message(
+                "user-1",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "aaaaaaa1-2222-3333-4444-555555555555".to_string(),
+                    remote_id: "msg-4".to_string(),
+                    flags: vec![],
+                    blob: b"placeholder".to_vec(),
+                    body: "placeholder".to_string(),
+                    body_structure: "placeholder-structure".to_string(),
+                    envelope: "placeholder-envelope".to_string(),
+                    size: 11,
+                    recent: false,
+                },
+            )
+            .expect("append message");
+        assert_eq!(summary.uid, 1);
+
+        store
+            .replace_message_content(
+                "user-1",
+                "aaaaaaa1-2222-3333-4444-555555555555",
+                b"updated body",
+                "updated",
+                "updated-structure",
+                "updated-envelope",
+                12,
+            )
+            .expect("replace message content");
+
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
+        assert_eq!(snapshot.messages[0].summary.uid, 1);
+        assert_eq!(snapshot.messages[0].summary.size, 12);
+        assert_eq!(snapshot.messages[0].body, "updated");
+        assert_eq!(snapshot.messages[0].body_structure, "updated-structure");
+        assert_eq!(snapshot.messages[0].envelope, "updated-envelope");
+        assert_eq!(
+            store
+                .read_message_blob("user-1", "aaaaaaa1-2222-3333-4444-555555555555")
+                .expect("blob"),
+            b"updated body"
         );
     }
 
@@ -1234,9 +1386,13 @@ mod tests {
         assert!(!account_paths.wal_path().exists());
         assert!(!account_paths.shm_path().exists());
         assert_eq!(
-            std::fs::read_dir(DeferredDeleteManager::new(store.bootstrap.layout.db_dir()).expect("manager").deferred_delete_dir())
-                .expect("read deferred")
-                .count(),
+            std::fs::read_dir(
+                DeferredDeleteManager::new(store.bootstrap.layout.db_dir())
+                    .expect("manager")
+                    .deferred_delete_dir()
+            )
+            .expect("read deferred")
+            .count(),
             3
         );
     }
@@ -1299,7 +1455,9 @@ mod tests {
                 ],
             )
             .expect("add flags");
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert_eq!(
             snapshot.messages[0].summary.flags,
             vec![
@@ -1316,7 +1474,9 @@ mod tests {
                 &["\\Seen".to_string()],
             )
             .expect("remove flag");
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert_eq!(
             snapshot.messages[0].summary.flags,
             vec!["\\Answered".to_string(), "\\Flagged".to_string()]
@@ -1329,8 +1489,13 @@ mod tests {
                 &["\\Draft".to_string()],
             )
             .expect("set flags");
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
-        assert_eq!(snapshot.messages[0].summary.flags, vec!["\\Draft".to_string()]);
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot.messages[0].summary.flags,
+            vec!["\\Draft".to_string()]
+        );
     }
 
     #[test]
@@ -1380,7 +1545,9 @@ mod tests {
             )
             .expect("append");
 
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert!(!snapshot.messages[0].summary.mailbox_deleted);
         assert!(!snapshot.messages[0].summary.message_deleted);
 
@@ -1392,14 +1559,18 @@ mod tests {
                 true,
             )
             .expect("mark mailbox deleted");
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert!(snapshot.messages[0].summary.mailbox_deleted);
         assert!(!snapshot.messages[0].summary.message_deleted);
 
         store
             .set_message_deleted("user-1", "44444444-4444-4444-4444-444444444444", true)
             .expect("mark global deleted");
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert!(snapshot.messages[0].summary.mailbox_deleted);
         assert!(snapshot.messages[0].summary.message_deleted);
 
@@ -1414,7 +1585,9 @@ mod tests {
         store
             .set_message_deleted("user-1", "44444444-4444-4444-4444-444444444444", false)
             .expect("clear global deleted");
-        let snapshot = store.mailbox_snapshot("user-1", mailbox.internal_id).expect("snapshot");
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
         assert!(!snapshot.messages[0].summary.mailbox_deleted);
         assert!(!snapshot.messages[0].summary.message_deleted);
     }
@@ -1492,7 +1665,9 @@ mod tests {
         assert_eq!(copied.remote_id, "msg-5");
         assert_eq!(copied.flags, vec!["\\Seen".to_string()]);
 
-        let inbox_snapshot = store.mailbox_snapshot("user-1", inbox.internal_id).expect("inbox");
+        let inbox_snapshot = store
+            .mailbox_snapshot("user-1", inbox.internal_id)
+            .expect("inbox");
         let archive_snapshot = store
             .mailbox_snapshot("user-1", archive.internal_id)
             .expect("archive");
@@ -1512,7 +1687,9 @@ mod tests {
             )
             .expect("remove from inbox");
 
-        let inbox_snapshot = store.mailbox_snapshot("user-1", inbox.internal_id).expect("inbox");
+        let inbox_snapshot = store
+            .mailbox_snapshot("user-1", inbox.internal_id)
+            .expect("inbox");
         let archive_snapshot = store
             .mailbox_snapshot("user-1", archive.internal_id)
             .expect("archive");
@@ -1571,12 +1748,10 @@ mod tests {
         store
             .delete_mailbox("user-1", mailbox.internal_id)
             .expect("delete mailbox");
-        assert!(
-            store
-                .list_upstream_mailboxes("user-1")
-                .expect("mailboxes after delete")
-                .is_empty()
-        );
+        assert!(store
+            .list_upstream_mailboxes("user-1")
+            .expect("mailboxes after delete")
+            .is_empty());
         assert!(
             store
                 .list_deleted_subscriptions("user-1")
@@ -1611,6 +1786,89 @@ mod tests {
                 name: "Archive".to_string(),
                 remote_id: "mbox-archive".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn finds_message_by_remote_id_and_updates_message_content() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[9u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+
+        let mailbox = store
+            .create_mailbox(
+                "user-1",
+                &NewMailbox {
+                    remote_id: "0".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 4001,
+                    subscribed: true,
+                    attributes: vec![],
+                    flags: vec![],
+                    permanent_flags: vec![],
+                },
+            )
+            .expect("create mailbox");
+
+        store
+            .append_message(
+                "user-1",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "77777777-7777-7777-7777-777777777777".to_string(),
+                    remote_id: "msg-remote".to_string(),
+                    flags: vec![],
+                    blob: b"Subject: old\r\n\r\nold-body".to_vec(),
+                    body: "old-body".to_string(),
+                    body_structure: "old-structure".to_string(),
+                    envelope: "old-envelope".to_string(),
+                    size: 21,
+                    recent: false,
+                },
+            )
+            .expect("append");
+
+        assert_eq!(
+            store
+                .find_message_internal_id_by_remote_id("user-1", "msg-remote")
+                .expect("find"),
+            Some("77777777-7777-7777-7777-777777777777".to_string())
+        );
+
+        let updated = NewMessage {
+            internal_id: "77777777-7777-7777-7777-777777777777".to_string(),
+            remote_id: "msg-remote".to_string(),
+            flags: vec![],
+            blob: b"Subject: new\r\n\r\nnew-body".to_vec(),
+            body: "new-body".to_string(),
+            body_structure: "new-structure".to_string(),
+            envelope: "new-envelope".to_string(),
+            size: 24,
+            recent: false,
+        };
+        store
+            .update_message_content("user-1", &updated.internal_id, &updated)
+            .expect("update");
+
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
+        assert_eq!(snapshot.messages[0].body, "new-body");
+        assert_eq!(snapshot.messages[0].body_structure, "new-structure");
+        assert_eq!(snapshot.messages[0].envelope, "new-envelope");
+        assert_eq!(
+            store
+                .read_message_blob("user-1", &updated.internal_id)
+                .expect("blob"),
+            b"Subject: new\r\n\r\nnew-body"
         );
     }
 }

@@ -1,32 +1,8 @@
 use std::collections::HashSet;
 
-use crate::{
-    error::{GluonError, Result},
-    key::GluonKey,
-    layout::CacheLayout,
-    target::CompatibilityTarget,
-};
+use gluon_rs_core::{AccountBootstrap, CacheLayout, GluonCoreError};
 
-#[derive(Debug, Clone)]
-pub struct AccountBootstrap {
-    pub account_id: String,
-    pub storage_user_id: String,
-    pub key: GluonKey,
-}
-
-impl AccountBootstrap {
-    pub fn new(
-        account_id: impl Into<String>,
-        storage_user_id: impl Into<String>,
-        key: GluonKey,
-    ) -> Self {
-        Self {
-            account_id: account_id.into(),
-            storage_user_id: storage_user_id.into(),
-            key,
-        }
-    }
-}
+use crate::{error::Result, target::CompatibilityTarget};
 
 #[derive(Debug, Clone)]
 pub struct StoreBootstrap {
@@ -36,7 +12,11 @@ pub struct StoreBootstrap {
 }
 
 impl StoreBootstrap {
-    pub fn new(layout: CacheLayout, target: CompatibilityTarget, accounts: Vec<AccountBootstrap>) -> Self {
+    pub fn new(
+        layout: CacheLayout,
+        target: CompatibilityTarget,
+        accounts: Vec<AccountBootstrap>,
+    ) -> Self {
         Self {
             layout,
             target,
@@ -50,14 +30,16 @@ impl StoreBootstrap {
 
         for account in &self.accounts {
             if !account_ids.insert(account.account_id.clone()) {
-                return Err(GluonError::DuplicateAccountId {
+                return Err(GluonCoreError::DuplicateAccountId {
                     account_id: account.account_id.clone(),
-                });
+                }
+                .into());
             }
             if !storage_user_ids.insert(account.storage_user_id.clone()) {
-                return Err(GluonError::DuplicateStorageUserId {
+                return Err(GluonCoreError::DuplicateStorageUserId {
                     storage_user_id: account.storage_user_id.clone(),
-                });
+                }
+                .into());
             }
             self.layout.account_paths(account.storage_user_id.clone())?;
         }
@@ -68,7 +50,9 @@ impl StoreBootstrap {
 
 #[cfg(test)]
 mod tests {
-    use crate::{key::GluonKey, layout::CacheLayout, target::CompatibilityTarget};
+    use gluon_rs_core::{CacheLayout, GluonKey};
+
+    use crate::target::CompatibilityTarget;
 
     use super::{AccountBootstrap, StoreBootstrap};
 

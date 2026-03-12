@@ -70,6 +70,7 @@ hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }
 sha1 = "0.10"
 base32 = "0.5"
+gluon-rs-mail = { path = "crates/gluon-rs-mail" }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -81,3 +82,9 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 [build-dependencies]
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
+
+[workspace]
+members = [
+    "crates/gluon-rs-core",
+    "crates/gluon-rs-mail",
+]

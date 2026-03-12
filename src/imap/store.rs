@@ -1150,6 +1150,55 @@ impl GluonStore {
         }
     }
 
+    fn build_account_sqlite_snapshot(
+        &self,
+        storage_user_id: &str,
+        account: &GluonAccountState,
+    ) -> Result<Vec<u8>> {
+        let db_path = self.account_db_path(storage_user_id);
+        let temp_root = db_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.root.clone());
+        std::fs::create_dir_all(&temp_root)?;
+        let snapshot_path = temp_root.join(format!(
+            "{storage_user_id}.snapshot-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+
+        Self::persist_account_to_sqlite_once(&snapshot_path, account).map_err(|err| {
+            super::ImapError::Protocol(format!(
+                "failed to build sqlite account snapshot {}: {err}",
+                snapshot_path.display()
+            ))
+        })?;
+
+        let snapshot_bytes = std::fs::read(&snapshot_path).map_err(|err| {
+            super::ImapError::Protocol(format!(
+                "failed to read sqlite account snapshot {}: {err}",
+                snapshot_path.display()
+            ))
+        })?;
+
+        let _ = std::fs::remove_file(&snapshot_path);
+        for sidecar_path in Self::account_db_sidecar_paths(&snapshot_path) {
+            let _ = std::fs::remove_file(sidecar_path);
+        }
+
+        Ok(snapshot_bytes)
+    }
+
+    fn account_db_sidecar_paths(db_path: &Path) -> [PathBuf; 2] {
+        [
+            PathBuf::from(format!("{}-wal", db_path.display())),
+            PathBuf::from(format!("{}-shm", db_path.display())),
+        ]
+    }
+
     fn persist_account(
         &self,
         storage_user_id: &str,
@@ -1159,6 +1208,8 @@ impl GluonStore {
         let mut txn = self.txn_manager.begin(storage_user_id).map_err(|err| {
             super::ImapError::Protocol(format!("failed to begin gluon txn: {err}"))
         })?;
+        let db_path = self.account_db_path(storage_user_id);
+        let sqlite_snapshot = self.build_account_sqlite_snapshot(storage_user_id, account)?;
 
         for (relative_path, bytes) in message_writes {
             txn.stage_write(relative_path, bytes).map_err(|err| {
@@ -1169,11 +1220,24 @@ impl GluonStore {
             })?;
         }
 
-        txn.commit().map_err(|err| {
-            super::ImapError::Protocol(format!("failed to commit gluon txn: {err}"))
+        txn.stage_write(&db_path, &sqlite_snapshot).map_err(|err| {
+            super::ImapError::Protocol(format!(
+                "failed to stage gluon sqlite index {}: {err}",
+                db_path.display()
+            ))
         })?;
 
-        self.persist_account_to_sqlite(storage_user_id, account)
+        for sidecar_path in Self::account_db_sidecar_paths(&db_path) {
+            txn.stage_delete(&sidecar_path).map_err(|err| {
+                super::ImapError::Protocol(format!(
+                    "failed to stage gluon sqlite sidecar delete {}: {err}",
+                    sidecar_path.display()
+                ))
+            })?;
+        }
+
+        txn.commit()
+            .map_err(|err| super::ImapError::Protocol(format!("failed to commit gluon txn: {err}")))
     }
 
     fn blob_counter_from_name(name: &str) -> Option<u64> {
@@ -2708,5 +2772,64 @@ mod tests {
         let removed = events.recv().await.unwrap();
         assert_eq!(removed.kind, StoreEventKind::MessageRemoved);
         assert_eq!(removed.uid, Some(uid));
+    }
+
+    #[test]
+    fn gluon_persist_account_stages_sqlite_snapshot_and_sidecar_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = GluonStore::new(
+            temp.path().to_path_buf(),
+            HashMap::from([("account-1".to_string(), "user-1".to_string())]),
+        )
+        .expect("store");
+
+        let mut inbox = GluonMailboxData::new();
+        inbox.next_uid = 2;
+        inbox.mod_seq = 1;
+        inbox.uid_order.push(1);
+        inbox.proton_to_uid.insert("msg-1".to_string(), 1);
+        inbox.uid_to_proton.insert(1, "msg-1".to_string());
+        inbox.metadata.insert(1, make_meta("msg-1", 1));
+        inbox.flags.insert(1, vec!["\\Seen".to_string()]);
+        inbox.uid_to_blob.insert(1, "00000001.msg".to_string());
+
+        let account = GluonAccountState {
+            next_blob_id: 2,
+            mailboxes: HashMap::from([("INBOX".to_string(), inbox)]),
+        };
+
+        let db_path = store.account_db_path("user-1");
+        let wal_path = PathBuf::from(format!("{}-wal", db_path.display()));
+        let shm_path = PathBuf::from(format!("{}-shm", db_path.display()));
+        std::fs::create_dir_all(db_path.parent().expect("db parent")).expect("db dir");
+        std::fs::write(&wal_path, b"stale wal").expect("write wal");
+        std::fs::write(&shm_path, b"stale shm").expect("write shm");
+
+        store
+            .persist_account(
+                "user-1",
+                &account,
+                &[(
+                    PathBuf::from("backend/store/user-1/00000001.msg"),
+                    b"From: staged\r\n\r\nbody".to_vec(),
+                )],
+            )
+            .expect("persist account");
+
+        assert!(db_path.exists());
+        assert!(!wal_path.exists());
+        assert!(!shm_path.exists());
+        assert!(temp
+            .path()
+            .join("backend/store/user-1/00000001.msg")
+            .exists());
+
+        let loaded = store
+            .load_account_from_sqlite("user-1")
+            .expect("load sqlite")
+            .expect("account present");
+        let inbox = loaded.mailboxes.get("INBOX").expect("inbox");
+        assert_eq!(inbox.uid_to_blob.get(&1), Some(&"00000001.msg".to_string()));
+        assert_eq!(inbox.uid_to_proton.get(&1), Some(&"msg-1".to_string()));
     }
 }

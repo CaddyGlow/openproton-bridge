@@ -9,6 +9,42 @@ struct CompleteLoginArgs {
     granted_scopes: Vec<String>,
 }
 
+fn build_mail_runtime_config(
+    bind_host: String,
+    settings: &StoredMailSettings,
+) -> anyhow::Result<bridge::mail_runtime::MailRuntimeConfig> {
+    let imap_port = u16::try_from(settings.imap_port)
+        .with_context(|| format!("invalid IMAP port in grpc settings: {}", settings.imap_port))?;
+    let smtp_port = u16::try_from(settings.smtp_port)
+        .with_context(|| format!("invalid SMTP port in grpc settings: {}", settings.smtp_port))?;
+
+    Ok(bridge::mail_runtime::MailRuntimeConfig {
+        bind_host,
+        imap_port,
+        smtp_port,
+        dav_enable: false,
+        dav_port: 8080,
+        dav_tls_mode: bridge::mail_runtime::DavTlsMode::None,
+        disable_tls: false,
+        use_ssl_for_imap: settings.use_ssl_for_imap,
+        use_ssl_for_smtp: settings.use_ssl_for_smtp,
+        api_base_url: "https://mail-api.proton.me".to_string(),
+        event_poll_interval: std::time::Duration::from_secs(30),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(
+            settings.pim_reconcile_tick_secs as u64,
+        ),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(
+            settings.pim_contacts_reconcile_secs as u64,
+        ),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(
+            settings.pim_calendar_reconcile_secs as u64,
+        ),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(
+            settings.pim_calendar_horizon_reconcile_secs as u64,
+        ),
+    })
+}
+
 impl BridgeService {
     fn new(state: Arc<GrpcState>) -> Self {
         Self { state }
@@ -34,36 +70,7 @@ impl BridgeService {
         &self,
         settings: &StoredMailSettings,
     ) -> anyhow::Result<bridge::mail_runtime::MailRuntimeConfig> {
-        let imap_port = u16::try_from(settings.imap_port).with_context(|| {
-            format!("invalid IMAP port in grpc settings: {}", settings.imap_port)
-        })?;
-        let smtp_port = u16::try_from(settings.smtp_port).with_context(|| {
-            format!("invalid SMTP port in grpc settings: {}", settings.smtp_port)
-        })?;
-        Ok(bridge::mail_runtime::MailRuntimeConfig {
-            bind_host: self.state.bind_host.clone(),
-            imap_port,
-            smtp_port,
-            dav_enable: false,
-            dav_port: 8080,
-            dav_tls_mode: bridge::mail_runtime::DavTlsMode::None,
-            disable_tls: false,
-            use_ssl_for_imap: settings.use_ssl_for_imap,
-            use_ssl_for_smtp: settings.use_ssl_for_smtp,
-            event_poll_interval: std::time::Duration::from_secs(30),
-            pim_reconcile_tick_interval: std::time::Duration::from_secs(
-                settings.pim_reconcile_tick_secs as u64,
-            ),
-            pim_contacts_reconcile_interval: std::time::Duration::from_secs(
-                settings.pim_contacts_reconcile_secs as u64,
-            ),
-            pim_calendar_reconcile_interval: std::time::Duration::from_secs(
-                settings.pim_calendar_reconcile_secs as u64,
-            ),
-            pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(
-                settings.pim_calendar_horizon_reconcile_secs as u64,
-            ),
-        })
+        build_mail_runtime_config(self.state.bind_host.clone(), settings)
     }
 
     async fn start_mail_runtime_with_settings(
@@ -1352,5 +1359,36 @@ impl BridgeService {
         }
 
         Ok(has_active_keys)
+    }
+}
+
+#[cfg(test)]
+mod service_tests {
+    use super::{build_mail_runtime_config, StoredMailSettings};
+
+    #[test]
+    fn runtime_config_ignores_legacy_backend_fields_in_stored_settings_payload() {
+        let settings: StoredMailSettings = serde_json::from_str(
+            r#"{
+                "imap_port": 1143,
+                "smtp_port": 1025,
+                "use_ssl_for_imap": true,
+                "use_ssl_for_smtp": true,
+                "imap_read_backend": "compat",
+                "imap_mutation_backend": "compat",
+                "pim_reconcile_tick_secs": 600,
+                "pim_contacts_reconcile_secs": 86400,
+                "pim_calendar_reconcile_secs": 86400,
+                "pim_calendar_horizon_reconcile_secs": 43200
+            }"#,
+        )
+        .unwrap();
+
+        let config = build_mail_runtime_config("127.0.0.1".to_string(), &settings).unwrap();
+
+        assert_eq!(config.imap_port, 1143);
+        assert_eq!(config.smtp_port, 1025);
+        assert!(config.use_ssl_for_imap);
+        assert!(config.use_ssl_for_smtp);
     }
 }

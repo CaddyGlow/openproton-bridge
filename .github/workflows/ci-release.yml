@@ -49,10 +49,17 @@ jobs:
       - name: Run backend integration gate
         run: cargo test --locked integration_ --lib
 
-      - name: Run gluon integration and recovery gate
+      - name: Run gluon fixture and recovery gate
         run: |
+          cargo test --locked --test gluon_compatibility_target
+          cargo test --locked --test gluon_fixture_manifest
           cargo test --locked --test gluon_integration
+          cargo test --locked --test gluon_corruption
           cargo test --locked --test gluon_recovery_integration
+
+      - name: Run gluon backend parity gate
+        run: |
+          cargo test --locked with_gluon_mail_backend
 
   build-release-artifacts:
     name: Build release (${{ matrix.os }})

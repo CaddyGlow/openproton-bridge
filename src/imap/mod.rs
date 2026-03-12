@@ -2,6 +2,8 @@ pub mod command;
 pub mod gluon_codec;
 pub mod gluon_connector;
 pub mod gluon_lock;
+pub mod gluon_mailbox_mutation;
+pub mod gluon_mailbox_view;
 pub mod gluon_txn;
 pub mod mailbox;
 pub mod mailbox_catalog;

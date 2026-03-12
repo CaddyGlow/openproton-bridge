@@ -12,7 +12,7 @@ const TXN_ROOT_DIR: &str = ".gluon-txn";
 const LOCK_ROOT_DIR: &str = ".gluon-locks";
 const JOURNAL_FILE: &str = "journal.json";
 const COMMIT_MARKER_FILE: &str = "commit.marker";
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -30,6 +30,8 @@ pub enum GluonTxnError {
     TransactionClosed,
     #[error("recovery failed because neither staged nor target file exists (target: {target}, staged: {staged})")]
     MissingStageAndTarget { target: PathBuf, staged: PathBuf },
+    #[error("recovery failed because a staged write entry is missing its staged file path (target: {target})")]
+    MissingStagedPath { target: PathBuf },
     #[error("injected failure after {applied} operations")]
     InjectedFailure { applied: usize },
 }
@@ -159,28 +161,9 @@ impl GluonTxnManager {
                     continue;
                 }
 
-                let target = journal.entries[index].target.clone();
-                let staged = journal.entries[index].staged.clone();
-
-                if staged.exists() {
-                    if let Some(parent) = target.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    fs::rename(&staged, &target)?;
-                    journal.entries[index].applied = true;
-                    write_journal(&journal_path, &journal)?;
-                    recovered_ops += 1;
-                    continue;
-                }
-
-                if target.exists() {
-                    journal.entries[index].applied = true;
-                    write_journal(&journal_path, &journal)?;
-                    recovered_ops += 1;
-                    continue;
-                }
-
-                return Err(GluonTxnError::MissingStageAndTarget { target, staged });
+                apply_journal_entry(&mut journal.entries[index])?;
+                write_journal(&journal_path, &journal)?;
+                recovered_ops += 1;
             }
 
             fs::remove_dir_all(&txn_dir)?;
@@ -219,8 +202,22 @@ impl GluonTxn {
         fs::write(&staged_path, bytes.as_ref())?;
 
         self.entries.push(TxnEntry {
+            kind: TxnEntryKind::Write,
             target,
-            staged: staged_path,
+            staged: Some(staged_path),
+            applied: false,
+        });
+        Ok(())
+    }
+
+    pub fn stage_delete(&mut self, target: impl AsRef<Path>) -> Result<()> {
+        self.ensure_open()?;
+
+        let target = resolve_target(&self.root, target.as_ref())?;
+        self.entries.push(TxnEntry {
+            kind: TxnEntryKind::Delete,
+            target,
+            staged: None,
             applied: false,
         });
         Ok(())
@@ -268,14 +265,7 @@ impl GluonTxn {
                 continue;
             }
 
-            let target = journal.entries[index].target.clone();
-            let staged = journal.entries[index].staged.clone();
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::rename(&staged, &target)?;
-
-            journal.entries[index].applied = true;
+            apply_journal_entry(&mut journal.entries[index])?;
             applied += 1;
             write_journal(&self.journal_path, &journal)?;
 
@@ -337,9 +327,20 @@ struct TxnJournal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TxnEntry {
+    #[serde(default)]
+    kind: TxnEntryKind,
     target: PathBuf,
-    staged: PathBuf,
+    #[serde(default)]
+    staged: Option<PathBuf>,
     applied: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+enum TxnEntryKind {
+    #[default]
+    Write,
+    Delete,
 }
 
 fn write_journal(path: &Path, journal: &TxnJournal) -> Result<()> {
@@ -356,6 +357,48 @@ fn write_journal(path: &Path, journal: &TxnJournal) -> Result<()> {
 fn read_journal(path: &Path) -> Result<TxnJournal> {
     let payload = fs::read(path)?;
     Ok(serde_json::from_slice(&payload)?)
+}
+
+fn apply_journal_entry(entry: &mut TxnEntry) -> Result<()> {
+    match entry.kind {
+        TxnEntryKind::Write => {
+            let staged = entry
+                .staged
+                .clone()
+                .ok_or_else(|| GluonTxnError::MissingStagedPath {
+                    target: entry.target.clone(),
+                })?;
+
+            if staged.exists() {
+                if let Some(parent) = entry.target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::rename(&staged, &entry.target)?;
+                entry.applied = true;
+                return Ok(());
+            }
+
+            if entry.target.exists() {
+                entry.applied = true;
+                return Ok(());
+            }
+
+            Err(GluonTxnError::MissingStageAndTarget {
+                target: entry.target.clone(),
+                staged,
+            })
+        }
+        TxnEntryKind::Delete => {
+            match fs::remove_file(&entry.target) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+
+            entry.applied = true;
+            Ok(())
+        }
+    }
 }
 
 fn resolve_target(root: &Path, target: &Path) -> Result<PathBuf> {

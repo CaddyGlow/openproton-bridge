@@ -282,6 +282,7 @@ mod tests {
             disable_tls: true,
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
+            api_base_url: "https://mail-api.proton.me".to_string(),
             event_poll_interval: Duration::from_secs(30),
             pim_reconcile_tick_interval:
                 crate::bridge::mail_runtime::DEFAULT_PIM_RECONCILE_TICK_INTERVAL,

@@ -62,6 +62,7 @@ pub struct MailRuntimeConfig {
     pub disable_tls: bool,
     pub use_ssl_for_imap: bool,
     pub use_ssl_for_smtp: bool,
+    pub api_base_url: String,
     pub imap_read_backend: ImapReadBackend,
     pub imap_mutation_backend: ImapMutationBackend,
     pub event_poll_interval: Duration,
@@ -501,7 +502,7 @@ async fn prepare_runtime_context(
             .await;
     }
     let runtime_snapshot = runtime_accounts.snapshot().await;
-    let api_base_url = "https://mail-api.proton.me".to_string();
+    let api_base_url = config.api_base_url.clone();
 
     let bootstrap_account_ids = active_sessions
         .iter()

@@ -50,6 +50,7 @@ impl BridgeService {
             disable_tls: false,
             use_ssl_for_imap: settings.use_ssl_for_imap,
             use_ssl_for_smtp: settings.use_ssl_for_smtp,
+            api_base_url: "https://mail-api.proton.me".to_string(),
             imap_read_backend: settings.imap_read_backend,
             imap_mutation_backend: settings.imap_mutation_backend,
             event_poll_interval: std::time::Duration::from_secs(30),

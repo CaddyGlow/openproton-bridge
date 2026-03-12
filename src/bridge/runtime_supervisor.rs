@@ -282,6 +282,7 @@ mod tests {
             disable_tls: true,
             use_ssl_for_imap: false,
             use_ssl_for_smtp: false,
+            api_base_url: "https://mail-api.proton.me".to_string(),
             imap_read_backend: crate::bridge::mail_runtime::ImapReadBackend::GluonMailReadOnly,
             imap_mutation_backend: crate::bridge::mail_runtime::ImapMutationBackend::GluonMail,
             event_poll_interval: Duration::from_secs(30),

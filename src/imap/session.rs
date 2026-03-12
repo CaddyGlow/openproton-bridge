@@ -34,6 +34,16 @@ use super::Result;
 /// RFC 2177 recommends servers terminate IDLE after 30 minutes.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+fn resolve_api_base_url_for_mode(configured_base_url: &str, api_mode: types::ApiMode) -> String {
+    if matches!(api_mode, types::ApiMode::Webmail)
+        && configured_base_url == types::ApiMode::Bridge.base_url()
+    {
+        types::ApiMode::Webmail.base_url().to_string()
+    } else {
+        configured_base_url.to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum State {
     NotAuthenticated,
@@ -355,7 +365,7 @@ where
 
         // Create authenticated ProtonClient
         let mut client = match ProtonClient::authenticated_with_mode(
-            account_session.api_mode.base_url(),
+            &resolve_api_base_url_for_mode(&self.config.api_base_url, account_session.api_mode),
             account_session.api_mode,
             &account_session.uid,
             &account_session.access_token,
@@ -426,7 +436,10 @@ where
                     };
                     account_session = refreshed;
                     client = match ProtonClient::authenticated_with_mode(
-                        account_session.api_mode.base_url(),
+                        &resolve_api_base_url_for_mode(
+                            &self.config.api_base_url,
+                            account_session.api_mode,
+                        ),
                         account_session.api_mode,
                         &account_session.uid,
                         &account_session.access_token,
@@ -492,7 +505,10 @@ where
                     };
                     account_session = refreshed;
                     client = match ProtonClient::authenticated_with_mode(
-                        account_session.api_mode.base_url(),
+                        &resolve_api_base_url_for_mode(
+                            &self.config.api_base_url,
+                            account_session.api_mode,
+                        ),
                         account_session.api_mode,
                         &account_session.uid,
                         &account_session.access_token,
@@ -1750,7 +1766,7 @@ where
                     }
                 };
                 client = match ProtonClient::authenticated_with_mode(
-                    refreshed.api_mode.base_url(),
+                    &resolve_api_base_url_for_mode(&self.config.api_base_url, refreshed.api_mode),
                     refreshed.api_mode,
                     &refreshed.uid,
                     &refreshed.access_token,

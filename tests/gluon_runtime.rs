@@ -25,6 +25,8 @@ use sequoia_openpgp::crypto::Password;
 use sequoia_openpgp::serialize::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn make_meta(id: &str) -> MessageMetadata {
     MessageMetadata {
@@ -181,7 +183,11 @@ fn runtime_auth_material_fixture(passphrase: &str, email: &str) -> RuntimeAuthMa
     }
 }
 
-fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
+fn seed_runtime_gluon_store_with_flags(
+    runtime_paths: &RuntimePaths,
+    session: &Session,
+    flags: &[&str],
+) {
     let gluon_root = runtime_paths
         .gluon_paths(Some("gluon"))
         .root()
@@ -220,7 +226,7 @@ fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
             &NewMessage {
                 internal_id: "internal-runtime-1".to_string(),
                 remote_id: "runtime-msg-1".to_string(),
-                flags: vec!["\\Seen".to_string()],
+                flags: flags.iter().map(|flag| (*flag).to_string()).collect(),
                 blob,
                 body: "runtime-body".to_string(),
                 body_structure: "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 12 1 NIL NIL NIL)"
@@ -231,6 +237,10 @@ fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
             },
         )
         .expect("append runtime message");
+}
+
+fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
+    seed_runtime_gluon_store_with_flags(runtime_paths, session, &["\\Seen"]);
 }
 
 async fn free_port() -> u16 {
@@ -356,6 +366,7 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
         disable_tls: false,
         use_ssl_for_imap: false,
         use_ssl_for_smtp: false,
+        api_base_url: "https://mail-api.proton.me".to_string(),
         imap_read_backend: ImapReadBackend::GluonMailReadOnly,
         imap_mutation_backend: ImapMutationBackend::GluonMail,
         event_poll_interval: std::time::Duration::from_secs(30),
@@ -478,6 +489,7 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
         disable_tls: false,
         use_ssl_for_imap: false,
         use_ssl_for_smtp: false,
+        api_base_url: "https://mail-api.proton.me".to_string(),
         imap_read_backend: ImapReadBackend::GluonMailReadOnly,
         imap_mutation_backend: ImapMutationBackend::GluonMail,
         event_poll_interval: std::time::Duration::from_secs(30),
@@ -579,5 +591,149 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
     let done = read_until_tag(&mut reader, "a003 ").await;
     assert!(done.contains("a003 OK IDLE terminated"), "{done}");
 
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/unread"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/unlabel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000,
+            "EventID": "event-0",
+            "Refresh": 0,
+            "Events": []
+        })))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let config = MailRuntimeConfig {
+        bind_host: "127.0.0.1".to_string(),
+        imap_port,
+        smtp_port,
+        dav_enable: false,
+        dav_port: 8080,
+        dav_tls_mode: DavTlsMode::None,
+        disable_tls: false,
+        use_ssl_for_imap: false,
+        use_ssl_for_smtp: false,
+        api_base_url: server.uri(),
+        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
+        imap_mutation_backend: ImapMutationBackend::GluonMail,
+        event_poll_interval: std::time::Duration::from_secs(30),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
+    };
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    runtime
+        .runtime_accounts()
+        .set_auth_material(
+            &AccountId(session.uid.clone()),
+            Arc::new(runtime_auth_material_fixture(
+                "test-passphrase",
+                &session.email,
+            )),
+        )
+        .await
+        .expect("seed runtime auth material");
+
+    let scoped_mailbox = format!("{}::INBOX", session.uid);
+    let uid = runtime
+        .imap_connector()
+        .list_uids(&scoped_mailbox)
+        .await
+        .expect("list runtime uids")
+        .into_iter()
+        .next()
+        .expect("seeded runtime uid");
+    runtime
+        .imap_connector()
+        .update_message_flags(
+            &scoped_mailbox,
+            uid,
+            vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+        )
+        .await
+        .expect("seed initial runtime flags");
+
+    let stream = connect_with_retry(imap_port).await;
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+
+    let greeting = read_line(&mut reader).await;
+    assert!(greeting.contains("OK IMAP4rev1"), "{greeting}");
+
+    write
+        .write_all(b"a001 LOGIN runtime@proton.me bridge-password\r\n")
+        .await
+        .expect("write login");
+    write.flush().await.expect("flush login");
+    let login = read_until_tag(&mut reader, "a001 ").await;
+    assert!(login.contains("a001 OK"), "{login}");
+
+    write
+        .write_all(b"a002 SELECT INBOX\r\n")
+        .await
+        .expect("write select");
+    write.flush().await.expect("flush select");
+    let select = read_until_tag(&mut reader, "a002 ").await;
+    assert!(select.contains("1 EXISTS"), "{select}");
+    assert!(select.contains("a002 OK"), "{select}");
+
+    write
+        .write_all(b"a003 STORE 1 FLAGS ()\r\n")
+        .await
+        .expect("write store");
+    write.flush().await.expect("flush store");
+    let store = read_until_tag(&mut reader, "a003 ").await;
+    assert!(store.contains("* 1 FETCH (FLAGS ())"), "{store}");
+    assert!(store.contains("a003 OK STORE completed"), "{store}");
+
+    server.verify().await;
     runtime.stop().await.expect("stop runtime");
 }

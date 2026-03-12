@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
+use gluon_rs_mail::{
+    AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, NewMailbox,
+    NewMessage, StoreBootstrap,
+};
 use openproton_bridge::api::types::{
     Address, AddressKey, ApiMode, EmailAddress, MessageMetadata, Session, UserKey,
 };
@@ -177,6 +181,58 @@ fn runtime_auth_material_fixture(passphrase: &str, email: &str) -> RuntimeAuthMa
     }
 }
 
+fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
+    let gluon_root = runtime_paths
+        .gluon_paths(Some("gluon"))
+        .root()
+        .to_path_buf();
+    let store = CompatibleStore::open(StoreBootstrap::new(
+        CacheLayout::new(gluon_root),
+        CompatibilityTarget::pinned("2046c95ca745"),
+        vec![AccountBootstrap::new(
+            &session.uid,
+            &session.uid,
+            GluonKey::try_from_slice(&[7u8; 32]).expect("gluon key"),
+        )],
+    ))
+    .expect("open compatible store");
+
+    let mailbox = store
+        .create_mailbox(
+            &session.uid,
+            &NewMailbox {
+                remote_id: "0".to_string(),
+                name: "INBOX".to_string(),
+                uid_validity: 42,
+                subscribed: true,
+                attributes: Vec::new(),
+                flags: Vec::new(),
+                permanent_flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+            },
+        )
+        .expect("create runtime inbox");
+
+    let blob = b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nFrom: Alice <alice@proton.me>\r\nTo: Runtime <runtime@proton.me>\r\nSubject: Runtime Subject\r\nMessage-ID: <runtime-msg-1@example.test>\r\n\r\nruntime-body".to_vec();
+    store
+        .append_message(
+            &session.uid,
+            mailbox.internal_id,
+            &NewMessage {
+                internal_id: "internal-runtime-1".to_string(),
+                remote_id: "runtime-msg-1".to_string(),
+                flags: vec!["\\Seen".to_string()],
+                blob,
+                body: "runtime-body".to_string(),
+                body_structure: "(\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 12 1 NIL NIL NIL)"
+                    .to_string(),
+                envelope: "(\"Tue, 14 Nov 2023 22:13:20 +0000\" \"Runtime Subject\" ((NIL NIL \"alice\" \"proton.me\")) ((NIL NIL \"alice\" \"proton.me\")) ((NIL NIL \"alice\" \"proton.me\")) ((NIL NIL \"runtime\" \"proton.me\")) NIL NIL NIL \"<runtime-msg-1@example.test>\")".to_string(),
+                size: 190,
+                recent: false,
+            },
+        )
+        .expect("append runtime message");
+}
+
 async fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -274,6 +330,7 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
+    seed_runtime_gluon_store(&runtime_paths, &session);
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -351,6 +408,16 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     assert!(list.contains("* LIST"), "{list}");
     assert!(list.contains("INBOX"), "{list}");
     assert!(list.contains("a002 OK"), "{list}");
+
+    write
+        .write_all(b"a003 SELECT INBOX\r\n")
+        .await
+        .expect("write select");
+    write.flush().await.expect("flush select");
+
+    let select = read_until_tag(&mut reader, "a003 ").await;
+    assert!(select.contains("1 EXISTS"), "{select}");
+    assert!(select.contains("a003 OK"), "{select}");
 
     runtime.stop().await.expect("stop runtime");
 }

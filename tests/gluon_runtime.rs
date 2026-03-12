@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use gluon_rs_mail::{
@@ -1140,6 +1141,112 @@ async fn be030_mail_runtime_event_update_reaches_idle_with_gluon_defaults() {
     write.flush().await.expect("flush done");
     let done = read_until_tag(&mut reader, "a003 ").await;
     assert!(done.contains("a003 OK IDLE terminated"), "{done}");
+
+    server.verify().await;
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_event_delete_surfaces_via_noop_with_gluon_defaults() {
+    let server = MockServer::start().await;
+    let event_zero_polls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/event-0"))
+        .respond_with({
+            let event_zero_polls = event_zero_polls.clone();
+            move |_req: &wiremock::Request| {
+                let poll = event_zero_polls.fetch_add(1, Ordering::SeqCst);
+                if poll == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "Code": 1000,
+                        "EventID": "event-0",
+                        "More": 0,
+                        "Refresh": 0,
+                        "Events": []
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "Code": 1000,
+                        "EventID": "event-1",
+                        "More": 0,
+                        "Refresh": 0,
+                        "Events": [{"Messages": [{"ID": "runtime-msg-1", "Action": 0}]}]
+                    }))
+                }
+            }
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/event-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000,
+            "EventID": "event-1",
+            "More": 0,
+            "Refresh": 0,
+            "Events": []
+        })))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    VaultCheckpointStore::new(runtime_paths.settings_dir().to_path_buf())
+        .save_checkpoint(
+            &AccountId(session.uid.clone()),
+            &EventCheckpoint {
+                last_event_id: "event-0".to_string(),
+                last_event_ts: Some(1_700_000_000),
+                sync_state: Some(CheckpointSyncState::Ok),
+            },
+        )
+        .expect("save runtime checkpoint");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let mut config = runtime_test_config(imap_port, smtp_port, server.uri());
+    config.event_poll_interval = std::time::Duration::from_millis(100);
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    seed_runtime_auth(&runtime, &session).await;
+
+    let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+    write.write_all(b"a003 NOOP\r\n").await.expect("write noop");
+    write.flush().await.expect("flush noop");
+    let noop = read_until_tag(&mut reader, "a003 ").await;
+    assert!(noop.contains("* 1 EXPUNGE"), "{noop}");
+    assert!(noop.contains("* 0 EXISTS"), "{noop}");
+    assert!(noop.contains("a003 OK NOOP completed"), "{noop}");
+
+    let scoped_inbox = format!("{}::INBOX", session.uid);
+    assert!(runtime
+        .imap_connector()
+        .list_uids(&scoped_inbox)
+        .await
+        .expect("list inbox after delete event")
+        .is_empty());
 
     server.verify().await;
     runtime.stop().await.expect("stop runtime");

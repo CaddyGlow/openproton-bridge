@@ -540,7 +540,6 @@ async fn prepare_runtime_context(
         mailbox_mutation,
         mailbox_view,
         store,
-        mutation_mode: imap::session::MutationMode::Strict,
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {

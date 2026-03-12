@@ -52,13 +52,6 @@ enum State {
     Logout,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MutationMode {
-    #[default]
-    Strict,
-    Compat,
-}
-
 pub struct SessionConfig {
     pub api_base_url: String,
     pub auth_router: AuthRouter,
@@ -68,7 +61,6 @@ pub struct SessionConfig {
     pub mailbox_catalog: Arc<dyn GluonMailboxCatalog>,
     pub mailbox_mutation: Arc<dyn GluonMailboxMutation>,
     pub mailbox_view: Arc<dyn GluonMailboxView>,
-    pub mutation_mode: MutationMode,
 }
 
 static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -737,10 +729,6 @@ where
             Some(account_id) => format!("{account_id}::{mailbox}"),
             None => mailbox.to_string(),
         }
-    }
-
-    fn strict_mutation_mode(&self) -> bool {
-        self.config.mutation_mode == MutationMode::Strict
     }
 
     fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
@@ -1906,12 +1894,10 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync seen flag upstream"
                                 );
-                                if self.strict_mutation_mode() {
-                                    return self
-                                        .writer
-                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
-                                        .await;
-                                }
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                    .await;
                             }
                         } else {
                             if let Err(err) =
@@ -1924,12 +1910,10 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync unseen flag upstream"
                                 );
-                                if self.strict_mutation_mode() {
-                                    return self
-                                        .writer
-                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
-                                        .await;
-                                }
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                    .await;
                             }
                         }
                     }
@@ -1951,12 +1935,10 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync flagged state upstream"
                                 );
-                                if self.strict_mutation_mode() {
-                                    return self
-                                        .writer
-                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
-                                        .await;
-                                }
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                    .await;
                             }
                         } else {
                             if let Err(err) =
@@ -1970,12 +1952,10 @@ where
                                     proton_id = %proton_id,
                                     "failed to sync unflagged state upstream"
                                 );
-                                if self.strict_mutation_mode() {
-                                    return self
-                                        .writer
-                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
-                                        .await;
-                                }
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                    .await;
                             }
                         }
                     }
@@ -2139,13 +2119,11 @@ where
                                 permanent = is_trash_or_spam,
                                 "failed to sync expunge mutation upstream"
                             );
-                            if self.strict_mutation_mode() {
-                                if let Some(tag) = tag {
-                                    self.writer
-                                        .tagged_no(tag, "EXPUNGE failed: upstream mutation failed")
-                                        .await?;
-                                    return Ok(false);
-                                }
+                            if let Some(tag) = tag {
+                                self.writer
+                                    .tagged_no(tag, "EXPUNGE failed: upstream mutation failed")
+                                    .await?;
+                                return Ok(false);
                             }
                         }
                     }
@@ -2235,12 +2213,10 @@ where
                                 permanent = is_trash_or_spam,
                                 "failed to sync uid expunge mutation upstream"
                             );
-                            if self.strict_mutation_mode() {
-                                return self
-                                    .writer
-                                    .tagged_no(tag, "UID EXPUNGE failed: upstream mutation failed")
-                                    .await;
-                            }
+                            return self
+                                .writer
+                                .tagged_no(tag, "UID EXPUNGE failed: upstream mutation failed")
+                                .await;
                         }
                     }
                 }
@@ -2318,12 +2294,10 @@ where
                             proton_id = %proton_id,
                             "failed to sync copy destination label upstream"
                         );
-                        if self.strict_mutation_mode() {
-                            return self
-                                .writer
-                                .tagged_no(tag, "COPY failed: upstream mutation failed")
-                                .await;
-                        }
+                        return self
+                            .writer
+                            .tagged_no(tag, "COPY failed: upstream mutation failed")
+                            .await;
                     }
                 }
             }
@@ -2426,12 +2400,10 @@ where
                         proton_id = %proton_id,
                         "failed to sync move destination label upstream"
                     );
-                    if self.strict_mutation_mode() {
-                        return self
-                            .writer
-                            .tagged_no(tag, "MOVE failed: upstream mutation failed")
-                            .await;
-                    }
+                    return self
+                        .writer
+                        .tagged_no(tag, "MOVE failed: upstream mutation failed")
+                        .await;
                 }
 
                 if source_mb.label_id != dest_mb.label_id {
@@ -2450,12 +2422,10 @@ where
                             proton_id = %proton_id,
                             "failed to sync move source label removal upstream"
                         );
-                        if self.strict_mutation_mode() {
-                            return self
-                                .writer
-                                .tagged_no(tag, "MOVE failed: upstream mutation failed")
-                                .await;
-                        }
+                        return self
+                            .writer
+                            .tagged_no(tag, "MOVE failed: upstream mutation failed")
+                            .await;
                     }
                 }
             }
@@ -3164,7 +3134,7 @@ mod tests {
         }
     }
 
-    fn test_compat_config_with_mode(mutation_mode: MutationMode) -> Arc<SessionConfig> {
+    fn test_store_backed_config() -> Arc<SessionConfig> {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
         let store = InMemoryStore::new();
@@ -3178,17 +3148,7 @@ mod tests {
             mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
             mailbox_view: StoreBackedMailboxView::new(store.clone()),
             store,
-            mutation_mode,
         })
-    }
-
-    fn test_compat_config() -> Arc<SessionConfig> {
-        test_compat_config_with_mode(MutationMode::Compat)
-    }
-
-    #[test]
-    fn mutation_mode_defaults_to_strict() {
-        assert_eq!(MutationMode::default(), MutationMode::Strict);
     }
 
     struct TestGluonMailFixture {
@@ -3196,22 +3156,15 @@ mod tests {
     }
 
     fn test_gluon_mail_view_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_config(false, MutationMode::Strict)
+        test_gluon_mail_config(false)
     }
 
     fn test_gluon_mail_backend_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_backend_config_with_mode(MutationMode::Strict)
-    }
-
-    fn test_gluon_mail_backend_config_with_mode(
-        mutation_mode: MutationMode,
-    ) -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_config(true, mutation_mode)
+        test_gluon_mail_config(true)
     }
 
     fn test_gluon_mail_config(
         use_gluon_mutation_backend: bool,
-        mutation_mode: MutationMode,
     ) -> (Arc<SessionConfig>, TestGluonMailFixture) {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
@@ -3300,7 +3253,6 @@ mod tests {
             mailbox_mutation,
             mailbox_view,
             store,
-            mutation_mode,
         });
 
         (config, TestGluonMailFixture { _tempdir: tempdir })
@@ -3450,13 +3402,12 @@ mod tests {
             mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
             mailbox_view: StoreBackedMailboxView::new(store.clone()),
             store,
-            mutation_mode: MutationMode::Compat,
         })
     }
 
     #[tokio::test]
     async fn test_greet() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.greet().await.unwrap();
@@ -3471,7 +3422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_capability() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 CAPABILITY").await.unwrap();
@@ -3491,7 +3442,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 NOOP").await.unwrap();
@@ -3506,7 +3457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_selected_emits_exists_on_store_change() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3562,7 +3513,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_selected_waits_for_done_and_emits_exists() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3615,7 +3566,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_exists_when_new_message_arrives_after_start() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3717,7 +3668,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_expunge_and_exists_on_delete() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3848,7 +3799,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_flag_fetch_on_flag_only_change() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3979,7 +3930,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_logout() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         let action = session.handle_line("a001 LOGOUT").await.unwrap();
@@ -3996,7 +3947,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_bad_password() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session
@@ -4077,7 +4028,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_not_authenticated() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 LIST \"\" \"*\"").await.unwrap();
@@ -4092,7 +4043,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_not_authenticated() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 SELECT INBOX").await.unwrap();
@@ -4107,7 +4058,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_authenticated() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4174,7 +4125,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_selected_mailbox() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -4194,7 +4145,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_command() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 BOGUS").await.unwrap();
@@ -4209,7 +4160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_starttls() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         let action = session.handle_line("a001 STARTTLS").await.unwrap();
@@ -4251,7 +4202,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4285,7 +4236,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_returns_body_item_not_bodystructure() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4346,7 +4297,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_section_returns_empty_literal_when_content_missing() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4394,7 +4345,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4532,7 +4483,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4665,7 +4616,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_copies_local_message_without_api_client() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4764,38 +4715,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_compat_mode_succeeds_when_upstream_fails() {
-        let config = test_compat_config_with_mode(MutationMode::Compat);
-        let (mut session, mut client_read, _client_write) =
-            create_session_pair(config.clone()).await;
-
-        session.state = State::Selected;
-        session.selected_mailbox = Some("INBOX".to_string());
-        session.authenticated_account_id = Some("test-uid".to_string());
-        session.client = Some(failing_client());
-
-        config
-            .store
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
-            .await
-            .unwrap();
-
-        session.handle_line("a001 COPY 1 Archive").await.unwrap();
-
-        let mut buf = vec![0u8; 4096];
-        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
-            .await
-            .unwrap();
-        let response = String::from_utf8_lossy(&buf[..n]);
-        assert!(response.contains("COPY completed"), "response={response}");
-
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
-        assert_eq!(archive_uids.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_copy_strict_mode_fails_when_upstream_fails() {
-        let config = test_compat_config_with_mode(MutationMode::Strict);
+    async fn test_copy_fails_when_upstream_fails() {
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4828,8 +4749,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_strict_mode_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config_with_mode(MutationMode::Strict);
+    async fn test_copy_fails_when_upstream_fails_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4890,7 +4811,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5039,7 +4960,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_moves_local_message_without_api_client() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5151,8 +5072,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_strict_mode_fails_when_upstream_fails() {
-        let config = test_compat_config_with_mode(MutationMode::Strict);
+    async fn test_move_fails_when_upstream_fails() {
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5193,8 +5114,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_move_strict_mode_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config_with_mode(MutationMode::Strict);
+    async fn test_move_fails_when_upstream_fails_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5263,7 +5184,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5327,7 +5248,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_move_without_api_client_uses_uid_selection() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5391,7 +5312,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5562,8 +5483,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expunge_strict_mode_fails_when_upstream_fails() {
-        let config = test_compat_config_with_mode(MutationMode::Strict);
+    async fn test_expunge_fails_when_upstream_fails() {
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5601,8 +5522,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_expunge_strict_mode_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config_with_mode(MutationMode::Strict);
+    async fn test_expunge_fails_when_upstream_fails_with_gluon_mail_backend() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5648,8 +5569,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_uid_expunge_strict_mode_fails_when_upstream_fails() {
-        let config = test_compat_config_with_mode(MutationMode::Strict);
+    async fn test_uid_expunge_fails_when_upstream_fails() {
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5691,7 +5612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_examine_reports_first_unseen_sequence_number() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5765,7 +5686,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5819,7 +5740,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5877,7 +5798,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_after_examine_resets_read_only_mode() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5947,7 +5868,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_after_examine_deselects_mailbox() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5995,7 +5916,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6119,7 +6040,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_fetch_flags_always_includes_uid() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6149,7 +6070,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_store_flags_response_includes_uid() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6222,7 +6143,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_cached_rfc822() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6365,7 +6286,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6442,7 +6363,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_reports_first_unseen_sequence_and_permanentflags() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6699,7 +6620,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_exits_on_done() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6739,7 +6660,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unselect_does_not_expunge() {
-        let config = test_compat_config();
+        let config = test_store_backed_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 

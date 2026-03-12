@@ -8,7 +8,7 @@ use openproton_bridge::imap::mailbox_catalog::RuntimeMailboxCatalog;
 use openproton_bridge::imap::mailbox_mutation::StoreBackedMailboxMutation;
 use openproton_bridge::imap::mailbox_view::StoreBackedMailboxView;
 use openproton_bridge::imap::server::{run_server_with_tls_config as run_imap_server, ImapServer};
-use openproton_bridge::imap::session::{MutationMode, SessionConfig};
+use openproton_bridge::imap::session::SessionConfig;
 use openproton_bridge::imap::store::InMemoryStore;
 use openproton_bridge::smtp::server::{run_server_with_tls_config as run_smtp_server, SmtpServer};
 use openproton_bridge::smtp::session::SmtpSessionConfig;
@@ -46,7 +46,6 @@ fn test_imap_config() -> Arc<SessionConfig> {
         mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
         mailbox_view: StoreBackedMailboxView::new(store.clone()),
         store,
-        mutation_mode: MutationMode::Strict,
     })
 }
 

@@ -28,7 +28,7 @@ This document is the execution plan for tickets `BE-016` through `BE-033`.
 - Frozen on: `2026-03-03`
 - Proton Bridge commit: `92305960372cbe7a7e7acf3debb3c19c5e82bfb1`
 - Gluon commit: `2046c95ca7455812254eaef2f77da0aaaee3fae1`
-- Current fixture limitation: `tests/fixtures/proton_profile_gluon_sanitized` still contains placeholder sqlite artifacts for file-family coverage, so `BE-029` remains open until a real upstream cache-open fixture is available.
+- Current fixture limitation: `tests/fixtures/proton_profile_gluon_sanitized` still contains placeholder sqlite artifacts for file-family coverage, but `BE-029` is now satisfied by the private local official-Bridge fixture gate in `tests/gluon_real_fixture.rs`.
 
 ## Target Architecture
 
@@ -96,8 +96,8 @@ These reuse `gluon-rs-core` infra only, not mail semantics.
 ## Current Status As Of 2026-03-12
 
 - `BE-017` through `BE-028` are effectively implemented in the repo. The Gluon-backed read, mutation, connector, runtime selection, and event-worker paths exist and are covered by focused tests.
-- `BE-029` is partial. File-family capture, manifest checks, schema assertions, and unsupported-case documentation are in place, but true cache-open parity against a real upstream fixture set is still blocked by sanitized placeholder sqlite artifacts in `tests/fixtures/proton_profile_gluon_sanitized`.
-- A manual private-fixture parity harness now exists in `tests/gluon_real_fixture.rs`. It accepts either `OPENPROTON_REAL_GLUON_PROFILE=/path/to/bridge-v3` or `OPENPROTON_REAL_GLUON_ARCHIVE=/path/to/profile.tar`, and it can also take `OPENPROTON_REAL_VAULT_KEY` (or legacy alias `OPENPROTON_REAL_GLUON_KEY`) to decrypt `vault.enc`, derive real per-account `gluon_key` bindings, and verify real blob decryption against private local data without checking secrets or fixture payloads into the repo.
+- `BE-029` is complete under the current acceptance rule. File-family capture, manifest checks, schema assertions, and unsupported-case documentation remain in place for the checked-in sanitized fixture, and `tests/gluon_real_fixture.rs` now proves cache-open parity plus real blob decode against a private local official Bridge fixture.
+- The private-fixture parity harness accepts either `OPENPROTON_REAL_GLUON_PROFILE=/path/to/bridge-v3` or `OPENPROTON_REAL_GLUON_ARCHIVE=/path/to/profile.tar`, and it can also take `OPENPROTON_REAL_VAULT_KEY` (or legacy alias `OPENPROTON_REAL_GLUON_KEY`) to decrypt `vault.enc`, derive real per-account `gluon_key` bindings, and verify real blob decryption without checking secrets or fixture payloads into the repo.
 - `BE-030` is in progress. IMAP read/mutation/IDLE parity and multiple event-worker Gluon paths are covered, but mixed event-batch and broader runtime parity are not yet fully closed.
 - `BE-031` is in progress. Recovery and corruption suites cover interrupted transaction replay, cache-move rollback recovery, missing-blob repair, and partial-sqlite fallback, but the plan still owes explicit corruption behavior docs.
 - `BE-032` has not started in earnest. CI still treats the Gluon backend as an incremental parity target, not the only/default backend, and release-candidate cutover criteria are not complete.
@@ -489,7 +489,7 @@ Deliverables:
 - fixture-open tests
 - schema/version assertions
 - documented unsupported cases if any remain
-- manual private-profile/archive gate until a sanitized cache-open fixture can be checked in
+- manual private-profile/archive gate over an official Bridge fixture kept outside the repo
 
 Required tests:
 

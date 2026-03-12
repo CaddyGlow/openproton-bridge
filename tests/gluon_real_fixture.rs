@@ -9,6 +9,7 @@ use gluon_rs_mail::{
     SchemaProbe, StoreBootstrap,
 };
 use openproton_bridge::vault;
+use rusqlite::Connection;
 
 const REAL_ARCHIVE_ENV: &str = "OPENPROTON_REAL_GLUON_ARCHIVE";
 const REAL_PROFILE_ENV: &str = "OPENPROTON_REAL_GLUON_PROFILE";
@@ -98,6 +99,51 @@ fn find_upstream_storage_user_ids(gluon_root: &Path) -> Vec<String> {
     ids
 }
 
+fn assert_upstream_db_contract(gluon_root: &Path, storage_user_id: &str) {
+    let db_path = gluon_root
+        .join("backend")
+        .join("db")
+        .join(format!("{storage_user_id}.db"));
+    let conn = Connection::open(&db_path)
+        .unwrap_or_else(|err| panic!("failed to open upstream db {}: {err}", db_path.display()));
+    let version = conn
+        .query_row(
+            "SELECT version FROM gluon_version WHERE id = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read gluon_version from {}: {err}",
+                db_path.display()
+            )
+        });
+    assert!(
+        version >= 1,
+        "expected nonzero upstream gluon_version in {}",
+        db_path.display()
+    );
+
+    let connector_rows = conn
+        .query_row(
+            "SELECT COUNT(*) FROM connector_settings WHERE id = 0",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or_else(|err| {
+            panic!(
+                "failed to read connector_settings from {}: {err}",
+                db_path.display()
+            )
+        });
+    assert_eq!(
+        connector_rows,
+        1,
+        "expected connector_settings bootstrap row in {}",
+        db_path.display()
+    );
+}
+
 fn resolve_real_vault_key() -> Option<[u8; 32]> {
     let encoded = env::var(REAL_VAULT_KEY_ENV)
         .ok()
@@ -173,6 +219,8 @@ fn be029_open_read_only_accepts_real_archive_fixture() {
     );
 
     for (index, storage_user_id) in storage_user_ids.iter().enumerate() {
+        assert_upstream_db_contract(&gluon_root, storage_user_id);
+
         let bootstrap = StoreBootstrap::new(
             CacheLayout::new(&gluon_root),
             CompatibilityTarget::default(),

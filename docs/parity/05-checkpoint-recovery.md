@@ -90,7 +90,7 @@ Validation tasks:
 
 - Multi-account recovery replay with one degraded account and one healthy account.
 
-### 5) Fixture-open parity remains blocked by sanitized placeholder sqlite artifacts (open)
+### 5) Checked-in sanitized sqlite artifacts remain placeholder-only (non-blocking)
 
 Observed:
 
@@ -99,11 +99,12 @@ Observed:
 
 Risk:
 
-- We cannot yet claim full upstream cache-open parity against a real official Gluon cache set.
+- The checked-in fixture alone does not prove upstream cache-open parity.
+- `BE-029` is covered instead by the private local official-Bridge gate in `tests/gluon_real_fixture.rs`, which opens a real upstream cache outside the repo.
 
 Validation tasks:
 
-- Capture and pin a real sanitized upstream cache set whose sqlite artifacts remain openable by the compatibility store.
+- Optionally capture and pin a real sanitized upstream cache set whose sqlite artifacts remain openable by the compatibility store.
 
 ## Proposed implementation plan (step 6 execution)
 
@@ -115,7 +116,7 @@ Validation tasks:
    - repeated transient failures
 3. Add parity assertions that checkpoint progression is monotonic and restart-safe.
 4. Expand recovery/restart fixtures to validate enum-state progression under mixed failure modes.
-5. Replace placeholder sanitized sqlite artifacts with a real cache-open fixture set for `BE-029`.
+5. Optionally replace placeholder sanitized sqlite artifacts with a real cache-open fixture set later; this is no longer required to close `BE-029`.
 
 ## Acceptance gates for checkpoint/recovery parity
 

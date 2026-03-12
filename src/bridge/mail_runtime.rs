@@ -183,6 +183,7 @@ pub struct MailRuntimeHandle {
     runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
     runtime_snapshot: Vec<super::accounts::RuntimeAccountInfo>,
     pim_reconcile_metrics: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
+    imap_connector: Arc<dyn imap::gluon_connector::GluonImapConnector>,
 }
 
 impl MailRuntimeHandle {
@@ -211,6 +212,10 @@ impl MailRuntimeHandle {
             .read()
             .map(|snapshot| snapshot.clone())
             .unwrap_or_default()
+    }
+
+    pub fn imap_connector(&self) -> Arc<dyn imap::gluon_connector::GluonImapConnector> {
+        self.imap_connector.clone()
     }
 
     pub async fn wait(self) -> anyhow::Result<()> {
@@ -305,6 +310,7 @@ pub async fn start(
     let pim_reconcile_metrics = Arc::new(std::sync::RwLock::new(
         PimReconcileMetricsSnapshot::default(),
     ));
+    let imap_connector = prepared.imap_config.gluon_connector.clone();
     let (stop_tx, stop_rx) = oneshot::channel();
 
     let join_handle = tokio::spawn(run_runtime(
@@ -329,6 +335,7 @@ pub async fn start(
         runtime_accounts,
         runtime_snapshot,
         pim_reconcile_metrics,
+        imap_connector,
     })
 }
 

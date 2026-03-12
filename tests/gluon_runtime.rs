@@ -291,6 +291,18 @@ async fn read_until_tag(
     response
 }
 
+async fn read_chunk_with_timeout(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    timeout: std::time::Duration,
+) -> String {
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(timeout, tokio::io::AsyncReadExt::read(reader, &mut buf))
+        .await
+        .expect("read timeout")
+        .expect("read chunk");
+    String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
 #[test]
 fn be028_persistent_json_store_paths_are_test_only() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -440,6 +452,132 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     let search = read_until_tag(&mut reader, "a005 ").await;
     assert!(search.contains("* SEARCH 1"), "{search}");
     assert!(search.contains("a005 OK SEARCH completed"), "{search}");
+
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let config = MailRuntimeConfig {
+        bind_host: "127.0.0.1".to_string(),
+        imap_port,
+        smtp_port,
+        dav_enable: false,
+        dav_port: 8080,
+        dav_tls_mode: DavTlsMode::None,
+        disable_tls: false,
+        use_ssl_for_imap: false,
+        use_ssl_for_smtp: false,
+        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
+        imap_mutation_backend: ImapMutationBackend::GluonMail,
+        event_poll_interval: std::time::Duration::from_secs(30),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
+    };
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    runtime
+        .runtime_accounts()
+        .set_auth_material(
+            &AccountId(session.uid.clone()),
+            Arc::new(runtime_auth_material_fixture(
+                "test-passphrase",
+                &session.email,
+            )),
+        )
+        .await
+        .expect("seed runtime auth material");
+
+    let scoped_mailbox = format!("{}::INBOX", session.uid);
+    let uid = runtime
+        .imap_connector()
+        .list_uids(&scoped_mailbox)
+        .await
+        .expect("list runtime uids")
+        .into_iter()
+        .next()
+        .expect("seeded runtime uid");
+
+    let stream = connect_with_retry(imap_port).await;
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+
+    let greeting = read_line(&mut reader).await;
+    assert!(greeting.contains("OK IMAP4rev1"), "{greeting}");
+
+    write
+        .write_all(b"a001 LOGIN runtime@proton.me bridge-password\r\n")
+        .await
+        .expect("write login");
+    write.flush().await.expect("flush login");
+
+    let login = read_until_tag(&mut reader, "a001 ").await;
+    assert!(login.contains("a001 OK"), "{login}");
+
+    write
+        .write_all(b"a002 SELECT INBOX\r\n")
+        .await
+        .expect("write select");
+    write.flush().await.expect("flush select");
+
+    let select = read_until_tag(&mut reader, "a002 ").await;
+    assert!(select.contains("1 EXISTS"), "{select}");
+    assert!(select.contains("a002 OK"), "{select}");
+
+    write.write_all(b"a003 IDLE\r\n").await.expect("write idle");
+    write.flush().await.expect("flush idle");
+
+    let continuation =
+        read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(1)).await;
+    assert!(continuation.contains("+ idling"), "{continuation}");
+
+    runtime
+        .imap_connector()
+        .update_message_flags(
+            &scoped_mailbox,
+            uid,
+            vec!["\\Seen".to_string(), "\\Flagged".to_string()],
+        )
+        .await
+        .expect("update runtime flags");
+
+    let update = read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(1)).await;
+    assert!(update.contains("FETCH (FLAGS ("), "{update}");
+    assert!(update.contains("\\Flagged"), "{update}");
+    assert!(!update.contains("EXISTS"), "{update}");
+
+    write.write_all(b"DONE\r\n").await.expect("write done");
+    write.flush().await.expect("flush done");
+
+    let done = read_until_tag(&mut reader, "a003 ").await;
+    assert!(done.contains("a003 OK IDLE terminated"), "{done}");
 
     runtime.stop().await.expect("stop runtime");
 }

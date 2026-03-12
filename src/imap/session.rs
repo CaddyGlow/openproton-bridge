@@ -3148,7 +3148,7 @@ mod tests {
         }
     }
 
-    fn test_config_with_mode(mutation_mode: MutationMode) -> Arc<SessionConfig> {
+    fn test_compat_config_with_mode(mutation_mode: MutationMode) -> Arc<SessionConfig> {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
         let store = InMemoryStore::new();
@@ -3166,8 +3166,8 @@ mod tests {
         })
     }
 
-    fn test_config() -> Arc<SessionConfig> {
-        test_config_with_mode(MutationMode::Compat)
+    fn test_compat_config() -> Arc<SessionConfig> {
+        test_compat_config_with_mode(MutationMode::Compat)
     }
 
     struct TestGluonMailFixture {
@@ -3394,7 +3394,7 @@ mod tests {
         }
     }
 
-    fn multi_account_config(api_base_url: &str) -> Arc<SessionConfig> {
+    fn multi_account_compat_config(api_base_url: &str) -> Arc<SessionConfig> {
         let account_a = crate::api::types::Session {
             uid: "uid-a".to_string(),
             access_token: "access-a".to_string(),
@@ -3435,7 +3435,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_greet() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.greet().await.unwrap();
@@ -3450,7 +3450,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_capability() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 CAPABILITY").await.unwrap();
@@ -3470,7 +3470,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 NOOP").await.unwrap();
@@ -3485,7 +3485,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_selected_emits_exists_on_store_change() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3541,7 +3541,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_selected_waits_for_done_and_emits_exists() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3594,7 +3594,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_exists_when_new_message_arrives_after_start() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3696,7 +3696,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_expunge_and_exists_on_delete() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3827,7 +3827,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_flag_fetch_on_flag_only_change() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3958,7 +3958,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_logout() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         let action = session.handle_line("a001 LOGOUT").await.unwrap();
@@ -3975,7 +3975,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_bad_password() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session
@@ -4012,7 +4012,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = multi_account_config(&server.uri());
+        let config = multi_account_compat_config(&server.uri());
         config
             .runtime_accounts
             .set_health(
@@ -4056,7 +4056,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_not_authenticated() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 LIST \"\" \"*\"").await.unwrap();
@@ -4071,7 +4071,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_not_authenticated() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 SELECT INBOX").await.unwrap();
@@ -4086,7 +4086,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_authenticated() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4153,7 +4153,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_selected_mailbox() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -4173,7 +4173,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_command() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 BOGUS").await.unwrap();
@@ -4188,7 +4188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_starttls() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         let action = session.handle_line("a001 STARTTLS").await.unwrap();
@@ -4230,7 +4230,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4264,7 +4264,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_returns_body_item_not_bodystructure() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4325,7 +4325,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_section_returns_empty_literal_when_content_missing() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4373,7 +4373,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4511,7 +4511,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4644,7 +4644,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_copies_local_message_without_api_client() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4744,7 +4744,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_compat_mode_succeeds_when_upstream_fails() {
-        let config = test_config_with_mode(MutationMode::Compat);
+        let config = test_compat_config_with_mode(MutationMode::Compat);
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4774,7 +4774,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_strict_mode_fails_when_upstream_fails() {
-        let config = test_config_with_mode(MutationMode::Strict);
+        let config = test_compat_config_with_mode(MutationMode::Strict);
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4869,7 +4869,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5018,7 +5018,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_moves_local_message_without_api_client() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5131,7 +5131,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_strict_mode_fails_when_upstream_fails() {
-        let config = test_config_with_mode(MutationMode::Strict);
+        let config = test_compat_config_with_mode(MutationMode::Strict);
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5242,7 +5242,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5306,7 +5306,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_move_without_api_client_uses_uid_selection() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5370,7 +5370,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5542,7 +5542,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expunge_strict_mode_fails_when_upstream_fails() {
-        let config = test_config_with_mode(MutationMode::Strict);
+        let config = test_compat_config_with_mode(MutationMode::Strict);
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5628,7 +5628,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_expunge_strict_mode_fails_when_upstream_fails() {
-        let config = test_config_with_mode(MutationMode::Strict);
+        let config = test_compat_config_with_mode(MutationMode::Strict);
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5670,7 +5670,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_examine_reports_first_unseen_sequence_number() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5744,7 +5744,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5798,7 +5798,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5856,7 +5856,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_after_examine_resets_read_only_mode() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5926,7 +5926,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_after_examine_deselects_mailbox() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5974,7 +5974,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6098,7 +6098,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_fetch_flags_always_includes_uid() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6128,7 +6128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_store_flags_response_includes_uid() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6201,7 +6201,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_cached_rfc822() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6344,7 +6344,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6421,7 +6421,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_reports_first_unseen_sequence_and_permanentflags() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6678,7 +6678,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_exits_on_done() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6718,7 +6718,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unselect_does_not_expunge() {
-        let config = test_config();
+        let config = test_compat_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 

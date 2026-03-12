@@ -97,6 +97,7 @@ These reuse `gluon-rs-core` infra only, not mail semantics.
 
 - `BE-017` through `BE-028` are effectively implemented in the repo. The Gluon-backed read, mutation, connector, runtime selection, and event-worker paths exist and are covered by focused tests.
 - `BE-029` is partial. File-family capture, manifest checks, schema assertions, and unsupported-case documentation are in place, but true cache-open parity against a real upstream fixture set is still blocked by sanitized placeholder sqlite artifacts in `tests/fixtures/proton_profile_gluon_sanitized`.
+- A manual external-archive parity harness now exists in `tests/gluon_real_fixture.rs`. It accepts `OPENPROTON_REAL_GLUON_ARCHIVE=/path/to/profile.tar` and proves `CompatibleStore::open_read_only` can enumerate upstream mailboxes from a real extracted cache without checking private fixture data into the repo.
 - `BE-030` is in progress. IMAP read/mutation/IDLE parity and multiple event-worker Gluon paths are covered, but mixed event-batch and broader runtime parity are not yet fully closed.
 - `BE-031` is in progress. Recovery and corruption suites cover interrupted transaction replay, cache-move rollback recovery, missing-blob repair, and partial-sqlite fallback, but the plan still owes explicit corruption behavior docs.
 - `BE-032` has not started in earnest. CI still treats the Gluon backend as an incremental parity target, not the only/default backend, and release-candidate cutover criteria are not complete.
@@ -488,6 +489,7 @@ Deliverables:
 - fixture-open tests
 - schema/version assertions
 - documented unsupported cases if any remain
+- manual external-archive gate until a sanitized cache-open fixture can be checked in
 
 Required tests:
 

@@ -1,8 +1,19 @@
 use std::collections::HashMap;
 use std::fs;
+use std::sync::Arc;
 
+use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::api::types::{EmailAddress, MessageMetadata};
+use openproton_bridge::bridge::mail_runtime::{
+    self, DavTlsMode, ImapMutationBackend, ImapReadBackend, MailRuntimeConfig,
+    MailRuntimeTransition,
+};
+use openproton_bridge::bridge::session_manager::SessionManager;
 use openproton_bridge::imap::store::new_runtime_message_store;
+use openproton_bridge::paths::RuntimePaths;
+use openproton_bridge::vault;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 
 fn make_meta(id: &str) -> MessageMetadata {
     MessageMetadata {
@@ -88,6 +99,80 @@ fn is_cfg_test_guarded(source: &str, marker: &str) -> bool {
     matches!(previous_non_empty, Some(line) if line.trim() == "#[cfg(test)]")
 }
 
+fn runtime_test_session() -> Session {
+    Session {
+        uid: "uid-gluon-runtime".to_string(),
+        access_token: "live-access-token".to_string(),
+        refresh_token: "refresh-token".to_string(),
+        email: "runtime@proton.me".to_string(),
+        display_name: "Runtime Test".to_string(),
+        api_mode: ApiMode::Bridge,
+        key_passphrase: Some(base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"test-passphrase",
+        )),
+        bridge_password: Some("bridge-password".to_string()),
+    }
+}
+
+async fn free_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind temp port");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    port
+}
+
+async fn free_port_excluding(excluded: &[u16]) -> u16 {
+    loop {
+        let candidate = free_port().await;
+        if !excluded.contains(&candidate) {
+            return candidate;
+        }
+    }
+}
+
+async fn connect_with_retry(port: u16) -> TcpStream {
+    let addr = format!("127.0.0.1:{port}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+
+    loop {
+        match TcpStream::connect(&addr).await {
+            Ok(stream) => return stream,
+            Err(err) if tokio::time::Instant::now() < deadline => {
+                let _ = err;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(err) => panic!("connect to {addr} failed: {err}"),
+        }
+    }
+}
+
+async fn read_line(reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>) -> String {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read line");
+    line
+}
+
+async fn read_until_tag(
+    reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+    terminal_tag: &str,
+) -> String {
+    let mut response = String::new();
+    loop {
+        let line = read_line(reader).await;
+        if line.is_empty() {
+            break;
+        }
+        response.push_str(&line);
+        if line.starts_with(terminal_tag) {
+            break;
+        }
+    }
+    response
+}
+
 #[test]
 fn be028_persistent_json_store_paths_are_test_only() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -117,4 +202,71 @@ fn be028_persistent_json_store_paths_are_test_only() {
         !grpc_src.contains("PersistentStore"),
         "grpc runtime path must not reference PersistentStore"
     );
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_starts_imap_listener_with_gluon_defaults() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let config = MailRuntimeConfig {
+        bind_host: "127.0.0.1".to_string(),
+        imap_port,
+        smtp_port,
+        dav_enable: false,
+        dav_port: 8080,
+        dav_tls_mode: DavTlsMode::None,
+        disable_tls: false,
+        use_ssl_for_imap: false,
+        use_ssl_for_smtp: false,
+        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
+        imap_mutation_backend: ImapMutationBackend::GluonMail,
+        event_poll_interval: std::time::Duration::from_secs(30),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
+    };
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session)
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+
+    let stream = connect_with_retry(imap_port).await;
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+
+    let greeting = read_line(&mut reader).await;
+    assert!(greeting.contains("OK IMAP4rev1"), "{greeting}");
+
+    write
+        .write_all(b"a001 CAPABILITY\r\n")
+        .await
+        .expect("write capability");
+    write.flush().await.expect("flush capability");
+
+    let response = read_until_tag(&mut reader, "a001 ").await;
+    assert!(response.contains("* CAPABILITY IMAP4rev1"), "{response}");
+    assert!(response.contains("a001 OK"), "{response}");
+
+    runtime.stop().await.expect("stop runtime");
 }

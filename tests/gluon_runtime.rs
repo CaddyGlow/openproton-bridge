@@ -1138,8 +1138,13 @@ async fn be030_mail_runtime_event_update_reaches_idle_with_gluon_defaults() {
         read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(1)).await;
     assert!(continuation.contains("+ idling"), "{continuation}");
 
-    let update = read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(8)).await;
-    assert!(update.contains("2 EXISTS"), "{update}");
+    let mut idle_output = continuation;
+    if !idle_output.contains("2 EXISTS") {
+        idle_output.push_str(
+            &read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(8)).await,
+        );
+    }
+    assert!(idle_output.contains("2 EXISTS"), "{idle_output}");
 
     let scoped_inbox = format!("{}::INBOX", session.uid);
     assert_eq!(

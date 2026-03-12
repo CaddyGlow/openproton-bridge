@@ -14,6 +14,22 @@ Primary files:
 
 ## Current findings
 
+### Implemented Gluon recovery/corruption behaviors
+
+Observed:
+
+- Startup replays pending Gluon transaction journals before loading account state.
+- Unrecoverable pending journal artifacts fail startup with a `GluonCorruption` error rooted at `.gluon-txn`.
+- Missing blob references are repaired deterministically by pruning stale UID/blob mappings, persisting the repaired sqlite index, and bumping `uid_validity` so IMAP clients drop stale caches.
+- Readable but partial sqlite state falls back to blob discovery instead of surfacing mixed partial metadata.
+- Cache moves with unresolved staged transaction paths fail until the original root is restored and recovery can complete against the staged paths.
+
+Primary regression coverage:
+
+- `tests/gluon_recovery_integration.rs`
+- `tests/gluon_corruption.rs`
+- `tests/gluon_store_read.rs`
+
 ### 1) Checkpoint model differs from upstream sync-state model (medium)
 
 Observed:
@@ -74,6 +90,21 @@ Validation tasks:
 
 - Multi-account recovery replay with one degraded account and one healthy account.
 
+### 5) Fixture-open parity remains blocked by sanitized placeholder sqlite artifacts (open)
+
+Observed:
+
+- The checked-in sanitized fixture intentionally contains placeholder sqlite/deferred-delete artifacts for file-family coverage.
+- This is documented in `tests/fixtures/gluon_fixture_manifest.json` and enforced by fixture tests.
+
+Risk:
+
+- We cannot yet claim full upstream cache-open parity against a real official Gluon cache set.
+
+Validation tasks:
+
+- Capture and pin a real sanitized upstream cache set whose sqlite artifacts remain openable by the compatibility store.
+
 ## Proposed implementation plan (step 6 execution)
 
 1. Define a normalized checkpoint state machine document and validate all existing `sync_state` writes against it.
@@ -84,6 +115,7 @@ Validation tasks:
    - repeated transient failures
 3. Add parity assertions that checkpoint progression is monotonic and restart-safe.
 4. Expand recovery/restart fixtures to validate enum-state progression under mixed failure modes.
+5. Replace placeholder sanitized sqlite artifacts with a real cache-open fixture set for `BE-029`.
 
 ## Acceptance gates for checkpoint/recovery parity
 

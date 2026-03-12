@@ -2,16 +2,23 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 
-use openproton_bridge::api::types::{ApiMode, Session};
-use openproton_bridge::api::types::{EmailAddress, MessageMetadata};
+use openproton_bridge::api::types::{
+    Address, AddressKey, ApiMode, EmailAddress, MessageMetadata, Session, UserKey,
+};
+use openproton_bridge::bridge::accounts::RuntimeAuthMaterial;
 use openproton_bridge::bridge::mail_runtime::{
     self, DavTlsMode, ImapMutationBackend, ImapReadBackend, MailRuntimeConfig,
     MailRuntimeTransition,
 };
 use openproton_bridge::bridge::session_manager::SessionManager;
+use openproton_bridge::bridge::types::AccountId;
 use openproton_bridge::imap::store::new_runtime_message_store;
 use openproton_bridge::paths::RuntimePaths;
 use openproton_bridge::vault;
+use sequoia_openpgp as openpgp;
+use sequoia_openpgp::cert::CertBuilder;
+use sequoia_openpgp::crypto::Password;
+use sequoia_openpgp::serialize::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -115,6 +122,61 @@ fn runtime_test_session() -> Session {
     }
 }
 
+fn generate_test_cert_armored(password: &str) -> String {
+    let (cert, _) = CertBuilder::general_purpose(None, Some("runtime@test.local"))
+        .set_password(Some(Password::from(password)))
+        .generate()
+        .expect("generate test cert");
+
+    let mut armored_buf = Vec::new();
+    let mut armor_writer =
+        openpgp::armor::Writer::new(&mut armored_buf, openpgp::armor::Kind::SecretKey)
+            .expect("armor writer");
+    cert.as_tsk()
+        .serialize(&mut armor_writer)
+        .expect("serialize test cert");
+    armor_writer.finalize().expect("finalize armor");
+
+    String::from_utf8(armored_buf).expect("armor utf8")
+}
+
+fn runtime_auth_material_fixture(passphrase: &str, email: &str) -> RuntimeAuthMaterial {
+    let user_key = UserKey {
+        id: "user-key-1".to_string(),
+        private_key: generate_test_cert_armored(passphrase),
+        token: None,
+        signature: None,
+        primary: Some(1),
+        flags: None,
+        active: 1,
+    };
+    let address_key = AddressKey {
+        id: "addr-key-1".to_string(),
+        private_key: generate_test_cert_armored(passphrase),
+        token: None,
+        signature: None,
+        primary: Some(1),
+        flags: None,
+        active: 1,
+    };
+    let address = Address {
+        id: "addr-1".to_string(),
+        email: email.to_string(),
+        status: 1,
+        receive: 1,
+        send: 1,
+        address_type: 1,
+        order: 0,
+        display_name: "Runtime Test".to_string(),
+        keys: vec![address_key],
+    };
+
+    RuntimeAuthMaterial {
+        user_keys: vec![user_key],
+        addresses: vec![address],
+    }
+}
+
 async fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -205,7 +267,7 @@ fn be028_persistent_json_store_paths_are_test_only() {
 }
 
 #[tokio::test]
-async fn be030_mail_runtime_starts_imap_listener_with_gluon_defaults() {
+async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     let temp = tempfile::tempdir().expect("tempdir");
     let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
     let session = runtime_test_session();
@@ -238,7 +300,7 @@ async fn be030_mail_runtime_starts_imap_listener_with_gluon_defaults() {
         runtime_paths.settings_dir().to_path_buf(),
     ));
     session_manager
-        .seed_session(session)
+        .seed_session(session.clone())
         .await
         .expect("seed live runtime session");
     let runtime = mail_runtime::start(
@@ -250,6 +312,17 @@ async fn be030_mail_runtime_starts_imap_listener_with_gluon_defaults() {
     )
     .await
     .expect("start mail runtime");
+    runtime
+        .runtime_accounts()
+        .set_auth_material(
+            &AccountId(session.uid.clone()),
+            Arc::new(runtime_auth_material_fixture(
+                "test-passphrase",
+                &session.email,
+            )),
+        )
+        .await
+        .expect("seed runtime auth material");
 
     let stream = connect_with_retry(imap_port).await;
     let (read, mut write) = stream.into_split();
@@ -259,14 +332,25 @@ async fn be030_mail_runtime_starts_imap_listener_with_gluon_defaults() {
     assert!(greeting.contains("OK IMAP4rev1"), "{greeting}");
 
     write
-        .write_all(b"a001 CAPABILITY\r\n")
+        .write_all(b"a001 LOGIN runtime@proton.me bridge-password\r\n")
         .await
-        .expect("write capability");
-    write.flush().await.expect("flush capability");
+        .expect("write login");
+    write.flush().await.expect("flush login");
 
     let response = read_until_tag(&mut reader, "a001 ").await;
-    assert!(response.contains("* CAPABILITY IMAP4rev1"), "{response}");
     assert!(response.contains("a001 OK"), "{response}");
+    assert!(response.contains("LOGIN completed"), "{response}");
+
+    write
+        .write_all(b"a002 LIST \"\" \"*\"\r\n")
+        .await
+        .expect("write list");
+    write.flush().await.expect("flush list");
+
+    let list = read_until_tag(&mut reader, "a002 ").await;
+    assert!(list.contains("* LIST"), "{list}");
+    assert!(list.contains("INBOX"), "{list}");
+    assert!(list.contains("a002 OK"), "{list}");
 
     runtime.stop().await.expect("stop runtime");
 }

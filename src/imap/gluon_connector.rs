@@ -167,6 +167,8 @@ pub trait GluonImapConnector: Send + Sync {
     async fn delete_mailbox(&self, mailbox: &str, silent: bool) -> Result<()>;
     async fn remove_message_by_uid(&self, mailbox: &str, uid: u32) -> Result<()>;
     async fn remove_message_by_proton_id(&self, mailbox: &str, proton_id: &str) -> Result<()>;
+    async fn update_message_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>)
+        -> Result<()>;
     async fn copy_message(
         &self,
         source_mailbox: &str,
@@ -301,6 +303,21 @@ impl GluonImapConnector for StoreBackedConnector {
                 0,
             ));
         }
+        Ok(())
+    }
+
+    async fn update_message_flags(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        flags: Vec<String>,
+    ) -> Result<()> {
+        let proton_id = self.store.get_proton_id(mailbox, uid).await?;
+        self.store.set_flags(mailbox, uid, flags.clone()).await?;
+        self.publish_authored(GluonUpdate::MessageFlagsUpdated {
+            message: GluonMessageRef::from_mailbox_name(mailbox, uid, proton_id, 0),
+            flags: Some(flags),
+        });
         Ok(())
     }
 
@@ -640,6 +657,21 @@ impl GluonImapConnector for GluonMailConnector {
                 0,
             ));
         }
+        Ok(())
+    }
+
+    async fn update_message_flags(
+        &self,
+        mailbox: &str,
+        uid: u32,
+        flags: Vec<String>,
+    ) -> Result<()> {
+        let proton_id = self.view.get_proton_id(mailbox, uid).await?;
+        self.mutation.set_flags(mailbox, uid, flags.clone()).await?;
+        self.publish_authored(GluonUpdate::MessageFlagsUpdated {
+            message: GluonMessageRef::from_mailbox_name(mailbox, uid, proton_id, 0),
+            flags: Some(flags),
+        });
         Ok(())
     }
 

@@ -816,19 +816,27 @@ where
             .await?;
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
         let previous_exists = self.selected_mailbox_uids.len() as u32;
-        if snapshot.mod_seq > previous_mod_seq || snapshot.exists != previous_exists {
-            let current_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
-            let mut current_flags: HashMap<u32, Vec<String>> = HashMap::new();
-            for uid in &current_uids {
-                current_flags.insert(
-                    *uid,
-                    self.config
-                        .mailbox_view
-                        .get_flags(&scoped_mailbox, *uid)
-                        .await?,
-                );
-            }
+        let current_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+        let mut current_flags: HashMap<u32, Vec<String>> = HashMap::new();
+        for uid in &current_uids {
+            current_flags.insert(
+                *uid,
+                self.config
+                    .mailbox_view
+                    .get_flags(&scoped_mailbox, *uid)
+                    .await?,
+            );
+        }
+        let has_uid_change = current_uids != self.selected_mailbox_uids;
+        let has_flag_change = current_uids
+            .iter()
+            .any(|uid| self.selected_mailbox_flags.get(uid) != current_flags.get(uid));
 
+        if snapshot.mod_seq > previous_mod_seq
+            || snapshot.exists != previous_exists
+            || has_uid_change
+            || has_flag_change
+        {
             if self.selected_mailbox_mod_seq.is_some() {
                 let current_uid_set: HashSet<u32> = current_uids.iter().copied().collect();
                 let mut removed_count = 0u32;
@@ -3858,6 +3866,70 @@ mod tests {
         config
             .store
             .set_flags("test-uid::INBOX", uid, vec!["\\Seen".to_string()])
+            .await
+            .unwrap();
+
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("FETCH (FLAGS (\\Seen))"),
+            "response={response}"
+        );
+        assert!(!response.contains("EXISTS"), "response={response}");
+
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), idle_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_idle_emits_flag_fetch_on_gluon_connector_flag_change() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-idle-flag",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-idle-flag\r\n\r\nbody",
+        )
+        .await;
+        prime_selected_state_from_view(&mut session, &config, "test-uid::INBOX").await;
+        session.selected_mailbox_flags.insert(uid, Vec::new());
+
+        let idle_task =
+            tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"), "response={response}");
+
+        config
+            .gluon_connector
+            .update_message_flags("test-uid::INBOX", uid, vec!["\\Seen".to_string()])
             .await
             .unwrap();
 

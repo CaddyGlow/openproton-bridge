@@ -18,9 +18,14 @@ use crate::api::types::{
 };
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
-use crate::imap::gluon_connector::{GluonImapConnector, StoreBackedConnector};
+use crate::imap::gluon_connector::GluonImapConnector;
+#[cfg(test)]
+use crate::imap::gluon_connector::StoreBackedConnector;
 use crate::imap::mailbox;
-use crate::imap::mailbox_view::{GluonMailboxView, StoreBackedMailboxView};
+use crate::imap::mailbox_view::GluonMailboxView;
+#[cfg(test)]
+use crate::imap::mailbox_view::StoreBackedMailboxView;
+#[cfg(test)]
 use crate::imap::store::MessageStore;
 use crate::pim::incremental as pim_incremental;
 use crate::pim::store::PimStore;
@@ -2087,81 +2092,6 @@ pub async fn run_event_worker(config: EventWorkerConfig, poll_interval: Duration
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    start_event_worker_group_with_sync_progress(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        None,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group_with_sync_progress(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    start_event_worker_group_with_compat_store_and_sync_progress_and_pim(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        HashMap::new(),
-        sync_progress_callback,
-        poll_interval,
-    )
-}
-
-// Compat-only convenience wrapper that still synthesizes store-backed state.
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_worker_group_with_compat_store_and_sync_progress_and_pim(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    pim_stores: HashMap<String, Arc<PimStore>>,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> EventWorkerGroup {
-    let connector = StoreBackedConnector::new(store.clone());
-    let mailbox_view = StoreBackedMailboxView::new(store.clone());
-    start_event_worker_group_with_sync_progress_and_pim_and_connector(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        mailbox_view,
-        connector,
-        checkpoint_store,
-        pim_stores,
-        sync_progress_callback,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn build_event_worker_configs(
     runtime_accounts: Arc<RuntimeAccountRegistry>,
     accounts: Vec<RuntimeAccountInfo>,
@@ -2239,80 +2169,6 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
         shutdown_tx,
         handles,
     }
-}
-
-pub fn start_event_workers(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    poll_interval: Duration,
-) -> Vec<JoinHandle<()>> {
-    start_event_workers_with_sync_progress(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        None,
-        poll_interval,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_workers_with_sync_progress(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> Vec<JoinHandle<()>> {
-    start_event_workers_with_compat_store_and_sync_progress_and_pim(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        store,
-        checkpoint_store,
-        HashMap::new(),
-        sync_progress_callback,
-        poll_interval,
-    )
-}
-
-// Compat-only convenience wrapper that still synthesizes store-backed state.
-#[allow(clippy::too_many_arguments)]
-pub fn start_event_workers_with_compat_store_and_sync_progress_and_pim(
-    runtime_accounts: Arc<RuntimeAccountRegistry>,
-    accounts: Vec<RuntimeAccountInfo>,
-    api_base_url: String,
-    auth_router: AuthRouter,
-    store: Arc<dyn MessageStore>,
-    checkpoint_store: SharedCheckpointStore,
-    pim_stores: HashMap<String, Arc<PimStore>>,
-    sync_progress_callback: Option<SyncProgressCallback>,
-    poll_interval: Duration,
-) -> Vec<JoinHandle<()>> {
-    let connector = StoreBackedConnector::new(store.clone());
-    let mailbox_view = StoreBackedMailboxView::new(store.clone());
-    start_event_workers_with_sync_progress_and_pim_and_connector(
-        runtime_accounts,
-        accounts,
-        api_base_url,
-        auth_router,
-        mailbox_view,
-        connector,
-        checkpoint_store,
-        pim_stores,
-        sync_progress_callback,
-        poll_interval,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2405,7 +2261,7 @@ mod tests {
         })
     }
 
-    // Rollback/compat helper that still builds the legacy store-backed worker shape.
+    // Store-backed helper for targeted tests that do not need a Gluon fixture.
     fn event_worker_config(
         server_uri: &str,
         runtime: Arc<RuntimeAccountRegistry>,
@@ -2458,6 +2314,15 @@ mod tests {
             checkpoints,
         );
         (config, tempdir)
+    }
+
+    fn store_backed_worker_components(
+        store: Arc<dyn MessageStore>,
+    ) -> (Arc<dyn GluonMailboxView>, Arc<dyn GluonImapConnector>) {
+        (
+            StoreBackedMailboxView::new(store.clone()),
+            StoreBackedConnector::new(store),
+        )
     }
 
     #[test]
@@ -5455,13 +5320,17 @@ mod tests {
             sample_session("uid-2", "b@proton.me", "p2"),
         ]));
 
-        let handles = start_event_workers(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let handles = start_event_workers_with_sync_progress_and_pim_and_connector(
             runtime,
             accounts,
             "http://127.0.0.1:1".to_string(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints,
+            HashMap::new(),
+            None,
             Duration::from_secs(3600),
         );
         assert_eq!(handles.len(), 2);
@@ -5499,13 +5368,17 @@ mod tests {
             sample_session("uid-2", "b@proton.me", "p2"),
         ]));
 
-        let group = start_event_worker_group(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let group = start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime,
             accounts,
             "http://127.0.0.1:1".to_string(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints,
+            HashMap::new(),
+            None,
             Duration::from_secs(3600),
         );
         assert_eq!(group.len(), 2);
@@ -5583,13 +5456,17 @@ mod tests {
             },
         ];
 
-        let group = start_event_worker_group(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let group = start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime.clone(),
             accounts,
             server.uri(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints.clone(),
+            HashMap::new(),
+            None,
             Duration::from_millis(50),
         );
 
@@ -5780,13 +5657,16 @@ mod tests {
             progress_events_sink.lock().unwrap().push(event);
         });
 
-        let group = start_event_worker_group_with_sync_progress(
+        let (mailbox_view, connector) = store_backed_worker_components(store);
+        let group = start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime,
             accounts,
             server.uri(),
             auth_router,
-            store,
+            mailbox_view,
+            connector,
             checkpoints,
+            HashMap::new(),
             Some(callback),
             Duration::from_millis(50),
         );

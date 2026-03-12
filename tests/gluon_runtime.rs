@@ -313,6 +313,98 @@ async fn read_chunk_with_timeout(
     String::from_utf8_lossy(&buf[..n]).to_string()
 }
 
+fn runtime_test_config(imap_port: u16, smtp_port: u16, api_base_url: String) -> MailRuntimeConfig {
+    MailRuntimeConfig {
+        bind_host: "127.0.0.1".to_string(),
+        imap_port,
+        smtp_port,
+        dav_enable: false,
+        dav_port: 8080,
+        dav_tls_mode: DavTlsMode::None,
+        disable_tls: false,
+        use_ssl_for_imap: false,
+        use_ssl_for_smtp: false,
+        api_base_url,
+        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
+        imap_mutation_backend: ImapMutationBackend::GluonMail,
+        event_poll_interval: std::time::Duration::from_secs(30),
+        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
+        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
+        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
+    }
+}
+
+async fn seed_runtime_auth(runtime: &mail_runtime::MailRuntimeHandle, session: &Session) {
+    runtime
+        .runtime_accounts()
+        .set_auth_material(
+            &AccountId(session.uid.clone()),
+            Arc::new(runtime_auth_material_fixture(
+                "test-passphrase",
+                &session.email,
+            )),
+        )
+        .await
+        .expect("seed runtime auth material");
+}
+
+async fn login_and_select_inbox(
+    imap_port: u16,
+) -> (
+    BufReader<tokio::net::tcp::OwnedReadHalf>,
+    tokio::net::tcp::OwnedWriteHalf,
+) {
+    let stream = connect_with_retry(imap_port).await;
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+
+    let greeting = read_line(&mut reader).await;
+    assert!(greeting.contains("OK IMAP4rev1"), "{greeting}");
+
+    write
+        .write_all(b"a001 LOGIN runtime@proton.me bridge-password\r\n")
+        .await
+        .expect("write login");
+    write.flush().await.expect("flush login");
+    let login = read_until_tag(&mut reader, "a001 ").await;
+    assert!(login.contains("a001 OK"), "{login}");
+
+    write
+        .write_all(b"a002 SELECT INBOX\r\n")
+        .await
+        .expect("write select");
+    write.flush().await.expect("flush select");
+    let select = read_until_tag(&mut reader, "a002 ").await;
+    assert!(select.contains("1 EXISTS"), "{select}");
+    assert!(select.contains("a002 OK"), "{select}");
+
+    (reader, write)
+}
+
+async fn mount_runtime_event_mocks(server: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/latest"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000,
+            "EventID": "event-0",
+            "Refresh": 0,
+            "Events": []
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/event-0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000,
+            "EventID": "event-0",
+            "Refresh": 0,
+            "Events": []
+        })))
+        .mount(server)
+        .await;
+}
+
 #[test]
 fn be028_persistent_json_store_paths_are_test_only() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -356,25 +448,11 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
-    let config = MailRuntimeConfig {
-        bind_host: "127.0.0.1".to_string(),
+    let config = runtime_test_config(
         imap_port,
         smtp_port,
-        dav_enable: false,
-        dav_port: 8080,
-        dav_tls_mode: DavTlsMode::None,
-        disable_tls: false,
-        use_ssl_for_imap: false,
-        use_ssl_for_smtp: false,
-        api_base_url: "https://mail-api.proton.me".to_string(),
-        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
-        imap_mutation_backend: ImapMutationBackend::GluonMail,
-        event_poll_interval: std::time::Duration::from_secs(30),
-        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
-        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
-        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
-        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
-    };
+        "https://mail-api.proton.me".to_string(),
+    );
 
     let session_manager = Arc::new(SessionManager::new(
         runtime_paths.settings_dir().to_path_buf(),
@@ -392,17 +470,7 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     )
     .await
     .expect("start mail runtime");
-    runtime
-        .runtime_accounts()
-        .set_auth_material(
-            &AccountId(session.uid.clone()),
-            Arc::new(runtime_auth_material_fixture(
-                "test-passphrase",
-                &session.email,
-            )),
-        )
-        .await
-        .expect("seed runtime auth material");
+    seed_runtime_auth(&runtime, &session).await;
 
     let stream = connect_with_retry(imap_port).await;
     let (read, mut write) = stream.into_split();
@@ -479,25 +547,11 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
-    let config = MailRuntimeConfig {
-        bind_host: "127.0.0.1".to_string(),
+    let config = runtime_test_config(
         imap_port,
         smtp_port,
-        dav_enable: false,
-        dav_port: 8080,
-        dav_tls_mode: DavTlsMode::None,
-        disable_tls: false,
-        use_ssl_for_imap: false,
-        use_ssl_for_smtp: false,
-        api_base_url: "https://mail-api.proton.me".to_string(),
-        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
-        imap_mutation_backend: ImapMutationBackend::GluonMail,
-        event_poll_interval: std::time::Duration::from_secs(30),
-        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
-        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
-        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
-        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
-    };
+        "https://mail-api.proton.me".to_string(),
+    );
 
     let session_manager = Arc::new(SessionManager::new(
         runtime_paths.settings_dir().to_path_buf(),
@@ -515,17 +569,7 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
     )
     .await
     .expect("start mail runtime");
-    runtime
-        .runtime_accounts()
-        .set_auth_material(
-            &AccountId(session.uid.clone()),
-            Arc::new(runtime_auth_material_fixture(
-                "test-passphrase",
-                &session.email,
-            )),
-        )
-        .await
-        .expect("seed runtime auth material");
+    seed_runtime_auth(&runtime, &session).await;
 
     let scoped_mailbox = format!("{}::INBOX", session.uid);
     let uid = runtime
@@ -613,16 +657,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("GET"))
-        .and(path("/core/v4/events/latest"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "Code": 1000,
-            "EventID": "event-0",
-            "Refresh": 0,
-            "Events": []
-        })))
-        .mount(&server)
-        .await;
+    mount_runtime_event_mocks(&server).await;
 
     let temp = tempfile::tempdir().expect("tempdir");
     let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
@@ -634,25 +669,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
-    let config = MailRuntimeConfig {
-        bind_host: "127.0.0.1".to_string(),
-        imap_port,
-        smtp_port,
-        dav_enable: false,
-        dav_port: 8080,
-        dav_tls_mode: DavTlsMode::None,
-        disable_tls: false,
-        use_ssl_for_imap: false,
-        use_ssl_for_smtp: false,
-        api_base_url: server.uri(),
-        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
-        imap_mutation_backend: ImapMutationBackend::GluonMail,
-        event_poll_interval: std::time::Duration::from_secs(30),
-        pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
-        pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),
-        pim_calendar_reconcile_interval: std::time::Duration::from_secs(300),
-        pim_calendar_horizon_reconcile_interval: std::time::Duration::from_secs(300),
-    };
+    let config = runtime_test_config(imap_port, smtp_port, server.uri());
 
     let session_manager = Arc::new(SessionManager::new(
         runtime_paths.settings_dir().to_path_buf(),
@@ -670,17 +687,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
     )
     .await
     .expect("start mail runtime");
-    runtime
-        .runtime_accounts()
-        .set_auth_material(
-            &AccountId(session.uid.clone()),
-            Arc::new(runtime_auth_material_fixture(
-                "test-passphrase",
-                &session.email,
-            )),
-        )
-        .await
-        .expect("seed runtime auth material");
+    seed_runtime_auth(&runtime, &session).await;
 
     let scoped_mailbox = format!("{}::INBOX", session.uid);
     let uid = runtime
@@ -701,29 +708,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
         .await
         .expect("seed initial runtime flags");
 
-    let stream = connect_with_retry(imap_port).await;
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-
-    let greeting = read_line(&mut reader).await;
-    assert!(greeting.contains("OK IMAP4rev1"), "{greeting}");
-
-    write
-        .write_all(b"a001 LOGIN runtime@proton.me bridge-password\r\n")
-        .await
-        .expect("write login");
-    write.flush().await.expect("flush login");
-    let login = read_until_tag(&mut reader, "a001 ").await;
-    assert!(login.contains("a001 OK"), "{login}");
-
-    write
-        .write_all(b"a002 SELECT INBOX\r\n")
-        .await
-        .expect("write select");
-    write.flush().await.expect("flush select");
-    let select = read_until_tag(&mut reader, "a002 ").await;
-    assert!(select.contains("1 EXISTS"), "{select}");
-    assert!(select.contains("a002 OK"), "{select}");
+    let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
 
     write
         .write_all(b"a003 STORE 1 FLAGS ()\r\n")
@@ -733,6 +718,286 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
     let store = read_until_tag(&mut reader, "a003 ").await;
     assert!(store.contains("* 1 FETCH (FLAGS ())"), "{store}");
     assert!(store.contains("a003 OK STORE completed"), "{store}");
+
+    server.verify().await;
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/label"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_runtime_event_mocks(&server).await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let config = runtime_test_config(imap_port, smtp_port, server.uri());
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    seed_runtime_auth(&runtime, &session).await;
+
+    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let inbox_uid = runtime
+        .imap_connector()
+        .list_uids(&scoped_inbox)
+        .await
+        .expect("list runtime inbox uids")
+        .into_iter()
+        .next()
+        .expect("seeded inbox uid");
+    assert_eq!(inbox_uid, 1);
+
+    let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
+
+    write
+        .write_all(b"a003 COPY 1 Archive\r\n")
+        .await
+        .expect("write copy");
+    write.flush().await.expect("flush copy");
+    let copy = read_until_tag(&mut reader, "a003 ").await;
+    assert!(copy.contains("[COPYUID"), "{copy}");
+    assert!(copy.contains("COPY completed"), "{copy}");
+
+    let scoped_archive = format!("{}::Archive", session.uid);
+    assert_eq!(
+        runtime
+            .imap_connector()
+            .list_uids(&scoped_inbox)
+            .await
+            .expect("list inbox after copy"),
+        vec![1]
+    );
+    assert_eq!(
+        runtime
+            .imap_connector()
+            .list_uids(&scoped_archive)
+            .await
+            .expect("list archive after copy"),
+        vec![1]
+    );
+    let archive_literal = runtime
+        .imap_connector()
+        .get_message_literal(&scoped_archive, 1)
+        .await
+        .expect("archive literal result")
+        .expect("archive literal");
+    let archive_body = String::from_utf8_lossy(&archive_literal);
+    assert!(archive_body.contains("Runtime Subject"), "{archive_body}");
+
+    server.verify().await;
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_expunge_syncs_upstream_with_gluon_defaults() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/label"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_runtime_event_mocks(&server).await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let config = runtime_test_config(imap_port, smtp_port, server.uri());
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    seed_runtime_auth(&runtime, &session).await;
+
+    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let inbox_uid = runtime
+        .imap_connector()
+        .list_uids(&scoped_inbox)
+        .await
+        .expect("list runtime inbox uids")
+        .into_iter()
+        .next()
+        .expect("seeded inbox uid");
+    runtime
+        .imap_connector()
+        .update_message_flags(
+            &scoped_inbox,
+            inbox_uid,
+            vec!["\\Seen".to_string(), "\\Deleted".to_string()],
+        )
+        .await
+        .expect("mark message deleted");
+
+    let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
+
+    write
+        .write_all(b"a003 EXPUNGE\r\n")
+        .await
+        .expect("write expunge");
+    write.flush().await.expect("flush expunge");
+    let expunge = read_until_tag(&mut reader, "a003 ").await;
+    assert!(expunge.contains("* 1 EXPUNGE"), "{expunge}");
+    assert!(expunge.contains("a003 OK EXPUNGE completed"), "{expunge}");
+
+    assert!(runtime
+        .imap_connector()
+        .list_uids(&scoped_inbox)
+        .await
+        .expect("list inbox after expunge")
+        .is_empty());
+
+    server.verify().await;
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
+    let server = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/label"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path("/mail/v4/messages/unlabel"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_runtime_event_mocks(&server).await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let config = runtime_test_config(imap_port, smtp_port, server.uri());
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    seed_runtime_auth(&runtime, &session).await;
+
+    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let inbox_uid = runtime
+        .imap_connector()
+        .list_uids(&scoped_inbox)
+        .await
+        .expect("list runtime inbox uids")
+        .into_iter()
+        .next()
+        .expect("seeded inbox uid");
+    assert_eq!(inbox_uid, 1);
+
+    let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
+
+    write
+        .write_all(b"a003 MOVE 1 Archive\r\n")
+        .await
+        .expect("write move");
+    write.flush().await.expect("flush move");
+    let move_response = read_until_tag(&mut reader, "a003 ").await;
+    assert!(move_response.contains("* 1 EXPUNGE"), "{move_response}");
+    assert!(move_response.contains("MOVE completed"), "{move_response}");
+
+    let scoped_archive = format!("{}::Archive", session.uid);
+    assert!(runtime
+        .imap_connector()
+        .list_uids(&scoped_inbox)
+        .await
+        .expect("list inbox after move")
+        .is_empty());
+    assert_eq!(
+        runtime
+            .imap_connector()
+            .list_uids(&scoped_archive)
+            .await
+            .expect("list archive after move"),
+        vec![1]
+    );
+    let archive_literal = runtime
+        .imap_connector()
+        .get_message_literal(&scoped_archive, 1)
+        .await
+        .expect("archive literal result")
+        .expect("archive literal");
+    let archive_body = String::from_utf8_lossy(&archive_literal);
+    assert!(archive_body.contains("Runtime Subject"), "{archive_body}");
 
     server.verify().await;
     runtime.stop().await.expect("stop runtime");

@@ -1383,19 +1383,22 @@ mod service_tests {
     use crate::bridge::mail_runtime::{ImapMutationBackend, ImapReadBackend};
 
     #[test]
-    fn runtime_config_ignores_legacy_backend_selection_from_stored_settings() {
-        let settings = StoredMailSettings {
-            imap_port: 1143,
-            smtp_port: 1025,
-            use_ssl_for_imap: true,
-            use_ssl_for_smtp: true,
-            imap_read_backend: ImapReadBackend::Compat,
-            imap_mutation_backend: ImapMutationBackend::Compat,
-            pim_reconcile_tick_secs: 600,
-            pim_contacts_reconcile_secs: 86_400,
-            pim_calendar_reconcile_secs: 86_400,
-            pim_calendar_horizon_reconcile_secs: 43_200,
-        };
+    fn runtime_config_uses_gluon_backends_after_loading_legacy_backend_settings() {
+        let settings: StoredMailSettings = serde_json::from_str(
+            r#"{
+                "imap_port": 1143,
+                "smtp_port": 1025,
+                "use_ssl_for_imap": true,
+                "use_ssl_for_smtp": true,
+                "imap_read_backend": "compat",
+                "imap_mutation_backend": "compat",
+                "pim_reconcile_tick_secs": 600,
+                "pim_contacts_reconcile_secs": 86400,
+                "pim_calendar_reconcile_secs": 86400,
+                "pim_calendar_horizon_reconcile_secs": 43200
+            }"#,
+        )
+        .unwrap();
 
         let config = build_mail_runtime_config("127.0.0.1".to_string(), &settings).unwrap();
 

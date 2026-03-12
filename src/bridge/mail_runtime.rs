@@ -7,7 +7,6 @@ use anyhow::Context;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_NO_PAD;
 use base64::Engine;
 use rand::RngCore;
-use serde::de::Error as _;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
@@ -36,49 +35,6 @@ impl DavTlsMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
-pub enum ImapReadBackend {
-    #[default]
-    #[serde(rename = "gluon_mail_read_only")]
-    GluonMailReadOnly,
-}
-
-impl<'de> serde::Deserialize<'de> for ImapReadBackend {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "gluon_mail_read_only" | "compat" => Ok(Self::GluonMailReadOnly),
-            other => Err(D::Error::unknown_variant(
-                other,
-                &["gluon_mail_read_only", "compat"],
-            )),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Default)]
-pub enum ImapMutationBackend {
-    #[default]
-    #[serde(rename = "gluon_mail")]
-    GluonMail,
-}
-
-impl<'de> serde::Deserialize<'de> for ImapMutationBackend {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        match value.as_str() {
-            "gluon_mail" | "compat" => Ok(Self::GluonMail),
-            other => Err(D::Error::unknown_variant(other, &["gluon_mail", "compat"])),
-        }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct MailRuntimeConfig {
     pub bind_host: String,
@@ -91,8 +47,6 @@ pub struct MailRuntimeConfig {
     pub use_ssl_for_imap: bool,
     pub use_ssl_for_smtp: bool,
     pub api_base_url: String,
-    pub imap_read_backend: ImapReadBackend,
-    pub imap_mutation_backend: ImapMutationBackend,
     pub event_poll_interval: Duration,
     pub pim_reconcile_tick_interval: Duration,
     pub pim_contacts_reconcile_interval: Duration,
@@ -1701,7 +1655,7 @@ mod tests {
 
     use super::{
         build_gluon_mail_compatible_store, handle_startup_refresh_failure, is_sync_scope_due,
-        ImapMutationBackend, ImapReadBackend, Session,
+        Session,
     };
     use crate::api::error::ApiError;
     use crate::api::types::ApiMode;
@@ -1853,26 +1807,6 @@ mod tests {
         assert_eq!(store.bootstrap().accounts.len(), 1);
         assert_eq!(store.bootstrap().accounts[0].account_id, "account-1");
         assert_eq!(store.bootstrap().accounts[0].storage_user_id, "user-1");
-    }
-
-    #[test]
-    fn imap_read_backend_maps_legacy_compat_to_gluon_mail_read_only() {
-        let decoded: ImapReadBackend = serde_json::from_str("\"compat\"").unwrap();
-        assert_eq!(decoded, ImapReadBackend::GluonMailReadOnly);
-        assert_eq!(
-            ImapReadBackend::default(),
-            ImapReadBackend::GluonMailReadOnly
-        );
-    }
-
-    #[test]
-    fn imap_mutation_backend_maps_legacy_compat_to_gluon_mail() {
-        let decoded: ImapMutationBackend = serde_json::from_str("\"compat\"").unwrap();
-        assert_eq!(decoded, ImapMutationBackend::GluonMail);
-        assert_eq!(
-            ImapMutationBackend::default(),
-            ImapMutationBackend::GluonMail
-        );
     }
 
     #[tokio::test]

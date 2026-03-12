@@ -9,16 +9,6 @@ struct CompleteLoginArgs {
     granted_scopes: Vec<String>,
 }
 
-fn production_imap_backends() -> (
-    bridge::mail_runtime::ImapReadBackend,
-    bridge::mail_runtime::ImapMutationBackend,
-) {
-    (
-        bridge::mail_runtime::ImapReadBackend::GluonMailReadOnly,
-        bridge::mail_runtime::ImapMutationBackend::GluonMail,
-    )
-}
-
 fn build_mail_runtime_config(
     bind_host: String,
     settings: &StoredMailSettings,
@@ -27,9 +17,6 @@ fn build_mail_runtime_config(
         .with_context(|| format!("invalid IMAP port in grpc settings: {}", settings.imap_port))?;
     let smtp_port = u16::try_from(settings.smtp_port)
         .with_context(|| format!("invalid SMTP port in grpc settings: {}", settings.smtp_port))?;
-    // Keep parsing legacy backend selections from older settings files, but do not
-    // let them steer the live runtime now that Gluon is the production-only path.
-    let (imap_read_backend, imap_mutation_backend) = production_imap_backends();
 
     Ok(bridge::mail_runtime::MailRuntimeConfig {
         bind_host,
@@ -42,8 +29,6 @@ fn build_mail_runtime_config(
         use_ssl_for_imap: settings.use_ssl_for_imap,
         use_ssl_for_smtp: settings.use_ssl_for_smtp,
         api_base_url: "https://mail-api.proton.me".to_string(),
-        imap_read_backend,
-        imap_mutation_backend,
         event_poll_interval: std::time::Duration::from_secs(30),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(
             settings.pim_reconcile_tick_secs as u64,
@@ -1380,10 +1365,9 @@ impl BridgeService {
 #[cfg(test)]
 mod service_tests {
     use super::{build_mail_runtime_config, StoredMailSettings};
-    use crate::bridge::mail_runtime::{ImapMutationBackend, ImapReadBackend};
 
     #[test]
-    fn runtime_config_uses_gluon_backends_after_loading_legacy_backend_settings() {
+    fn runtime_config_ignores_legacy_backend_fields_in_stored_settings_payload() {
         let settings: StoredMailSettings = serde_json::from_str(
             r#"{
                 "imap_port": 1143,
@@ -1402,7 +1386,9 @@ mod service_tests {
 
         let config = build_mail_runtime_config("127.0.0.1".to_string(), &settings).unwrap();
 
-        assert_eq!(config.imap_read_backend, ImapReadBackend::GluonMailReadOnly);
-        assert_eq!(config.imap_mutation_backend, ImapMutationBackend::GluonMail);
+        assert_eq!(config.imap_port, 1143);
+        assert_eq!(config.smtp_port, 1025);
+        assert!(config.use_ssl_for_imap);
+        assert!(config.use_ssl_for_smtp);
     }
 }

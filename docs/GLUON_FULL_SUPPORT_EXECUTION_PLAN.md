@@ -100,7 +100,7 @@ These reuse `gluon-rs-core` infra only, not mail semantics.
 - The private-fixture parity harness accepts either `OPENPROTON_REAL_GLUON_PROFILE=/path/to/bridge-v3` or `OPENPROTON_REAL_GLUON_ARCHIVE=/path/to/profile.tar`, and it can also take `OPENPROTON_REAL_VAULT_KEY` (or legacy alias `OPENPROTON_REAL_GLUON_KEY`) to decrypt `vault.enc`, derive real per-account `gluon_key` bindings, and verify real blob decryption without checking secrets or fixture payloads into the repo.
 - `BE-030` is in progress. IMAP read/mutation/IDLE parity and multiple event-worker Gluon paths are covered, compat-only IMAP helpers are explicitly named, and there is now a live mail-runtime IMAP probe on the Gluon defaults that exercises startup, offline `LOGIN`, authenticated `LIST`/`SELECT`/`FETCH`/`SEARCH`, authenticated `COPY`/`MOVE`/`STORE`/`EXPUNGE` upstream sync, direct connector-driven `IDLE` flag updates, event-worker-driven create/delete updates, and refresh-resync updates surfaced through real IMAP `IDLE`/`NOOP`. The remaining gap is narrower release/cutover confidence rather than missing core runtime protocol coverage.
 - `BE-031` is in progress. Recovery and corruption suites cover interrupted transaction replay, cache-move rollback recovery, missing-blob repair, partial-sqlite fallback, and the corresponding corruption behavior docs are landed. The remaining gap is broader cutover confidence rather than missing recovery documentation.
-- `BE-032` is in progress. CI coverage exists for the Gluon backend, the runtime defaults IMAP read and mutation backends to Gluon, and legacy `"compat"` settings now deserialize as Gluon aliases instead of selecting a separate runtime branch. Remaining work is the release-candidate acceptance checklist plus operator-facing cutover and rollback docs.
+- `BE-032` is in progress. CI coverage exists for the Gluon backend, backend-selection fields have been removed from the persisted/runtime config surface, and old JSON keys are ignored on load. Remaining work is the release-candidate acceptance checklist plus operator-facing cutover and rollback docs.
 
 ## Lane Ownership
 
@@ -471,7 +471,7 @@ Outcome:
 Deliverables:
 
 - append/store/copy/move/expunge use adapter
-- Gluon is the default runtime backend, and legacy `"compat"` backend settings deserialize to the Gluon path rather than selecting a separate runtime branch
+- Gluon is the only runtime backend path, and legacy backend-selection keys are ignored if they still exist in older settings files
 
 Required tests:
 
@@ -590,7 +590,7 @@ Handoff: include risks, assumptions, and follow-up needed by main agent.
 
 ## Cutover Readiness Gate
 
-Production runtime is single-backend Gluon. Keep legacy `"compat"` parsing only as a backward-compatible alias for stored settings payloads until all are true:
+Production runtime is single-backend Gluon. Keep old backend-selection JSON keys load-tolerant until all are true:
 
 - `BE-029` green
 - `BE-030` green

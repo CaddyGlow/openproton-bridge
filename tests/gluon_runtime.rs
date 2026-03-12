@@ -13,8 +13,7 @@ use openproton_bridge::api::types::{
 use openproton_bridge::bridge::accounts::RuntimeAuthMaterial;
 use openproton_bridge::bridge::events::VaultCheckpointStore;
 use openproton_bridge::bridge::mail_runtime::{
-    self, DavTlsMode, ImapMutationBackend, ImapReadBackend, MailRuntimeConfig,
-    MailRuntimeTransition,
+    self, DavTlsMode, MailRuntimeConfig, MailRuntimeTransition,
 };
 use openproton_bridge::bridge::session_manager::SessionManager;
 use openproton_bridge::bridge::types::{
@@ -374,8 +373,6 @@ fn runtime_test_config(imap_port: u16, smtp_port: u16, api_base_url: String) -> 
         use_ssl_for_imap: false,
         use_ssl_for_smtp: false,
         api_base_url,
-        imap_read_backend: ImapReadBackend::GluonMailReadOnly,
-        imap_mutation_backend: ImapMutationBackend::GluonMail,
         event_poll_interval: std::time::Duration::from_secs(30),
         pim_reconcile_tick_interval: std::time::Duration::from_secs(60),
         pim_contacts_reconcile_interval: std::time::Duration::from_secs(300),

@@ -46,7 +46,7 @@ fn test_imap_config() -> Arc<SessionConfig> {
         mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
         mailbox_view: StoreBackedMailboxView::new(store.clone()),
         store,
-        mutation_mode: MutationMode::Compat,
+        mutation_mode: MutationMode::Strict,
     })
 }
 

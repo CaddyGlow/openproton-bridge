@@ -90,11 +90,12 @@ Validation tasks:
 Observed:
 
 - OpenProton `MutationMode::{Compat,Strict}` governs whether upstream mutation errors fail IMAP commands.
+- The live bridge now defaults to `Strict`, matching Proton Bridge command-level mutation behavior.
 - Tests exist for strict failures (`COPY`, `MOVE`, `EXPUNGE`, `UID EXPUNGE`) and compat success fallback.
 
 Risk:
 
-- Behavior is intentional but should be explicitly documented as divergence if upstream command-level policy differs.
+- `Compat` remains available for explicitly scoped tests and fallback analysis, so drift can re-enter if callers start depending on it implicitly.
 
 Validation tasks:
 

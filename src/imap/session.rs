@@ -55,8 +55,8 @@ enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MutationMode {
     #[default]
-    Compat,
     Strict,
+    Compat,
 }
 
 pub struct SessionConfig {
@@ -3186,16 +3186,21 @@ mod tests {
         test_compat_config_with_mode(MutationMode::Compat)
     }
 
+    #[test]
+    fn mutation_mode_defaults_to_strict() {
+        assert_eq!(MutationMode::default(), MutationMode::Strict);
+    }
+
     struct TestGluonMailFixture {
         _tempdir: TempDir,
     }
 
     fn test_gluon_mail_view_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_config(false, MutationMode::Compat)
+        test_gluon_mail_config(false, MutationMode::Strict)
     }
 
     fn test_gluon_mail_backend_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_backend_config_with_mode(MutationMode::Compat)
+        test_gluon_mail_backend_config_with_mode(MutationMode::Strict)
     }
 
     fn test_gluon_mail_backend_config_with_mode(

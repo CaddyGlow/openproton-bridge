@@ -11,7 +11,7 @@
 ## Current Cutover State
 
 - `BE-017` through `BE-028`: landed in repo
-- `BE-029`: partial because sanitized sqlite fixture artifacts are placeholders, so real upstream cache-open parity remains open; a manual private profile/archive gate now exists in `tests/gluon_real_fixture.rs`
+- `BE-029`: partial because sanitized sqlite fixture artifacts are placeholders, so real upstream cache-open parity remains open; a manual private profile/archive gate with optional real blob-decode verification now exists in `tests/gluon_real_fixture.rs`
 - `BE-030`: in progress with IMAP, IDLE, and event-worker parity coverage on the Gluon backend
 - `BE-031`: in progress with recovery/corruption tests and behavior docs landed; remaining gap is broader cutover confidence rather than missing recovery semantics documentation
 - `BE-032`: pending default cutover and CI gate tightening

@@ -431,5 +431,15 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     assert!(fetch.contains("runtime-body"), "{fetch}");
     assert!(fetch.contains("a004 OK FETCH completed"), "{fetch}");
 
+    write
+        .write_all(b"a005 SEARCH SUBJECT \"Runtime Subject\"\r\n")
+        .await
+        .expect("write search");
+    write.flush().await.expect("flush search");
+
+    let search = read_until_tag(&mut reader, "a005 ").await;
+    assert!(search.contains("* SEARCH 1"), "{search}");
+    assert!(search.contains("a005 OK SEARCH completed"), "{search}");
+
     runtime.stop().await.expect("stop runtime");
 }

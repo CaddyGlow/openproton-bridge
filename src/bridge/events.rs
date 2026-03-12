@@ -3018,6 +3018,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_updates_checkpoint_and_store_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .and(header("x-pm-uid", "uid-1"))
+            .and(header("Authorization", "Bearer access-uid-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{"Messages": [{"ID": "msg-1", "Action": 1}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mail/v4/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message_json(
+                "msg-1",
+                &["0"],
+                1,
+            )))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.last_event_id, "event-1");
+        assert!(checkpoint.last_event_ts.is_some());
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
     async fn poll_account_once_with_pim_contact_delta_updates_cache_and_checkpoint() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -4329,6 +4388,101 @@ mod tests {
             .get_user_labels(&AccountId("uid-1".to_string()))
             .is_empty());
         assert!(store
+            .list_uids("uid-1::Labels/Obsolete")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_account_once_label_event_clears_deleted_mailbox_state_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Labels": [{
+                        "ID": "label-custom-1",
+                        "Action": 0
+                    }]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/labels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "Labels": []
+            })))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        runtime.set_user_labels(
+            &AccountId("uid-1".to_string()),
+            vec![crate::imap::mailbox::ResolvedMailbox {
+                name: "Labels/Obsolete".to_string(),
+                label_id: "label-custom-1".to_string(),
+                special_use: None,
+                selectable: true,
+            }],
+        );
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime.clone(), auth_router, checkpoints);
+
+        config
+            .connector
+            .upsert_metadata(
+                "uid-1::Labels/Obsolete",
+                "msg-obsolete-1",
+                MessageMetadata {
+                    id: "msg-obsolete-1".to_string(),
+                    address_id: "addr-1".to_string(),
+                    label_ids: vec!["label-custom-1".to_string()],
+                    external_id: None,
+                    subject: "Obsolete note".to_string(),
+                    sender: crate::api::types::EmailAddress {
+                        name: "Alice".to_string(),
+                        address: "alice@proton.me".to_string(),
+                    },
+                    to_list: Vec::new(),
+                    cc_list: Vec::new(),
+                    bcc_list: Vec::new(),
+                    reply_tos: Vec::new(),
+                    flags: 0,
+                    time: 1_700_000_000,
+                    size: 64,
+                    unread: 1,
+                    is_replied: 0,
+                    is_replied_all: 0,
+                    is_forwarded: 0,
+                    num_attachments: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+
+        assert!(runtime
+            .get_user_labels(&AccountId("uid-1".to_string()))
+            .is_empty());
+        assert!(config
+            .mailbox_view
             .list_uids("uid-1::Labels/Obsolete")
             .await
             .unwrap()

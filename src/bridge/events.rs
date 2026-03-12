@@ -4654,6 +4654,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_account_once_message_and_label_batch_stays_incremental_with_gluon_mail_backend() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/core/v4/events/event-0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "Code": 1000,
+                "EventID": "event-1",
+                "More": 0,
+                "Refresh": 0,
+                "Events": [{
+                    "Messages": [{"ID": "msg-1", "Action": 1}],
+                    "Labels": [{"ID": "label-custom-1", "Action": 2}]
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mail/v4/messages/msg-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(message_json(
+                "msg-1",
+                &["0"],
+                1,
+            )))
+            .mount(&server)
+            .await;
+
+        let session = sample_session("uid-1", "alice@proton.me", "pass-a");
+        let runtime = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
+        let registry = AccountRegistry::from_single_session(sample_session(
+            "uid-1",
+            "alice@proton.me",
+            "pass-a",
+        ));
+        let auth_router = AuthRouter::new(registry);
+        let checkpoints: SharedCheckpointStore = Arc::new(InMemoryCheckpointStore::new());
+        let (config, _tempdir) =
+            gluon_event_worker_config(&server.uri(), runtime, auth_router, checkpoints.clone());
+
+        let next = poll_account_once(&config, "event-0").await.unwrap();
+        assert_eq!(next, "event-1");
+        assert_eq!(
+            config
+                .mailbox_view
+                .get_uid("uid-1::INBOX", "msg-1")
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let checkpoint = checkpoints
+            .load_checkpoint(&AccountId("uid-1".to_string()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.sync_state, Some(CheckpointSyncState::Ok));
+    }
+
+    #[tokio::test]
     async fn start_event_workers_starts_one_task_per_account() {
         let accounts = vec![
             RuntimeAccountInfo {

@@ -14,4 +14,4 @@
 - `BE-029`: complete under the current acceptance rule via `tests/gluon_real_fixture.rs`, which validates a private local official-Bridge profile/archive and optionally derives real blob keys from `vault.enc`; the checked-in sanitized fixture remains placeholder-only for file-family coverage
 - `BE-030`: in progress with IMAP, IDLE, and event-worker parity coverage on the Gluon backend
 - `BE-031`: in progress with recovery/corruption tests and behavior docs landed; remaining gap is broader cutover confidence rather than missing recovery semantics documentation
-- `BE-032`: pending default cutover and CI gate tightening
+- `BE-032`: in progress; IMAP runtime defaults now point at Gluon and CI exercises the Gluon parity suites, but compat rollback wiring and final cutover criteria are still being narrowed

@@ -98,9 +98,9 @@ These reuse `gluon-rs-core` infra only, not mail semantics.
 - `BE-017` through `BE-028` are effectively implemented in the repo. The Gluon-backed read, mutation, connector, runtime selection, and event-worker paths exist and are covered by focused tests.
 - `BE-029` is complete under the current acceptance rule. File-family capture, manifest checks, schema assertions, and unsupported-case documentation remain in place for the checked-in sanitized fixture, and `tests/gluon_real_fixture.rs` now proves cache-open parity plus real blob decode against a private local official Bridge fixture.
 - The private-fixture parity harness accepts either `OPENPROTON_REAL_GLUON_PROFILE=/path/to/bridge-v3` or `OPENPROTON_REAL_GLUON_ARCHIVE=/path/to/profile.tar`, and it can also take `OPENPROTON_REAL_VAULT_KEY` (or legacy alias `OPENPROTON_REAL_GLUON_KEY`) to decrypt `vault.enc`, derive real per-account `gluon_key` bindings, and verify real blob decryption without checking secrets or fixture payloads into the repo.
-- `BE-030` is in progress. IMAP read/mutation/IDLE parity and multiple event-worker Gluon paths are covered, but mixed event-batch and broader runtime parity are not yet fully closed.
+- `BE-030` is in progress. IMAP read/mutation/IDLE parity and multiple event-worker Gluon paths are covered, but broader runtime parity and final helper cleanup are not yet fully closed.
 - `BE-031` is in progress. Recovery and corruption suites cover interrupted transaction replay, cache-move rollback recovery, missing-blob repair, and partial-sqlite fallback, but the plan still owes explicit corruption behavior docs.
-- `BE-032` has not started in earnest. CI still treats the Gluon backend as an incremental parity target, not the only/default backend, and release-candidate cutover criteria are not complete.
+- `BE-032` is in progress. CI coverage exists for the Gluon backend and the runtime now defaults IMAP read and mutation backends to Gluon, but release-candidate cutover criteria and compat-path retirement are not complete.
 
 ## Lane Ownership
 
@@ -471,7 +471,7 @@ Outcome:
 Deliverables:
 
 - append/store/copy/move/expunge use adapter
-- backend selection switch in runtime
+- Gluon is the default runtime backend, with compat retained only as rollback wiring
 
 Required tests:
 
@@ -529,7 +529,7 @@ Required tests:
 
 Outcome:
 
-- new backend is green in CI and can become the default
+- new backend is green in CI and default cutover can be defended with explicit rollback guidance
 
 Deliverables:
 
@@ -590,7 +590,7 @@ Handoff: include risks, assumptions, and follow-up needed by main agent.
 
 ## Cutover Readiness Gate
 
-Do not switch the bridge default backend until all are true:
+Keep compat rollback wiring available until all are true:
 
 - `BE-029` green
 - `BE-030` green

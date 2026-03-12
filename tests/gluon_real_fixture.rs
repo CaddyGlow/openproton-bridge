@@ -9,8 +9,15 @@ use gluon_rs_mail::{
 };
 
 const REAL_ARCHIVE_ENV: &str = "OPENPROTON_REAL_GLUON_ARCHIVE";
+const REAL_PROFILE_ENV: &str = "OPENPROTON_REAL_GLUON_PROFILE";
 const ARCHIVE_GLUON_SUBTREE: &str =
     "Users/rick/Library/Application Support/protonmail/bridge-v3/gluon";
+const PROFILE_GLUON_SUBTREE: &str = "gluon";
+
+struct ResolvedGluonRoot {
+    root: PathBuf,
+    _temp: Option<tempfile::TempDir>,
+}
 
 fn extract_real_archive_fixture(archive_path: &Path, output_root: &Path) {
     let status = Command::new("tar")
@@ -58,22 +65,30 @@ fn find_upstream_storage_user_ids(gluon_root: &Path) -> Vec<String> {
     ids
 }
 
-#[test]
-fn be029_open_read_only_accepts_real_archive_fixture() {
-    let Some(archive_path) = env::var_os(REAL_ARCHIVE_ENV).map(PathBuf::from) else {
-        eprintln!("skipping be029 real archive parity test; {REAL_ARCHIVE_ENV} is not set");
-        return;
-    };
-    assert!(
-        archive_path.exists(),
-        "configured archive path does not exist: {}",
-        archive_path.display()
-    );
+fn resolve_real_gluon_root() -> Option<ResolvedGluonRoot> {
+    if let Some(profile_path) = env::var_os(REAL_PROFILE_ENV).map(PathBuf::from) {
+        let root = profile_path.join(PROFILE_GLUON_SUBTREE);
+        return Some(ResolvedGluonRoot { root, _temp: None });
+    }
 
+    let archive_path = env::var_os(REAL_ARCHIVE_ENV).map(PathBuf::from)?;
     let temp = tempfile::tempdir().expect("tempdir");
     extract_real_archive_fixture(&archive_path, temp.path());
+    Some(ResolvedGluonRoot {
+        root: temp.path().join(ARCHIVE_GLUON_SUBTREE),
+        _temp: Some(temp),
+    })
+}
 
-    let gluon_root = temp.path().join(ARCHIVE_GLUON_SUBTREE);
+#[test]
+fn be029_open_read_only_accepts_real_archive_fixture() {
+    let Some(resolved) = resolve_real_gluon_root() else {
+        eprintln!(
+            "skipping be029 real archive parity test; set {REAL_PROFILE_ENV} or {REAL_ARCHIVE_ENV}"
+        );
+        return;
+    };
+    let gluon_root = resolved.root;
     assert!(
         gluon_root.exists(),
         "archive did not contain expected Gluon subtree: {}",
@@ -109,6 +124,10 @@ fn be029_open_read_only_accepts_real_archive_fixture() {
             SchemaFamily::UpstreamCore,
             "expected real archive fixture to expose an upstream-compatible DB for {storage_user_id}"
         );
+        assert!(
+            !probe.mailbox_message_tables().is_empty(),
+            "expected mailbox_message tables in real archive fixture for {storage_user_id}"
+        );
 
         let mailboxes = store
             .list_upstream_mailboxes(storage_user_id)
@@ -117,24 +136,74 @@ fn be029_open_read_only_accepts_real_archive_fixture() {
             !mailboxes.is_empty(),
             "expected at least one mailbox in real archive fixture for {storage_user_id}"
         );
+        let deleted = store
+            .list_deleted_subscriptions(storage_user_id)
+            .unwrap_or_else(|err| {
+                panic!("failed to list deleted subscriptions for {storage_user_id}: {err}")
+            });
+        let mut total_messages = 0usize;
+        let mut total_snapshot_messages = 0usize;
+        let mut total_existing_blobs = 0usize;
 
-        let total_messages: usize = mailboxes
-            .iter()
-            .map(|mailbox| {
-                store
-                    .list_upstream_mailbox_messages(storage_user_id, mailbox.internal_id)
-                    .unwrap_or_else(|err| {
-                        panic!(
-                            "failed to list messages for {} mailbox {}: {err}",
-                            storage_user_id, mailbox.name
-                        )
-                    })
-                    .len()
-            })
-            .sum();
+        for mailbox in &mailboxes {
+            let listed = store
+                .list_upstream_mailbox_messages(storage_user_id, mailbox.internal_id)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to list messages for {} mailbox {}: {err}",
+                        storage_user_id, mailbox.name
+                    )
+                });
+            let snapshot = store
+                .mailbox_snapshot(storage_user_id, mailbox.internal_id)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to read snapshot for {} mailbox {}: {err}",
+                        storage_user_id, mailbox.name
+                    )
+                });
+
+            assert_eq!(
+                snapshot.mailbox.internal_id, mailbox.internal_id,
+                "snapshot mailbox id should match listed mailbox for {storage_user_id}"
+            );
+            assert_eq!(
+                snapshot.message_count,
+                listed.len(),
+                "snapshot/listed message counts should match for {} mailbox {}",
+                storage_user_id,
+                mailbox.name
+            );
+            assert!(
+                snapshot.next_uid >= 1,
+                "next uid should be initialized for {} mailbox {}",
+                storage_user_id,
+                mailbox.name
+            );
+
+            total_messages += listed.len();
+            total_snapshot_messages += snapshot.messages.len();
+            total_existing_blobs += snapshot
+                .messages
+                .iter()
+                .filter(|msg| msg.blob_exists)
+                .count();
+        }
         assert!(
             total_messages > 0,
             "expected real archive fixture to contain mapped upstream messages for {storage_user_id}"
+        );
+        assert_eq!(
+            total_snapshot_messages, total_messages,
+            "snapshot and listing totals should match for {storage_user_id}"
+        );
+        assert!(
+            total_existing_blobs > 0,
+            "expected at least one real blob path in archive fixture for {storage_user_id}"
+        );
+        assert!(
+            deleted.len() <= mailboxes.len(),
+            "deleted subscription count should stay bounded for {storage_user_id}"
         );
     }
 }

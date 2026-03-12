@@ -60,14 +60,17 @@ impl GluonMailMailboxMutation {
         storage_user_id: &str,
         mailbox_name: &str,
     ) -> Result<Option<UpstreamMailbox>> {
-        self.store
-            .list_upstream_mailboxes(storage_user_id)
-            .map(|mailboxes| {
-                mailboxes
-                    .into_iter()
-                    .find(|mailbox| mailbox.name.eq_ignore_ascii_case(mailbox_name))
-            })
-            .map_err(map_mail_error)
+        match self.store.list_upstream_mailboxes(storage_user_id) {
+            Ok(mailboxes) => Ok(mailboxes
+                .into_iter()
+                .find(|mailbox| mailbox.name.eq_ignore_ascii_case(mailbox_name))),
+            Err(gluon_rs_mail::GluonError::IncompatibleSchema { family })
+                if family == "Missing" =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(map_mail_error(err)),
+        }
     }
 
     fn ensure_mailbox(&self, mailbox: &str) -> Result<(String, UpstreamMailbox)> {

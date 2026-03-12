@@ -340,7 +340,7 @@ struct PreparedMailRuntime {
     runtime_snapshot: Vec<super::accounts::RuntimeAccountInfo>,
     api_base_url: String,
     auth_router: super::auth_router::AuthRouter,
-    event_store: Arc<dyn imap::store::MessageStore>,
+    event_mailbox_view: Arc<dyn imap::mailbox_view::GluonMailboxView>,
     pim_stores: HashMap<String, Arc<PimStore>>,
     checkpoint_store: super::events::SharedCheckpointStore,
     poll_interval: Duration,
@@ -519,7 +519,6 @@ async fn prepare_runtime_context(
         account_storage_ids,
     )
     .context("failed to initialize runtime IMAP store")?;
-    let gluon_connector = imap::gluon_connector::StoreBackedConnector::new(store.clone());
     let mailbox_catalog =
         imap::mailbox_catalog::RuntimeMailboxCatalog::new(runtime_accounts.clone());
     let mailbox_view = build_mailbox_view(
@@ -536,7 +535,20 @@ async fn prepare_runtime_context(
         gluon_paths.root(),
     )
     .context("failed to initialize IMAP mailbox mutation backend")?;
-    let event_store = store.clone();
+    let event_mailbox_view = build_event_mailbox_view(
+        config.imap_mutation_backend,
+        store.clone(),
+        &gluon_bootstrap,
+        gluon_paths.root(),
+    )
+    .context("failed to initialize event mailbox view backend")?;
+    let gluon_connector = build_gluon_connector(
+        config.imap_mutation_backend,
+        store.clone(),
+        &gluon_bootstrap,
+        gluon_paths.root(),
+    )
+    .context("failed to initialize Gluon connector backend")?;
     let mut pim_stores = HashMap::new();
     for account in &gluon_bootstrap.accounts {
         let pim_store = PimStore::new(gluon_paths.account_db_path(&account.storage_user_id))
@@ -589,7 +601,7 @@ async fn prepare_runtime_context(
         runtime_snapshot,
         api_base_url,
         auth_router,
-        event_store,
+        event_mailbox_view,
         pim_stores,
         checkpoint_store: Arc::new(super::events::VaultCheckpointStore::new(
             settings_dir.to_path_buf(),
@@ -634,6 +646,40 @@ fn build_mailbox_mutation(
             Ok(imap::gluon_mailbox_mutation::GluonMailMailboxMutation::new(
                 Arc::new(store),
             ))
+        }
+    }
+}
+
+fn build_event_mailbox_view(
+    backend: ImapMutationBackend,
+    store: Arc<dyn imap::store::MessageStore>,
+    gluon_bootstrap: &vault::GluonStoreBootstrap,
+    gluon_root: &std::path::Path,
+) -> anyhow::Result<Arc<dyn imap::mailbox_view::GluonMailboxView>> {
+    match backend {
+        ImapMutationBackend::Compat => Ok(imap::mailbox_view::StoreBackedMailboxView::new(store)),
+        ImapMutationBackend::GluonMail => {
+            let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, true)?;
+            Ok(imap::gluon_mailbox_view::GluonMailMailboxView::new(
+                Arc::new(store),
+            ))
+        }
+    }
+}
+
+fn build_gluon_connector(
+    backend: ImapMutationBackend,
+    store: Arc<dyn imap::store::MessageStore>,
+    gluon_bootstrap: &vault::GluonStoreBootstrap,
+    gluon_root: &std::path::Path,
+) -> anyhow::Result<Arc<dyn imap::gluon_connector::GluonImapConnector>> {
+    match backend {
+        ImapMutationBackend::Compat => Ok(imap::gluon_connector::StoreBackedConnector::new(store)),
+        ImapMutationBackend::GluonMail => {
+            let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, false)?;
+            Ok(imap::gluon_connector::GluonMailConnector::new(Arc::new(
+                store,
+            )))
         }
     }
 }
@@ -691,7 +737,7 @@ async fn run_runtime(
         runtime_snapshot,
         api_base_url,
         auth_router,
-        event_store,
+        event_mailbox_view,
         pim_stores,
         checkpoint_store,
         poll_interval,
@@ -758,7 +804,7 @@ async fn run_runtime(
             runtime_snapshot,
             api_base_url,
             auth_router,
-            event_store,
+            event_mailbox_view,
             imap_config.gluon_connector.clone(),
             checkpoint_store,
             pim_stores,

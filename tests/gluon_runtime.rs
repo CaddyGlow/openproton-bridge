@@ -10,12 +10,15 @@ use openproton_bridge::api::types::{
     Address, AddressKey, ApiMode, EmailAddress, MessageMetadata, Session, UserKey,
 };
 use openproton_bridge::bridge::accounts::RuntimeAuthMaterial;
+use openproton_bridge::bridge::events::VaultCheckpointStore;
 use openproton_bridge::bridge::mail_runtime::{
     self, DavTlsMode, ImapMutationBackend, ImapReadBackend, MailRuntimeConfig,
     MailRuntimeTransition,
 };
 use openproton_bridge::bridge::session_manager::SessionManager;
-use openproton_bridge::bridge::types::AccountId;
+use openproton_bridge::bridge::types::{
+    AccountId, CheckpointSyncState, EventCheckpoint, EventCheckpointStore,
+};
 use openproton_bridge::imap::store::new_runtime_message_store;
 use openproton_bridge::paths::RuntimePaths;
 use openproton_bridge::vault;
@@ -52,6 +55,34 @@ fn make_meta(id: &str) -> MessageMetadata {
         is_forwarded: 0,
         num_attachments: 0,
     }
+}
+
+fn runtime_event_message_json(
+    message_id: &str,
+    label_ids: &[&str],
+    unread: i32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Code": 1000,
+        "Message": {
+            "ID": message_id,
+            "AddressID": "addr-1",
+            "LabelIDs": label_ids,
+            "Subject": "Event Subject",
+            "Sender": {"Name": "Alice", "Address": "alice@proton.me"},
+            "ToList": [],
+            "CCList": [],
+            "BCCList": [],
+            "Time": 1700000000,
+            "Size": 100,
+            "Unread": unread,
+            "NumAttachments": 0,
+            "Header": "From: alice@proton.me\r\n",
+            "Body": "body",
+            "MIMEType": "text/plain",
+            "Attachments": []
+        }
+    })
 }
 
 #[tokio::test]
@@ -998,6 +1029,117 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
         .expect("archive literal");
     let archive_body = String::from_utf8_lossy(&archive_literal);
     assert!(archive_body.contains("Runtime Subject"), "{archive_body}");
+
+    server.verify().await;
+    runtime.stop().await.expect("stop runtime");
+}
+
+#[tokio::test]
+async fn be030_mail_runtime_event_update_reaches_idle_with_gluon_defaults() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/event-0"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000,
+            "EventID": "event-1",
+            "More": 0,
+            "Refresh": 0,
+            "Events": [{"Messages": [{"ID": "msg-2", "Action": 1}]}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/core/v4/events/event-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "Code": 1000,
+            "EventID": "event-1",
+            "More": 0,
+            "Refresh": 0,
+            "Events": []
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/mail/v4/messages/msg-2"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(runtime_event_message_json(
+                "msg-2",
+                &["0"],
+                1,
+            )),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let runtime_paths = RuntimePaths::resolve(Some(temp.path())).expect("runtime paths");
+    let session = runtime_test_session();
+    vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
+    vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
+        .expect("save gluon key");
+    VaultCheckpointStore::new(runtime_paths.settings_dir().to_path_buf())
+        .save_checkpoint(
+            &AccountId(session.uid.clone()),
+            &EventCheckpoint {
+                last_event_id: "event-0".to_string(),
+                last_event_ts: Some(1_700_000_000),
+                sync_state: Some(CheckpointSyncState::Ok),
+            },
+        )
+        .expect("save runtime checkpoint");
+    seed_runtime_gluon_store(&runtime_paths, &session);
+
+    let imap_port = free_port().await;
+    let smtp_port = free_port_excluding(&[imap_port]).await;
+    let mut config = runtime_test_config(imap_port, smtp_port, server.uri());
+    config.event_poll_interval = std::time::Duration::from_millis(500);
+
+    let session_manager = Arc::new(SessionManager::new(
+        runtime_paths.settings_dir().to_path_buf(),
+    ));
+    session_manager
+        .seed_session(session.clone())
+        .await
+        .expect("seed live runtime session");
+    let runtime = mail_runtime::start(
+        runtime_paths,
+        session_manager,
+        config,
+        MailRuntimeTransition::Startup,
+        None,
+    )
+    .await
+    .expect("start mail runtime");
+    seed_runtime_auth(&runtime, &session).await;
+
+    let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
+
+    write.write_all(b"a003 IDLE\r\n").await.expect("write idle");
+    write.flush().await.expect("flush idle");
+
+    let continuation =
+        read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(1)).await;
+    assert!(continuation.contains("+ idling"), "{continuation}");
+
+    let update = read_chunk_with_timeout(&mut reader, std::time::Duration::from_secs(4)).await;
+    assert!(update.contains("2 EXISTS"), "{update}");
+
+    let scoped_inbox = format!("{}::INBOX", session.uid);
+    assert_eq!(
+        runtime
+            .imap_connector()
+            .list_uids(&scoped_inbox)
+            .await
+            .expect("list inbox after event"),
+        vec![1, 2]
+    );
+
+    write.write_all(b"DONE\r\n").await.expect("write done");
+    write.flush().await.expect("flush done");
+    let done = read_until_tag(&mut reader, "a003 ").await;
+    assert!(done.contains("a003 OK IDLE terminated"), "{done}");
 
     server.verify().await;
     runtime.stop().await.expect("stop runtime");

@@ -152,3 +152,42 @@ fn be017_fixture_capture_contract_matches_be016_families() {
         "BE-017 fixture manifest must cover every BE-016 required family"
     );
 }
+
+#[test]
+fn be029_fixture_manifest_documents_sanitized_sqlite_limitations() {
+    let root = repo_root();
+    let manifest_path = root.join("tests/fixtures/gluon_fixture_manifest.json");
+    let manifest = read_fixture_json(&manifest_path);
+
+    let unsupported_cases = manifest
+        .get("unsupported_cases")
+        .and_then(Value::as_array)
+        .expect("fixture manifest must define unsupported_cases[]");
+    assert!(
+        unsupported_cases.iter().any(|entry| {
+            entry
+                .as_str()
+                .map(|text| text.contains("CompatibleStore") && text.contains("placeholder"))
+                .unwrap_or(false)
+        }),
+        "fixture manifest must document placeholder sqlite artifacts as non-openable by CompatibleStore"
+    );
+
+    let primary_db =
+        root.join("tests/fixtures/proton_profile_gluon_sanitized/backend/db/user-redacted.db");
+    let deferred_delete = root.join(
+        "tests/fixtures/proton_profile_gluon_sanitized/backend/db/deferred_delete/user-redacted.db.1700000000",
+    );
+    let primary_db_bytes = fs::read(&primary_db).expect("read sanitized primary db fixture");
+    let deferred_delete_bytes =
+        fs::read(&deferred_delete).expect("read sanitized deferred delete fixture");
+
+    assert!(
+        primary_db_bytes.starts_with(b"sqlite-placeholder:"),
+        "sanitized primary db fixture should remain an explicit placeholder artifact"
+    );
+    assert!(
+        deferred_delete_bytes.starts_with(b"deferred-delete-placeholder:"),
+        "sanitized deferred delete fixture should remain an explicit placeholder artifact"
+    );
+}

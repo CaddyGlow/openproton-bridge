@@ -815,7 +815,8 @@ where
             .mailbox_snapshot(&scoped_mailbox)
             .await?;
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
-        if snapshot.mod_seq > previous_mod_seq {
+        let previous_exists = self.selected_mailbox_uids.len() as u32;
+        if snapshot.mod_seq > previous_mod_seq || snapshot.exists != previous_exists {
             let current_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
             let mut current_flags: HashMap<u32, Vec<String>> = HashMap::new();
             for uid in &current_uids {
@@ -839,7 +840,6 @@ where
                     }
                 }
 
-                let previous_exists = self.selected_mailbox_uids.len() as u32;
                 if snapshot.exists != previous_exists {
                     self.writer
                         .untagged(&format!("{} EXISTS", snapshot.exists))
@@ -3362,6 +3362,30 @@ mod tests {
         (session, client_read, client_write)
     }
 
+    async fn prime_selected_state_from_view(
+        session: &mut ImapSession<tokio::io::DuplexStream, tokio::io::DuplexStream>,
+        config: &Arc<SessionConfig>,
+        scoped_mailbox: &str,
+    ) {
+        let snapshot = config
+            .mailbox_view
+            .mailbox_snapshot(scoped_mailbox)
+            .await
+            .unwrap();
+        session.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
+        session.selected_mailbox_uids =
+            config.mailbox_view.list_uids(scoped_mailbox).await.unwrap();
+        session.selected_mailbox_flags.clear();
+        for uid in &session.selected_mailbox_uids {
+            let flags = config
+                .mailbox_view
+                .get_flags(scoped_mailbox, *uid)
+                .await
+                .unwrap();
+            session.selected_mailbox_flags.insert(*uid, flags);
+        }
+    }
+
     fn multi_account_config(api_base_url: &str) -> Arc<SessionConfig> {
         let account_a = crate::api::types::Session {
             uid: "uid-a".to_string(),
@@ -3477,6 +3501,34 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("1 EXISTS"));
         assert!(response.contains("a001 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_noop_selected_emits_exists_on_gluon_connector_create() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, _client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.selected_mailbox_mod_seq = Some(0);
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        config
+            .gluon_connector
+            .upsert_metadata("test-uid::INBOX", "msg-noop", make_meta("msg-noop", 1))
+            .await
+            .unwrap();
+
+        session.handle_line("a001 NOOP").await.unwrap();
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::io::AsyncReadExt::read(&mut client_read, &mut buf)
+            .await
+            .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("2 EXISTS"), "response={response}");
+        assert!(response.contains("a001 OK"), "response={response}");
     }
 
     #[tokio::test]
@@ -3654,21 +3706,7 @@ mod tests {
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
-        let snapshot = config
-            .store
-            .mailbox_snapshot("test-uid::INBOX")
-            .await
-            .unwrap();
-        session.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
-        session.selected_mailbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
-        for uid in &session.selected_mailbox_uids {
-            let flags = config
-                .store
-                .get_flags("test-uid::INBOX", *uid)
-                .await
-                .unwrap();
-            session.selected_mailbox_flags.insert(*uid, flags);
-        }
+        prime_selected_state_from_view(&mut session, &config, "test-uid::INBOX").await;
 
         let idle_task =
             tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
@@ -3700,6 +3738,75 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("EXPUNGE"), "response={response}");
         assert!(response.contains("1 EXISTS"), "response={response}");
+
+        tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
+            .await
+            .unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), idle_task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_idle_emits_expunge_and_exists_on_gluon_connector_delete() {
+        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (mut session, mut client_read, mut client_write) =
+            create_session_pair(config.clone()).await;
+
+        session.state = State::Selected;
+        session.selected_mailbox = Some("INBOX".to_string());
+        session.authenticated_account_id = Some("test-uid".to_string());
+
+        let uid1 = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-idle-delete-1",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-idle-delete-1\r\n\r\none",
+        )
+        .await;
+        let _uid2 = seed_gluon_backend_message(
+            &config,
+            "INBOX",
+            "msg-idle-delete-2",
+            1,
+            b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-idle-delete-2\r\n\r\ntwo",
+        )
+        .await;
+        assert_eq!(uid1, 2);
+        prime_selected_state_from_view(&mut session, &config, "test-uid::INBOX").await;
+
+        let idle_task =
+            tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
+
+        let mut buf = vec![0u8; 1024];
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("+ idling"), "response={response}");
+
+        config
+            .gluon_connector
+            .remove_message_by_uid("test-uid::INBOX", uid1)
+            .await
+            .unwrap();
+
+        let n = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read(&mut client_read, &mut buf),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(response.contains("EXPUNGE"), "response={response}");
+        assert!(response.contains("2 EXISTS"), "response={response}");
 
         tokio::io::AsyncWriteExt::write_all(&mut client_write, b"DONE\r\n")
             .await

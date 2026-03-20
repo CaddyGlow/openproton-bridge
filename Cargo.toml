@@ -87,4 +87,5 @@ protoc-bin-vendored = "3"
 members = [
     "crates/gluon-rs-core",
     "crates/gluon-rs-mail",
+    "apps/bridge-ui/src-tauri",
 ]

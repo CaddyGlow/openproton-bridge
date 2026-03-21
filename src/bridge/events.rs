@@ -9,6 +9,9 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
+
 use crate::api::client::ProtonClient;
 use crate::api::error::{is_auth_error, ApiError};
 use crate::api::events as api_events;
@@ -18,6 +21,8 @@ use crate::api::types::{
 };
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
+use crate::bridge::sync_state;
+use crate::crypto::keys::{self, Keyring};
 use crate::imap::gluon_connector::GluonImapConnector;
 #[cfg(test)]
 use crate::imap::gluon_connector::StoreBackedConnector;
@@ -25,10 +30,12 @@ use crate::imap::mailbox;
 use crate::imap::mailbox_view::GluonMailboxView;
 #[cfg(test)]
 use crate::imap::mailbox_view::StoreBackedMailboxView;
+use crate::imap::rfc822;
 #[cfg(test)]
 use crate::imap::store::MessageStore;
 use crate::pim::incremental as pim_incremental;
 use crate::pim::store::PimStore;
+use crate::vault;
 
 use super::accounts::{
     AccountHealth, AccountRuntimeError, RuntimeAccountInfo, RuntimeAccountRegistry,
@@ -391,6 +398,7 @@ pub struct EventWorkerConfig {
     pub pim_store: Option<Arc<PimStore>>,
     pub checkpoint_store: SharedCheckpointStore,
     pub sync_progress_callback: Option<SyncProgressCallback>,
+    pub settings_dir: Option<PathBuf>,
 }
 
 impl EventWorkerConfig {
@@ -416,6 +424,7 @@ impl EventWorkerConfig {
             pim_store: None,
             checkpoint_store,
             sync_progress_callback: None,
+            settings_dir: None,
         }
     }
 
@@ -426,6 +435,11 @@ impl EventWorkerConfig {
 
     pub fn with_sync_progress_callback(mut self, callback: SyncProgressCallback) -> Self {
         self.sync_progress_callback = Some(callback);
+        self
+    }
+
+    pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
+        self.settings_dir = Some(dir);
         self
     }
 }
@@ -1179,6 +1193,59 @@ async fn bounded_resync_account_for_generation(
         "Syncing messages"
     );
 
+    // Build keyrings for full body sync (best-effort: fall back to metadata-only on failure)
+    let addr_keyrings: Option<HashMap<String, Keyring>> =
+        match build_address_keyrings(config, session).await {
+            Ok(keyrings) => {
+                info!(
+                    account_id = %config.account_id.0,
+                    num_keyrings = keyrings.len(),
+                    "built address keyrings for full body sync"
+                );
+                Some(keyrings)
+            }
+            Err(err) => {
+                warn!(
+                    account_id = %config.account_id.0,
+                    error = %err,
+                    "failed to build keyrings; falling back to metadata-only sync"
+                );
+                None
+            }
+        };
+
+    // Resolve Proton User ID and load Go bridge sync state
+    let proton_user_id = config.settings_dir.as_deref().and_then(|dir| {
+        vault::get_user_id_by_account_id(dir, &config.account_id.0)
+            .map_err(|e| {
+                warn!(
+                    account_id = %config.account_id.0,
+                    error = %e,
+                    "failed to resolve proton user id for sync state"
+                );
+                e
+            })
+            .ok()
+    });
+
+    let mut sync_status = proton_user_id
+        .as_deref()
+        .and_then(|uid| {
+            config.settings_dir.as_deref().and_then(|dir| {
+                sync_state::load_sync_state(dir, uid)
+                    .map_err(|e| {
+                        warn!(
+                            account_id = %config.account_id.0,
+                            error = %e,
+                            "failed to load sync state; starting fresh"
+                        );
+                        e
+                    })
+                    .ok()
+            })
+        })
+        .unwrap_or_default();
+
     let mut total_steps = mailbox::system_mailboxes()
         .iter()
         .filter(|mb| mb.selectable)
@@ -1188,13 +1255,34 @@ async fn bounded_resync_account_for_generation(
     let mut synced_message_ids = HashSet::new();
     let mut total_applied = 0usize;
 
+    // Use sync state cursor to resume from where either bridge last stopped.
+    // The Go bridge processes INBOX messages in descending order (newest first)
+    // using end_id as a cursor. If we have a last_synced_message_id, use it as
+    // the initial end_id for INBOX to skip already-synced messages.
+    let resume_cursor = if !sync_status.last_synced_message_id.is_empty() {
+        info!(
+            account_id = %config.account_id.0,
+            last_synced_id = %sync_status.last_synced_message_id,
+            num_synced = sync_status.num_synced_messages,
+            "resuming sync from Go bridge cursor"
+        );
+        Some(sync_status.last_synced_message_id.clone())
+    } else {
+        None
+    };
+
     for mb in mailbox::system_mailboxes() {
         if !mb.selectable {
             continue;
         }
         ensure_account_generation(config, expected_generation, "bounded_resync_mailbox").await?;
 
-        let mut end_id: Option<String> = None;
+        // For INBOX, start from the sync state cursor to skip already-synced messages
+        let mut end_id: Option<String> = if mb.label_id == "0" {
+            resume_cursor.clone()
+        } else {
+            None
+        };
         loop {
             ensure_account_generation(config, expected_generation, "bounded_resync_page").await?;
             let request_phase = if end_id.is_some() {
@@ -1263,6 +1351,40 @@ async fn bounded_resync_account_for_generation(
                 if synced_message_ids.insert(metadata.id.clone()) {
                     apply_metadata_to_store(config, &metadata, expected_generation).await?;
                     total_applied += 1;
+
+                    // Download full body and store RFC822
+                    if let Some(ref keyrings) = addr_keyrings {
+                        let scoped = scoped_mailbox_name(&config.account_id, mb.name);
+                        if let Ok(Some(uid)) =
+                            config.mailbox_view.get_uid(&scoped, &metadata.id).await
+                        {
+                            download_and_store_rfc822(
+                                config,
+                                client,
+                                keyrings,
+                                &metadata.id,
+                                &metadata.address_id,
+                                &scoped,
+                                uid,
+                            )
+                            .await;
+                        }
+                    }
+
+                    // Update sync state cursor
+                    sync_status.last_synced_message_id = metadata.id.clone();
+                    sync_status.num_synced_messages += 1;
+                }
+            }
+
+            // Persist sync state after each page
+            if let (Some(ref user_id), Some(ref dir)) = (&proton_user_id, &config.settings_dir) {
+                if let Err(e) = sync_state::save_sync_state(dir, user_id, &sync_status) {
+                    warn!(
+                        account_id = %config.account_id.0,
+                        error = %e,
+                        "failed to save sync state after page"
+                    );
                 }
             }
 
@@ -1296,6 +1418,32 @@ async fn bounded_resync_account_for_generation(
         resync_started_at.elapsed(),
     );
     progress_guard.finish();
+
+    if let Some(ref dir) = config.settings_dir {
+        if let Err(err) = vault::set_sync_complete(dir, &config.account_id.0) {
+            warn!(
+                account_id = %config.account_id.0,
+                error = %err,
+                "failed to mark vault sync complete"
+            );
+        }
+    }
+
+    // Mark sync state complete for Go bridge compatibility
+    if addr_keyrings.is_some() {
+        sync_status.has_labels = true;
+        sync_status.has_messages = true;
+        sync_status.has_message_count = true;
+        if let (Some(ref user_id), Some(ref dir)) = (&proton_user_id, &config.settings_dir) {
+            if let Err(e) = sync_state::save_sync_state(dir, user_id, &sync_status) {
+                warn!(
+                    account_id = %config.account_id.0,
+                    error = %e,
+                    "failed to save final sync state"
+                );
+            }
+        }
+    }
 
     let duration = resync_started_at.elapsed();
     if total_applied == 0 {
@@ -1344,6 +1492,130 @@ async fn bounded_resync_account_for_generation(
     );
 
     Ok(())
+}
+
+async fn build_address_keyrings(
+    config: &EventWorkerConfig,
+    session: &Session,
+) -> std::result::Result<HashMap<String, Keyring>, String> {
+    let passphrase_b64 = session
+        .key_passphrase
+        .as_deref()
+        .ok_or_else(|| "no key_passphrase in session".to_string())?;
+    let passphrase = BASE64
+        .decode(passphrase_b64)
+        .map_err(|e| format!("base64 decode passphrase: {e}"))?;
+
+    let auth_material = config
+        .runtime_accounts
+        .get_auth_material(&config.account_id)
+        .await
+        .ok_or_else(|| "no auth material available".to_string())?;
+
+    let user_keyring = keys::unlock_user_keys(&auth_material.user_keys, &passphrase)
+        .map_err(|e| format!("unlock user keys: {e}"))?;
+
+    let mut keyrings = HashMap::new();
+    for addr in &auth_material.addresses {
+        match keys::unlock_address_keys(&addr.keys, &passphrase, &user_keyring) {
+            Ok(kr) => {
+                keyrings.insert(addr.id.clone(), kr);
+            }
+            Err(e) => {
+                warn!(
+                    account_id = %config.account_id.0,
+                    address_id = %addr.id,
+                    error = %e,
+                    "failed to unlock address keys; skipping address"
+                );
+            }
+        }
+    }
+
+    if keyrings.is_empty() {
+        return Err("no address keyrings could be unlocked".to_string());
+    }
+
+    Ok(keyrings)
+}
+
+async fn download_and_store_rfc822(
+    config: &EventWorkerConfig,
+    client: &ProtonClient,
+    addr_keyrings: &HashMap<String, Keyring>,
+    message_id: &str,
+    address_id: &str,
+    scoped_mailbox: &str,
+    uid: u32,
+) {
+    let keyring = match addr_keyrings.get(address_id) {
+        Some(kr) => kr,
+        None => {
+            debug!(
+                account_id = %config.account_id.0,
+                message_id = %message_id,
+                address_id = %address_id,
+                "no keyring for address; skipping body download"
+            );
+            return;
+        }
+    };
+
+    let full_msg = match messages::get_message(client, message_id).await {
+        Ok(resp) => resp.message,
+        Err(e) => {
+            warn!(
+                account_id = %config.account_id.0,
+                message_id = %message_id,
+                error = %e,
+                "failed to download message body; skipping"
+            );
+            return;
+        }
+    };
+
+    let rfc822_bytes = match rfc822::build_rfc822(client, keyring, &full_msg).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                account_id = %config.account_id.0,
+                message_id = %message_id,
+                error = %e,
+                "failed to build RFC822; skipping"
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = config
+        .connector
+        .store_rfc822(scoped_mailbox, uid, rfc822_bytes)
+        .await
+    {
+        warn!(
+            account_id = %config.account_id.0,
+            message_id = %message_id,
+            error = %e,
+            "failed to store RFC822; skipping"
+        );
+    }
+}
+
+fn vault_sync_complete(config: &EventWorkerConfig) -> bool {
+    let Some(ref dir) = config.settings_dir else {
+        return true;
+    };
+    match vault::is_sync_complete(dir, &config.account_id.0) {
+        Ok(complete) => complete,
+        Err(err) => {
+            warn!(
+                account_id = %config.account_id.0,
+                error = %err,
+                "failed to read vault sync status; assuming complete"
+            );
+            true
+        }
+    }
 }
 
 fn emit_sync_progress(
@@ -1787,7 +2059,7 @@ async fn run_event_worker_with_shutdown(
                 };
                 if startup_resync_pending {
                     match cached_message_count_for_generation(&config, expected_generation).await {
-                        Ok(cached_count) if cached_count > 0 => {
+                        Ok(cached_count) if cached_count > 0 && vault_sync_complete(&config) => {
                             if last_event_id.trim().is_empty() {
                                 match bootstrap_latest_event_cursor_for_generation(
                                     &config,
@@ -2102,6 +2374,7 @@ fn build_event_worker_configs(
     checkpoint_store: SharedCheckpointStore,
     pim_stores: HashMap<String, Arc<PimStore>>,
     sync_progress_callback: Option<SyncProgressCallback>,
+    settings_dir: Option<PathBuf>,
 ) -> Vec<EventWorkerConfig> {
     accounts
         .into_iter()
@@ -2124,6 +2397,9 @@ fn build_event_worker_configs(
             if let Some(callback) = sync_progress_callback.as_ref() {
                 config = config.with_sync_progress_callback(callback.clone());
             }
+            if let Some(ref dir) = settings_dir {
+                config = config.with_settings_dir(dir.clone());
+            }
             config
         })
         .collect()
@@ -2141,6 +2417,7 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
     pim_stores: HashMap<String, Arc<PimStore>>,
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
+    settings_dir: Option<PathBuf>,
 ) -> EventWorkerGroup {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let handles = build_event_worker_configs(
@@ -2153,6 +2430,7 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
         checkpoint_store,
         pim_stores,
         sync_progress_callback,
+        settings_dir,
     )
     .into_iter()
     .map(|account| {
@@ -2183,6 +2461,7 @@ pub fn start_event_workers_with_sync_progress_and_pim_and_connector(
     pim_stores: HashMap<String, Arc<PimStore>>,
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
+    settings_dir: Option<PathBuf>,
 ) -> Vec<JoinHandle<()>> {
     build_event_worker_configs(
         runtime_accounts,
@@ -2194,6 +2473,7 @@ pub fn start_event_workers_with_sync_progress_and_pim_and_connector(
         checkpoint_store,
         pim_stores,
         sync_progress_callback,
+        settings_dir,
     )
     .into_iter()
     .map(|config| tokio::spawn(run_event_worker(config, poll_interval)))
@@ -2386,6 +2666,7 @@ mod tests {
             checkpoints,
             HashMap::new(),
             None,
+            None,
         );
 
         assert_eq!(configs.len(), 2);
@@ -2424,6 +2705,7 @@ mod tests {
             checkpoints,
             pim_stores,
             Some(callback),
+            None,
         );
 
         assert_eq!(configs.len(), 1);
@@ -5332,6 +5614,7 @@ mod tests {
             HashMap::new(),
             None,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(handles.len(), 2);
         for handle in handles {
@@ -5380,6 +5663,7 @@ mod tests {
             HashMap::new(),
             None,
             Duration::from_secs(3600),
+            None,
         );
         assert_eq!(group.len(), 2);
         group.shutdown().await;
@@ -5468,6 +5752,7 @@ mod tests {
             HashMap::new(),
             None,
             Duration::from_millis(50),
+            None,
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -5669,6 +5954,7 @@ mod tests {
             HashMap::new(),
             Some(callback),
             Duration::from_millis(50),
+            None,
         );
 
         let start = tokio::time::Instant::now();

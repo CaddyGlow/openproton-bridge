@@ -28,7 +28,6 @@ use super::mailbox_mutation::GluonMailboxMutation;
 use super::mailbox_view::GluonMailboxView;
 use super::response::ResponseWriter;
 use super::rfc822;
-use super::store::MessageStore;
 use super::Result;
 
 /// RFC 2177 recommends servers terminate IDLE after 30 minutes.
@@ -56,7 +55,6 @@ pub struct SessionConfig {
     pub api_base_url: String,
     pub auth_router: AuthRouter,
     pub runtime_accounts: Arc<RuntimeAccountRegistry>,
-    pub store: Arc<dyn MessageStore>,
     pub gluon_connector: Arc<dyn GluonImapConnector>,
     pub mailbox_catalog: Arc<dyn GluonMailboxCatalog>,
     pub mailbox_mutation: Arc<dyn GluonMailboxMutation>,
@@ -3147,7 +3145,6 @@ mod tests {
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
             mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
             mailbox_view: StoreBackedMailboxView::new(store.clone()),
-            store,
         })
     }
 
@@ -3252,7 +3249,6 @@ mod tests {
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
             mailbox_mutation,
             mailbox_view,
-            store,
         });
 
         (config, TestGluonMailFixture { _tempdir: tempdir })
@@ -3401,7 +3397,6 @@ mod tests {
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts.clone()),
             mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
             mailbox_view: StoreBackedMailboxView::new(store.clone()),
-            store,
         })
     }
 
@@ -3467,7 +3462,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -3523,7 +3518,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -3590,7 +3585,7 @@ mod tests {
         assert!(response.contains("+ idling"), "response={response}");
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -3677,12 +3672,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid1 = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         let _uid2 = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -3703,7 +3698,7 @@ mod tests {
         assert!(response.contains("+ idling"), "response={response}");
 
         config
-            .store
+            .mailbox_mutation
             .remove_message("test-uid::INBOX", uid1)
             .await
             .unwrap();
@@ -3808,12 +3803,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         let snapshot = config
-            .store
+            .mailbox_view
             .mailbox_snapshot("test-uid::INBOX")
             .await
             .unwrap();
@@ -3836,7 +3831,7 @@ mod tests {
         assert!(response.contains("+ idling"), "response={response}");
 
         config
-            .store
+            .mailbox_mutation
             .set_flags("test-uid::INBOX", uid, vec!["\\Seen".to_string()])
             .await
             .unwrap();
@@ -4066,7 +4061,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::Drafts", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -4228,7 +4223,11 @@ mod tests {
         assert!(response.contains("2 EXISTS"), "response={response}");
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
 
-        let uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(uids.len(), 2);
 
         server.verify().await;
@@ -4245,12 +4244,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_rfc822(
                 "test-uid::INBOX",
                 uid,
@@ -4306,7 +4305,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -4363,12 +4362,12 @@ mod tests {
         );
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .set_flags(
                 "test-uid::INBOX",
                 uid,
@@ -4501,7 +4500,7 @@ mod tests {
         );
 
         let src_uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -4519,13 +4518,21 @@ mod tests {
             "response should contain COPYUID: {response}"
         );
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids, vec![src_uid]);
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archived_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::Archive", archive_uids[0])
             .await
             .unwrap();
@@ -4625,7 +4632,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let src_uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -4639,13 +4646,21 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("COPY completed"), "response={response}");
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids, vec![src_uid]);
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archived_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::Archive", archive_uids[0])
             .await
             .unwrap();
@@ -4726,7 +4741,7 @@ mod tests {
         session.client = Some(failing_client());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -4744,7 +4759,11 @@ mod tests {
             "response={response}"
         );
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert!(archive_uids.is_empty());
     }
 
@@ -4829,12 +4848,12 @@ mod tests {
         );
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -4849,19 +4868,27 @@ mod tests {
         assert!(response.contains("* 1 EXPUNGE"), "response={response}");
         assert!(response.contains("MOVE completed"), "response={response}");
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::INBOX", inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-2"));
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::Archive", archive_uids[0])
             .await
             .unwrap();
@@ -4969,12 +4996,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -4989,19 +5016,27 @@ mod tests {
         assert!(response.contains("* 1 EXPUNGE"), "response={response}");
         assert!(response.contains("MOVE completed"), "response={response}");
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::INBOX", inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-2"));
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::Archive", archive_uids[0])
             .await
             .unwrap();
@@ -5083,12 +5118,12 @@ mod tests {
         session.client = Some(failing_client());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -5106,10 +5141,18 @@ mod tests {
             "response={response}"
         );
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids.len(), 2);
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert!(archive_uids.is_empty());
     }
 
@@ -5202,12 +5245,12 @@ mod tests {
         );
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         let uid2 = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -5225,19 +5268,27 @@ mod tests {
         assert!(response.contains("* 2 EXPUNGE"), "response={response}");
         assert!(response.contains("MOVE completed"), "response={response}");
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::INBOX", inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-1"));
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::Archive", archive_uids[0])
             .await
             .unwrap();
@@ -5257,12 +5308,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         let uid2 = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -5280,19 +5331,27 @@ mod tests {
         assert!(response.contains("* 2 EXPUNGE"), "response={response}");
         assert!(response.contains("MOVE completed"), "response={response}");
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::INBOX", inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-1"));
 
-        let archive_uids = config.store.list_uids("test-uid::Archive").await.unwrap();
+        let archive_uids = config
+            .mailbox_view
+            .list_uids("test-uid::Archive")
+            .await
+            .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
-            .store
+            .mailbox_view
             .get_proton_id("test-uid::Archive", archive_uids[0])
             .await
             .unwrap();
@@ -5330,12 +5389,12 @@ mod tests {
         );
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
             .await
             .unwrap();
@@ -5353,7 +5412,11 @@ mod tests {
             "response={response}"
         );
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert!(inbox_uids.is_empty());
 
         server.verify().await;
@@ -5494,12 +5557,12 @@ mod tests {
         session.client = Some(failing_client());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
             .await
             .unwrap();
@@ -5517,7 +5580,11 @@ mod tests {
             "response={response}"
         );
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids, vec![uid]);
     }
 
@@ -5580,12 +5647,12 @@ mod tests {
         session.client = Some(failing_client());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
             .await
             .unwrap();
@@ -5606,7 +5673,11 @@ mod tests {
             "response={response}"
         );
 
-        let inbox_uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let inbox_uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(inbox_uids, vec![uid]);
     }
 
@@ -5620,12 +5691,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 0))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -5704,7 +5775,7 @@ mod tests {
         );
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -5758,12 +5829,12 @@ mod tests {
         );
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_rfc822(
                 "test-uid::INBOX",
                 uid,
@@ -5787,7 +5858,7 @@ mod tests {
         assert!(response.contains("a001 OK FETCH completed"));
 
         let flags = config
-            .store
+            .mailbox_view
             .get_flags("test-uid::INBOX", uid)
             .await
             .unwrap();
@@ -5806,12 +5877,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::Drafts", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -5876,7 +5947,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -5933,12 +6004,12 @@ mod tests {
         );
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_rfc822(
                 "test-uid::INBOX",
                 uid,
@@ -5966,7 +6037,7 @@ mod tests {
         );
 
         let flags = config
-            .store
+            .mailbox_view
             .get_flags("test-uid::INBOX", uid)
             .await
             .unwrap();
@@ -6049,7 +6120,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -6079,7 +6150,7 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -6152,12 +6223,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_rfc822(
                 "test-uid::INBOX",
                 uid,
@@ -6303,7 +6374,7 @@ mod tests {
         );
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
@@ -6371,12 +6442,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 0))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
             .await
             .unwrap();
@@ -6669,12 +6740,12 @@ mod tests {
         session.authenticated_account_id = Some("test-uid".to_string());
 
         let uid = config
-            .store
+            .mailbox_mutation
             .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
             .await
             .unwrap();
         config
-            .store
+            .mailbox_mutation
             .add_flags("test-uid::INBOX", uid, &["\\Deleted".to_string()])
             .await
             .unwrap();
@@ -6698,7 +6769,11 @@ mod tests {
         assert!(session.selected_mailbox.is_none());
 
         // Message should still exist in the store
-        let uids = config.store.list_uids("test-uid::INBOX").await.unwrap();
+        let uids = config
+            .mailbox_view
+            .list_uids("test-uid::INBOX")
+            .await
+            .unwrap();
         assert_eq!(uids.len(), 1, "message must not be expunged");
     }
 }

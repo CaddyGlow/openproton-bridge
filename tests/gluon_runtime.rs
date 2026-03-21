@@ -513,6 +513,7 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
         config,
         MailRuntimeTransition::Startup,
         None,
+        None,
     )
     .await
     .expect("start mail runtime");
@@ -611,6 +612,7 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
         session_manager,
         config,
         MailRuntimeTransition::Startup,
+        None,
         None,
     )
     .await
@@ -730,6 +732,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
         config,
         MailRuntimeTransition::Startup,
         None,
+        None,
     )
     .await
     .expect("start mail runtime");
@@ -806,6 +809,7 @@ async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
         session_manager,
         config,
         MailRuntimeTransition::Startup,
+        None,
         None,
     )
     .await
@@ -902,6 +906,7 @@ async fn be030_mail_runtime_expunge_syncs_upstream_with_gluon_defaults() {
         config,
         MailRuntimeTransition::Startup,
         None,
+        None,
     )
     .await
     .expect("start mail runtime");
@@ -993,6 +998,7 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
         session_manager,
         config,
         MailRuntimeTransition::Startup,
+        None,
         None,
     )
     .await
@@ -1124,6 +1130,7 @@ async fn be030_mail_runtime_event_update_reaches_idle_with_gluon_defaults() {
         config,
         MailRuntimeTransition::Startup,
         None,
+        None,
     )
     .await
     .expect("start mail runtime");
@@ -1243,6 +1250,7 @@ async fn be030_mail_runtime_event_delete_surfaces_via_noop_with_gluon_defaults()
         session_manager,
         config,
         MailRuntimeTransition::Startup,
+        None,
         None,
     )
     .await
@@ -1365,6 +1373,7 @@ async fn be030_mail_runtime_refresh_resync_surfaces_via_noop_with_gluon_defaults
         session_manager,
         config,
         MailRuntimeTransition::Startup,
+        None,
         None,
     )
     .await

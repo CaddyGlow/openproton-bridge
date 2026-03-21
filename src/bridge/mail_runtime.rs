@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -222,6 +223,7 @@ pub async fn start(
     config: MailRuntimeConfig,
     transition: MailRuntimeTransition,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
+    external_sync_callback: Option<super::events::SyncProgressCallback>,
 ) -> Result<MailRuntimeHandle, MailRuntimeStartError> {
     let prepared = prepare_runtime_context(&runtime_paths, session_manager, &config).await?;
 
@@ -307,6 +309,7 @@ pub async fn start(
         dav_listener,
         stop_rx,
         notify_tx,
+        external_sync_callback,
         pim_reconcile_metrics.clone(),
     ));
 
@@ -338,6 +341,7 @@ struct PreparedMailRuntime {
     pim_contacts_reconcile_interval: Duration,
     pim_calendar_reconcile_interval: Duration,
     pim_calendar_horizon_reconcile_interval: Duration,
+    settings_dir: PathBuf,
 }
 
 async fn prepare_runtime_context(
@@ -499,16 +503,6 @@ async fn prepare_runtime_context(
         "resolved gluon store bootstrap context"
     );
 
-    let account_storage_ids = gluon_bootstrap
-        .accounts
-        .iter()
-        .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
-        .collect();
-    let store: Arc<dyn imap::store::MessageStore> = imap::store::new_runtime_message_store(
-        gluon_paths.root().to_path_buf(),
-        account_storage_ids,
-    )
-    .context("failed to initialize runtime IMAP store")?;
     let mailbox_catalog =
         imap::mailbox_catalog::RuntimeMailboxCatalog::new(runtime_accounts.clone());
     let mailbox_view = build_mailbox_view(&gluon_bootstrap, gluon_paths.root())
@@ -539,7 +533,6 @@ async fn prepare_runtime_context(
         mailbox_catalog,
         mailbox_mutation,
         mailbox_view,
-        store,
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {
@@ -580,6 +573,7 @@ async fn prepare_runtime_context(
         pim_contacts_reconcile_interval: config.pim_contacts_reconcile_interval,
         pim_calendar_reconcile_interval: config.pim_calendar_reconcile_interval,
         pim_calendar_horizon_reconcile_interval: config.pim_calendar_horizon_reconcile_interval,
+        settings_dir: settings_dir.to_path_buf(),
     })
 }
 
@@ -623,7 +617,7 @@ fn build_gluon_connector(
     )))
 }
 
-fn build_gluon_mail_compatible_store(
+pub(crate) fn build_gluon_mail_compatible_store(
     gluon_bootstrap: &vault::GluonStoreBootstrap,
     gluon_root: &std::path::Path,
     read_only: bool,
@@ -667,6 +661,7 @@ async fn run_runtime(
     dav_listener: Option<TcpListener>,
     shutdown_rx: oneshot::Receiver<()>,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
+    external_sync_callback: Option<super::events::SyncProgressCallback>,
     pim_reconcile_metrics: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
 ) -> anyhow::Result<()> {
     let PreparedMailRuntime {
@@ -684,6 +679,7 @@ async fn run_runtime(
         pim_contacts_reconcile_interval,
         pim_calendar_reconcile_interval,
         pim_calendar_horizon_reconcile_interval,
+        settings_dir,
         ..
     } = prepared;
 
@@ -692,11 +688,11 @@ async fn run_runtime(
         .map(|info| (info.account_id.0.clone(), info.email.clone()))
         .collect();
     let notify_for_callback = notify_tx.clone();
-    let sync_progress_callback: super::events::SyncProgressCallback =
-        Arc::new(move |event| match event {
+    let sync_progress_callback: super::events::SyncProgressCallback = Arc::new(move |event| {
+        match &event {
             super::events::SyncProgressUpdate::Started { user_id } => {
                 let label = account_lookup
-                    .get(&user_id)
+                    .get(user_id)
                     .cloned()
                     .unwrap_or_else(|| user_id.clone());
                 tracing::info!(user_id = %user_id, "account sync started");
@@ -705,15 +701,12 @@ async fn run_runtime(
                 }
             }
             super::events::SyncProgressUpdate::Progress {
-                user_id,
-                progress,
-                elapsed_ms: _,
-                remaining_ms: _,
+                user_id, progress, ..
             } => {
                 tracing::debug!(user_id = %user_id, progress, "account sync progress");
                 if let Some(tx) = notify_for_callback.as_ref() {
                     let label = account_lookup
-                        .get(&user_id)
+                        .get(user_id)
                         .cloned()
                         .unwrap_or_else(|| user_id.clone());
                     let _ = tx.send(format!(
@@ -724,7 +717,7 @@ async fn run_runtime(
             }
             super::events::SyncProgressUpdate::Finished { user_id } => {
                 let label = account_lookup
-                    .get(&user_id)
+                    .get(user_id)
                     .cloned()
                     .unwrap_or_else(|| user_id.clone());
                 tracing::info!(user_id = %user_id, "account sync finished");
@@ -732,7 +725,11 @@ async fn run_runtime(
                     let _ = tx.send(format!("[event] sync finished: {label}"));
                 }
             }
-        });
+        }
+        if let Some(ref cb) = external_sync_callback {
+            cb(event);
+        }
+    });
 
     let pim_stores_for_reconcile = pim_stores.clone();
     let dav_pim_stores = pim_stores.clone();
@@ -749,6 +746,7 @@ async fn run_runtime(
             pim_stores,
             Some(sync_progress_callback),
             poll_interval,
+            Some(settings_dir),
         );
 
     let pim_reconcile_task = tokio::spawn(run_pim_reconcile_periodically(

@@ -133,6 +133,10 @@ pub async fn run_server_with_options(
         owner = "mail_runtime",
         "using mail runtime as the single grpc sync worker owner"
     );
+    service
+        .state
+        .runtime_supervisor
+        .set_sync_callback(service.build_sync_progress_callback());
     if start_mail_runtime_on_startup {
         service.start_mail_runtime_on_startup().await;
     } else {

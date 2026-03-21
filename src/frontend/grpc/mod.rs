@@ -455,6 +455,7 @@ async fn maybe_start_grpc_sync_workers(
             HashMap::new(),
             Some(sync_progress_callback),
             std::time::Duration::from_secs(30),
+            Some(runtime_paths.settings_dir().to_path_buf()),
         ),
     ))
 }

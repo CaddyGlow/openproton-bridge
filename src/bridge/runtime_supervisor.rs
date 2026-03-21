@@ -20,6 +20,20 @@ pub struct RuntimeSupervisor {
     handle: Mutex<Option<SupervisorRuntimeHandle>>,
     start_snapshot: Mutex<Option<RuntimeStartSnapshot>>,
     transition_lock: Mutex<()>,
+    shared_sync_callback: SharedSyncCallback,
+}
+
+type SharedSyncCallback = Arc<std::sync::RwLock<Option<super::events::SyncProgressCallback>>>;
+
+fn wrap_shared_callback(shared: &SharedSyncCallback) -> super::events::SyncProgressCallback {
+    let shared = shared.clone();
+    Arc::new(move |event| {
+        if let Ok(guard) = shared.read() {
+            if let Some(cb) = guard.as_ref() {
+                cb(event);
+            }
+        }
+    })
 }
 
 impl RuntimeSupervisor {
@@ -33,11 +47,18 @@ impl RuntimeSupervisor {
             handle: Mutex::new(None),
             start_snapshot: Mutex::new(None),
             transition_lock: Mutex::new(()),
+            shared_sync_callback: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
     pub fn session_manager(&self) -> Arc<super::session_manager::SessionManager> {
         self.session_manager.clone()
+    }
+
+    pub fn set_sync_callback(&self, callback: super::events::SyncProgressCallback) {
+        if let Ok(mut guard) = self.shared_sync_callback.write() {
+            *guard = Some(callback);
+        }
     }
 
     pub async fn start(
@@ -52,6 +73,17 @@ impl RuntimeSupervisor {
         Ok(())
     }
 
+    pub async fn start_with_sync_callback(
+        &self,
+        config: MailRuntimeConfig,
+        transition: MailRuntimeTransition,
+        sync_callback: Option<super::events::SyncProgressCallback>,
+    ) -> Result<(), MailRuntimeStartError> {
+        let _transition_guard = self.transition_lock.lock().await;
+        self.start_locked(config, transition, None, sync_callback)
+            .await
+    }
+
     pub async fn start_with_snapshot(
         &self,
         config: MailRuntimeConfig,
@@ -59,7 +91,8 @@ impl RuntimeSupervisor {
         notify_tx: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<RuntimeStartSnapshot, MailRuntimeStartError> {
         let _transition_guard = self.transition_lock.lock().await;
-        self.start_locked(config, transition, notify_tx).await?;
+        self.start_locked(config, transition, notify_tx, None)
+            .await?;
         Ok(self
             .start_snapshot
             .lock()
@@ -86,7 +119,7 @@ impl RuntimeSupervisor {
         self.stop_locked("restart")
             .await
             .map_err(|err| MailRuntimeStartError::Prepare(err.context("failed to stop runtime")))?;
-        self.start_locked(config, transition, notify_tx).await
+        self.start_locked(config, transition, notify_tx, None).await
     }
 
     pub async fn wait_for_termination(&self) -> anyhow::Result<()> {
@@ -128,6 +161,7 @@ impl RuntimeSupervisor {
         config: MailRuntimeConfig,
         transition: MailRuntimeTransition,
         notify_tx: Option<mpsc::UnboundedSender<String>>,
+        sync_callback: Option<super::events::SyncProgressCallback>,
     ) -> Result<(), MailRuntimeStartError> {
         if let Some(finished) = self.take_finished_handle().await {
             finished.stop().await.map_err(|err| {
@@ -141,12 +175,15 @@ impl RuntimeSupervisor {
             return Ok(());
         }
 
+        let effective_callback =
+            sync_callback.unwrap_or_else(|| wrap_shared_callback(&self.shared_sync_callback));
         let handle = mail_runtime::start(
             self.runtime_paths.clone(),
             self.session_manager.clone(),
             config,
             transition,
             notify_tx,
+            Some(effective_callback),
         )
         .await?;
         let start_snapshot = RuntimeStartSnapshot {

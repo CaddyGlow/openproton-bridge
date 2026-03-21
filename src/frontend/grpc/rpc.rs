@@ -607,7 +607,7 @@ async fn optimize_cache_message(
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
     account_id: crate::bridge::types::AccountId,
     addr_keyrings: Arc<HashMap<String, Arc<crate::crypto::keys::Keyring>>>,
-    store: Arc<dyn crate::imap::store::MessageStore>,
+    mutation: Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation>,
 ) -> bool {
     let msg_resp = match crate::api::messages::get_message(&client, &proton_id).await {
         Ok(msg) => msg,
@@ -692,7 +692,7 @@ async fn optimize_cache_message(
         }
     };
 
-    if let Err(err) = store.store_rfc822(&mailbox, uid, data).await {
+    if let Err(err) = mutation.store_rfc822(&mailbox, uid, data).await {
         warn!(
             account_id = %account_id.0,
             mailbox = %mailbox,
@@ -709,7 +709,8 @@ async fn optimize_cache_message(
 #[allow(clippy::result_large_err)]
 async fn run_cache_optimization_for_account(
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
-    store: Arc<dyn crate::imap::store::MessageStore>,
+    view: Arc<dyn crate::imap::mailbox_view::GluonMailboxView>,
+    mutation: Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation>,
     account: Session,
     mailboxes: Vec<String>,
     semaphore: Arc<Semaphore>,
@@ -836,7 +837,7 @@ async fn run_cache_optimization_for_account(
 
     for mailbox in mailboxes.iter() {
         let scoped = scoped_cache_mailbox(&account.uid, mailbox);
-        let uids = match store.list_uids(&scoped).await {
+        let uids = match view.list_uids(&scoped).await {
             Ok(uids) => uids,
             Err(err) => {
                 warn!(
@@ -850,7 +851,7 @@ async fn run_cache_optimization_for_account(
         };
 
         for uid in uids {
-            match store.get_rfc822(&scoped, uid).await {
+            match view.get_rfc822(&scoped, uid).await {
                 Ok(Some(_)) => continue,
                 Ok(None) => {}
                 Err(err) => {
@@ -865,7 +866,7 @@ async fn run_cache_optimization_for_account(
                 }
             }
 
-            let proton_id = match store.get_proton_id(&scoped, uid).await {
+            let proton_id = match view.get_proton_id(&scoped, uid).await {
                 Ok(Some(proton_id)) => proton_id,
                 Ok(None) => continue,
                 Err(err) => {
@@ -882,7 +883,7 @@ async fn run_cache_optimization_for_account(
 
             let handle = {
                 let runtime_accounts = runtime_accounts.clone();
-                let store = store.clone();
+                let mutation = mutation.clone();
                 let client = client.clone();
                 let account_id = account_id.clone();
                 let mailbox = scoped.clone();
@@ -913,7 +914,7 @@ async fn run_cache_optimization_for_account(
                         runtime_accounts,
                         account_id,
                         addr_keyrings,
-                        store,
+                        mutation,
                     )
                     .await
                 })
@@ -951,7 +952,8 @@ async fn run_cache_optimization_for_account(
 #[allow(clippy::result_large_err)]
 async fn run_cache_optimization(
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
-    store: Arc<dyn crate::imap::store::MessageStore>,
+    view: Arc<dyn crate::imap::mailbox_view::GluonMailboxView>,
+    mutation: Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation>,
     accounts: Vec<Session>,
     mailboxes: Vec<String>,
     concurrency: usize,
@@ -960,13 +962,15 @@ async fn run_cache_optimization(
     let mut handles = Vec::new();
     for account in accounts {
         let runtime_accounts = runtime_accounts.clone();
-        let store = store.clone();
+        let view = view.clone();
+        let mutation = mutation.clone();
         let mailboxes = mailboxes.clone();
         let semaphore = semaphore.clone();
         handles.push(tokio::spawn(async move {
             run_cache_optimization_for_account(
                 runtime_accounts,
-                store,
+                view,
+                mutation,
                 account,
                 mailboxes,
                 semaphore,
@@ -1128,23 +1132,37 @@ impl pb::bridge_server::Bridge for BridgeService {
                 other => status_from_vault_error(other),
             })?;
 
-        let account_storage_ids = bootstrap
-            .accounts
-            .into_iter()
-            .map(|account| (account.account_id.clone(), account.storage_user_id.clone()))
-            .collect::<HashMap<_, _>>();
         let gluon_paths = self
             .state
             .runtime_paths
             .gluon_paths(Some(bootstrap.gluon_dir.as_str()));
-        let store = crate::imap::store::new_runtime_message_store(
-            gluon_paths.root().to_path_buf(),
-            account_storage_ids,
-        )
-        .map_err(|err| Status::internal(format!("failed to open runtime message store: {err}")))?;
+        let compatible_store = std::sync::Arc::new(
+            bridge::mail_runtime::build_gluon_mail_compatible_store(
+                &bootstrap,
+                gluon_paths.root(),
+                false,
+            )
+            .map_err(|err| {
+                Status::internal(format!("failed to open compatible store: {err}"))
+            })?,
+        );
+        let view: std::sync::Arc<dyn crate::imap::mailbox_view::GluonMailboxView> =
+            crate::imap::gluon_mailbox_view::GluonMailMailboxView::new(compatible_store.clone());
+        let mutation: std::sync::Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation> =
+            crate::imap::gluon_mailbox_mutation::GluonMailMailboxMutation::new(
+                compatible_store,
+            );
 
         tokio::spawn(async move {
-            run_cache_optimization(runtime_accounts, store, accounts, mailboxes, concurrency).await;
+            run_cache_optimization(
+                runtime_accounts,
+                view,
+                mutation,
+                accounts,
+                mailboxes,
+                concurrency,
+            )
+            .await;
         });
 
         Ok(Response::new(pb::OptimizeCacheResponse { started: true }))

@@ -181,6 +181,7 @@ pub trait GluonImapConnector: Send + Sync {
         previous_mailboxes: &[String],
         next_mailboxes: &[String],
     ) -> Result<()>;
+    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()>;
 }
 
 #[derive(Clone)]
@@ -437,6 +438,10 @@ impl GluonImapConnector for StoreBackedConnector {
         }
 
         Ok(())
+    }
+
+    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+        self.store.store_rfc822(mailbox, uid, data).await
     }
 }
 
@@ -799,6 +804,10 @@ impl GluonImapConnector for GluonMailConnector {
         }
 
         Ok(())
+    }
+
+    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+        self.mutation.store_rfc822(mailbox, uid, data).await
     }
 }
 

@@ -2334,6 +2334,32 @@ pub fn set_gluon_key_by_account_id(dir: &Path, account_id: &str, gluon_key: Vec<
     save_vault_data(dir, &mut data)
 }
 
+pub fn get_user_id_by_account_id(dir: &Path, account_id: &str) -> Result<String> {
+    let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+    Ok(user.user_id.clone())
+}
+
+pub fn is_sync_complete(dir: &Path, account_id: &str) -> Result<bool> {
+    let data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+    Ok(user.sync_status.has_labels && user.sync_status.has_messages)
+}
+
+pub fn set_sync_complete(dir: &Path, account_id: &str) -> Result<()> {
+    let mut data = load_vault_data(dir)?.ok_or(VaultError::NotLoggedIn)?;
+    let Some(user) = data.users.iter_mut().find(|u| u.auth_uid == account_id) else {
+        return Err(VaultError::AccountNotFound(account_id.to_string()));
+    };
+    user.sync_status.has_labels = true;
+    user.sync_status.has_messages = true;
+    save_vault_data(dir, &mut data)
+}
+
 pub fn save_gluon_id_bindings_by_account_id(
     dir: &Path,
     account_id: &str,

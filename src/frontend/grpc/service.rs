@@ -81,9 +81,10 @@ impl BridgeService {
         let config = self
             .mail_runtime_config_from_settings(settings)
             .map_err(bridge::mail_runtime::MailRuntimeStartError::Prepare)?;
+        let sync_callback = self.build_sync_progress_callback();
         self.state
             .runtime_supervisor
-            .start(config, transition, None)
+            .start_with_sync_callback(config, transition, Some(sync_callback))
             .await
     }
 
@@ -746,6 +747,26 @@ impl BridgeService {
                 user_id: user_id.to_string(),
             })),
         }));
+    }
+
+    fn build_sync_progress_callback(&self) -> bridge::events::SyncProgressCallback {
+        let service = self.clone();
+        Arc::new(move |event| match event {
+            bridge::events::SyncProgressUpdate::Started { user_id } => {
+                service.emit_sync_started(&user_id);
+            }
+            bridge::events::SyncProgressUpdate::Progress {
+                user_id,
+                progress,
+                elapsed_ms,
+                remaining_ms,
+            } => {
+                service.emit_sync_progress(&user_id, progress, elapsed_ms, remaining_ms);
+            }
+            bridge::events::SyncProgressUpdate::Finished { user_id } => {
+                service.emit_sync_finished(&user_id);
+            }
+        })
     }
 
     fn emit_sync_started(&self, user_id: &str) {

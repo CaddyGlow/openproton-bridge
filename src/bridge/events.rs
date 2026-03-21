@@ -1246,6 +1246,45 @@ async fn bounded_resync_account_for_generation(
         })
         .unwrap_or_default();
 
+    // Fetch total message count from AllMail label (same as Go bridge)
+    if !sync_status.has_message_count {
+        match messages::get_grouped_message_count(client).await {
+            Ok(counts) => {
+                for gc in &counts {
+                    if gc.label_id == crate::api::types::ALL_MAIL_LABEL {
+                        sync_status.total_message_count = gc.total;
+                        sync_status.has_message_count = true;
+                        info!(
+                            account_id = %config.account_id.0,
+                            total_message_count = gc.total,
+                            "fetched total message count from AllMail"
+                        );
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    account_id = %config.account_id.0,
+                    error = %e,
+                    "failed to fetch grouped message count"
+                );
+            }
+        }
+    }
+
+    let has_sync_state_progress = sync_status.total_message_count > 0;
+
+    // Emit initial progress based on sync state (matches Go bridge's starting point)
+    if has_sync_state_progress {
+        emit_sync_progress_ratio(
+            config,
+            sync_status.num_synced_messages,
+            sync_status.total_message_count,
+            resync_started_at.elapsed(),
+        );
+    }
+
     let mut total_steps = mailbox::system_mailboxes()
         .iter()
         .filter(|mb| mb.selectable)
@@ -1255,34 +1294,13 @@ async fn bounded_resync_account_for_generation(
     let mut synced_message_ids = HashSet::new();
     let mut total_applied = 0usize;
 
-    // Use sync state cursor to resume from where either bridge last stopped.
-    // The Go bridge processes INBOX messages in descending order (newest first)
-    // using end_id as a cursor. If we have a last_synced_message_id, use it as
-    // the initial end_id for INBOX to skip already-synced messages.
-    let resume_cursor = if !sync_status.last_synced_message_id.is_empty() {
-        info!(
-            account_id = %config.account_id.0,
-            last_synced_id = %sync_status.last_synced_message_id,
-            num_synced = sync_status.num_synced_messages,
-            "resuming sync from Go bridge cursor"
-        );
-        Some(sync_status.last_synced_message_id.clone())
-    } else {
-        None
-    };
-
     for mb in mailbox::system_mailboxes() {
         if !mb.selectable {
             continue;
         }
         ensure_account_generation(config, expected_generation, "bounded_resync_mailbox").await?;
 
-        // For INBOX, start from the sync state cursor to skip already-synced messages
-        let mut end_id: Option<String> = if mb.label_id == "0" {
-            resume_cursor.clone()
-        } else {
-            None
-        };
+        let mut end_id: Option<String> = None;
         loop {
             ensure_account_generation(config, expected_generation, "bounded_resync_page").await?;
             let request_phase = if end_id.is_some() {
@@ -1334,12 +1352,15 @@ async fn bounded_resync_account_for_generation(
             if page_count == RESYNC_PAGE_SIZE {
                 total_steps = total_steps.saturating_add(1);
             }
-            emit_sync_progress(
-                config,
-                completed_steps,
-                total_steps,
-                resync_started_at.elapsed(),
-            );
+            // Fallback: page-based progress when we don't have sync state totals
+            if !has_sync_state_progress {
+                emit_sync_progress_ratio(
+                    config,
+                    completed_steps as i64,
+                    total_steps.max(1) as i64,
+                    resync_started_at.elapsed(),
+                );
+            }
 
             if messages.is_empty() {
                 break;
@@ -1352,13 +1373,15 @@ async fn bounded_resync_account_for_generation(
                     apply_metadata_to_store(config, &metadata, expected_generation).await?;
                     total_applied += 1;
 
-                    // Download full body and store RFC822
+                    // Download full body and store RFC822.
+                    // Only count toward sync state when body is successfully stored,
+                    // matching Go bridge's counting (all 4 stages complete per message).
                     if let Some(ref keyrings) = addr_keyrings {
                         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
                         if let Ok(Some(uid)) =
                             config.mailbox_view.get_uid(&scoped, &metadata.id).await
                         {
-                            download_and_store_rfc822(
+                            if download_and_store_rfc822(
                                 config,
                                 client,
                                 keyrings,
@@ -1367,13 +1390,23 @@ async fn bounded_resync_account_for_generation(
                                 &scoped,
                                 uid,
                             )
-                            .await;
+                            .await
+                            {
+                                sync_status.num_synced_messages += 1;
+                                sync_status.last_synced_message_id = metadata.id.clone();
+
+                                // Report progress as num_synced / total to match Go bridge
+                                if sync_status.total_message_count > 0 {
+                                    emit_sync_progress_ratio(
+                                        config,
+                                        sync_status.num_synced_messages,
+                                        sync_status.total_message_count,
+                                        resync_started_at.elapsed(),
+                                    );
+                                }
+                            }
                         }
                     }
-
-                    // Update sync state cursor
-                    sync_status.last_synced_message_id = metadata.id.clone();
-                    sync_status.num_synced_messages += 1;
                 }
             }
 
@@ -1411,12 +1444,21 @@ async fn bounded_resync_account_for_generation(
         "completed refresh resync"
     );
 
-    emit_sync_progress(
-        config,
-        total_steps,
-        total_steps,
-        resync_started_at.elapsed(),
-    );
+    if has_sync_state_progress {
+        emit_sync_progress_ratio(
+            config,
+            sync_status.num_synced_messages,
+            sync_status.total_message_count,
+            resync_started_at.elapsed(),
+        );
+    } else {
+        emit_sync_progress_ratio(
+            config,
+            total_steps as i64,
+            total_steps as i64,
+            resync_started_at.elapsed(),
+        );
+    }
     progress_guard.finish();
 
     if let Some(ref dir) = config.settings_dir {
@@ -1539,6 +1581,8 @@ async fn build_address_keyrings(
     Ok(keyrings)
 }
 
+/// Download full message body, build RFC822, and store it.
+/// Returns `true` if the body was successfully stored.
 async fn download_and_store_rfc822(
     config: &EventWorkerConfig,
     client: &ProtonClient,
@@ -1547,7 +1591,7 @@ async fn download_and_store_rfc822(
     address_id: &str,
     scoped_mailbox: &str,
     uid: u32,
-) {
+) -> bool {
     let keyring = match addr_keyrings.get(address_id) {
         Some(kr) => kr,
         None => {
@@ -1557,7 +1601,7 @@ async fn download_and_store_rfc822(
                 address_id = %address_id,
                 "no keyring for address; skipping body download"
             );
-            return;
+            return false;
         }
     };
 
@@ -1570,7 +1614,7 @@ async fn download_and_store_rfc822(
                 error = %e,
                 "failed to download message body; skipping"
             );
-            return;
+            return false;
         }
     };
 
@@ -1583,7 +1627,7 @@ async fn download_and_store_rfc822(
                 error = %e,
                 "failed to build RFC822; skipping"
             );
-            return;
+            return false;
         }
     };
 
@@ -1598,7 +1642,10 @@ async fn download_and_store_rfc822(
             error = %e,
             "failed to store RFC822; skipping"
         );
+        return false;
     }
+
+    true
 }
 
 fn vault_sync_complete(config: &EventWorkerConfig) -> bool {
@@ -1618,18 +1665,18 @@ fn vault_sync_complete(config: &EventWorkerConfig) -> bool {
     }
 }
 
-fn emit_sync_progress(
+fn emit_sync_progress_ratio(
     config: &EventWorkerConfig,
-    completed_steps: usize,
-    total_steps: usize,
+    completed: i64,
+    total: i64,
     elapsed: Duration,
 ) {
     let Some(callback) = config.sync_progress_callback.as_ref() else {
         return;
     };
 
-    let total = total_steps.max(1) as f64;
-    let progress = (completed_steps as f64 / total).clamp(0.0, 1.0);
+    let total_f = total.max(1) as f64;
+    let progress = (completed as f64 / total_f).clamp(0.0, 1.0);
     let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
     let remaining_ms = if progress > 0.0 && progress < 1.0 {
         ((elapsed_ms as f64) * ((1.0 - progress) / progress))

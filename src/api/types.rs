@@ -409,6 +409,15 @@ pub struct MessageResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
+pub struct MessageGroupCount {
+    #[serde(rename = "LabelID")]
+    pub label_id: String,
+    pub total: i64,
+    pub unread: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
 pub struct MessagesMetadataResponse {
     pub messages: Vec<MessageMetadata>,
     pub total: i64,

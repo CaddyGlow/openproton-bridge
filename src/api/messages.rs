@@ -9,8 +9,8 @@ use super::client::{
 };
 use super::error::{ApiError, Result};
 use super::types::{
-    AttachmentResponse, CreateDraftReq, MessageFilter, MessageResponse, MessagesMetadataResponse,
-    SendDraftReq, SendDraftResponse, UpdateDraftReq,
+    AttachmentResponse, CreateDraftReq, MessageFilter, MessageGroupCount, MessageResponse,
+    MessagesMetadataResponse, SendDraftReq, SendDraftResponse, UpdateDraftReq,
 };
 
 const API_SUCCESS_CODE: i64 = 1000;
@@ -250,6 +250,21 @@ fn build_message_metadata_body(
     body.insert("Sort".to_string(), serde_json::json!("ID"));
 
     Ok(serde_json::Value::Object(body))
+}
+
+/// Fetch grouped message counts per label.
+///
+/// Reference: go-proton-api Client.GetGroupedMessageCount
+pub async fn get_grouped_message_count(client: &ProtonClient) -> Result<Vec<MessageGroupCount>> {
+    let resp = send_logged(client.get("/mail/v4/messages/count")).await?;
+    let json: serde_json::Value = resp.json().await?;
+    check_api_response(&json)?;
+    let counts: Vec<MessageGroupCount> = serde_json::from_value(
+        json.get("Counts")
+            .cloned()
+            .unwrap_or(serde_json::Value::Array(vec![])),
+    )?;
+    Ok(counts)
 }
 
 /// Fetch a full message including encrypted body and attachment metadata.

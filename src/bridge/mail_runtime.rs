@@ -513,6 +513,20 @@ async fn prepare_runtime_context(
         .context("failed to initialize event mailbox view backend")?;
     let gluon_connector = build_gluon_connector(&gluon_bootstrap, gluon_paths.root())
         .context("failed to initialize Gluon connector backend")?;
+
+    let schema_init_store =
+        build_gluon_mail_compatible_store(&gluon_bootstrap, gluon_paths.root(), false)
+            .context("failed to open store for eager schema init")?;
+    for account in &gluon_bootstrap.accounts {
+        if let Err(err) = schema_init_store.initialize_upstream_schema(&account.storage_user_id) {
+            tracing::warn!(
+                account_id = %account.account_id,
+                error = %err,
+                "failed to eagerly initialize upstream mail schema"
+            );
+        }
+    }
+
     let mut pim_stores = HashMap::new();
     for account in &gluon_bootstrap.accounts {
         let pim_store = PimStore::new(gluon_paths.account_db_path(&account.storage_user_id))

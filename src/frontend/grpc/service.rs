@@ -1158,6 +1158,35 @@ impl BridgeService {
             return None;
         }
 
+        // Return cached data if still fresh.  The GUI polls GetUserList every
+        // ~500ms; without this cache each poll triggers a live HTTP round-trip
+        // to /core/v4/users which floods the API during sync.
+        {
+            let cache = self.state.user_api_data_cache.lock().await;
+            if let Some(entry) = cache.get(&session.uid) {
+                if entry.fetched_at.elapsed() < USER_API_DATA_CACHE_TTL {
+                    return Some(entry.data.clone());
+                }
+            }
+        }
+
+        let result = self.fetch_user_api_data_uncached(session).await;
+
+        if let Some(ref data) = result {
+            let mut cache = self.state.user_api_data_cache.lock().await;
+            cache.insert(
+                session.uid.clone(),
+                CachedUserApiData {
+                    data: data.clone(),
+                    fetched_at: std::time::Instant::now(),
+                },
+            );
+        }
+
+        result
+    }
+
+    async fn fetch_user_api_data_uncached(&self, session: &Session) -> Option<UserApiData> {
         let mut access_token = self.resolve_session_access_token(session).await;
         if access_token.is_none() {
             access_token = self.refresh_session_access_token(session).await;

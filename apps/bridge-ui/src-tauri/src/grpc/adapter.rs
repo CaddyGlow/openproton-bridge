@@ -1434,6 +1434,7 @@ fn stream_ui_event(event: &pb::StreamEvent) -> Option<UiEvent> {
                         "users".to_string(),
                         format!("sync_user:{}", sync.user_id),
                         format!("sync_progress:{progress_percent}"),
+                        format!("sync_remaining_ms:{}", sync.remaining_ms.max(0)),
                     ],
                 })
             }
@@ -1676,6 +1677,10 @@ mod tests {
             .refresh_hints
             .iter()
             .any(|hint| hint == "sync_progress:42"));
+        assert!(ui_event
+            .refresh_hints
+            .iter()
+            .any(|hint| hint == "sync_remaining_ms:1200"));
     }
 
     #[test]

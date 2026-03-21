@@ -192,6 +192,17 @@ struct PendingHumanVerification {
     details: HumanVerificationDetails,
 }
 
+/// Cached result from `/core/v4/users` to avoid flooding the API.
+/// The Go bridge GUI polls `GetUserList` every ~500ms; without this cache each
+/// poll makes a live HTTP request.
+struct CachedUserApiData {
+    data: UserApiData,
+    fetched_at: std::time::Instant,
+}
+
+/// How long a `UserApiData` cache entry is considered fresh.
+const USER_API_DATA_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct GrpcState {
     runtime_paths: RuntimePaths,
     bind_host: String,
@@ -209,6 +220,7 @@ struct GrpcState {
     app_settings: Mutex<StoredAppSettings>,
     sync_workers_enabled: bool,
     sync_event_workers: Mutex<Option<bridge::events::EventWorkerGroup>>,
+    user_api_data_cache: Mutex<HashMap<String, CachedUserApiData>>,
 }
 
 #[derive(Clone)]
@@ -687,6 +699,7 @@ fn session_to_user(
     session: &Session,
     split_mode: bool,
     api_data: Option<&UserApiData>,
+    known_addresses: &[String],
 ) -> pb::User {
     let avatar_text = session
         .email
@@ -699,6 +712,12 @@ fn session_to_user(
         session.display_name.clone()
     } else {
         api_data.display_name
+    };
+
+    let addresses = if known_addresses.is_empty() {
+        vec![session.email.clone()]
+    } else {
+        known_addresses.to_vec()
     };
 
     pb::User {
@@ -715,7 +734,7 @@ fn session_to_user(
             .unwrap_or_default()
             .as_bytes()
             .to_vec(),
-        addresses: vec![session.email.clone()],
+        addresses,
         name: api_data.name,
         display_name,
         max_upload: api_data.max_upload,
@@ -1171,6 +1190,7 @@ mod tests {
             mail_runtime_transition_lock: Mutex::new(()),
             sync_workers_enabled: false,
             sync_event_workers: Mutex::new(None),
+            user_api_data_cache: Mutex::new(HashMap::new()),
         });
         BridgeService::new(state)
     }
@@ -1418,7 +1438,11 @@ mod tests {
             pass_used_bytes: 5,
         };
 
-        let user = session_to_user(&session, true, Some(&api_data));
+        let addrs = vec![
+            "alice@example.com".to_string(),
+            "alias@example.com".to_string(),
+        ];
+        let user = session_to_user(&session, true, Some(&api_data), &addrs);
         assert_eq!(user.id, "uid-1");
         assert_eq!(user.username, "alice@example.com");
         assert!(user.split_mode);
@@ -1435,6 +1459,10 @@ mod tests {
         assert_eq!(user.name, "alice");
         assert_eq!(user.display_name, "Alice API");
         assert_eq!(user.password, b"bridge-pass");
+        assert_eq!(
+            user.addresses,
+            vec!["alice@example.com", "alias@example.com"]
+        );
     }
 
     #[test]
@@ -1450,8 +1478,9 @@ mod tests {
             bridge_password: None,
         };
 
-        let user = session_to_user(&session, false, None);
+        let user = session_to_user(&session, false, None, &[]);
         assert_eq!(user.display_name, "Bob Session");
+        assert_eq!(user.addresses, vec!["bob@example.com"]);
         assert_eq!(user.used_bytes, 0);
         assert_eq!(user.total_bytes, 0);
         assert_eq!(user.password, b"");

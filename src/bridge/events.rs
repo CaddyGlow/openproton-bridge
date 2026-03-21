@@ -5,8 +5,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rand::Rng;
-use tokio::sync::watch;
-use tokio::task::JoinHandle;
+use tokio::sync::{watch, Semaphore};
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -219,11 +219,21 @@ pub enum EventWorkerError {
 
 pub type SharedCheckpointStore = Arc<dyn EventCheckpointStore<Error = ()> + Send + Sync>;
 const RESYNC_PAGE_SIZE: i32 = 150;
+const DEFAULT_RESYNC_RFC822_CONCURRENCY: usize = 6;
+const MAX_RESYNC_RFC822_CONCURRENCY: usize = 32;
 const MAX_EVENT_PAGES_PER_POLL: usize = 50;
 const REFRESH_MAIL_FLAG: i32 = 1;
 const MAX_FAILURE_BACKOFF: Duration = Duration::from_secs(300);
 const WORKER_STATS_LOG_EVERY_ATTEMPTS: u64 = 20;
 const MAX_INITIAL_POLL_STAGGER_MS: u64 = 2_000;
+const SYNC_PROGRESS_MIN_DELTA: f64 = 0.001;
+const SYNC_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy)]
+struct SyncProgressThrottleState {
+    progress: f64,
+    elapsed: Duration,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SyncProgressUpdate {
@@ -935,6 +945,7 @@ async fn apply_metadata_to_store(
     metadata: &MessageMetadata,
     expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
+    let label_ids: HashSet<&str> = metadata.label_ids.iter().map(String::as_str).collect();
     ensure_account_generation(config, expected_generation, "apply_metadata_to_store").await?;
     for mb in mailbox::system_mailboxes() {
         if !mb.selectable {
@@ -942,7 +953,7 @@ async fn apply_metadata_to_store(
         }
         ensure_account_generation(config, expected_generation, "apply_metadata_to_store").await?;
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
-        let in_mailbox = metadata.label_ids.iter().any(|label| label == mb.label_id);
+        let in_mailbox = label_ids.contains(mb.label_id);
         if in_mailbox {
             config
                 .connector
@@ -961,7 +972,7 @@ async fn apply_metadata_to_store(
     let user_labels = config.runtime_accounts.get_user_labels(&config.account_id);
     for ul in &user_labels {
         let scoped = scoped_mailbox_name(&config.account_id, &ul.name);
-        let in_mailbox = metadata.label_ids.iter().any(|label| label == &ul.label_id);
+        let in_mailbox = label_ids.contains(ul.label_id.as_str());
         if in_mailbox {
             config
                 .connector
@@ -978,6 +989,102 @@ async fn apply_metadata_to_store(
     }
 
     Ok(())
+}
+
+/// Batch-apply metadata for a page of messages, using `batch_upsert_metadata`
+/// to publish a single gluon update per mailbox instead of one per message.
+/// This matches the Go bridge's "MessagesCreated: MessageCount=64" pattern.
+///
+/// Returns the UIDs assigned to each message in the target `scoped_mailbox`.
+async fn batch_apply_metadata_to_store(
+    config: &EventWorkerConfig,
+    messages: &[MessageMetadata],
+    scoped_mailbox: &str,
+    target_label_id: &str,
+    expected_generation: u64,
+) -> Result<HashMap<String, u32>, EventWorkerError> {
+    ensure_account_generation(config, expected_generation, "batch_apply_metadata").await?;
+
+    // Group messages that belong to the target mailbox for batch upsert.
+    let mut batch_entries: Vec<(&str, MessageMetadata)> = Vec::new();
+    let mut remove_ids: Vec<&str> = Vec::new();
+
+    for metadata in messages {
+        let in_mailbox = metadata.label_ids.iter().any(|l| l == target_label_id);
+        if in_mailbox {
+            batch_entries.push((&metadata.id, metadata.clone()));
+        } else {
+            remove_ids.push(&metadata.id);
+        }
+    }
+
+    // Batch-remove messages that don't belong to this mailbox.
+    for proton_id in &remove_ids {
+        config
+            .connector
+            .remove_message_by_proton_id(scoped_mailbox, proton_id)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+    }
+
+    // Batch-upsert messages that belong to this mailbox.
+    let mut uid_map = HashMap::new();
+    if !batch_entries.is_empty() {
+        let uids = config
+            .connector
+            .batch_upsert_metadata(scoped_mailbox, &batch_entries)
+            .await
+            .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+        for (i, uid) in uids.into_iter().enumerate() {
+            uid_map.insert(batch_entries[i].0.to_string(), uid);
+        }
+    }
+
+    // Also apply to other system mailboxes and user labels (individual upserts
+    // for cross-mailbox membership).
+    let user_labels = config.runtime_accounts.get_user_labels(&config.account_id);
+    for metadata in messages {
+        let label_ids: HashSet<&str> = metadata.label_ids.iter().map(String::as_str).collect();
+
+        for mb in mailbox::system_mailboxes() {
+            if !mb.selectable || mb.label_id == target_label_id {
+                continue;
+            }
+            let scoped = scoped_mailbox_name(&config.account_id, mb.name);
+            if label_ids.contains(mb.label_id) {
+                config
+                    .connector
+                    .upsert_metadata(&scoped, &metadata.id, metadata.clone())
+                    .await
+                    .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+            } else {
+                config
+                    .connector
+                    .remove_message_by_proton_id(&scoped, &metadata.id)
+                    .await
+                    .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+            }
+        }
+
+        for ul in &user_labels {
+            let scoped = scoped_mailbox_name(&config.account_id, &ul.name);
+            if label_ids.contains(ul.label_id.as_str()) {
+                config
+                    .connector
+                    .upsert_metadata(&scoped, &metadata.id, metadata.clone())
+                    .await
+                    .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+            } else {
+                config
+                    .connector
+                    .remove_message_by_proton_id(&scoped, &metadata.id)
+                    .await
+                    .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
+            }
+        }
+    }
+
+    Ok(uid_map)
 }
 
 async fn reconcile_user_label_topology(
@@ -1194,18 +1301,22 @@ async fn bounded_resync_account_for_generation(
     );
 
     // Build keyrings for full body sync (best-effort: fall back to metadata-only on failure)
-    let addr_keyrings: Option<HashMap<String, Keyring>> =
+    let addr_keyrings: Option<Arc<HashMap<String, Arc<Keyring>>>> =
         match build_address_keyrings(config, session).await {
             Ok(keyrings) => {
                 info!(
+                    service = "imap",
+                    user = %config.account_id.0,
                     account_id = %config.account_id.0,
                     num_keyrings = keyrings.len(),
                     "built address keyrings for full body sync"
                 );
-                Some(keyrings)
+                Some(Arc::new(keyrings))
             }
             Err(err) => {
                 warn!(
+                    service = "imap",
+                    user = %config.account_id.0,
                     account_id = %config.account_id.0,
                     error = %err,
                     "failed to build keyrings; falling back to metadata-only sync"
@@ -1235,6 +1346,8 @@ async fn bounded_resync_account_for_generation(
                 sync_state::load_sync_state(dir, uid)
                     .map_err(|e| {
                         warn!(
+                            service = "imap",
+                            user = %config.account_id.0,
                             account_id = %config.account_id.0,
                             error = %e,
                             "failed to load sync state; starting fresh"
@@ -1245,6 +1358,19 @@ async fn bounded_resync_account_for_generation(
             })
         })
         .unwrap_or_default();
+    info!(
+        service = "imap",
+        user = %config.account_id.0,
+        account_id = %config.account_id.0,
+        account_email = %config.account_email,
+        has_labels = sync_status.has_labels,
+        has_messages = sync_status.has_messages,
+        has_message_count = sync_status.has_message_count,
+        num_synced_messages = sync_status.num_synced_messages,
+        total_message_count = sync_status.total_message_count,
+        last_synced_message_id = %sync_status.last_synced_message_id,
+        "loaded imap sync state snapshot"
+    );
 
     // Fetch total message count from AllMail label (same as Go bridge)
     if !sync_status.has_message_count {
@@ -1255,6 +1381,8 @@ async fn bounded_resync_account_for_generation(
                         sync_status.total_message_count = gc.total;
                         sync_status.has_message_count = true;
                         info!(
+                            service = "imap",
+                            user = %config.account_id.0,
                             account_id = %config.account_id.0,
                             total_message_count = gc.total,
                             "fetched total message count from AllMail"
@@ -1265,6 +1393,8 @@ async fn bounded_resync_account_for_generation(
             }
             Err(e) => {
                 warn!(
+                    service = "imap",
+                    user = %config.account_id.0,
                     account_id = %config.account_id.0,
                     error = %e,
                     "failed to fetch grouped message count"
@@ -1274,14 +1404,19 @@ async fn bounded_resync_account_for_generation(
     }
 
     let has_sync_state_progress = sync_status.total_message_count > 0;
+    let mut progress_throttle_state: Option<SyncProgressThrottleState> = None;
+    let rfc822_concurrency = resync_rfc822_concurrency();
+    let rfc822_semaphore = Arc::new(Semaphore::new(rfc822_concurrency));
 
     // Emit initial progress based on sync state (matches Go bridge's starting point)
     if has_sync_state_progress {
-        emit_sync_progress_ratio(
+        emit_sync_progress_ratio_throttled(
             config,
             sync_status.num_synced_messages,
             sync_status.total_message_count,
             resync_started_at.elapsed(),
+            &mut progress_throttle_state,
+            true,
         );
     }
 
@@ -1299,6 +1434,7 @@ async fn bounded_resync_account_for_generation(
             continue;
         }
         ensure_account_generation(config, expected_generation, "bounded_resync_mailbox").await?;
+        let scoped_mailbox = scoped_mailbox_name(&config.account_id, mb.name);
 
         let mut end_id: Option<String> = None;
         loop {
@@ -1309,6 +1445,8 @@ async fn bounded_resync_account_for_generation(
                 "mailbox_start"
             };
             info!(
+                service = "imap",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 account_email = %config.account_email,
                 mailbox = %mb.name,
@@ -1338,6 +1476,8 @@ async fn bounded_resync_account_for_generation(
             let page_count = messages.len() as i32;
             let next_end_id = messages.last().map(|metadata| metadata.id.as_str());
             info!(
+                service = "imap",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 account_email = %config.account_email,
                 mailbox = %mb.name,
@@ -1349,16 +1489,36 @@ async fn bounded_resync_account_for_generation(
                 last_message_id = ?next_end_id,
                 "resync mailbox metadata page"
             );
+            debug!(
+                service = "imap",
+                user = %config.account_id.0,
+                account_id = %config.account_id.0,
+                mailbox = %mb.name,
+                metadata_collected = sync_status.num_synced_messages,
+                metadata_total = sync_status.total_message_count,
+                "metadata collected"
+            );
             if page_count == RESYNC_PAGE_SIZE {
                 total_steps = total_steps.saturating_add(1);
             }
-            // Fallback: page-based progress when we don't have sync state totals
-            if !has_sync_state_progress {
-                emit_sync_progress_ratio(
+            // Emit per-page heartbeat progress to avoid long silent intervals.
+            if has_sync_state_progress {
+                emit_sync_progress_ratio_throttled(
+                    config,
+                    sync_status.num_synced_messages,
+                    sync_status.total_message_count,
+                    resync_started_at.elapsed(),
+                    &mut progress_throttle_state,
+                    false,
+                );
+            } else {
+                emit_sync_progress_ratio_throttled(
                     config,
                     completed_steps as i64,
                     total_steps.max(1) as i64,
                     resync_started_at.elapsed(),
+                    &mut progress_throttle_state,
+                    false,
                 );
             }
 
@@ -1367,53 +1527,143 @@ async fn bounded_resync_account_for_generation(
             }
 
             end_id = next_end_id.map(str::to_string);
+            let mut page_rfc822_synced = 0i64;
 
-            for metadata in messages {
-                if synced_message_ids.insert(metadata.id.clone()) {
-                    apply_metadata_to_store(config, &metadata, expected_generation).await?;
-                    total_applied += 1;
+            // Phase 1: Batch-apply all metadata for the page using a single
+            // gluon update per mailbox (matching Go bridge "MessagesCreated:
+            // MessageCount=64" pattern).
+            struct BodyDownloadEntry {
+                message_id: String,
+                address_id: String,
+                uid: u32,
+            }
 
-                    // Download full body and store RFC822.
-                    // Only count toward sync state when body is successfully stored,
-                    // matching Go bridge's counting (all 4 stages complete per message).
-                    if let Some(ref keyrings) = addr_keyrings {
-                        let scoped = scoped_mailbox_name(&config.account_id, mb.name);
-                        if let Ok(Some(uid)) =
-                            config.mailbox_view.get_uid(&scoped, &metadata.id).await
-                        {
-                            if download_and_store_rfc822(
-                                config,
-                                client,
-                                keyrings,
-                                &metadata.id,
-                                &metadata.address_id,
-                                &scoped,
+            // Filter to new messages only.
+            let new_messages: Vec<&MessageMetadata> = messages
+                .iter()
+                .filter(|m| synced_message_ids.insert(m.id.clone()))
+                .collect();
+            total_applied += new_messages.len();
+
+            let new_owned: Vec<MessageMetadata> =
+                new_messages.iter().map(|m| (*m).clone()).collect();
+            let uid_map = batch_apply_metadata_to_store(
+                config,
+                &new_owned,
+                &scoped_mailbox,
+                mb.label_id,
+                expected_generation,
+            )
+            .await?;
+
+            // Collect body download entries from the UID map.
+            let mut body_entries: Vec<BodyDownloadEntry> = Vec::new();
+            if let Some(keyrings) = addr_keyrings.as_ref() {
+                for metadata in &new_owned {
+                    if keyrings.contains_key(&metadata.address_id) {
+                        if let Some(&uid) = uid_map.get(&metadata.id) {
+                            body_entries.push(BodyDownloadEntry {
+                                message_id: metadata.id.clone(),
+                                address_id: metadata.address_id.clone(),
                                 uid,
-                            )
-                            .await
-                            {
-                                sync_status.num_synced_messages += 1;
-                                sync_status.last_synced_message_id = metadata.id.clone();
-
-                                // Report progress as num_synced / total to match Go bridge
-                                if sync_status.total_message_count > 0 {
-                                    emit_sync_progress_ratio(
-                                        config,
-                                        sync_status.num_synced_messages,
-                                        sync_status.total_message_count,
-                                        resync_started_at.elapsed(),
-                                    );
-                                }
-                            }
+                            });
                         }
                     }
                 }
             }
 
+            // Phase 2: Spawn all body download tasks at once, letting the
+            // semaphore control concurrency. This matches Go bridge which
+            // creates "child jobs" of concurrent downloads after collecting
+            // metadata.
+            let mut rfc822_tasks: JoinSet<(String, bool)> = JoinSet::new();
+
+            for entry in body_entries {
+                let config = config.clone();
+                let client = client.clone();
+                let keyrings = addr_keyrings.clone().unwrap();
+                let scoped_mailbox = scoped_mailbox.clone();
+                let semaphore = rfc822_semaphore.clone();
+                let task_message_id = entry.message_id.clone();
+                rfc822_tasks.spawn(async move {
+                    let permit = match semaphore.acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(err) => {
+                            warn!(
+                                service = "imap",
+                                user = %config.account_id.0,
+                                account_id = %config.account_id.0,
+                                message_id = %entry.message_id,
+                                error = %err,
+                                "rfc822 sync semaphore closed"
+                            );
+                            return (task_message_id, false);
+                        }
+                    };
+                    let _permit = permit;
+
+                    let success = download_and_store_rfc822(
+                        &config,
+                        &client,
+                        keyrings.as_ref(),
+                        &entry.message_id,
+                        &entry.address_id,
+                        &scoped_mailbox,
+                        entry.uid,
+                    )
+                    .await;
+                    (task_message_id, success)
+                });
+            }
+
+            // Phase 3: Drain all body download tasks, reporting progress.
+            while let Some(task) = rfc822_tasks.join_next().await {
+                match task {
+                    Ok((message_id, true)) => {
+                        sync_status.num_synced_messages += 1;
+                        sync_status.last_synced_message_id = message_id;
+                        page_rfc822_synced += 1;
+                    }
+                    Ok((_message_id, false)) => {}
+                    Err(err) => {
+                        warn!(
+                            service = "imap",
+                            user = %config.account_id.0,
+                            account_id = %config.account_id.0,
+                            error = %err,
+                            "rfc822 sync task join failed"
+                        );
+                    }
+                }
+
+                if has_sync_state_progress {
+                    emit_sync_progress_ratio_throttled(
+                        config,
+                        sync_status.num_synced_messages,
+                        sync_status.total_message_count,
+                        resync_started_at.elapsed(),
+                        &mut progress_throttle_state,
+                        false,
+                    );
+                }
+            }
+            debug!(
+                service = "imap",
+                user = %config.account_id.0,
+                account_id = %config.account_id.0,
+                mailbox = %mb.name,
+                rfc822_synced = page_rfc822_synced,
+                metadata_collected = sync_status.num_synced_messages,
+                metadata_total = sync_status.total_message_count,
+                "completed mailbox metadata page body sync"
+            );
+
             // Persist sync state after each page
             if let (Some(ref user_id), Some(ref dir)) = (&proton_user_id, &config.settings_dir) {
                 if let Err(e) = sync_state::save_sync_state(dir, user_id, &sync_status) {
                     warn!(
+                        service = "imap",
+                        user = %config.account_id.0,
                         account_id = %config.account_id.0,
                         error = %e,
                         "failed to save sync state after page"
@@ -1427,6 +1677,8 @@ async fn bounded_resync_account_for_generation(
 
             if end_id.is_none() {
                 warn!(
+                    service = "imap",
+                    user = %config.account_id.0,
                     account_id = %config.account_id.0,
                     account_email = %config.account_email,
                     label_id = %mb.label_id,
@@ -1438,25 +1690,33 @@ async fn bounded_resync_account_for_generation(
     }
 
     debug!(
+        service = "imap",
+        user = %config.account_id.0,
         account_id = %config.account_id.0,
         account_email = %config.account_email,
         total_applied,
+        metadata_collected = sync_status.num_synced_messages,
+        metadata_total = sync_status.total_message_count,
         "completed refresh resync"
     );
 
     if has_sync_state_progress {
-        emit_sync_progress_ratio(
+        emit_sync_progress_ratio_throttled(
             config,
             sync_status.num_synced_messages,
             sync_status.total_message_count,
             resync_started_at.elapsed(),
+            &mut progress_throttle_state,
+            true,
         );
     } else {
-        emit_sync_progress_ratio(
+        emit_sync_progress_ratio_throttled(
             config,
             total_steps as i64,
             total_steps as i64,
             resync_started_at.elapsed(),
+            &mut progress_throttle_state,
+            true,
         );
     }
     progress_guard.finish();
@@ -1464,6 +1724,8 @@ async fn bounded_resync_account_for_generation(
     if let Some(ref dir) = config.settings_dir {
         if let Err(err) = vault::set_sync_complete(dir, &config.account_id.0) {
             warn!(
+                service = "imap",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 error = %err,
                 "failed to mark vault sync complete"
@@ -1479,6 +1741,8 @@ async fn bounded_resync_account_for_generation(
         if let (Some(ref user_id), Some(ref dir)) = (&proton_user_id, &config.settings_dir) {
             if let Err(e) = sync_state::save_sync_state(dir, user_id, &sync_status) {
                 warn!(
+                    service = "imap",
+                    user = %config.account_id.0,
                     account_id = %config.account_id.0,
                     error = %e,
                     "failed to save final sync state"
@@ -1539,7 +1803,7 @@ async fn bounded_resync_account_for_generation(
 async fn build_address_keyrings(
     config: &EventWorkerConfig,
     session: &Session,
-) -> std::result::Result<HashMap<String, Keyring>, String> {
+) -> std::result::Result<HashMap<String, Arc<Keyring>>, String> {
     let passphrase_b64 = session
         .key_passphrase
         .as_deref()
@@ -1561,10 +1825,12 @@ async fn build_address_keyrings(
     for addr in &auth_material.addresses {
         match keys::unlock_address_keys(&addr.keys, &passphrase, &user_keyring) {
             Ok(kr) => {
-                keyrings.insert(addr.id.clone(), kr);
+                keyrings.insert(addr.id.clone(), Arc::new(kr));
             }
             Err(e) => {
                 warn!(
+                    service = "imap",
+                    user = %config.account_id.0,
                     account_id = %config.account_id.0,
                     address_id = %addr.id,
                     error = %e,
@@ -1586,7 +1852,7 @@ async fn build_address_keyrings(
 async fn download_and_store_rfc822(
     config: &EventWorkerConfig,
     client: &ProtonClient,
-    addr_keyrings: &HashMap<String, Keyring>,
+    addr_keyrings: &HashMap<String, Arc<Keyring>>,
     message_id: &str,
     address_id: &str,
     scoped_mailbox: &str,
@@ -1596,6 +1862,8 @@ async fn download_and_store_rfc822(
         Some(kr) => kr,
         None => {
             debug!(
+                service = "imap",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 message_id = %message_id,
                 address_id = %address_id,
@@ -1609,6 +1877,8 @@ async fn download_and_store_rfc822(
         Ok(resp) => resp.message,
         Err(e) => {
             warn!(
+                service = "imap",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 message_id = %message_id,
                 error = %e,
@@ -1618,10 +1888,12 @@ async fn download_and_store_rfc822(
         }
     };
 
-    let rfc822_bytes = match rfc822::build_rfc822(client, keyring, &full_msg).await {
+    let rfc822_bytes = match rfc822::build_rfc822(client, keyring.as_ref(), &full_msg).await {
         Ok(bytes) => bytes,
         Err(e) => {
             warn!(
+                service = "imap",
+                user = %config.account_id.0,
                 account_id = %config.account_id.0,
                 message_id = %message_id,
                 error = %e,
@@ -1637,6 +1909,8 @@ async fn download_and_store_rfc822(
         .await
     {
         warn!(
+            service = "imap",
+            user = %config.account_id.0,
             account_id = %config.account_id.0,
             message_id = %message_id,
             error = %e,
@@ -1663,6 +1937,55 @@ fn vault_sync_complete(config: &EventWorkerConfig) -> bool {
             true
         }
     }
+}
+
+fn resync_rfc822_concurrency() -> usize {
+    let Some(raw) = std::env::var("OPENPROTON_RESYNC_RFC822_CONCURRENCY").ok() else {
+        return DEFAULT_RESYNC_RFC822_CONCURRENCY;
+    };
+
+    match raw.parse::<usize>() {
+        Ok(value) if value > 0 => value.min(MAX_RESYNC_RFC822_CONCURRENCY),
+        Ok(_) | Err(_) => {
+            warn!(
+                env_var = "OPENPROTON_RESYNC_RFC822_CONCURRENCY",
+                value = %raw,
+                default = DEFAULT_RESYNC_RFC822_CONCURRENCY,
+                "invalid rfc822 sync concurrency; using default"
+            );
+            DEFAULT_RESYNC_RFC822_CONCURRENCY
+        }
+    }
+}
+
+fn emit_sync_progress_ratio_throttled(
+    config: &EventWorkerConfig,
+    completed: i64,
+    total: i64,
+    elapsed: Duration,
+    throttle_state: &mut Option<SyncProgressThrottleState>,
+    force: bool,
+) {
+    let total_f = total.max(1) as f64;
+    let progress = (completed as f64 / total_f).clamp(0.0, 1.0);
+
+    let should_emit = force
+        || match throttle_state {
+            None => true,
+            Some(previous) => {
+                let progress_delta = (progress - previous.progress).abs();
+                let elapsed_delta = elapsed.saturating_sub(previous.elapsed);
+                progress_delta >= SYNC_PROGRESS_MIN_DELTA
+                    || elapsed_delta >= SYNC_PROGRESS_MIN_INTERVAL
+            }
+        };
+
+    if !should_emit {
+        return;
+    }
+
+    emit_sync_progress_ratio(config, completed, total, elapsed);
+    *throttle_state = Some(SyncProgressThrottleState { progress, elapsed });
 }
 
 fn emit_sync_progress_ratio(

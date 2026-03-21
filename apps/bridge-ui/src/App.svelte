@@ -80,6 +80,7 @@
   type RetryTrigger = 'manual' | 'auto'
   type UserParityHook = {
     syncProgress?: number | null
+    syncRemainingMs?: number | null
     disconnected?: boolean
     recovering?: boolean
     error?: string | null
@@ -299,6 +300,26 @@
     return `${value.toFixed(decimals)} ${units[unitIndex]}`
   }
 
+  function formatEta(remainingMs: number): string {
+    const totalSeconds = Math.max(0, Math.round(remainingMs / 1000))
+    if (totalSeconds < 60) {
+      return `${totalSeconds}s`
+    }
+    const totalMinutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+    if (totalMinutes < 60) {
+      return `${totalMinutes}m ${seconds}s`
+    }
+    const totalHours = Math.floor(totalMinutes / 60)
+    const minutes = totalMinutes % 60
+    if (totalHours < 24) {
+      return `${totalHours}h ${minutes}m`
+    }
+    const days = Math.floor(totalHours / 24)
+    const hours = totalHours % 24
+    return `${days}d ${hours}h`
+  }
+
   function accountStorageSummary(user: UserSummary): string | null {
     if (!Number.isFinite(user.total_bytes) || user.total_bytes <= 0) {
       return null
@@ -312,7 +333,11 @@
       return 'Disconnected'
     }
     if (typeof parity?.syncProgress === 'number' && parity.syncProgress >= 0 && parity.syncProgress < 100) {
-      return `Synchronizing (${parity.syncProgress}%)`
+      const etaSuffix =
+        typeof parity.syncRemainingMs === 'number' && Number.isFinite(parity.syncRemainingMs)
+          ? `... ETA ${formatEta(Math.max(0, parity.syncRemainingMs))}`
+          : ''
+      return `Synchronizing (${parity.syncProgress}%)${etaSuffix}`
     }
     if (parity?.recovering) {
       return 'Recovering session'
@@ -549,6 +574,10 @@
 
       byId[user.id] = {
         syncProgress: typeof syncProgress === 'number' ? normalizeSyncProgress(syncProgress) : null,
+        syncRemainingMs:
+          typeof runtime.syncRemainingMs === 'number' && Number.isFinite(runtime.syncRemainingMs)
+            ? Math.max(0, Math.round(runtime.syncRemainingMs))
+            : null,
         disconnected,
         recovering,
         error,
@@ -581,12 +610,16 @@
     const userId = hintValue(notification.refresh_hints, 'sync_user')
     const username = hintValue(notification.refresh_hints, 'sync_username')
     const progressHint = hintValue(notification.refresh_hints, 'sync_progress')
+    const remainingMsHint = hintValue(notification.refresh_hints, 'sync_remaining_ms')
     const parsedProgress = progressHint ? Number.parseInt(progressHint, 10) : NaN
+    const parsedRemainingMs = remainingMsHint ? Number.parseInt(remainingMsHint, 10) : NaN
     const progress = Number.isFinite(parsedProgress) ? normalizeSyncProgress(parsedProgress) : null
+    const remainingMs = Number.isFinite(parsedRemainingMs) ? Math.max(0, parsedRemainingMs) : null
 
     if (notification.code === 'sync_started' && userId) {
       updateUserRuntimeParity(userId, {
         syncProgress: 0,
+        syncRemainingMs: null,
         recovering: true,
         disconnected: false,
         error: null,
@@ -597,6 +630,7 @@
     if (notification.code === 'sync_progress' && userId) {
       updateUserRuntimeParity(userId, {
         syncProgress: progress ?? 0,
+        syncRemainingMs: remainingMs,
         recovering: true,
         disconnected: false,
         error: null,
@@ -607,6 +641,7 @@
     if (notification.code === 'sync_finished' && userId) {
       updateUserRuntimeParity(userId, {
         syncProgress: 100,
+        syncRemainingMs: null,
         recovering: false,
         disconnected: false,
         error: null,
@@ -1189,6 +1224,12 @@
 
   async function toggleSplitMode(userId: string, current: boolean) {
     logger.info('app', 'toggle split mode requested', { userId, next: !current })
+    updateUserRuntimeParity(userId, {
+      syncProgress: null,
+      recovering: true,
+      disconnected: false,
+      error: null,
+    })
     await setUserSplitMode(userId, !current)
     await refreshUsersData()
   }

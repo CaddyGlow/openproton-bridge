@@ -125,6 +125,7 @@ pub async fn run_server_with_options(
         app_settings: Mutex::new(app_settings),
         sync_workers_enabled: true,
         sync_event_workers: Mutex::new(None),
+        user_api_data_cache: Mutex::new(HashMap::new()),
     });
 
     let service = BridgeService::new(state);

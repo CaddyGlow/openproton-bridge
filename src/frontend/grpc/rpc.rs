@@ -246,6 +246,24 @@ impl BridgeService {
             .map_err(|err| Status::internal(format!("failed to load managed sessions: {err}")))
     }
 
+    async fn address_emails_for_account(&self, account_uid: &str) -> Vec<String> {
+        let runtime_accounts = self
+            .state
+            .runtime_supervisor
+            .session_manager()
+            .runtime_accounts();
+        let account_id = bridge::types::AccountId(account_uid.to_string());
+        match runtime_accounts.get_auth_material(&account_id).await {
+            Some(material) => material
+                .addresses
+                .iter()
+                .filter(|addr| addr.status == 1)
+                .map(|addr| addr.email.clone())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
     #[allow(clippy::result_large_err)]
     async fn managed_session_by_lookup(&self, lookup: &str) -> Result<Session, Status> {
         let lookup = lookup.trim();
@@ -2017,7 +2035,8 @@ impl pb::bridge_server::Bridge for BridgeService {
                     .flatten()
                     .unwrap_or(false);
             let api_data = self.fetch_user_api_data(session).await;
-            users.push(session_to_user(session, split_mode, api_data.as_ref()));
+            let addresses = self.address_emails_for_account(&session.uid).await;
+            users.push(session_to_user(session, split_mode, api_data.as_ref(), &addresses));
         }
         Ok(Response::new(pb::UserListResponse { users }))
     }
@@ -2031,10 +2050,12 @@ impl pb::bridge_server::Bridge for BridgeService {
             .flatten()
             .unwrap_or(false);
         let api_data = self.fetch_user_api_data(&session).await;
+        let addresses = self.address_emails_for_account(&session.uid).await;
         Ok(Response::new(session_to_user(
             &session,
             split_mode,
             api_data.as_ref(),
+            &addresses,
         )))
     }
 
@@ -2890,6 +2911,7 @@ mod grpc_wire_tests {
             app_settings: Mutex::new(app_settings),
             sync_workers_enabled: false,
             sync_event_workers: Mutex::new(None),
+            user_api_data_cache: Mutex::new(HashMap::new()),
         });
         BridgeService::new(state)
     }

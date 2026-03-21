@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use gluon_rs_mail::{CompatibleStore, NewMailbox, UpstreamMailbox};
 use tokio::sync::broadcast;
+use tracing::{debug, info};
 
 use super::gluon_mailbox_mutation::GluonMailMailboxMutation;
 use super::gluon_mailbox_view::GluonMailMailboxView;
@@ -107,6 +108,7 @@ impl GluonUpdateReceiver {
                 update = self.authored_updates.recv() => {
                     let update = update?;
                     self.push_authored_keys(update.keys());
+                    log_gluon_update("authored", &update);
                     return Ok(update);
                 }
                 event = self.store_events.recv() => {
@@ -114,8 +116,10 @@ impl GluonUpdateReceiver {
                     if let Some(update) = GluonUpdate::from_store_event(event) {
                         let keys = update.keys();
                         if self.consume_matching_authored(&keys) {
+                            log_gluon_update("store_mirrored_ignored", &update);
                             continue;
                         }
+                        log_gluon_update("store", &update);
                         return Ok(update);
                     }
                 }
@@ -182,6 +186,28 @@ pub trait GluonImapConnector: Send + Sync {
         next_mailboxes: &[String],
     ) -> Result<()>;
     async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()>;
+
+    /// Upsert metadata for a batch of messages into a single mailbox, publishing
+    /// a single batched `GluonUpdate` instead of one per message.  Returns the
+    /// assigned UID for each entry (in the same order as the input).
+    ///
+    /// This matches the Go bridge pattern where `MessagesCreated` carries up to
+    /// 64 messages in a single gluon update.
+    async fn batch_upsert_metadata(
+        &self,
+        mailbox: &str,
+        entries: &[(&str, MessageMetadata)],
+    ) -> Result<Vec<u32>> {
+        // Default: fall back to individual upserts.
+        let mut uids = Vec::with_capacity(entries.len());
+        for (proton_id, metadata) in entries {
+            uids.push(
+                self.upsert_metadata(mailbox, proton_id, metadata.clone())
+                    .await?,
+            );
+        }
+        Ok(uids)
+    }
 }
 
 #[derive(Clone)]
@@ -197,6 +223,7 @@ impl StoreBackedConnector {
     }
 
     fn publish_authored(&self, update: GluonUpdate) {
+        log_gluon_update("connector_store_backed", &update);
         let _ = self.authored_tx.send(update);
     }
 }
@@ -443,6 +470,67 @@ impl GluonImapConnector for StoreBackedConnector {
     async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
         self.store.store_rfc822(mailbox, uid, data).await
     }
+
+    async fn batch_upsert_metadata(
+        &self,
+        mailbox: &str,
+        entries: &[(&str, MessageMetadata)],
+    ) -> Result<Vec<u32>> {
+        let mut uids = Vec::with_capacity(entries.len());
+        let mut created_messages = Vec::new();
+        let mut updated_count = 0usize;
+
+        for (proton_id, metadata) in entries {
+            let existing_uid = self.store.get_uid(mailbox, proton_id).await?;
+            let uid = self
+                .store
+                .store_metadata(mailbox, proton_id, metadata.clone())
+                .await?;
+            let flags = self.store.get_flags(mailbox, uid).await.ok();
+            uids.push(uid);
+
+            if existing_uid.is_some() {
+                // Existing messages still get individual update events.
+                self.publish_authored(GluonUpdate::message_updated(
+                    mailbox,
+                    uid,
+                    Some(proton_id.to_string()),
+                    flags,
+                    0,
+                ));
+                updated_count += 1;
+            } else {
+                let message = GluonMessageRef::from_mailbox_name(
+                    mailbox,
+                    uid,
+                    Some(proton_id.to_string()),
+                    0,
+                );
+                created_messages.push(GluonCreatedMessage {
+                    mailbox_names: vec![message.mailbox_name.clone()],
+                    message,
+                    flags,
+                });
+            }
+        }
+
+        if !created_messages.is_empty() {
+            self.publish_authored(GluonUpdate::MessagesCreated {
+                messages: created_messages,
+                ignore_unknown_mailbox_ids: false,
+            });
+        }
+
+        tracing::debug!(
+            mailbox,
+            total = entries.len(),
+            created = entries.len() - updated_count,
+            updated = updated_count,
+            "batch_upsert_metadata"
+        );
+
+        Ok(uids)
+    }
 }
 
 #[derive(Clone)]
@@ -468,6 +556,7 @@ impl GluonMailConnector {
     }
 
     fn publish_authored(&self, update: GluonUpdate) {
+        log_gluon_update("connector_gluon_mail", &update);
         let _ = self.authored_tx.send(update);
     }
 
@@ -511,6 +600,14 @@ impl GluonMailConnector {
             .storage_user_id_for_account(scoped.account_id.as_deref())
             .to_string();
         if let Some(mailbox_state) = self.mailbox_by_name(&storage_user_id, mailbox_name)? {
+            debug!(
+                service = "imap",
+                pkg = "gluon/user",
+                account_id = scoped.account_id.as_deref().unwrap_or_default(),
+                storage_user_id = %storage_user_id,
+                mailbox_name = %mailbox_name,
+                "resolved existing Gluon mailbox"
+            );
             return Ok((storage_user_id, mailbox_state));
         }
 
@@ -535,6 +632,15 @@ impl GluonMailConnector {
                 },
             )
             .map_err(map_mail_error)?;
+        debug!(
+            service = "imap",
+            pkg = "gluon/user",
+            account_id = scoped.account_id.as_deref().unwrap_or_default(),
+            storage_user_id = %storage_user_id,
+            mailbox_name = %mailbox_name,
+            internal_id = created.internal_id,
+            "created Gluon mailbox"
+        );
         Ok((storage_user_id, created))
     }
 }
@@ -809,6 +915,66 @@ impl GluonImapConnector for GluonMailConnector {
     async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
         self.mutation.store_rfc822(mailbox, uid, data).await
     }
+
+    async fn batch_upsert_metadata(
+        &self,
+        mailbox: &str,
+        entries: &[(&str, MessageMetadata)],
+    ) -> Result<Vec<u32>> {
+        let mut uids = Vec::with_capacity(entries.len());
+        let mut created_messages = Vec::new();
+        let mut updated_count = 0usize;
+
+        for (proton_id, metadata) in entries {
+            let existing_uid = self.view.get_uid(mailbox, proton_id).await?;
+            let uid = self
+                .mutation
+                .store_metadata(mailbox, proton_id, metadata.clone())
+                .await?;
+            let flags = self.mutation.get_flags(mailbox, uid).await.ok();
+            uids.push(uid);
+
+            if existing_uid.is_some() {
+                self.publish_authored(GluonUpdate::message_updated(
+                    mailbox,
+                    uid,
+                    Some(proton_id.to_string()),
+                    flags,
+                    0,
+                ));
+                updated_count += 1;
+            } else {
+                let message = GluonMessageRef::from_mailbox_name(
+                    mailbox,
+                    uid,
+                    Some(proton_id.to_string()),
+                    0,
+                );
+                created_messages.push(GluonCreatedMessage {
+                    mailbox_names: vec![message.mailbox_name.clone()],
+                    message,
+                    flags,
+                });
+            }
+        }
+
+        if !created_messages.is_empty() {
+            self.publish_authored(GluonUpdate::MessagesCreated {
+                messages: created_messages,
+                ignore_unknown_mailbox_ids: false,
+            });
+        }
+
+        tracing::debug!(
+            mailbox,
+            total = entries.len(),
+            created = entries.len() - updated_count,
+            updated = updated_count,
+            "batch_upsert_metadata"
+        );
+
+        Ok(uids)
+    }
 }
 
 fn current_uid_validity() -> u32 {
@@ -855,6 +1021,40 @@ impl GluonMessageRef {
 }
 
 impl GluonUpdate {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Noop => "noop",
+            Self::MessagesCreated { .. } => "messages_created",
+            Self::MessageUpdated { .. } => "message_updated",
+            Self::MessageDeleted { .. } => "message_deleted",
+            Self::MessageFlagsUpdated { .. } => "message_flags_updated",
+            Self::MessageMailboxesUpdated { .. } => "message_mailboxes_updated",
+            Self::MailboxCreated { .. } => "mailbox_created",
+            Self::MailboxUpdated { .. } => "mailbox_updated",
+            Self::MailboxUpdatedOrCreated { .. } => "mailbox_updated_or_created",
+            Self::MailboxDeleted { .. } => "mailbox_deleted",
+            Self::MailboxDeletedSilent { .. } => "mailbox_deleted_silent",
+            Self::MailboxIDChanged { .. } => "mailbox_id_changed",
+            Self::MessageIDChanged { .. } => "message_id_changed",
+            Self::UIDValidityBumped { .. } => "uid_validity_bumped",
+        }
+    }
+
+    fn message_count(&self) -> usize {
+        match self {
+            Self::MessagesCreated { messages, .. } => messages.len(),
+            Self::Noop
+            | Self::MailboxCreated { .. }
+            | Self::MailboxUpdated { .. }
+            | Self::MailboxUpdatedOrCreated { .. }
+            | Self::MailboxDeleted { .. }
+            | Self::MailboxDeletedSilent { .. }
+            | Self::MailboxIDChanged { .. }
+            | Self::UIDValidityBumped { .. } => 0,
+            _ => 1,
+        }
+    }
+
     fn messages_created(
         mailbox: &str,
         uid: u32,
@@ -1122,6 +1322,29 @@ enum GluonUpdateKeyKind {
     MailboxIDChanged,
     MessageIDChanged,
     UIDValidityBumped,
+}
+
+fn log_gluon_update(source: &str, update: &GluonUpdate) {
+    let keys = update.keys();
+    let primary = keys.first();
+    let scoped_mailbox = primary
+        .map(|key| key.scoped_mailbox.as_str())
+        .unwrap_or_default();
+    let account_id = update.account_id().unwrap_or_default();
+    info!(
+        service = "imap",
+        pkg = "gluon/user",
+        source,
+        update_kind = update.kind(),
+        account_id,
+        update_keys = keys.len(),
+        affected_mailboxes = update.affected_scoped_mailboxes().len(),
+        message_count = update.message_count(),
+        scoped_mailbox,
+        uid = ?primary.and_then(|key| key.uid),
+        proton_id = ?primary.and_then(|key| key.proton_id.as_deref()),
+        "Applying update"
+    );
 }
 
 fn scoped_mailbox_string(account_id: Option<&str>, mailbox_name: &str) -> String {

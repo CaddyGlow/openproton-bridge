@@ -3,6 +3,7 @@
 
   type UserParityHook = {
     syncProgress?: number | null
+    syncRemainingMs?: number | null
     disconnected?: boolean
     recovering?: boolean
     error?: string | null
@@ -98,6 +99,34 @@
     return null
   }
 
+  function syncRemainingMsForUser(userId: string): number | null {
+    const remainingMs = userParityById[userId]?.syncRemainingMs
+    if (typeof remainingMs !== 'number' || !Number.isFinite(remainingMs)) {
+      return null
+    }
+    return Math.max(0, Math.round(remainingMs))
+  }
+
+  function formatEta(remainingMs: number): string {
+    const totalSeconds = Math.max(0, Math.round(remainingMs / 1000))
+    if (totalSeconds < 60) {
+      return `${totalSeconds}s`
+    }
+    const totalMinutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+    if (totalMinutes < 60) {
+      return `${totalMinutes}m ${seconds}s`
+    }
+    const totalHours = Math.floor(totalMinutes / 60)
+    const minutes = totalMinutes % 60
+    if (totalHours < 24) {
+      return `${totalHours}h ${minutes}m`
+    }
+    const days = Math.floor(totalHours / 24)
+    const hours = totalHours % 24
+    return `${days}d ${hours}h`
+  }
+
   function syncStatusForUser(user: UserSummary): string {
     const hook = userParityById[user.id]
     if (hook?.error) {
@@ -105,7 +134,9 @@
     }
     const progress = syncProgressForUser(user.id)
     if (typeof progress === 'number' && progress < 100) {
-      return `Synchronizing (${progress}%)...`
+      const remainingMs = syncRemainingMsForUser(user.id)
+      const etaSuffix = typeof remainingMs === 'number' ? ` ETA ${formatEta(remainingMs)}` : ''
+      return `Synchronizing (${progress}%)...${etaSuffix}`
     }
     if (hook?.recovering) {
       return 'Recovering session...'
@@ -144,6 +175,21 @@
 
   const activeUserSyncStatus = $derived(activeUser ? syncStatusForUser(activeUser) : '')
   const activeUserSyncProgress = $derived(activeUser ? syncProgressForUser(activeUser.id) : null)
+
+  let selectedAddressIndex = $state(0)
+  let lastActiveUserId = $state('')
+  $effect(() => {
+    const uid = activeUser?.id ?? ''
+    if (uid !== lastActiveUserId) {
+      lastActiveUserId = uid
+      selectedAddressIndex = 0
+    }
+  })
+  const displayedAddress = $derived(
+    activeUser?.split_mode && activeUser.addresses.length > 0
+      ? activeUser.addresses[selectedAddressIndex] ?? activeUser.addresses[0]
+      : activeUser?.username ?? '',
+  )
   const activeUserStorage = $derived(
     activeUser && activeUser.total_bytes > 0
       ? {
@@ -159,7 +205,7 @@
       ? [
           { label: 'Hostname', value: hostname || '127.0.0.1' },
           { label: 'Port', value: imapPort },
-          { label: 'Username', value: activeUser.username },
+          { label: 'Username', value: displayedAddress },
           { label: 'Password', value: activeUserPassword },
           { label: 'Security', value: securityLabel(useSslImap) },
         ]
@@ -171,7 +217,7 @@
       ? [
           { label: 'Hostname', value: hostname || '127.0.0.1' },
           { label: 'Port', value: smtpPort },
-          { label: 'Username', value: activeUser.username },
+          { label: 'Username', value: displayedAddress },
           { label: 'Password', value: activeUserPassword },
           { label: 'Security', value: securityLabel(useSslSmtp) },
         ]
@@ -255,6 +301,27 @@
         <span class="switch-knob"></span>
       </button>
     </section>
+
+    {#if activeUser.split_mode && activeUser.addresses.length > 1}
+      <section class="user-view-row address-selector">
+        <div>
+          <p class="user-view-row-title">Address</p>
+          <p class="muted">Select the address to view IMAP/SMTP settings for.</p>
+        </div>
+        <select
+          class="address-select"
+          value={activeUser.addresses[selectedAddressIndex] ?? activeUser.addresses[0]}
+          onchange={(e) => {
+            const idx = activeUser.addresses.indexOf(e.currentTarget.value)
+            if (idx >= 0) selectedAddressIndex = idx
+          }}
+        >
+          {#each activeUser.addresses as addr}
+            <option value={addr}>{addr}</option>
+          {/each}
+        </select>
+      </section>
+    {/if}
 
     <section class="mailbox-section">
       <h3>Mailbox details</h3>

@@ -27,13 +27,17 @@
   let step = $state<WizardStep>('selector')
   let selectedClient = $state<ClientType>('other')
   let previouslyOpen = $state(false)
+  let selectedAddressIndex = $state(0)
 
-  const selectedAddress = $derived(addresses[0] || username)
+  const selectedAddress = $derived(
+    addresses.length > 0 ? (addresses[selectedAddressIndex] ?? addresses[0]) : username,
+  )
 
   $effect(() => {
     if (open && !previouslyOpen) {
       step = 'selector'
       selectedClient = 'other'
+      selectedAddressIndex = 0
     }
     previouslyOpen = open
   })
@@ -136,6 +140,25 @@
         <div class="client-config-body" data-testid="client-config-parameters">
           <h3>Client Parameters</h3>
           <p class="muted">Use these values in {clientLabel(selectedClient)}.</p>
+
+          {#if addresses.length > 1}
+            <div class="address-picker">
+              <label for="wizard-address-select">Address</label>
+              <select
+                id="wizard-address-select"
+                class="address-select"
+                value={selectedAddress}
+                onchange={(e) => {
+                  const idx = addresses.indexOf(e.currentTarget.value)
+                  if (idx >= 0) selectedAddressIndex = idx
+                }}
+              >
+                {#each addresses as addr}
+                  <option value={addr}>{addr}</option>
+                {/each}
+              </select>
+            </div>
+          {/if}
 
           <div class="parameter-grid">
             <article class="parameter-card">
@@ -240,5 +263,17 @@
   .parameter-card p {
     margin: 5px 0;
     font-size: 0.84rem;
+  }
+
+  .address-picker {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .address-picker label {
+    font-weight: 600;
+    font-size: 0.9rem;
+    white-space: nowrap;
   }
 </style>

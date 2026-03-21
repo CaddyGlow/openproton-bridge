@@ -2092,13 +2092,26 @@ pub fn remove_session(dir: &Path) -> Result<()> {
     if default_email_file.exists() {
         std::fs::remove_file(&default_email_file)?;
     }
-    // Also try to remove keychain entry (best-effort) from all known service names.
-    for service in keychain_services_for_config(&store_config) {
-        if let Ok(entry) = new_keyring_entry(&service, &store_config.secret) {
-            let _ = entry.delete_credential();
+    // Also try to remove keychain/pass entries (best-effort), but only when the
+    // effective backend actually uses a secure store.  In test binaries
+    // effective_credential_store_backend forces File, so we skip entirely.
+    let backend = effective_credential_store_backend(store_config.backend);
+    if matches!(
+        backend,
+        CredentialStoreBackend::Auto | CredentialStoreBackend::System
+    ) {
+        for service in keychain_services_for_config(&store_config) {
+            if let Ok(entry) = new_keyring_entry(&service, &store_config.secret) {
+                let _ = entry.delete_credential();
+            }
         }
     }
-    let _ = try_pass_delete_with_config(&store_config);
+    if matches!(
+        backend,
+        CredentialStoreBackend::Auto | CredentialStoreBackend::Pass
+    ) {
+        let _ = try_pass_delete_with_config(&store_config);
+    }
     Ok(())
 }
 

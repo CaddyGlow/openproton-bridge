@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use crate::grpc::{adapter::UserSummary, pb::UserState};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -5,6 +7,16 @@ use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 const MAIN_TRAY_ID: &str = "main-tray";
 const USER_ACTION_PREFIX: &str = "select_user:";
+
+static LAST_TRAY_FINGERPRINT: Mutex<String> = Mutex::new(String::new());
+
+fn tray_fingerprint(users: &[UserSummary]) -> String {
+    users
+        .iter()
+        .map(|u| format!("{}:{}", u.username, u.state))
+        .collect::<Vec<_>>()
+        .join("|")
+}
 
 fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
@@ -58,6 +70,14 @@ pub fn refresh_tray_users<R: Runtime>(
     app: &AppHandle<R>,
     users: &[UserSummary],
 ) -> tauri::Result<()> {
+    let fp = tray_fingerprint(users);
+    if let Ok(mut last) = LAST_TRAY_FINGERPRINT.lock() {
+        if *last == fp {
+            return Ok(());
+        }
+        *last = fp;
+    }
+
     let menu = build_tray_menu(app, users)?;
     if let Some(tray) = app.tray_by_id(MAIN_TRAY_ID) {
         tray.set_menu(Some(menu))?;

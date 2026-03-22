@@ -135,6 +135,7 @@ mod tests {
     use crate::imap::gluon_connector::{
         GluonImapConnector, GluonMailConnector, GluonMailbox, GluonMessageRef, GluonUpdate,
     };
+    use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
     use gluon_rs_mail::{
         AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey,
         StoreBootstrap,
@@ -145,10 +146,9 @@ mod tests {
     fn maps_gluon_updates_into_jmap_change_sets() {
         let change = change_set_from_gluon_update(&GluonUpdate::MessageFlagsUpdated {
             message: GluonMessageRef {
-                account_id: Some("uid-1".to_string()),
-                mailbox_name: "INBOX".to_string(),
-                uid: 7,
-                proton_id: Some("msg-7".to_string()),
+                mailbox: ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                uid: ImapUid::from(7u32),
+                proton_id: Some(ProtonMessageId::from("msg-7")),
                 mod_seq: 4,
             },
             flags: Some(vec!["\\\\Seen".to_string()]),
@@ -166,8 +166,7 @@ mod tests {
         tracker
             .apply_gluon_update(&GluonUpdate::MailboxCreated {
                 mailbox: GluonMailbox {
-                    account_id: Some("uid-1".to_string()),
-                    mailbox_name: "INBOX".to_string(),
+                    mailbox: ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
                     mod_seq: 1,
                 },
             })
@@ -176,10 +175,9 @@ mod tests {
             .apply_gluon_update(&GluonUpdate::MessagesCreated {
                 messages: vec![crate::imap::gluon_connector::GluonCreatedMessage {
                     message: GluonMessageRef {
-                        account_id: Some("uid-1".to_string()),
-                        mailbox_name: "INBOX".to_string(),
-                        uid: 1,
-                        proton_id: Some("msg-1".to_string()),
+                        mailbox: ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                        uid: ImapUid::from(1u32),
+                        proton_id: Some(ProtonMessageId::from("msg-1")),
                         mod_seq: 2,
                     },
                     mailbox_names: vec!["INBOX".to_string()],
@@ -198,8 +196,7 @@ mod tests {
     fn ignores_unscoped_updates() {
         assert!(change_set_from_gluon_update(&GluonUpdate::MailboxCreated {
             mailbox: GluonMailbox {
-                account_id: None,
-                mailbox_name: "INBOX".to_string(),
+                mailbox: ScopedMailboxId::from_parts(None, "INBOX"),
                 mod_seq: 1,
             },
         })
@@ -232,11 +229,16 @@ mod tests {
             .clone()
             .spawn_connector_subscription(connector.clone());
 
-        connector.create_mailbox("uid-1::Labels/Projects").unwrap();
+        connector
+            .create_mailbox(&ScopedMailboxId::from_parts(
+                Some("uid-1"),
+                "Labels/Projects",
+            ))
+            .unwrap();
         let _ = connector
             .upsert_metadata(
-                "uid-1::Labels/Projects",
-                "msg-1",
+                &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/Projects"),
+                &ProtonMessageId::from("msg-1"),
                 crate::api::types::MessageMetadata {
                     id: "msg-1".to_string(),
                     address_id: "addr-1".to_string(),

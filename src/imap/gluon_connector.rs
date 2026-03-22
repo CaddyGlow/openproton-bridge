@@ -12,22 +12,21 @@ use super::gluon_mailbox_view::GluonMailMailboxView;
 use super::mailbox_mutation::GluonMailboxMutation;
 use super::mailbox_view::GluonMailboxView;
 use super::store::{StoreEvent, StoreEventKind};
+use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::{ImapError, Result};
 use crate::api::types::MessageMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GluonMailbox {
-    pub account_id: Option<String>,
-    pub mailbox_name: String,
+    pub mailbox: ScopedMailboxId,
     pub mod_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GluonMessageRef {
-    pub account_id: Option<String>,
-    pub mailbox_name: String,
-    pub uid: u32,
-    pub proton_id: Option<String>,
+    pub mailbox: ScopedMailboxId,
+    pub uid: ImapUid,
+    pub proton_id: Option<ProtonMessageId>,
     pub mod_seq: u64,
 }
 
@@ -88,8 +87,7 @@ pub enum GluonUpdate {
         remote_id: String,
     },
     UIDValidityBumped {
-        account_id: Option<String>,
-        mailbox_name: Option<String>,
+        mailbox: ScopedMailboxId,
         mod_seq: u64,
     },
 }
@@ -158,47 +156,61 @@ impl GluonUpdateReceiver {
 #[async_trait]
 pub trait GluonImapConnector: Send + Sync {
     fn subscribe_updates(&self) -> GluonUpdateReceiver;
-    async fn get_message_literal(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>>;
+    async fn get_message_literal(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+    ) -> Result<Option<Vec<u8>>>;
     async fn upsert_metadata(
         &self,
-        mailbox: &str,
-        proton_id: &str,
+        mailbox: &ScopedMailboxId,
+        proton_id: &ProtonMessageId,
         metadata: MessageMetadata,
-    ) -> Result<u32>;
-    async fn list_uids(&self, mailbox: &str) -> Result<Vec<u32>>;
-    fn create_mailbox(&self, mailbox: &str) -> Result<()>;
-    async fn rename_mailbox(&self, source_mailbox: &str, dest_mailbox: &str) -> Result<()>;
-    async fn delete_mailbox(&self, mailbox: &str, silent: bool) -> Result<()>;
-    async fn remove_message_by_uid(&self, mailbox: &str, uid: u32) -> Result<()>;
-    async fn remove_message_by_proton_id(&self, mailbox: &str, proton_id: &str) -> Result<()>;
-    async fn update_message_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>)
-        -> Result<()>;
+    ) -> Result<ImapUid>;
+    async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>>;
+    fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()>;
+    async fn rename_mailbox(
+        &self,
+        source_mailbox: &ScopedMailboxId,
+        dest_mailbox: &ScopedMailboxId,
+    ) -> Result<()>;
+    async fn delete_mailbox(&self, mailbox: &ScopedMailboxId, silent: bool) -> Result<()>;
+    async fn remove_message_by_uid(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<()>;
+    async fn remove_message_by_proton_id(
+        &self,
+        mailbox: &ScopedMailboxId,
+        proton_id: &ProtonMessageId,
+    ) -> Result<()>;
+    async fn update_message_flags(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        flags: Vec<String>,
+    ) -> Result<()>;
     async fn copy_message(
         &self,
-        source_mailbox: &str,
-        dest_mailbox: &str,
-        source_uid: u32,
-    ) -> Result<Option<u32>>;
+        source_mailbox: &ScopedMailboxId,
+        dest_mailbox: &ScopedMailboxId,
+        source_uid: ImapUid,
+    ) -> Result<Option<ImapUid>>;
     async fn update_message_mailboxes(
         &self,
-        proton_id: &str,
-        previous_mailboxes: &[String],
-        next_mailboxes: &[String],
+        proton_id: &ProtonMessageId,
+        previous_mailboxes: &[ScopedMailboxId],
+        next_mailboxes: &[ScopedMailboxId],
     ) -> Result<()>;
-    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()>;
+    async fn store_rfc822(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        data: Vec<u8>,
+    ) -> Result<()>;
 
-    /// Upsert metadata for a batch of messages into a single mailbox, publishing
-    /// a single batched `GluonUpdate` instead of one per message.  Returns the
-    /// assigned UID for each entry (in the same order as the input).
-    ///
-    /// This matches the Go bridge pattern where `MessagesCreated` carries up to
-    /// 64 messages in a single gluon update.
     async fn batch_upsert_metadata(
         &self,
-        mailbox: &str,
-        entries: &[(&str, MessageMetadata)],
-    ) -> Result<Vec<u32>> {
-        // Default: fall back to individual upserts.
+        mailbox: &ScopedMailboxId,
+        entries: &[(&ProtonMessageId, MessageMetadata)],
+    ) -> Result<Vec<ImapUid>> {
         let mut uids = Vec::with_capacity(entries.len());
         for (proton_id, metadata) in entries {
             uids.push(
@@ -266,21 +278,20 @@ impl GluonMailConnector {
         }
     }
 
-    fn ensure_mailbox(&self, mailbox: &str) -> Result<(String, UpstreamMailbox)> {
-        let scoped = ScopedMailbox::parse(mailbox);
-        let mailbox_name = if scoped.mailbox_name.is_empty() {
+    fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
+        let account_id = mailbox.account_id();
+        let mailbox_name = mailbox.mailbox_name();
+        let mailbox_name = if mailbox_name.is_empty() {
             "INBOX"
         } else {
-            scoped.mailbox_name.as_str()
+            mailbox_name
         };
-        let storage_user_id = self
-            .storage_user_id_for_account(scoped.account_id.as_deref())
-            .to_string();
+        let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
         if let Some(mailbox_state) = self.mailbox_by_name(&storage_user_id, mailbox_name)? {
             debug!(
                 service = "imap",
                 pkg = "gluon/user",
-                account_id = scoped.account_id.as_deref().unwrap_or_default(),
+                account_id = account_id.unwrap_or_default(),
                 storage_user_id = %storage_user_id,
                 mailbox_name = %mailbox_name,
                 "resolved existing Gluon mailbox"
@@ -312,7 +323,7 @@ impl GluonMailConnector {
         debug!(
             service = "imap",
             pkg = "gluon/user",
-            account_id = scoped.account_id.as_deref().unwrap_or_default(),
+            account_id = account_id.unwrap_or_default(),
             storage_user_id = %storage_user_id,
             mailbox_name = %mailbox_name,
             internal_id = created.internal_id,
@@ -332,16 +343,20 @@ impl GluonImapConnector for GluonMailConnector {
         }
     }
 
-    async fn get_message_literal(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+    async fn get_message_literal(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+    ) -> Result<Option<Vec<u8>>> {
         self.view.get_rfc822(mailbox, uid).await
     }
 
     async fn upsert_metadata(
         &self,
-        mailbox: &str,
-        proton_id: &str,
+        mailbox: &ScopedMailboxId,
+        proton_id: &ProtonMessageId,
         metadata: MessageMetadata,
-    ) -> Result<u32> {
+    ) -> Result<ImapUid> {
         let existing_uid = self.view.get_uid(mailbox, proton_id).await?;
         let uid = self
             .mutation
@@ -350,45 +365,47 @@ impl GluonImapConnector for GluonMailConnector {
         let flags = self.mutation.get_flags(mailbox, uid).await.ok();
 
         self.publish_authored(if existing_uid.is_some() {
-            GluonUpdate::message_updated(mailbox, uid, Some(proton_id.to_string()), flags, 0)
+            GluonUpdate::message_updated(mailbox, uid, Some(proton_id.clone()), flags, 0)
         } else {
-            GluonUpdate::messages_created(mailbox, uid, Some(proton_id.to_string()), flags, 0)
+            GluonUpdate::messages_created(mailbox, uid, Some(proton_id.clone()), flags, 0)
         });
 
         Ok(uid)
     }
 
-    async fn list_uids(&self, mailbox: &str) -> Result<Vec<u32>> {
+    async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>> {
         self.view.list_uids(mailbox).await
     }
 
-    fn create_mailbox(&self, mailbox: &str) -> Result<()> {
+    fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()> {
         let _ = self.ensure_mailbox(mailbox)?;
         self.publish_authored(GluonUpdate::MailboxCreated {
-            mailbox: GluonMailbox::from_mailbox_name(mailbox, 0),
+            mailbox: GluonMailbox::new(mailbox.clone(), 0),
         });
         Ok(())
     }
 
-    async fn rename_mailbox(&self, source_mailbox: &str, dest_mailbox: &str) -> Result<()> {
-        if source_mailbox.eq_ignore_ascii_case(dest_mailbox) {
+    async fn rename_mailbox(
+        &self,
+        source_mailbox: &ScopedMailboxId,
+        dest_mailbox: &ScopedMailboxId,
+    ) -> Result<()> {
+        if source_mailbox == dest_mailbox {
             return Ok(());
         }
 
-        let source = ScopedMailbox::parse(source_mailbox);
-        let dest = ScopedMailbox::parse(dest_mailbox);
         let source_storage_user_id = self
-            .storage_user_id_for_account(source.account_id.as_deref())
+            .storage_user_id_for_account(source_mailbox.account_id())
             .to_string();
 
         if let Some(source_mailbox_state) =
-            self.mailbox_by_name(&source_storage_user_id, &source.mailbox_name)?
+            self.mailbox_by_name(&source_storage_user_id, source_mailbox.mailbox_name())?
         {
             self.store
                 .rename_mailbox(
                     &source_storage_user_id,
                     source_mailbox_state.internal_id,
-                    &dest.mailbox_name,
+                    dest_mailbox.mailbox_name(),
                 )
                 .map_err(map_mail_error)?;
         } else {
@@ -396,20 +413,21 @@ impl GluonImapConnector for GluonMailConnector {
         }
 
         self.publish_authored(GluonUpdate::MailboxUpdated {
-            mailbox: GluonMailbox::from_mailbox_name(dest_mailbox, 0),
+            mailbox: GluonMailbox::new(dest_mailbox.clone(), 0),
         });
         self.publish_authored(GluonUpdate::MailboxDeletedSilent {
-            mailbox: GluonMailbox::from_mailbox_name(source_mailbox, 0),
+            mailbox: GluonMailbox::new(source_mailbox.clone(), 0),
         });
         Ok(())
     }
 
-    async fn delete_mailbox(&self, mailbox: &str, silent: bool) -> Result<()> {
-        let scoped = ScopedMailbox::parse(mailbox);
+    async fn delete_mailbox(&self, mailbox: &ScopedMailboxId, silent: bool) -> Result<()> {
         let storage_user_id = self
-            .storage_user_id_for_account(scoped.account_id.as_deref())
+            .storage_user_id_for_account(mailbox.account_id())
             .to_string();
-        if let Some(mailbox_state) = self.mailbox_by_name(&storage_user_id, &scoped.mailbox_name)? {
+        if let Some(mailbox_state) =
+            self.mailbox_by_name(&storage_user_id, mailbox.mailbox_name())?
+        {
             self.store
                 .delete_mailbox(&storage_user_id, mailbox_state.internal_id)
                 .map_err(map_mail_error)?;
@@ -417,31 +435,40 @@ impl GluonImapConnector for GluonMailConnector {
 
         self.publish_authored(if silent {
             GluonUpdate::MailboxDeletedSilent {
-                mailbox: GluonMailbox::from_mailbox_name(mailbox, 0),
+                mailbox: GluonMailbox::new(mailbox.clone(), 0),
             }
         } else {
             GluonUpdate::MailboxDeleted {
-                mailbox: GluonMailbox::from_mailbox_name(mailbox, 0),
+                mailbox: GluonMailbox::new(mailbox.clone(), 0),
             }
         });
 
         Ok(())
     }
 
-    async fn remove_message_by_uid(&self, mailbox: &str, uid: u32) -> Result<()> {
+    async fn remove_message_by_uid(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<()> {
         let proton_id = self.view.get_proton_id(mailbox, uid).await?;
         self.mutation.remove_message(mailbox, uid).await?;
-        self.publish_authored(GluonUpdate::message_deleted(mailbox, uid, proton_id, 0));
+        self.publish_authored(GluonUpdate::message_deleted(
+            mailbox,
+            uid,
+            proton_id.map(ProtonMessageId::from),
+            0,
+        ));
         Ok(())
     }
 
-    async fn remove_message_by_proton_id(&self, mailbox: &str, proton_id: &str) -> Result<()> {
+    async fn remove_message_by_proton_id(
+        &self,
+        mailbox: &ScopedMailboxId,
+        proton_id: &ProtonMessageId,
+    ) -> Result<()> {
         if let Some(uid) = self.view.get_uid(mailbox, proton_id).await? {
             self.mutation.remove_message(mailbox, uid).await?;
             self.publish_authored(GluonUpdate::message_deleted(
                 mailbox,
                 uid,
-                Some(proton_id.to_string()),
+                Some(proton_id.clone()),
                 0,
             ));
         }
@@ -450,14 +477,18 @@ impl GluonImapConnector for GluonMailConnector {
 
     async fn update_message_flags(
         &self,
-        mailbox: &str,
-        uid: u32,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
         flags: Vec<String>,
     ) -> Result<()> {
-        let proton_id = self.view.get_proton_id(mailbox, uid).await?;
+        let proton_id = self
+            .view
+            .get_proton_id(mailbox, uid)
+            .await?
+            .map(ProtonMessageId::from);
         self.mutation.set_flags(mailbox, uid, flags.clone()).await?;
         self.publish_authored(GluonUpdate::MessageFlagsUpdated {
-            message: GluonMessageRef::from_mailbox_name(mailbox, uid, proton_id, 0),
+            message: GluonMessageRef::new(mailbox.clone(), uid, proton_id, 0),
             flags: Some(flags),
         });
         Ok(())
@@ -465,17 +496,18 @@ impl GluonImapConnector for GluonMailConnector {
 
     async fn copy_message(
         &self,
-        source_mailbox: &str,
-        dest_mailbox: &str,
-        source_uid: u32,
-    ) -> Result<Option<u32>> {
-        let Some(proton_id) = self
+        source_mailbox: &ScopedMailboxId,
+        dest_mailbox: &ScopedMailboxId,
+        source_uid: ImapUid,
+    ) -> Result<Option<ImapUid>> {
+        let Some(proton_id_str) = self
             .mutation
             .get_proton_id(source_mailbox, source_uid)
             .await?
         else {
             return Ok(None);
         };
+        let proton_id = ProtonMessageId::from(proton_id_str);
         let Some(metadata) = self
             .mutation
             .get_metadata(source_mailbox, source_uid)
@@ -512,14 +544,14 @@ impl GluonImapConnector for GluonMailConnector {
 
     async fn update_message_mailboxes(
         &self,
-        proton_id: &str,
-        previous_mailboxes: &[String],
-        next_mailboxes: &[String],
+        proton_id: &ProtonMessageId,
+        previous_mailboxes: &[ScopedMailboxId],
+        next_mailboxes: &[ScopedMailboxId],
     ) -> Result<()> {
-        let previous_set: BTreeSet<&str> = previous_mailboxes.iter().map(String::as_str).collect();
-        let next_set: BTreeSet<&str> = next_mailboxes.iter().map(String::as_str).collect();
+        let previous_set: BTreeSet<&str> = previous_mailboxes.iter().map(|m| m.as_str()).collect();
+        let next_set: BTreeSet<&str> = next_mailboxes.iter().map(|m| m.as_str()).collect();
 
-        let mut source_mailbox = None;
+        let mut source_mailbox: Option<ScopedMailboxId> = None;
         let mut source_uid = None;
         let mut source_metadata = None;
         let mut source_flags = None;
@@ -536,7 +568,10 @@ impl GluonImapConnector for GluonMailConnector {
             }
         }
 
-        for mailbox in next_set.difference(&previous_set) {
+        for mailbox in next_mailboxes {
+            if previous_set.contains(mailbox.as_str()) {
+                continue;
+            }
             let (Some(metadata), Some(flags)) = (source_metadata.clone(), source_flags.clone())
             else {
                 continue;
@@ -551,7 +586,10 @@ impl GluonImapConnector for GluonMailConnector {
             }
         }
 
-        for mailbox in previous_set.difference(&next_set) {
+        for mailbox in previous_mailboxes {
+            if next_set.contains(mailbox.as_str()) {
+                continue;
+            }
             if let Some(uid) = self.view.get_uid(mailbox, proton_id).await? {
                 self.mutation.remove_message(mailbox, uid).await?;
             }
@@ -562,25 +600,18 @@ impl GluonImapConnector for GluonMailConnector {
             .cloned()
             .or_else(|| source_mailbox.clone())
             .or_else(|| previous_mailboxes.first().cloned());
-        let reference_uid = if let Some(mailbox) = reference_mailbox.as_deref() {
+        let reference_uid = if let Some(mailbox) = reference_mailbox.as_ref() {
             self.view.get_uid(mailbox, proton_id).await?
         } else {
             source_uid
         };
 
         if let (Some(mailbox), Some(uid)) = (reference_mailbox, reference_uid) {
-            let scoped = ScopedMailbox::parse(&mailbox);
             self.publish_authored(GluonUpdate::MessageMailboxesUpdated {
-                message: GluonMessageRef {
-                    account_id: scoped.account_id,
-                    mailbox_name: scoped.mailbox_name.clone(),
-                    uid,
-                    proton_id: Some(proton_id.to_string()),
-                    mod_seq: 0,
-                },
+                message: GluonMessageRef::new(mailbox, uid, Some(proton_id.clone()), 0),
                 mailbox_names: next_mailboxes
                     .iter()
-                    .map(|mailbox| ScopedMailbox::parse(mailbox).mailbox_name)
+                    .map(|m| m.mailbox_name().to_string())
                     .collect(),
                 flags: source_flags,
             });
@@ -589,15 +620,20 @@ impl GluonImapConnector for GluonMailConnector {
         Ok(())
     }
 
-    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+    async fn store_rfc822(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        data: Vec<u8>,
+    ) -> Result<()> {
         self.mutation.store_rfc822(mailbox, uid, data).await
     }
 
     async fn batch_upsert_metadata(
         &self,
-        mailbox: &str,
-        entries: &[(&str, MessageMetadata)],
-    ) -> Result<Vec<u32>> {
+        mailbox: &ScopedMailboxId,
+        entries: &[(&ProtonMessageId, MessageMetadata)],
+    ) -> Result<Vec<ImapUid>> {
         use super::mailbox as mailbox_mod;
 
         let uids = self.mutation.batch_store_metadata(mailbox, entries).await?;
@@ -611,10 +647,9 @@ impl GluonImapConnector for GluonMailConnector {
                 .map(str::to_string)
                 .collect();
 
-            let message =
-                GluonMessageRef::from_mailbox_name(mailbox, uid, Some(proton_id.to_string()), 0);
+            let message = GluonMessageRef::new(mailbox.clone(), uid, Some((*proton_id).clone()), 0);
             created_messages.push(GluonCreatedMessage {
-                mailbox_names: vec![message.mailbox_name.clone()],
+                mailbox_names: vec![mailbox.mailbox_name().to_string()],
                 message,
                 flags: Some(flags),
             });
@@ -627,7 +662,7 @@ impl GluonImapConnector for GluonMailConnector {
             });
         }
 
-        tracing::debug!(mailbox, total = entries.len(), "batch_upsert_metadata");
+        tracing::debug!(mailbox = %mailbox, total = entries.len(), "batch_upsert_metadata");
 
         Ok(uids)
     }
@@ -645,34 +680,24 @@ fn map_mail_error(err: gluon_rs_mail::GluonError) -> ImapError {
 }
 
 impl GluonMailbox {
-    fn from_mailbox_name(mailbox: &str, mod_seq: u64) -> Self {
-        let scoped = ScopedMailbox::parse(mailbox);
-        Self {
-            account_id: scoped.account_id,
-            mailbox_name: scoped.mailbox_name,
-            mod_seq,
-        }
-    }
-
-    fn scoped_mailbox(&self) -> String {
-        scoped_mailbox_string(self.account_id.as_deref(), &self.mailbox_name)
+    fn new(mailbox: ScopedMailboxId, mod_seq: u64) -> Self {
+        Self { mailbox, mod_seq }
     }
 }
 
 impl GluonMessageRef {
-    fn from_mailbox_name(mailbox: &str, uid: u32, proton_id: Option<String>, mod_seq: u64) -> Self {
-        let scoped = ScopedMailbox::parse(mailbox);
+    fn new(
+        mailbox: ScopedMailboxId,
+        uid: ImapUid,
+        proton_id: Option<ProtonMessageId>,
+        mod_seq: u64,
+    ) -> Self {
         Self {
-            account_id: scoped.account_id,
-            mailbox_name: scoped.mailbox_name,
+            mailbox,
             uid,
             proton_id,
             mod_seq,
         }
-    }
-
-    fn scoped_mailbox(&self) -> String {
-        scoped_mailbox_string(self.account_id.as_deref(), &self.mailbox_name)
     }
 }
 
@@ -712,16 +737,16 @@ impl GluonUpdate {
     }
 
     fn messages_created(
-        mailbox: &str,
-        uid: u32,
-        proton_id: Option<String>,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        proton_id: Option<ProtonMessageId>,
         flags: Option<Vec<String>>,
         mod_seq: u64,
     ) -> Self {
-        let message = GluonMessageRef::from_mailbox_name(mailbox, uid, proton_id, mod_seq);
+        let message = GluonMessageRef::new(mailbox.clone(), uid, proton_id, mod_seq);
         Self::MessagesCreated {
             messages: vec![GluonCreatedMessage {
-                mailbox_names: vec![message.mailbox_name.clone()],
+                mailbox_names: vec![mailbox.mailbox_name().to_string()],
                 message,
                 flags,
             }],
@@ -730,15 +755,15 @@ impl GluonUpdate {
     }
 
     fn message_updated(
-        mailbox: &str,
-        uid: u32,
-        proton_id: Option<String>,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        proton_id: Option<ProtonMessageId>,
         flags: Option<Vec<String>>,
         mod_seq: u64,
     ) -> Self {
-        let message = GluonMessageRef::from_mailbox_name(mailbox, uid, proton_id, mod_seq);
+        let message = GluonMessageRef::new(mailbox.clone(), uid, proton_id, mod_seq);
         Self::MessageUpdated {
-            mailbox_names: vec![message.mailbox_name.clone()],
+            mailbox_names: vec![mailbox.mailbox_name().to_string()],
             flags,
             message,
             allow_create: false,
@@ -746,22 +771,27 @@ impl GluonUpdate {
         }
     }
 
-    fn message_deleted(mailbox: &str, uid: u32, proton_id: Option<String>, mod_seq: u64) -> Self {
+    fn message_deleted(
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        proton_id: Option<ProtonMessageId>,
+        mod_seq: u64,
+    ) -> Self {
         Self::MessageDeleted {
-            message: GluonMessageRef::from_mailbox_name(mailbox, uid, proton_id, mod_seq),
+            message: GluonMessageRef::new(mailbox.clone(), uid, proton_id, mod_seq),
         }
     }
 
-    pub fn affected_scoped_mailboxes(&self) -> Vec<String> {
+    pub fn affected_scoped_mailboxes(&self) -> Vec<ScopedMailboxId> {
         match self {
             Self::Noop => Vec::new(),
             Self::MessagesCreated { messages, .. } => messages
                 .iter()
-                .flat_map(|message| {
-                    scoped_mailbox_strings(
-                        message.message.account_id.as_deref(),
-                        &message.mailbox_names,
-                    )
+                .flat_map(|msg| {
+                    let account_id = msg.message.mailbox.account_id();
+                    msg.mailbox_names
+                        .iter()
+                        .map(move |name| ScopedMailboxId::from_parts(account_id, name))
                 })
                 .collect(),
             Self::MessageUpdated {
@@ -773,31 +803,30 @@ impl GluonUpdate {
                 message,
                 mailbox_names,
                 ..
-            } => scoped_mailbox_strings(message.account_id.as_deref(), mailbox_names),
+            } => {
+                let account_id = message.mailbox.account_id();
+                mailbox_names
+                    .iter()
+                    .map(|name| ScopedMailboxId::from_parts(account_id, name))
+                    .collect()
+            }
             Self::MessageDeleted { message }
             | Self::MessageFlagsUpdated { message, .. }
-            | Self::MessageIDChanged { message, .. } => vec![message.scoped_mailbox()],
+            | Self::MessageIDChanged { message, .. } => vec![message.mailbox.clone()],
             Self::MailboxCreated { mailbox }
             | Self::MailboxUpdated { mailbox }
             | Self::MailboxUpdatedOrCreated { mailbox }
             | Self::MailboxDeleted { mailbox }
             | Self::MailboxDeletedSilent { mailbox }
-            | Self::MailboxIDChanged { mailbox, .. } => vec![mailbox.scoped_mailbox()],
-            Self::UIDValidityBumped {
-                account_id,
-                mailbox_name,
-                ..
-            } => mailbox_name
-                .iter()
-                .map(|mailbox_name| scoped_mailbox_string(account_id.as_deref(), mailbox_name))
-                .collect(),
+            | Self::MailboxIDChanged { mailbox, .. } => vec![mailbox.mailbox.clone()],
+            Self::UIDValidityBumped { mailbox, .. } => vec![mailbox.clone()],
         }
     }
 
-    pub fn affects_scoped_mailbox(&self, scoped_mailbox: &str) -> bool {
+    pub fn affects_scoped_mailbox(&self, scoped_mailbox: &ScopedMailboxId) -> bool {
         self.affected_scoped_mailboxes()
             .iter()
-            .any(|mailbox| mailbox == scoped_mailbox)
+            .any(|m| m == scoped_mailbox)
     }
 
     pub fn account_id(&self) -> Option<&str> {
@@ -805,56 +834,57 @@ impl GluonUpdate {
             Self::Noop => None,
             Self::MessagesCreated { messages, .. } => messages
                 .first()
-                .and_then(|message| message.message.account_id.as_deref()),
+                .and_then(|message| message.message.mailbox.account_id()),
             Self::MessageUpdated { message, .. }
             | Self::MessageDeleted { message }
             | Self::MessageFlagsUpdated { message, .. }
             | Self::MessageMailboxesUpdated { message, .. }
-            | Self::MessageIDChanged { message, .. } => message.account_id.as_deref(),
+            | Self::MessageIDChanged { message, .. } => message.mailbox.account_id(),
             Self::MailboxCreated { mailbox }
             | Self::MailboxUpdated { mailbox }
             | Self::MailboxUpdatedOrCreated { mailbox }
             | Self::MailboxDeleted { mailbox }
             | Self::MailboxDeletedSilent { mailbox }
-            | Self::MailboxIDChanged { mailbox, .. } => mailbox.account_id.as_deref(),
-            Self::UIDValidityBumped { account_id, .. } => account_id.as_deref(),
+            | Self::MailboxIDChanged { mailbox, .. } => mailbox.mailbox.account_id(),
+            Self::UIDValidityBumped { mailbox, .. } => mailbox.account_id(),
         }
     }
 
     fn from_store_event(event: StoreEvent) -> Option<Self> {
+        let mailbox = ScopedMailboxId::parse(&event.mailbox);
         match event.kind {
             StoreEventKind::MailboxCreated => Some(Self::MailboxCreated {
-                mailbox: GluonMailbox::from_mailbox_name(&event.mailbox, event.mod_seq),
+                mailbox: GluonMailbox::new(mailbox, event.mod_seq),
             }),
             StoreEventKind::MessageAdded => Some(Self::messages_created(
-                &event.mailbox,
-                event.uid?,
-                event.proton_id,
+                &mailbox,
+                ImapUid::from(event.uid?),
+                event.proton_id.map(ProtonMessageId::from),
                 None,
                 event.mod_seq,
             )),
             StoreEventKind::MessageUpdated | StoreEventKind::MessageBodyUpdated => {
                 Some(Self::message_updated(
-                    &event.mailbox,
-                    event.uid?,
-                    event.proton_id,
+                    &mailbox,
+                    ImapUid::from(event.uid?),
+                    event.proton_id.map(ProtonMessageId::from),
                     None,
                     event.mod_seq,
                 ))
             }
             StoreEventKind::MessageFlagsUpdated => Some(Self::MessageFlagsUpdated {
-                message: GluonMessageRef::from_mailbox_name(
-                    &event.mailbox,
-                    event.uid?,
-                    event.proton_id,
+                message: GluonMessageRef::new(
+                    mailbox,
+                    ImapUid::from(event.uid?),
+                    event.proton_id.map(ProtonMessageId::from),
                     event.mod_seq,
                 ),
                 flags: None,
             }),
             StoreEventKind::MessageRemoved => Some(Self::message_deleted(
-                &event.mailbox,
-                event.uid?,
-                event.proton_id,
+                &mailbox,
+                ImapUid::from(event.uid?),
+                event.proton_id.map(ProtonMessageId::from),
                 event.mod_seq,
             )),
         }
@@ -866,87 +896,80 @@ impl GluonUpdate {
             Self::MessagesCreated { messages, .. } => messages
                 .iter()
                 .map(|message| GluonUpdateKey {
-                    scoped_mailbox: message.message.scoped_mailbox(),
+                    scoped_mailbox: message.message.mailbox.clone(),
                     uid: Some(message.message.uid),
                     proton_id: message.message.proton_id.clone(),
                     kind: GluonUpdateKeyKind::MessagesCreated,
                 })
                 .collect(),
             Self::MessageUpdated { message, .. } => vec![GluonUpdateKey {
-                scoped_mailbox: message.scoped_mailbox(),
+                scoped_mailbox: message.mailbox.clone(),
                 uid: Some(message.uid),
                 proton_id: message.proton_id.clone(),
                 kind: GluonUpdateKeyKind::MessageUpdated,
             }],
             Self::MessageDeleted { message } => vec![GluonUpdateKey {
-                scoped_mailbox: message.scoped_mailbox(),
+                scoped_mailbox: message.mailbox.clone(),
                 uid: Some(message.uid),
                 proton_id: message.proton_id.clone(),
                 kind: GluonUpdateKeyKind::MessageDeleted,
             }],
             Self::MessageFlagsUpdated { message, .. } => vec![GluonUpdateKey {
-                scoped_mailbox: message.scoped_mailbox(),
+                scoped_mailbox: message.mailbox.clone(),
                 uid: Some(message.uid),
                 proton_id: message.proton_id.clone(),
                 kind: GluonUpdateKeyKind::MessageFlagsUpdated,
             }],
             Self::MessageMailboxesUpdated { message, .. } => vec![GluonUpdateKey {
-                scoped_mailbox: message.scoped_mailbox(),
+                scoped_mailbox: message.mailbox.clone(),
                 uid: Some(message.uid),
                 proton_id: message.proton_id.clone(),
                 kind: GluonUpdateKeyKind::MessageMailboxesUpdated,
             }],
             Self::MailboxCreated { mailbox } => vec![GluonUpdateKey {
-                scoped_mailbox: mailbox.scoped_mailbox(),
+                scoped_mailbox: mailbox.mailbox.clone(),
                 uid: None,
                 proton_id: None,
                 kind: GluonUpdateKeyKind::MailboxCreated,
             }],
             Self::MailboxUpdated { mailbox } => vec![GluonUpdateKey {
-                scoped_mailbox: mailbox.scoped_mailbox(),
+                scoped_mailbox: mailbox.mailbox.clone(),
                 uid: None,
                 proton_id: None,
                 kind: GluonUpdateKeyKind::MailboxUpdated,
             }],
             Self::MailboxUpdatedOrCreated { mailbox } => vec![GluonUpdateKey {
-                scoped_mailbox: mailbox.scoped_mailbox(),
+                scoped_mailbox: mailbox.mailbox.clone(),
                 uid: None,
                 proton_id: None,
                 kind: GluonUpdateKeyKind::MailboxUpdatedOrCreated,
             }],
             Self::MailboxDeleted { mailbox } => vec![GluonUpdateKey {
-                scoped_mailbox: mailbox.scoped_mailbox(),
+                scoped_mailbox: mailbox.mailbox.clone(),
                 uid: None,
                 proton_id: None,
                 kind: GluonUpdateKeyKind::MailboxDeleted,
             }],
             Self::MailboxDeletedSilent { mailbox } => vec![GluonUpdateKey {
-                scoped_mailbox: mailbox.scoped_mailbox(),
+                scoped_mailbox: mailbox.mailbox.clone(),
                 uid: None,
                 proton_id: None,
                 kind: GluonUpdateKeyKind::MailboxDeletedSilent,
             }],
             Self::MailboxIDChanged { mailbox, remote_id } => vec![GluonUpdateKey {
-                scoped_mailbox: mailbox.scoped_mailbox(),
+                scoped_mailbox: mailbox.mailbox.clone(),
                 uid: None,
-                proton_id: Some(remote_id.clone()),
+                proton_id: Some(ProtonMessageId::from(remote_id.as_str())),
                 kind: GluonUpdateKeyKind::MailboxIDChanged,
             }],
             Self::MessageIDChanged { message, remote_id } => vec![GluonUpdateKey {
-                scoped_mailbox: message.scoped_mailbox(),
+                scoped_mailbox: message.mailbox.clone(),
                 uid: Some(message.uid),
-                proton_id: Some(remote_id.clone()),
+                proton_id: Some(ProtonMessageId::from(remote_id.as_str())),
                 kind: GluonUpdateKeyKind::MessageIDChanged,
             }],
-            Self::UIDValidityBumped {
-                account_id,
-                mailbox_name,
-                ..
-            } => vec![GluonUpdateKey {
-                scoped_mailbox: scoped_mailbox_string(
-                    account_id.as_deref(),
-                    mailbox_name.as_deref().unwrap_or(""),
-                ),
+            Self::UIDValidityBumped { mailbox, .. } => vec![GluonUpdateKey {
+                scoped_mailbox: mailbox.clone(),
                 uid: None,
                 proton_id: None,
                 kind: GluonUpdateKeyKind::UIDValidityBumped,
@@ -957,9 +980,9 @@ impl GluonUpdate {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GluonUpdateKey {
-    scoped_mailbox: String,
-    uid: Option<u32>,
-    proton_id: Option<String>,
+    scoped_mailbox: ScopedMailboxId,
+    uid: Option<ImapUid>,
+    proton_id: Option<ProtonMessageId>,
     kind: GluonUpdateKeyKind,
 }
 
@@ -997,43 +1020,8 @@ fn log_gluon_update(source: &str, update: &GluonUpdate) {
         affected_mailboxes = update.affected_scoped_mailboxes().len(),
         message_count = update.message_count(),
         scoped_mailbox,
-        uid = ?primary.and_then(|key| key.uid),
-        proton_id = ?primary.and_then(|key| key.proton_id.as_deref()),
+        uid = ?primary.and_then(|key| key.uid.map(|u| u.value())),
+        proton_id = ?primary.and_then(|key| key.proton_id.as_ref().map(|p| p.as_str())),
         "Applying update"
     );
-}
-
-fn scoped_mailbox_string(account_id: Option<&str>, mailbox_name: &str) -> String {
-    match account_id {
-        Some(account_id) if !account_id.is_empty() => format!("{account_id}::{mailbox_name}"),
-        _ => mailbox_name.to_string(),
-    }
-}
-
-fn scoped_mailbox_strings(account_id: Option<&str>, mailbox_names: &[String]) -> Vec<String> {
-    mailbox_names
-        .iter()
-        .map(|mailbox_name| scoped_mailbox_string(account_id, mailbox_name))
-        .collect()
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ScopedMailbox {
-    account_id: Option<String>,
-    mailbox_name: String,
-}
-
-impl ScopedMailbox {
-    fn parse(mailbox: &str) -> Self {
-        match mailbox.split_once("::") {
-            Some((account_id, mailbox_name)) if !account_id.is_empty() => Self {
-                account_id: Some(account_id.to_string()),
-                mailbox_name: mailbox_name.to_string(),
-            },
-            _ => Self {
-                account_id: None,
-                mailbox_name: mailbox.to_string(),
-            },
-        }
-    }
 }

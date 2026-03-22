@@ -504,8 +504,8 @@ fn resolve_optimize_cache_concurrency(raw_concurrency: u32) -> usize {
     requested.clamp(1, OPTIMIZE_CACHE_CONCURRENCY_MAX)
 }
 
-fn scoped_cache_mailbox(account_id: &str, mailbox: &str) -> String {
-    format!("{account_id}::{mailbox}")
+fn scoped_cache_mailbox(account_id: &str, mailbox: &str) -> crate::imap::types::ScopedMailboxId {
+    crate::imap::types::ScopedMailboxId::from_parts(Some(account_id), mailbox)
 }
 
 #[allow(clippy::result_large_err)]
@@ -617,8 +617,8 @@ async fn load_cache_auth_material(
 
 #[allow(clippy::result_large_err)]
 async fn optimize_cache_message(
-    mailbox: String,
-    uid: u32,
+    mailbox: crate::imap::types::ScopedMailboxId,
+    uid: crate::imap::types::ImapUid,
     proton_id: String,
     mut client: ProtonClient,
     access_token: String,
@@ -714,7 +714,7 @@ async fn optimize_cache_message(
         warn!(
             account_id = %account_id.0,
             mailbox = %mailbox,
-            uid,
+            uid = uid.value(),
             error = %err,
             "failed to store optimized RFC822 cache entry"
         );
@@ -876,7 +876,7 @@ async fn run_cache_optimization_for_account(
                     warn!(
                         account_id = %account.uid,
                         mailbox = %scoped,
-                        uid,
+                        uid = uid.value(),
                         error = %err,
                         "failed to check RFC822 cache while optimizing"
                     );
@@ -891,7 +891,7 @@ async fn run_cache_optimization_for_account(
                     warn!(
                         account_id = %account.uid,
                         mailbox = %scoped,
-                        uid,
+                        uid = uid.value(),
                         error = %err,
                         "missing proton id while optimizing cache"
                     );

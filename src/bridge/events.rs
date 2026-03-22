@@ -27,6 +27,7 @@ use crate::imap::gluon_connector::GluonImapConnector;
 use crate::imap::mailbox;
 use crate::imap::mailbox_view::GluonMailboxView;
 use crate::imap::rfc822;
+use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use crate::pim::incremental as pim_incremental;
 use crate::pim::store::PimStore;
 use crate::vault;
@@ -465,8 +466,8 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-fn scoped_mailbox_name(account_id: &AccountId, mailbox_name: &str) -> String {
-    format!("{}::{}", account_id.0, mailbox_name)
+fn scoped_mailbox_name(account_id: &AccountId, mailbox_name: &str) -> ScopedMailboxId {
+    ScopedMailboxId::from_parts(Some(&account_id.0), mailbox_name)
 }
 
 fn redacted_subject_for_log(subject: &str) -> String {
@@ -498,9 +499,10 @@ async fn message_exists_in_store(
         }
         ensure_account_generation(config, expected_generation, "message_exists_in_store").await?;
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
+        let pid = ProtonMessageId::from(message_id);
         let uid = config
             .mailbox_view
-            .get_uid(&scoped, message_id)
+            .get_uid(&scoped, &pid)
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         if uid.is_some() {
@@ -948,16 +950,17 @@ async fn apply_metadata_to_store(
         ensure_account_generation(config, expected_generation, "apply_metadata_to_store").await?;
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         let in_mailbox = label_ids.contains(mb.label_id);
+        let pid = ProtonMessageId::from(metadata.id.as_str());
         if in_mailbox {
             config
                 .connector
-                .upsert_metadata(&scoped, &metadata.id, metadata.clone())
+                .upsert_metadata(&scoped, &pid, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         } else {
             config
                 .connector
-                .remove_message_by_proton_id(&scoped, &metadata.id)
+                .remove_message_by_proton_id(&scoped, &pid)
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
@@ -967,16 +970,17 @@ async fn apply_metadata_to_store(
     for ul in &user_labels {
         let scoped = scoped_mailbox_name(&config.account_id, &ul.name);
         let in_mailbox = label_ids.contains(ul.label_id.as_str());
+        let pid = ProtonMessageId::from(metadata.id.as_str());
         if in_mailbox {
             config
                 .connector
-                .upsert_metadata(&scoped, &metadata.id, metadata.clone())
+                .upsert_metadata(&scoped, &pid, metadata.clone())
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         } else {
             config
                 .connector
-                .remove_message_by_proton_id(&scoped, &metadata.id)
+                .remove_message_by_proton_id(&scoped, &pid)
                 .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
@@ -993,30 +997,34 @@ async fn apply_metadata_to_store(
 async fn batch_apply_metadata_to_store(
     config: &EventWorkerConfig,
     messages: &[MessageMetadata],
-    scoped_mailbox: &str,
+    scoped_mailbox: &ScopedMailboxId,
     target_label_id: &str,
     expected_generation: u64,
-) -> Result<HashMap<String, u32>, EventWorkerError> {
+) -> Result<HashMap<String, ImapUid>, EventWorkerError> {
     ensure_account_generation(config, expected_generation, "batch_apply_metadata").await?;
 
     // Group messages that belong to the target mailbox for batch upsert.
-    let mut batch_entries: Vec<(&str, MessageMetadata)> = Vec::new();
-    let mut remove_ids: Vec<&str> = Vec::new();
+    let proton_ids: Vec<ProtonMessageId> = messages
+        .iter()
+        .map(|m| ProtonMessageId::from(m.id.as_str()))
+        .collect();
+    let mut batch_entries: Vec<(&ProtonMessageId, MessageMetadata)> = Vec::new();
+    let mut remove_ids: Vec<usize> = Vec::new();
 
-    for metadata in messages {
+    for (i, metadata) in messages.iter().enumerate() {
         let in_mailbox = metadata.label_ids.iter().any(|l| l == target_label_id);
         if in_mailbox {
-            batch_entries.push((&metadata.id, metadata.clone()));
+            batch_entries.push((&proton_ids[i], metadata.clone()));
         } else {
-            remove_ids.push(&metadata.id);
+            remove_ids.push(i);
         }
     }
 
     // Batch-remove messages that don't belong to this mailbox.
-    for proton_id in &remove_ids {
+    for &idx in &remove_ids {
         config
             .connector
-            .remove_message_by_proton_id(scoped_mailbox, proton_id)
+            .remove_message_by_proton_id(scoped_mailbox, &proton_ids[idx])
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
     }
@@ -1030,15 +1038,16 @@ async fn batch_apply_metadata_to_store(
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         for (i, uid) in uids.into_iter().enumerate() {
-            uid_map.insert(batch_entries[i].0.to_string(), uid);
+            uid_map.insert(batch_entries[i].0.as_str().to_string(), uid);
         }
     }
 
     // Also apply to other system mailboxes and user labels (individual upserts
     // for cross-mailbox membership).
     let user_labels = config.runtime_accounts.get_user_labels(&config.account_id);
-    for metadata in messages {
+    for (mi, metadata) in messages.iter().enumerate() {
         let label_ids: HashSet<&str> = metadata.label_ids.iter().map(String::as_str).collect();
+        let pid = &proton_ids[mi];
 
         for mb in mailbox::system_mailboxes() {
             if !mb.selectable || mb.label_id == target_label_id {
@@ -1048,13 +1057,13 @@ async fn batch_apply_metadata_to_store(
             if label_ids.contains(mb.label_id) {
                 config
                     .connector
-                    .upsert_metadata(&scoped, &metadata.id, metadata.clone())
+                    .upsert_metadata(&scoped, pid, metadata.clone())
                     .await
                     .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
             } else {
                 config
                     .connector
-                    .remove_message_by_proton_id(&scoped, &metadata.id)
+                    .remove_message_by_proton_id(&scoped, pid)
                     .await
                     .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
             }
@@ -1065,13 +1074,13 @@ async fn batch_apply_metadata_to_store(
             if label_ids.contains(ul.label_id.as_str()) {
                 config
                     .connector
-                    .upsert_metadata(&scoped, &metadata.id, metadata.clone())
+                    .upsert_metadata(&scoped, pid, metadata.clone())
                     .await
                     .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
             } else {
                 config
                     .connector
-                    .remove_message_by_proton_id(&scoped, &metadata.id)
+                    .remove_message_by_proton_id(&scoped, pid)
                     .await
                     .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
             }
@@ -1366,6 +1375,34 @@ async fn bounded_resync_account_for_generation(
         "loaded imap sync state snapshot"
     );
 
+    // Go bridge: if syncStatus.IsComplete() { sync labels only; return }
+    if sync_status.has_labels && sync_status.has_messages {
+        info!(
+            service = "imap",
+            user = %config.account_id.0,
+            account_id = %config.account_id.0,
+            account_email = %config.account_email,
+            "Sync already complete, updating labels"
+        );
+        fetch_and_update_user_labels(config, client, expected_generation).await?;
+        let duration = resync_started_at.elapsed();
+        info!(
+            service = "imap",
+            user = %config.account_id.0,
+            user_id = %config.account_id.0,
+            account_id = %config.account_id.0,
+            account_email = %config.account_email,
+            start = sync_start,
+            start_unix = sync_start,
+            duration = ?duration,
+            duration_ms = duration.as_millis() as u64,
+            msg = "Finished user sync",
+            "Finished user sync"
+        );
+        progress_guard.finish();
+        return Ok(());
+    }
+
     // Fetch total message count from AllMail label (same as Go bridge)
     if !sync_status.has_message_count {
         match messages::get_grouped_message_count(client).await {
@@ -1529,7 +1566,7 @@ async fn bounded_resync_account_for_generation(
             struct BodyDownloadEntry {
                 message_id: String,
                 address_id: String,
-                uid: u32,
+                uid: ImapUid,
             }
 
             // Filter to new messages only.
@@ -1849,8 +1886,8 @@ async fn download_and_store_rfc822(
     addr_keyrings: &HashMap<String, Arc<Keyring>>,
     message_id: &str,
     address_id: &str,
-    scoped_mailbox: &str,
-    uid: u32,
+    scoped_mailbox: &ScopedMailboxId,
+    uid: ImapUid,
 ) -> bool {
     let keyring = match addr_keyrings.get(address_id) {
         Some(kr) => kr,
@@ -2017,11 +2054,12 @@ async fn apply_message_delete(
     expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
     ensure_account_generation(config, expected_generation, "apply_message_delete").await?;
+    let pid = ProtonMessageId::from(message_id);
     for mb in mailbox::system_mailboxes() {
         let scoped = scoped_mailbox_name(&config.account_id, mb.name);
         config
             .connector
-            .remove_message_by_proton_id(&scoped, message_id)
+            .remove_message_by_proton_id(&scoped, &pid)
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
     }
@@ -2029,7 +2067,7 @@ async fn apply_message_delete(
         let scoped = scoped_mailbox_name(&config.account_id, &label_mailbox.name);
         config
             .connector
-            .remove_message_by_proton_id(&scoped, message_id)
+            .remove_message_by_proton_id(&scoped, &pid)
             .await
             .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
     }
@@ -3545,10 +3583,13 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .get_uid("uid-1::INBOX", "msg-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
 
         let checkpoint = checkpoints
@@ -3725,8 +3766,8 @@ mod tests {
         config
             .connector
             .upsert_metadata(
-                "uid-1::INBOX",
-                "msg-1",
+                &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                &ProtonMessageId::from("msg-1"),
                 crate::api::types::MessageMetadata {
                     id: "msg-1".to_string(),
                     address_id: "addr-1".to_string(),
@@ -3757,7 +3798,10 @@ mod tests {
         let _ = poll_account_once(&config, "event-0").await.unwrap();
         assert!(config
             .mailbox_view
-            .get_uid("uid-1::INBOX", "msg-1")
+            .get_uid(
+                &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                &ProtonMessageId::from("msg-1")
+            )
             .await
             .unwrap()
             .is_none());
@@ -3887,10 +3931,13 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .get_uid("uid-1::INBOX", "msg-refresh-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-refresh-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
 
         let checkpoint = checkpoints
@@ -3934,8 +3981,12 @@ mod tests {
         let next = poll_account_once(&config, "event-0").await.unwrap();
         assert_eq!(next, "event-1");
         assert_eq!(
-            config.mailbox_view.list_uids("uid-1::INBOX").await.unwrap(),
-            Vec::<u32>::new()
+            config
+                .mailbox_view
+                .list_uids(&ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"))
+                .await
+                .unwrap(),
+            Vec::<ImapUid>::new()
         );
 
         let checkpoint = checkpoints
@@ -4004,8 +4055,12 @@ mod tests {
         assert_eq!(next, "event-3");
 
         assert_eq!(
-            config.mailbox_view.list_uids("uid-1::INBOX").await.unwrap(),
-            Vec::<u32>::new()
+            config
+                .mailbox_view
+                .list_uids(&ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"))
+                .await
+                .unwrap(),
+            Vec::<ImapUid>::new()
         );
         let checkpoint = checkpoints
             .load_checkpoint(&AccountId("uid-1".to_string()))
@@ -4163,7 +4218,10 @@ mod tests {
         assert_eq!(next, "event-1");
         assert!(config
             .mailbox_view
-            .get_uid("uid-1::INBOX", "msg-page2-0")
+            .get_uid(
+                &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                &ProtonMessageId::from("msg-page2-0")
+            )
             .await
             .unwrap()
             .is_some());
@@ -4362,10 +4420,13 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .get_uid("uid-1::INBOX", "msg-resync-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-resync-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
 
         let checkpoint = checkpoints
@@ -4418,8 +4479,12 @@ mod tests {
         let next = poll_account_once(&config, "event-0").await.unwrap();
         assert_eq!(next, "event-1");
         assert_eq!(
-            config.mailbox_view.list_uids("uid-1::INBOX").await.unwrap(),
-            Vec::<u32>::new()
+            config
+                .mailbox_view
+                .list_uids(&ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"))
+                .await
+                .unwrap(),
+            Vec::<ImapUid>::new()
         );
 
         let checkpoint = checkpoints
@@ -4489,8 +4554,8 @@ mod tests {
         config
             .connector
             .upsert_metadata(
-                "uid-1::Labels/Old Projects",
-                "msg-label-1",
+                &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/Old Projects"),
+                &ProtonMessageId::from("msg-label-1"),
                 MessageMetadata {
                     id: "msg-label-1".to_string(),
                     address_id: "addr-1".to_string(),
@@ -4528,14 +4593,20 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .get_uid("uid-1::Labels/New Projects", "msg-label-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/New Projects"),
+                    &ProtonMessageId::from("msg-label-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
         assert!(config
             .mailbox_view
-            .list_uids("uid-1::Labels/Old Projects")
+            .list_uids(&ScopedMailboxId::from_parts(
+                Some("uid-1"),
+                "Labels/Old Projects"
+            ))
             .await
             .unwrap()
             .is_empty());
@@ -4593,8 +4664,8 @@ mod tests {
         config
             .connector
             .upsert_metadata(
-                "uid-1::Labels/Obsolete",
-                "msg-obsolete-1",
+                &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/Obsolete"),
+                &ProtonMessageId::from("msg-obsolete-1"),
                 MessageMetadata {
                     id: "msg-obsolete-1".to_string(),
                     address_id: "addr-1".to_string(),
@@ -4630,7 +4701,10 @@ mod tests {
             .is_empty());
         assert!(config
             .mailbox_view
-            .list_uids("uid-1::Labels/Obsolete")
+            .list_uids(&ScopedMailboxId::from_parts(
+                Some("uid-1"),
+                "Labels/Obsolete"
+            ))
             .await
             .unwrap()
             .is_empty());
@@ -4719,10 +4793,13 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .get_uid("uid-1::INBOX", "msg-refresh-label-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-refresh-label-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
 
         let checkpoint = checkpoints
@@ -4779,10 +4856,13 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .get_uid("uid-1::INBOX", "msg-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
         let checkpoint = checkpoints
             .load_checkpoint(&AccountId("uid-1".to_string()))
@@ -5415,8 +5495,8 @@ mod tests {
             let connector = GluonMailConnector::new(gluon_store);
             connector
                 .upsert_metadata(
-                    "uid-1::INBOX",
-                    "msg-1",
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-1"),
                     MessageMetadata {
                         id: "msg-1".to_string(),
                         address_id: "addr-1".to_string(),
@@ -5497,10 +5577,13 @@ mod tests {
         );
         assert_eq!(
             mailbox_view_after
-                .get_uid("uid-1::INBOX", "msg-1")
+                .get_uid(
+                    &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
+                    &ProtonMessageId::from("msg-1")
+                )
                 .await
                 .unwrap(),
-            Some(1)
+            Some(ImapUid::from(1u32))
         );
     }
 

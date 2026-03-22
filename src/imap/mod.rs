@@ -14,6 +14,7 @@ pub mod rfc822;
 pub mod server;
 pub mod session;
 pub mod store;
+pub mod types;
 
 use std::path::PathBuf;
 

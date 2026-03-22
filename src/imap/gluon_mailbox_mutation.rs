@@ -15,6 +15,7 @@ use super::mailbox_mutation::GluonMailboxMutation;
 use super::mailbox_view::GluonMailboxView;
 use super::rfc822;
 use super::store::MailboxStatus;
+use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::{ImapError, Result};
 
 #[derive(Clone)]
@@ -31,18 +32,11 @@ impl GluonMailMailboxMutation {
         })
     }
 
-    fn scoped_mailbox_parts(mailbox: &str) -> (&str, &str) {
-        match mailbox.split_once("::") {
-            Some((account_id, mailbox_name)) if !account_id.is_empty() => {
-                let mailbox_name = if mailbox_name.is_empty() {
-                    "INBOX"
-                } else {
-                    mailbox_name
-                };
-                (account_id, mailbox_name)
-            }
-            _ => ("__default__", mailbox),
-        }
+    fn resolve_parts(mailbox: &ScopedMailboxId) -> (&str, &str) {
+        let account_id = mailbox.account_id().unwrap_or("__default__");
+        let name = mailbox.mailbox_name();
+        let name = if name.is_empty() { "INBOX" } else { name };
+        (account_id, name)
     }
 
     fn storage_user_id_for_account<'a>(&'a self, account_id: &'a str) -> &'a str {
@@ -73,8 +67,8 @@ impl GluonMailMailboxMutation {
         }
     }
 
-    fn ensure_mailbox(&self, mailbox: &str) -> Result<(String, UpstreamMailbox)> {
-        let (account_id, mailbox_name) = Self::scoped_mailbox_parts(mailbox);
+    fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
+        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
         if let Some(mailbox) = self.mailbox_by_name(&storage_user_id, mailbox_name)? {
             return Ok((storage_user_id, mailbox));
@@ -106,8 +100,8 @@ impl GluonMailMailboxMutation {
 
     fn message_by_uid(
         &self,
-        mailbox: &str,
-        uid: u32,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
     ) -> Result<Option<(String, UpstreamMailbox, UpstreamMailboxMessage)>> {
         let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
         let snapshot = self
@@ -117,16 +111,20 @@ impl GluonMailMailboxMutation {
         Ok(snapshot
             .messages
             .into_iter()
-            .find(|message| message.summary.uid == uid)
+            .find(|message| message.summary.uid == uid.value())
             .map(|message| (storage_user_id, mailbox_state, message)))
     }
 
-    fn placeholder_message(&self, proton_id: &str, meta: &MessageMetadata) -> NewMessage {
+    fn placeholder_message(
+        &self,
+        proton_id: &ProtonMessageId,
+        meta: &MessageMetadata,
+    ) -> NewMessage {
         let blob = metadata_blob(meta);
         let header = extract_header_section(&blob);
         NewMessage {
             internal_id: Uuid::new_v4().to_string(),
-            remote_id: proton_id.to_string(),
+            remote_id: proton_id.as_str().to_string(),
             flags: mailbox::message_flags(meta)
                 .into_iter()
                 .map(str::to_string)
@@ -143,20 +141,28 @@ impl GluonMailMailboxMutation {
 
 #[async_trait]
 impl GluonMailboxMutation for GluonMailMailboxMutation {
-    async fn get_metadata(&self, mailbox: &str, uid: u32) -> Result<Option<MessageMetadata>> {
+    async fn get_metadata(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+    ) -> Result<Option<MessageMetadata>> {
         self.view.get_metadata(mailbox, uid).await
     }
 
-    async fn get_proton_id(&self, mailbox: &str, uid: u32) -> Result<Option<String>> {
+    async fn get_proton_id(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+    ) -> Result<Option<String>> {
         self.view.get_proton_id(mailbox, uid).await
     }
 
     async fn store_metadata(
         &self,
-        mailbox: &str,
-        proton_id: &str,
+        mailbox: &ScopedMailboxId,
+        proton_id: &ProtonMessageId,
         meta: MessageMetadata,
-    ) -> Result<u32> {
+    ) -> Result<ImapUid> {
         if let Some(uid) = self.view.get_uid(mailbox, proton_id).await? {
             self.set_flags(
                 mailbox,
@@ -173,7 +179,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
         if let Some(internal_message_id) = self
             .store
-            .find_message_internal_id_by_remote_id(&storage_user_id, proton_id)
+            .find_message_internal_id_by_remote_id(&storage_user_id, proton_id.as_str())
             .map_err(map_mail_error)?
         {
             let summary = self
@@ -194,17 +200,22 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
                         .collect::<Vec<_>>(),
                 )
                 .map_err(map_mail_error)?;
-            return Ok(summary.uid);
+            return Ok(ImapUid::from(summary.uid));
         }
 
         let message = self.placeholder_message(proton_id, &meta);
         self.store
             .append_message(&storage_user_id, mailbox_state.internal_id, &message)
-            .map(|summary| summary.uid)
+            .map(|summary| ImapUid::from(summary.uid))
             .map_err(map_mail_error)
     }
 
-    async fn store_rfc822(&self, mailbox: &str, uid: u32, data: Vec<u8>) -> Result<()> {
+    async fn store_rfc822(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        data: Vec<u8>,
+    ) -> Result<()> {
         let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
         else {
             return Ok(());
@@ -230,11 +241,16 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .map_err(map_mail_error)
     }
 
-    async fn get_rfc822(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+    async fn get_rfc822(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<Vec<u8>>> {
         self.view.get_rfc822(mailbox, uid).await
     }
 
-    async fn set_flags(&self, mailbox: &str, uid: u32, flags: Vec<String>) -> Result<()> {
+    async fn set_flags(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        flags: Vec<String>,
+    ) -> Result<()> {
         let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
         else {
             return Ok(());
@@ -244,7 +260,12 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .map_err(map_mail_error)
     }
 
-    async fn add_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+    async fn add_flags(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        flags: &[String],
+    ) -> Result<()> {
         let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
         else {
             return Ok(());
@@ -254,7 +275,12 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .map_err(map_mail_error)
     }
 
-    async fn remove_flags(&self, mailbox: &str, uid: u32, flags: &[String]) -> Result<()> {
+    async fn remove_flags(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+        flags: &[String],
+    ) -> Result<()> {
         let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
         else {
             return Ok(());
@@ -264,11 +290,11 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .map_err(map_mail_error)
     }
 
-    async fn get_flags(&self, mailbox: &str, uid: u32) -> Result<Vec<String>> {
+    async fn get_flags(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Vec<String>> {
         self.view.get_flags(mailbox, uid).await
     }
 
-    async fn remove_message(&self, mailbox: &str, uid: u32) -> Result<()> {
+    async fn remove_message(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<()> {
         let Some((storage_user_id, mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
         else {
             return Ok(());
@@ -282,24 +308,24 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .map_err(map_mail_error)
     }
 
-    async fn mailbox_status(&self, mailbox: &str) -> Result<MailboxStatus> {
+    async fn mailbox_status(&self, mailbox: &ScopedMailboxId) -> Result<MailboxStatus> {
         self.view.mailbox_status(mailbox).await
     }
 
-    async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
+    async fn uid_to_seq(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<u32>> {
         self.view.uid_to_seq(mailbox, uid).await
     }
 
     async fn batch_store_metadata(
         &self,
-        mailbox: &str,
-        entries: &[(&str, MessageMetadata)],
-    ) -> Result<Vec<u32>> {
+        mailbox: &ScopedMailboxId,
+        entries: &[(&ProtonMessageId, MessageMetadata)],
+    ) -> Result<Vec<ImapUid>> {
         if entries.is_empty() {
             return Ok(Vec::new());
         }
 
-        let (account_id, mailbox_name) = Self::scoped_mailbox_parts(mailbox);
+        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
         let mailbox_state = match self.mailbox_by_name(&storage_user_id, mailbox_name)? {
             Some(m) => m,
@@ -313,7 +339,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .open_connection_rw(&storage_user_id)
             .map_err(map_mail_error)?;
 
-        let remote_ids: Vec<&str> = entries.iter().map(|(pid, _)| *pid).collect();
+        let remote_ids: Vec<&str> = entries.iter().map(|(pid, _)| pid.as_str()).collect();
 
         let existing_uids = self
             .store
@@ -331,16 +357,16 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         let mut new_messages: Vec<NewMessage> = Vec::new();
 
         for (proton_id, meta) in entries {
-            if let Some(&uid) = existing_uids.get(*proton_id) {
+            if let Some(&uid) = existing_uids.get(proton_id.as_str()) {
                 let flags: Vec<String> = mailbox::message_flags(meta)
                     .into_iter()
                     .map(str::to_string)
                     .collect();
-                if let Some(internal_id) = known_internal_ids.get(*proton_id) {
+                if let Some(internal_id) = known_internal_ids.get(proton_id.as_str()) {
                     flag_updates.push((internal_id.clone(), flags));
                 }
                 uids.push(uid);
-            } else if let Some(internal_id) = known_internal_ids.get(*proton_id) {
+            } else if let Some(internal_id) = known_internal_ids.get(proton_id.as_str()) {
                 let flags: Vec<String> = mailbox::message_flags(meta)
                     .into_iter()
                     .map(str::to_string)
@@ -402,20 +428,20 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
 
         for (i, (proton_id, _)) in entries.iter().enumerate() {
             if uids[i] == 0 {
-                uids[i] = uid_by_remote.get(proton_id).copied().unwrap_or(0);
+                uids[i] = uid_by_remote.get(proton_id.as_str()).copied().unwrap_or(0);
             }
         }
 
-        Ok(uids)
+        Ok(uids.into_iter().map(ImapUid::from).collect())
     }
 }
 
 impl GluonMailMailboxMutation {
     async fn default_batch_store_metadata(
         &self,
-        mailbox: &str,
-        entries: &[(&str, MessageMetadata)],
-    ) -> Result<Vec<u32>> {
+        mailbox: &ScopedMailboxId,
+        entries: &[(&ProtonMessageId, MessageMetadata)],
+    ) -> Result<Vec<ImapUid>> {
         let mut uids = Vec::with_capacity(entries.len());
         for (proton_id, meta) in entries {
             uids.push(
@@ -534,6 +560,7 @@ mod tests {
     use super::GluonMailMailboxMutation;
     use crate::api::types::{EmailAddress, MessageMetadata};
     use crate::imap::mailbox_mutation::GluonMailboxMutation;
+    use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 
     struct TestFixture {
         _tempdir: TempDir,
@@ -606,46 +633,46 @@ mod tests {
         }
     }
 
+    fn scoped(account: &str, mailbox: &str) -> ScopedMailboxId {
+        ScopedMailboxId::from_parts(Some(account), mailbox)
+    }
+
+    fn pid(id: &str) -> ProtonMessageId {
+        ProtonMessageId::from(id)
+    }
+
     #[tokio::test]
     async fn gluon_mailbox_mutation_writes_flags_and_rfc822() {
         let fixture = open_store();
         create_mailbox(&fixture.store, "INBOX", "0");
         let mutation = GluonMailMailboxMutation::new(fixture.store.clone());
 
+        let scoped = scoped("account-1", "INBOX");
         let uid = mutation
-            .store_metadata("account-1::INBOX", "msg-1", metadata())
+            .store_metadata(&scoped, &pid("msg-1"), metadata())
             .await
             .expect("store metadata");
-        assert_eq!(uid, 1);
+        assert_eq!(uid, ImapUid::from(1u32));
 
         let blob = b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nFrom: Alice <alice@example.test>\r\nTo: Bob <bob@example.test>\r\nSubject: Mutation Subject\r\nMessage-ID: <msg-1@example.test>\r\n\r\nmutation-body".to_vec();
         mutation
-            .store_rfc822("account-1::INBOX", uid, blob.clone())
+            .store_rfc822(&scoped, uid, blob.clone())
             .await
             .expect("store rfc822");
         mutation
-            .add_flags("account-1::INBOX", uid, &[String::from("\\Seen")])
+            .add_flags(&scoped, uid, &[String::from("\\Seen")])
             .await
             .expect("add flags");
 
         assert_eq!(
-            mutation
-                .get_rfc822("account-1::INBOX", uid)
-                .await
-                .expect("get rfc822"),
+            mutation.get_rfc822(&scoped, uid).await.expect("get rfc822"),
             Some(blob)
         );
         assert_eq!(
-            mutation
-                .get_flags("account-1::INBOX", uid)
-                .await
-                .expect("get flags"),
+            mutation.get_flags(&scoped, uid).await.expect("get flags"),
             vec!["\\Seen".to_string()]
         );
-        let status = mutation
-            .mailbox_status("account-1::INBOX")
-            .await
-            .expect("status");
+        let status = mutation.mailbox_status(&scoped).await.expect("status");
         assert_eq!(status.exists, 1);
         assert_eq!(status.unseen, 0);
         assert_eq!(status.next_uid, 2);
@@ -658,36 +685,39 @@ mod tests {
         create_mailbox(&fixture.store, "Archive", "archive");
         let mutation = GluonMailMailboxMutation::new(fixture.store.clone());
 
+        let inbox = scoped("account-1", "INBOX");
+        let archive = scoped("account-1", "Archive");
+
         let source_uid = mutation
-            .store_metadata("account-1::INBOX", "msg-1", metadata())
+            .store_metadata(&inbox, &pid("msg-1"), metadata())
             .await
             .expect("store metadata");
         let blob = b"Subject: Mutation Subject\r\n\r\ncopy-body".to_vec();
         mutation
-            .store_rfc822("account-1::INBOX", source_uid, blob.clone())
+            .store_rfc822(&inbox, source_uid, blob.clone())
             .await
             .expect("store rfc822");
 
         let archive_uid = mutation
-            .store_metadata("account-1::Archive", "msg-1", metadata())
+            .store_metadata(&archive, &pid("msg-1"), metadata())
             .await
             .expect("copy metadata");
-        assert_eq!(archive_uid, 1);
+        assert_eq!(archive_uid, ImapUid::from(1u32));
         assert_eq!(
             mutation
-                .get_rfc822("account-1::Archive", archive_uid)
+                .get_rfc822(&archive, archive_uid)
                 .await
                 .expect("archive blob"),
             Some(blob.clone())
         );
 
         mutation
-            .remove_message("account-1::INBOX", source_uid)
+            .remove_message(&inbox, source_uid)
             .await
             .expect("remove source");
         assert_eq!(
             mutation
-                .mailbox_status("account-1::INBOX")
+                .mailbox_status(&inbox)
                 .await
                 .expect("inbox status")
                 .exists,
@@ -695,7 +725,7 @@ mod tests {
         );
         assert_eq!(
             mutation
-                .mailbox_status("account-1::Archive")
+                .mailbox_status(&archive)
                 .await
                 .expect("archive status")
                 .exists,
@@ -703,7 +733,7 @@ mod tests {
         );
         assert_eq!(
             mutation
-                .get_rfc822("account-1::Archive", archive_uid)
+                .get_rfc822(&archive, archive_uid)
                 .await
                 .expect("archive blob"),
             Some(blob)

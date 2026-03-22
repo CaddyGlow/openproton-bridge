@@ -11,6 +11,7 @@ use crate::api::types::{EmailAddress, MessageMetadata};
 use super::mailbox;
 use super::mailbox_view::GluonMailboxView;
 use super::store::{MailboxSnapshot, MailboxStatus};
+use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::{ImapError, Result};
 
 #[derive(Clone)]
@@ -21,20 +22,6 @@ pub struct GluonMailMailboxView {
 impl GluonMailMailboxView {
     pub fn new(store: Arc<CompatibleStore>) -> Arc<Self> {
         Arc::new(Self { store })
-    }
-
-    fn scoped_mailbox_parts(mailbox: &str) -> (&str, &str) {
-        match mailbox.split_once("::") {
-            Some((account_id, mailbox_name)) if !account_id.is_empty() => {
-                let mailbox_name = if mailbox_name.is_empty() {
-                    "INBOX"
-                } else {
-                    mailbox_name
-                };
-                (account_id, mailbox_name)
-            }
-            _ => ("__default__", mailbox),
-        }
     }
 
     fn storage_user_id_for_account<'a>(&'a self, account_id: &'a str) -> &'a str {
@@ -65,8 +52,18 @@ impl GluonMailMailboxView {
         }
     }
 
-    fn upstream_snapshot(&self, mailbox: &str) -> Result<Option<UpstreamMailboxSnapshot>> {
-        let (account_id, mailbox_name) = Self::scoped_mailbox_parts(mailbox);
+    fn resolve_parts(mailbox: &ScopedMailboxId) -> (&str, &str) {
+        let account_id = mailbox.account_id().unwrap_or("__default__");
+        let name = mailbox.mailbox_name();
+        let name = if name.is_empty() { "INBOX" } else { name };
+        (account_id, name)
+    }
+
+    fn upstream_snapshot(
+        &self,
+        mailbox: &ScopedMailboxId,
+    ) -> Result<Option<UpstreamMailboxSnapshot>> {
+        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id);
         let Some(mailbox) = self.mailbox_by_name(storage_user_id, mailbox_name)? else {
             return Ok(None);
@@ -80,25 +77,30 @@ impl GluonMailMailboxView {
 
     fn metadata_for_message(
         &self,
-        mailbox_name: &str,
+        mailbox: &ScopedMailboxId,
         message: &UpstreamMailboxMessage,
     ) -> MessageMetadata {
+        let (account_id, _) = Self::resolve_parts(mailbox);
         let parsed = self
             .store
             .read_message_blob(
-                self.storage_user_id_for_account(Self::scoped_mailbox_parts(mailbox_name).0),
+                self.storage_user_id_for_account(account_id),
                 &message.summary.internal_id,
             )
             .ok()
-            .and_then(|data| parse_metadata_from_rfc822(mailbox_name, &message.summary, &data));
+            .and_then(|data| parse_metadata_from_rfc822(mailbox, &message.summary, &data));
 
-        parsed.unwrap_or_else(|| fallback_metadata(mailbox_name, message))
+        parsed.unwrap_or_else(|| fallback_metadata(mailbox, message))
     }
 }
 
 #[async_trait]
 impl GluonMailboxView for GluonMailMailboxView {
-    async fn get_metadata(&self, mailbox: &str, uid: u32) -> Result<Option<MessageMetadata>> {
+    async fn get_metadata(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+    ) -> Result<Option<MessageMetadata>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(None);
         };
@@ -106,11 +108,15 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .iter()
-            .find(|message| message.summary.uid == uid)
+            .find(|message| message.summary.uid == uid.value())
             .map(|message| self.metadata_for_message(mailbox, message)))
     }
 
-    async fn get_proton_id(&self, mailbox: &str, uid: u32) -> Result<Option<String>> {
+    async fn get_proton_id(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
+    ) -> Result<Option<String>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(None);
         };
@@ -118,11 +124,15 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .iter()
-            .find(|message| message.summary.uid == uid)
+            .find(|message| message.summary.uid == uid.value())
             .map(|message| message.summary.remote_id.clone()))
     }
 
-    async fn get_uid(&self, mailbox: &str, proton_id: &str) -> Result<Option<u32>> {
+    async fn get_uid(
+        &self,
+        mailbox: &ScopedMailboxId,
+        proton_id: &ProtonMessageId,
+    ) -> Result<Option<ImapUid>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(None);
         };
@@ -130,12 +140,12 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .iter()
-            .find(|message| message.summary.remote_id == proton_id)
-            .map(|message| message.summary.uid))
+            .find(|message| message.summary.remote_id == proton_id.as_str())
+            .map(|message| ImapUid::from(message.summary.uid)))
     }
 
-    async fn get_rfc822(&self, mailbox: &str, uid: u32) -> Result<Option<Vec<u8>>> {
-        let (account_id, _) = Self::scoped_mailbox_parts(mailbox);
+    async fn get_rfc822(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<Vec<u8>>> {
+        let (account_id, _) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id);
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(None);
@@ -143,7 +153,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         let Some(message) = snapshot
             .messages
             .iter()
-            .find(|message| message.summary.uid == uid)
+            .find(|message| message.summary.uid == uid.value())
         else {
             return Ok(None);
         };
@@ -154,7 +164,7 @@ impl GluonMailboxView for GluonMailMailboxView {
             .map_err(map_mail_error)
     }
 
-    async fn list_uids(&self, mailbox: &str) -> Result<Vec<u32>> {
+    async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(Vec::new());
         };
@@ -162,11 +172,11 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .iter()
-            .map(|message| message.summary.uid)
+            .map(|message| ImapUid::from(message.summary.uid))
             .collect())
     }
 
-    async fn mailbox_status(&self, mailbox: &str) -> Result<MailboxStatus> {
+    async fn mailbox_status(&self, mailbox: &ScopedMailboxId) -> Result<MailboxStatus> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(MailboxStatus {
                 uid_validity: 1,
@@ -190,7 +200,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         })
     }
 
-    async fn mailbox_snapshot(&self, mailbox: &str) -> Result<MailboxSnapshot> {
+    async fn mailbox_snapshot(&self, mailbox: &ScopedMailboxId) -> Result<MailboxSnapshot> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(MailboxSnapshot {
                 exists: 0,
@@ -204,7 +214,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         })
     }
 
-    async fn get_flags(&self, mailbox: &str, uid: u32) -> Result<Vec<String>> {
+    async fn get_flags(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Vec<String>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(Vec::new());
         };
@@ -212,12 +222,12 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .iter()
-            .find(|message| message.summary.uid == uid)
+            .find(|message| message.summary.uid == uid.value())
             .map(|message| message.summary.flags.clone())
             .unwrap_or_default())
     }
 
-    async fn seq_to_uid(&self, mailbox: &str, seq: u32) -> Result<Option<u32>> {
+    async fn seq_to_uid(&self, mailbox: &ScopedMailboxId, seq: u32) -> Result<Option<ImapUid>> {
         if seq == 0 {
             return Ok(None);
         }
@@ -229,10 +239,10 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .get(seq as usize - 1)
-            .map(|message| message.summary.uid))
+            .map(|message| ImapUid::from(message.summary.uid)))
     }
 
-    async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
+    async fn uid_to_seq(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<u32>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(None);
         };
@@ -240,7 +250,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         Ok(snapshot
             .messages
             .iter()
-            .position(|message| message.summary.uid == uid)
+            .position(|message| message.summary.uid == uid.value())
             .map(|index| index as u32 + 1))
     }
 }
@@ -270,13 +280,13 @@ fn computed_mod_seq(snapshot: &UpstreamMailboxSnapshot) -> u64 {
 }
 
 fn parse_metadata_from_rfc822(
-    mailbox_name: &str,
+    mailbox: &ScopedMailboxId,
     summary: &gluon_rs_mail::UpstreamMessageSummary,
     data: &[u8],
 ) -> Option<MessageMetadata> {
     let parsed = mailparse::parse_mail(data).ok()?;
     let header = parsed.get_headers();
-    let label_id = mailbox_label_id(mailbox_name, &summary.remote_id);
+    let label_id = mailbox_label_id(mailbox, &summary.remote_id);
     let date_header = header.get_first_value("Date");
     let time = date_header
         .as_deref()
@@ -305,11 +315,14 @@ fn parse_metadata_from_rfc822(
     })
 }
 
-fn fallback_metadata(mailbox_name: &str, message: &UpstreamMailboxMessage) -> MessageMetadata {
+fn fallback_metadata(
+    mailbox: &ScopedMailboxId,
+    message: &UpstreamMailboxMessage,
+) -> MessageMetadata {
     MessageMetadata {
         id: message.summary.remote_id.clone(),
         address_id: String::new(),
-        label_ids: vec![mailbox_label_id(mailbox_name, &message.summary.remote_id)],
+        label_ids: vec![mailbox_label_id(mailbox, &message.summary.remote_id)],
         external_id: None,
         subject: String::new(),
         sender: EmailAddress {
@@ -335,9 +348,8 @@ fn fallback_metadata(mailbox_name: &str, message: &UpstreamMailboxMessage) -> Me
     }
 }
 
-fn mailbox_label_id(mailbox_name: &str, fallback: &str) -> String {
-    let (_, unscoped) = GluonMailMailboxView::scoped_mailbox_parts(mailbox_name);
-    mailbox::find_mailbox(unscoped)
+fn mailbox_label_id(scoped: &ScopedMailboxId, fallback: &str) -> String {
+    mailbox::find_mailbox(scoped.mailbox_name())
         .map(|mailbox| mailbox.label_id.to_string())
         .unwrap_or_else(|| fallback.to_string())
 }
@@ -407,6 +419,7 @@ mod tests {
     use crate::api::types::{EmailAddress, MessageMetadata};
     use crate::imap::mailbox_view::GluonMailboxView;
     use crate::imap::rfc822;
+    use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 
     fn open_store() -> Arc<CompatibleStore> {
         let temp = tempdir().expect("tempdir");
@@ -486,6 +499,10 @@ mod tests {
         }
     }
 
+    fn scoped(account: &str, mailbox: &str) -> ScopedMailboxId {
+        ScopedMailboxId::from_parts(Some(account), mailbox)
+    }
+
     #[tokio::test]
     async fn gluon_mail_mailbox_view_reads_snapshot_and_blob_state() {
         let store = open_store();
@@ -503,38 +520,43 @@ mod tests {
             .expect("append message");
 
         let view = GluonMailMailboxView::new(store);
-        let scoped = "account-1::INBOX";
+        let scoped = scoped("account-1", "INBOX");
+        let uid1 = ImapUid::from(1u32);
+        let pid = ProtonMessageId::from("msg-1");
 
-        assert_eq!(view.list_uids(scoped).await.expect("uids"), vec![1]);
-        assert_eq!(view.get_uid(scoped, "msg-1").await.expect("uid"), Some(1));
+        assert_eq!(view.list_uids(&scoped).await.expect("uids"), vec![uid1]);
+        assert_eq!(view.get_uid(&scoped, &pid).await.expect("uid"), Some(uid1));
         assert_eq!(
-            view.get_proton_id(scoped, 1).await.expect("proton id"),
+            view.get_proton_id(&scoped, uid1).await.expect("proton id"),
             Some("msg-1".to_string())
         );
         assert_eq!(
-            view.get_rfc822(scoped, 1).await.expect("rfc822"),
+            view.get_rfc822(&scoped, uid1).await.expect("rfc822"),
             Some(blob)
         );
 
-        let status = view.mailbox_status(scoped).await.expect("status");
+        let status = view.mailbox_status(&scoped).await.expect("status");
         assert_eq!(status.uid_validity, 42);
         assert_eq!(status.next_uid, 2);
         assert_eq!(status.exists, 1);
         assert_eq!(status.unseen, 0);
 
-        let snapshot = view.mailbox_snapshot(scoped).await.expect("snapshot");
+        let snapshot = view.mailbox_snapshot(&scoped).await.expect("snapshot");
         assert_eq!(snapshot.exists, 1);
         assert!(snapshot.mod_seq > 0);
 
         assert_eq!(
-            view.get_flags(scoped, 1).await.expect("flags"),
+            view.get_flags(&scoped, uid1).await.expect("flags"),
             vec!["\\Seen".to_string()]
         );
-        assert_eq!(view.seq_to_uid(scoped, 1).await.expect("seq"), Some(1));
-        assert_eq!(view.uid_to_seq(scoped, 1).await.expect("uid->seq"), Some(1));
+        assert_eq!(view.seq_to_uid(&scoped, 1).await.expect("seq"), Some(uid1));
+        assert_eq!(
+            view.uid_to_seq(&scoped, uid1).await.expect("uid->seq"),
+            Some(1)
+        );
 
         let meta = view
-            .get_metadata(scoped, 1)
+            .get_metadata(&scoped, uid1)
             .await
             .expect("metadata")
             .expect("message metadata");
@@ -561,8 +583,9 @@ mod tests {
             .expect("remove blob");
 
         let view = GluonMailMailboxView::new(store);
+        let scoped = scoped("account-1", "INBOX");
         let meta = view
-            .get_metadata("account-1::INBOX", 1)
+            .get_metadata(&scoped, ImapUid::from(1u32))
             .await
             .expect("metadata")
             .expect("fallback metadata");

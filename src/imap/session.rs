@@ -28,6 +28,7 @@ use super::mailbox_mutation::GluonMailboxMutation;
 use super::mailbox_view::GluonMailboxView;
 use super::response::ResponseWriter;
 use super::rfc822;
+use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::Result;
 
 /// RFC 2177 recommends servers terminate IDLE after 30 minutes.
@@ -82,8 +83,8 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     primary_address_id: Option<String>,
     selected_mailbox: Option<String>,
     selected_mailbox_mod_seq: Option<u64>,
-    selected_mailbox_uids: Vec<u32>,
-    selected_mailbox_flags: HashMap<u32, Vec<String>>,
+    selected_mailbox_uids: Vec<ImapUid>,
+    selected_mailbox_flags: HashMap<ImapUid, Vec<String>>,
     selected_read_only: bool,
     authenticated_account_id: Option<String>,
     user_labels: Vec<mailbox::ResolvedMailbox>,
@@ -722,11 +723,8 @@ where
             .await
     }
 
-    fn scoped_mailbox_name(&self, mailbox: &str) -> String {
-        match &self.authenticated_account_id {
-            Some(account_id) => format!("{account_id}::{mailbox}"),
-            None => mailbox.to_string(),
-        }
+    fn scoped_mailbox_name(&self, mailbox: &str) -> ScopedMailboxId {
+        ScopedMailboxId::from_parts(self.authenticated_account_id.as_deref(), mailbox)
     }
 
     fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
@@ -745,21 +743,21 @@ where
 
     fn resolve_target_uids(
         &self,
-        all_uids: &[u32],
+        all_uids: &[ImapUid],
         sequence: &SequenceSet,
         uid_mode: bool,
-    ) -> Vec<u32> {
+    ) -> Vec<ImapUid> {
         if all_uids.is_empty() {
             return Vec::new();
         }
 
-        let max_uid = *all_uids.last().unwrap_or(&0);
+        let max_uid = all_uids.last().map(|u| u.value()).unwrap_or(0);
         let max_seq = all_uids.len() as u32;
 
         if uid_mode {
             all_uids
                 .iter()
-                .filter(|&&uid| sequence.contains(uid, max_uid))
+                .filter(|uid| sequence.contains(uid.value(), max_uid))
                 .copied()
                 .collect()
         } else {
@@ -774,10 +772,10 @@ where
 
     async fn copy_message_local(
         &self,
-        source_mailbox: &str,
-        dest_mailbox: &str,
-        source_uid: u32,
-    ) -> Result<Option<u32>> {
+        source_mailbox: &ScopedMailboxId,
+        dest_mailbox: &ScopedMailboxId,
+        source_uid: ImapUid,
+    ) -> Result<Option<ImapUid>> {
         let mutation = self.config.mailbox_mutation.clone();
         let Some(proton_id) = mutation.get_proton_id(source_mailbox, source_uid).await? else {
             return Ok(None);
@@ -787,7 +785,11 @@ where
         };
 
         let dest_uid = mutation
-            .store_metadata(dest_mailbox, &proton_id, metadata)
+            .store_metadata(
+                dest_mailbox,
+                &ProtonMessageId::from(proton_id.as_str()),
+                metadata,
+            )
             .await?;
 
         let flags = mutation.get_flags(source_mailbox, source_uid).await?;
@@ -819,7 +821,7 @@ where
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
         let previous_exists = self.selected_mailbox_uids.len() as u32;
         let current_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
-        let mut current_flags: HashMap<u32, Vec<String>> = HashMap::new();
+        let mut current_flags: HashMap<ImapUid, Vec<String>> = HashMap::new();
         for uid in &current_uids {
             current_flags.insert(
                 *uid,
@@ -840,7 +842,7 @@ where
             || has_flag_change
         {
             if self.selected_mailbox_mod_seq.is_some() {
-                let current_uid_set: HashSet<u32> = current_uids.iter().copied().collect();
+                let current_uid_set: HashSet<ImapUid> = current_uids.iter().copied().collect();
                 let mut removed_count = 0u32;
                 for (idx, uid) in self.selected_mailbox_uids.iter().enumerate() {
                     if !current_uid_set.contains(uid) {
@@ -1056,7 +1058,11 @@ where
                 // Populate store with message metadata
                 for meta in &meta_resp.messages {
                     mutation
-                        .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
+                        .store_metadata(
+                            &scoped_mailbox,
+                            &ProtonMessageId::from(meta.id.as_str()),
+                            meta.clone(),
+                        )
                         .await?;
                 }
 
@@ -1291,7 +1297,11 @@ where
 
                 for meta in &meta_resp.messages {
                     mutation
-                        .store_metadata(&scoped_mailbox, &meta.id, meta.clone())
+                        .store_metadata(
+                            &scoped_mailbox,
+                            &ProtonMessageId::from(meta.id.as_str()),
+                            meta.clone(),
+                        )
                         .await?;
                 }
 
@@ -1395,7 +1405,7 @@ where
             return self.writer.tagged_ok(tag, None, "FETCH completed").await;
         }
 
-        let max_uid = *all_uids.last().unwrap();
+        let max_uid = all_uids.last().map(|u| u.value()).unwrap_or(0);
         let max_seq = all_uids.len() as u32;
 
         // Expand macro items and ensure UID is included for UID FETCH (RFC 3501 7.4.2)
@@ -1414,11 +1424,11 @@ where
         });
 
         // Resolve which messages to fetch from current mailbox snapshot.
-        let target_messages: Vec<(u32, u32)> = if uid_mode {
+        let target_messages: Vec<(ImapUid, u32)> = if uid_mode {
             all_uids
                 .iter()
                 .enumerate()
-                .filter(|(_, &uid)| sequence.contains(uid, max_uid))
+                .filter(|(_, uid)| sequence.contains(uid.value(), max_uid))
                 .map(|(i, &uid)| (uid, i as u32 + 1))
                 .collect()
         } else {
@@ -1448,7 +1458,7 @@ where
                 if let Some(ref meta) = meta {
                     debug!(
                         pkg = "gluon/state/mailbox",
-                        UID = uid,
+                        UID = uid.value(),
                         mboxID = %scoped_mailbox,
                         messageID = %meta.id,
                         msg = "Fetch Body",
@@ -1714,8 +1724,8 @@ where
 
     async fn fetch_and_cache_rfc822(
         &mut self,
-        mailbox: &str,
-        uid: u32,
+        mailbox: &ScopedMailboxId,
+        uid: ImapUid,
         proton_id: &str,
     ) -> Result<Option<Vec<u8>>> {
         let mut client = match &self.client {
@@ -1888,7 +1898,7 @@ where
                                 warn!(
                                     error = %err,
                                     mailbox = %mailbox,
-                                    uid,
+                                    uid = uid.value(),
                                     proton_id = %proton_id,
                                     "failed to sync seen flag upstream"
                                 );
@@ -1904,7 +1914,7 @@ where
                                 warn!(
                                     error = %err,
                                     mailbox = %mailbox,
-                                    uid,
+                                    uid = uid.value(),
                                     proton_id = %proton_id,
                                     "failed to sync unseen flag upstream"
                                 );
@@ -1929,7 +1939,7 @@ where
                                 warn!(
                                     error = %err,
                                     mailbox = %mailbox,
-                                    uid,
+                                    uid = uid.value(),
                                     proton_id = %proton_id,
                                     "failed to sync flagged state upstream"
                                 );
@@ -1946,7 +1956,7 @@ where
                                 warn!(
                                     error = %err,
                                     mailbox = %mailbox,
-                                    uid,
+                                    uid = uid.value(),
                                     proton_id = %proton_id,
                                     "failed to sync unflagged state upstream"
                                 );
@@ -1998,7 +2008,7 @@ where
         let needs_rfc822 = criteria.iter().any(search_key_needs_rfc822);
 
         let mut results = Vec::new();
-        let max_uid = all_uids.last().copied().unwrap_or(0);
+        let max_uid = all_uids.last().copied().unwrap_or(ImapUid::from(0u32));
 
         for (i, &uid) in all_uids.iter().enumerate() {
             let seq = i as u32 + 1;
@@ -2112,7 +2122,7 @@ where
                             warn!(
                                 error = %err,
                                 mailbox = %mailbox,
-                                uid,
+                                uid = uid.value(),
                                 proton_id = %proton_id,
                                 permanent = is_trash_or_spam,
                                 "failed to sync expunge mutation upstream"
@@ -2172,7 +2182,7 @@ where
 
         for (i, &uid) in all_uids.iter().enumerate() {
             // Only expunge if UID is in the sequence set AND has \Deleted flag
-            if !sequence.contains(uid, max_uid) {
+            if !sequence.contains(uid.value(), max_uid.value()) {
                 continue;
             }
 
@@ -2206,7 +2216,7 @@ where
                             warn!(
                                 error = %err,
                                 mailbox = %mailbox,
-                                uid,
+                                uid = uid.value(),
                                 proton_id = %proton_id,
                                 permanent = is_trash_or_spam,
                                 "failed to sync uid expunge mutation upstream"
@@ -2288,7 +2298,7 @@ where
                             error = %err,
                             source_mailbox = %mailbox,
                             destination_mailbox = %dest_mb.name,
-                            uid,
+                            uid = uid.value(),
                             proton_id = %proton_id,
                             "failed to sync copy destination label upstream"
                         );
@@ -2369,7 +2379,7 @@ where
             return self.writer.tagged_ok(tag, None, "MOVE completed").await;
         }
 
-        let target_uid_set: HashSet<u32> = target_uids.iter().copied().collect();
+        let target_uid_set: HashSet<ImapUid> = target_uids.iter().copied().collect();
         let mut src_uids = Vec::new();
         let mut dst_uids = Vec::new();
         let mut expunged_seqs = Vec::new();
@@ -2394,7 +2404,7 @@ where
                         error = %err,
                         source_mailbox = %mailbox,
                         destination_mailbox = %dest_mb.name,
-                        uid,
+                        uid = uid.value(),
                         proton_id = %proton_id,
                         "failed to sync move destination label upstream"
                     );
@@ -2416,7 +2426,7 @@ where
                             error = %err,
                             source_mailbox = %mailbox,
                             destination_mailbox = %dest_mb.name,
-                            uid,
+                            uid = uid.value(),
                             proton_id = %proton_id,
                             "failed to sync move source label removal upstream"
                         );
@@ -2563,8 +2573,9 @@ where
 
         let mutation = self.config.mailbox_mutation.clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mb.name);
+        let proton_msg_id = ProtonMessageId::from(proton_id.as_str());
         let uid = mutation
-            .store_metadata(&scoped_mailbox, &proton_id, meta)
+            .store_metadata(&scoped_mailbox, &proton_msg_id, meta)
             .await?;
         mutation.store_rfc822(&scoped_mailbox, uid, literal).await?;
 
@@ -2579,7 +2590,7 @@ where
 
         info!(
             mailbox = %mb.name,
-            uid,
+            uid = uid.value(),
             size = literal_size,
             "APPEND completed"
         );
@@ -2646,15 +2657,15 @@ where
     }
 }
 
-fn format_copyuid(uid_validity: u32, src_uids: &[u32], dst_uids: &[u32]) -> String {
+fn format_copyuid(uid_validity: u32, src_uids: &[ImapUid], dst_uids: &[ImapUid]) -> String {
     let src = src_uids
         .iter()
-        .map(|u| u.to_string())
+        .map(|u| u.value().to_string())
         .collect::<Vec<_>>()
         .join(",");
     let dst = dst_uids
         .iter()
-        .map(|u| u.to_string())
+        .map(|u| u.value().to_string())
         .collect::<Vec<_>>()
         .join(",");
     format!("COPYUID {} {} {}", uid_validity, src, dst)
@@ -2696,10 +2707,10 @@ fn expand_fetch_items(items: &[FetchItem]) -> Vec<FetchItem> {
 
 fn evaluate_search_key(
     key: &SearchKey,
-    uid: u32,
+    uid: ImapUid,
     meta: &Option<types::MessageMetadata>,
     flags: &[String],
-    max_uid: u32,
+    max_uid: ImapUid,
     rfc822_data: Option<&[u8]>,
 ) -> bool {
     match key {
@@ -2823,7 +2834,7 @@ fn evaluate_search_key(
         }
         SearchKey::Larger(size) => meta.as_ref().map(|m| m.size > *size).unwrap_or(false),
         SearchKey::Smaller(size) => meta.as_ref().map(|m| m.size < *size).unwrap_or(false),
-        SearchKey::Uid(seq) => seq.contains(uid, max_uid),
+        SearchKey::Uid(seq) => seq.contains(uid.value(), max_uid.value()),
         SearchKey::Not(inner) => {
             !evaluate_search_key(inner, uid, meta, flags, max_uid, rfc822_data)
         }
@@ -3116,6 +3127,18 @@ mod tests {
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn scoped(account: &str, mailbox: &str) -> ScopedMailboxId {
+        ScopedMailboxId::from_parts(Some(account), mailbox)
+    }
+
+    fn pid(id: &str) -> ProtonMessageId {
+        ProtonMessageId::from(id)
+    }
+
+    fn iuid(v: u32) -> ImapUid {
+        ImapUid::from(v)
+    }
+
     fn test_session() -> crate::api::types::Session {
         crate::api::types::Session {
             uid: "test-uid".to_string(),
@@ -3289,14 +3312,15 @@ mod tests {
         proton_id: &str,
         unread: i32,
         body: &[u8],
-    ) -> u32 {
+    ) -> ImapUid {
         let mut meta = make_meta(proton_id, unread);
         meta.external_id = Some(format!("{proton_id}@example.test"));
         meta.size = body.len() as i64;
-        let scoped_mailbox = format!("test-uid::{mailbox_name}");
+        let scoped_mailbox = ScopedMailboxId::from_parts(Some("test-uid"), mailbox_name);
+        let pid = ProtonMessageId::from(proton_id);
         let uid = config
             .mailbox_mutation
-            .store_metadata(&scoped_mailbox, proton_id, meta)
+            .store_metadata(&scoped_mailbox, &pid, meta)
             .await
             .unwrap();
         config
@@ -3324,7 +3348,7 @@ mod tests {
     async fn prime_selected_state_from_view(
         session: &mut ImapSession<tokio::io::DuplexStream, tokio::io::DuplexStream>,
         config: &Arc<SessionConfig>,
-        scoped_mailbox: &str,
+        scoped_mailbox: &ScopedMailboxId,
     ) {
         let snapshot = config
             .mailbox_view
@@ -3465,7 +3489,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -3493,7 +3521,11 @@ mod tests {
 
         config
             .gluon_connector
-            .upsert_metadata("test-uid::INBOX", "msg-noop", make_meta("msg-noop", 1))
+            .upsert_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-noop"),
+                make_meta("msg-noop", 1),
+            )
             .await
             .unwrap();
 
@@ -3521,7 +3553,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -3588,7 +3624,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -3639,7 +3679,11 @@ mod tests {
 
         config
             .gluon_connector
-            .upsert_metadata("test-uid::INBOX", "msg-idle", make_meta("msg-idle", 1))
+            .upsert_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-idle"),
+                make_meta("msg-idle", 1),
+            )
             .await
             .unwrap();
 
@@ -3675,15 +3719,23 @@ mod tests {
 
         let uid1 = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         let _uid2 = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
-        prime_selected_state_from_view(&mut session, &config, "test-uid::INBOX").await;
+        prime_selected_state_from_view(&mut session, &config, &scoped("test-uid", "INBOX")).await;
 
         let idle_task =
             tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
@@ -3701,7 +3753,7 @@ mod tests {
 
         config
             .mailbox_mutation
-            .remove_message("test-uid::INBOX", uid1)
+            .remove_message(&scoped("test-uid", "INBOX"), uid1)
             .await
             .unwrap();
 
@@ -3751,8 +3803,8 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-idle-delete-2\r\n\r\ntwo",
         )
         .await;
-        assert_eq!(uid1, 2);
-        prime_selected_state_from_view(&mut session, &config, "test-uid::INBOX").await;
+        assert_eq!(uid1, iuid(2));
+        prime_selected_state_from_view(&mut session, &config, &scoped("test-uid", "INBOX")).await;
 
         let idle_task =
             tokio::spawn(async move { session.handle_line("a001 IDLE").await.unwrap() });
@@ -3770,7 +3822,7 @@ mod tests {
 
         config
             .gluon_connector
-            .remove_message_by_uid("test-uid::INBOX", uid1)
+            .remove_message_by_uid(&scoped("test-uid", "INBOX"), uid1)
             .await
             .unwrap();
 
@@ -3806,12 +3858,16 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         let snapshot = config
             .mailbox_view
-            .mailbox_snapshot("test-uid::INBOX")
+            .mailbox_snapshot(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         session.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
@@ -3834,7 +3890,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .set_flags("test-uid::INBOX", uid, vec!["\\Seen".to_string()])
+            .set_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                vec!["\\Seen".to_string()],
+            )
             .await
             .unwrap();
 
@@ -3879,7 +3939,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-idle-flag\r\n\r\nbody",
         )
         .await;
-        prime_selected_state_from_view(&mut session, &config, "test-uid::INBOX").await;
+        prime_selected_state_from_view(&mut session, &config, &scoped("test-uid", "INBOX")).await;
         session.selected_mailbox_flags.insert(uid, Vec::new());
 
         let idle_task =
@@ -3898,7 +3958,11 @@ mod tests {
 
         config
             .gluon_connector
-            .update_message_flags("test-uid::INBOX", uid, vec!["\\Seen".to_string()])
+            .update_message_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                vec!["\\Seen".to_string()],
+            )
             .await
             .unwrap();
 
@@ -4064,7 +4128,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::Drafts", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "Drafts"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -4227,7 +4295,7 @@ mod tests {
 
         let uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(uids.len(), 2);
@@ -4247,13 +4315,17 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
             .store_rfc822(
-                "test-uid::INBOX",
+                &scoped("test-uid", "INBOX"),
                 uid,
                 b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nbody".to_vec(),
             )
@@ -4308,7 +4380,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -4365,13 +4441,17 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
             .set_flags(
-                "test-uid::INBOX",
+                &scoped("test-uid", "INBOX"),
                 uid,
                 vec!["\\Seen".to_string(), "\\Flagged".to_string()],
             )
@@ -4439,7 +4519,7 @@ mod tests {
         config
             .mailbox_mutation
             .set_flags(
-                "test-uid::INBOX",
+                &scoped("test-uid", "INBOX"),
                 uid,
                 vec!["\\Seen".to_string(), "\\Flagged".to_string()],
             )
@@ -4463,7 +4543,7 @@ mod tests {
         );
         assert!(config
             .mailbox_mutation
-            .get_flags("test-uid::INBOX", uid)
+            .get_flags(&scoped("test-uid", "INBOX"), uid)
             .await
             .unwrap()
             .is_empty());
@@ -4503,7 +4583,11 @@ mod tests {
 
         let src_uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -4522,20 +4606,20 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids, vec![src_uid]);
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archived_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .get_proton_id(&scoped("test-uid", "Archive"), archive_uids[0])
             .await
             .unwrap();
         assert_eq!(archived_proton_id.as_deref(), Some("msg-1"));
@@ -4582,7 +4666,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-copy-sync\r\n\r\ncopy-body",
         )
         .await;
-        assert_eq!(uid, 2);
+        assert_eq!(uid, iuid(2));
 
         session.handle_line("a001 COPY 2 Archive").await.unwrap();
 
@@ -4597,23 +4681,23 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::INBOX")
+                .list_uids(&scoped("test-uid", "INBOX"))
                 .await
                 .unwrap(),
-            vec![1, 2]
+            vec![iuid(1), iuid(2)]
         );
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::Archive")
+                .list_uids(&scoped("test-uid", "Archive"))
                 .await
                 .unwrap(),
-            vec![1]
+            vec![iuid(1)]
         );
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::Archive", 1)
+                .get_proton_id(&scoped("test-uid", "Archive"), iuid(1))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4635,7 +4719,11 @@ mod tests {
 
         let src_uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -4650,20 +4738,20 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids, vec![src_uid]);
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archived_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .get_proton_id(&scoped("test-uid", "Archive"), archive_uids[0])
             .await
             .unwrap();
         assert_eq!(archived_proton_id.as_deref(), Some("msg-1"));
@@ -4687,7 +4775,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-copy\r\n\r\ncopy-body",
         )
         .await;
-        assert_eq!(uid, 2);
+        assert_eq!(uid, iuid(2));
 
         session.handle_line("a001 COPY 2 Archive").await.unwrap();
 
@@ -4700,14 +4788,14 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
-        assert_eq!(inbox_uids, vec![1, 2]);
+        assert_eq!(inbox_uids, vec![iuid(1), iuid(2)]);
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::INBOX", 2)
+                .get_proton_id(&scoped("test-uid", "INBOX"), iuid(2))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4716,14 +4804,14 @@ mod tests {
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
-        assert_eq!(archive_uids, vec![1]);
+        assert_eq!(archive_uids, vec![iuid(1)]);
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::Archive", 1)
+                .get_proton_id(&scoped("test-uid", "Archive"), iuid(1))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4744,7 +4832,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -4763,7 +4855,7 @@ mod tests {
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert!(archive_uids.is_empty());
@@ -4788,7 +4880,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-copy-fail\r\n\r\ncopy-body",
         )
         .await;
-        assert_eq!(uid, 2);
+        assert_eq!(uid, iuid(2));
 
         session.handle_line("a001 COPY 2 Archive").await.unwrap();
 
@@ -4804,7 +4896,7 @@ mod tests {
         );
         assert!(config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap()
             .is_empty());
@@ -4851,12 +4943,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -4872,26 +4972,26 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .get_proton_id(&scoped("test-uid", "INBOX"), inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-2"));
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .get_proton_id(&scoped("test-uid", "Archive"), archive_uids[0])
             .await
             .unwrap();
         assert_eq!(archive_proton_id.as_deref(), Some("msg-1"));
@@ -4947,7 +5047,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-move-sync\r\n\r\nmove-body",
         )
         .await;
-        assert_eq!(uid, 2);
+        assert_eq!(uid, iuid(2));
 
         session.handle_line("a001 MOVE 2 Archive").await.unwrap();
 
@@ -4961,23 +5061,23 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::INBOX")
+                .list_uids(&scoped("test-uid", "INBOX"))
                 .await
                 .unwrap(),
-            vec![1]
+            vec![iuid(1)]
         );
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::Archive")
+                .list_uids(&scoped("test-uid", "Archive"))
                 .await
                 .unwrap(),
-            vec![1]
+            vec![iuid(1)]
         );
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::Archive", 1)
+                .get_proton_id(&scoped("test-uid", "Archive"), iuid(1))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -4999,12 +5099,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -5020,26 +5128,26 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .get_proton_id(&scoped("test-uid", "INBOX"), inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-2"));
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .get_proton_id(&scoped("test-uid", "Archive"), archive_uids[0])
             .await
             .unwrap();
         assert_eq!(archive_proton_id.as_deref(), Some("msg-1"));
@@ -5063,7 +5171,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-move\r\n\r\nmove-body",
         )
         .await;
-        assert_eq!(uid, 2);
+        assert_eq!(uid, iuid(2));
 
         session.handle_line("a001 MOVE 2 Archive").await.unwrap();
 
@@ -5077,14 +5185,14 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
-        assert_eq!(inbox_uids, vec![1]);
+        assert_eq!(inbox_uids, vec![iuid(1)]);
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::INBOX", 1)
+                .get_proton_id(&scoped("test-uid", "INBOX"), iuid(1))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -5093,14 +5201,14 @@ mod tests {
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
-        assert_eq!(archive_uids, vec![1]);
+        assert_eq!(archive_uids, vec![iuid(1)]);
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::Archive", 1)
+                .get_proton_id(&scoped("test-uid", "Archive"), iuid(1))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -5121,12 +5229,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -5145,14 +5261,14 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids.len(), 2);
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert!(archive_uids.is_empty());
@@ -5177,7 +5293,7 @@ mod tests {
             b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-move-fail\r\n\r\nmove-body",
         )
         .await;
-        assert_eq!(uid, 2);
+        assert_eq!(uid, iuid(2));
 
         session.handle_line("a001 MOVE 2 Archive").await.unwrap();
 
@@ -5194,14 +5310,14 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::INBOX")
+                .list_uids(&scoped("test-uid", "INBOX"))
                 .await
                 .unwrap(),
-            vec![1, 2]
+            vec![iuid(1), iuid(2)]
         );
         assert!(config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap()
             .is_empty());
@@ -5248,12 +5364,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         let uid2 = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -5272,26 +5396,26 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .get_proton_id(&scoped("test-uid", "INBOX"), inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-1"));
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .get_proton_id(&scoped("test-uid", "Archive"), archive_uids[0])
             .await
             .unwrap();
         assert_eq!(archive_proton_id.as_deref(), Some("msg-2"));
@@ -5311,12 +5435,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         let uid2 = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -5335,26 +5467,26 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids.len(), 1);
         let inbox_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::INBOX", inbox_uids[0])
+            .get_proton_id(&scoped("test-uid", "INBOX"), inbox_uids[0])
             .await
             .unwrap();
         assert_eq!(inbox_proton_id.as_deref(), Some("msg-1"));
 
         let archive_uids = config
             .mailbox_view
-            .list_uids("test-uid::Archive")
+            .list_uids(&scoped("test-uid", "Archive"))
             .await
             .unwrap();
         assert_eq!(archive_uids.len(), 1);
         let archive_proton_id = config
             .mailbox_view
-            .get_proton_id("test-uid::Archive", archive_uids[0])
+            .get_proton_id(&scoped("test-uid", "Archive"), archive_uids[0])
             .await
             .unwrap();
         assert_eq!(archive_proton_id.as_deref(), Some("msg-2"));
@@ -5392,12 +5524,20 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &[String::from("\\Deleted")],
+            )
             .await
             .unwrap();
 
@@ -5416,7 +5556,7 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert!(inbox_uids.is_empty());
@@ -5464,7 +5604,11 @@ mod tests {
         .await;
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &[String::from("\\Deleted")],
+            )
             .await
             .unwrap();
 
@@ -5483,10 +5627,10 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::INBOX")
+                .list_uids(&scoped("test-uid", "INBOX"))
                 .await
                 .unwrap(),
-            vec![1]
+            vec![iuid(1)]
         );
 
         server.verify().await;
@@ -5512,7 +5656,11 @@ mod tests {
         .await;
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &[String::from("\\Deleted")],
+            )
             .await
             .unwrap();
 
@@ -5531,15 +5679,15 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::INBOX")
+                .list_uids(&scoped("test-uid", "INBOX"))
                 .await
                 .unwrap(),
-            vec![1]
+            vec![iuid(1)]
         );
         assert_eq!(
             config
                 .mailbox_view
-                .get_proton_id("test-uid::INBOX", 1)
+                .get_proton_id(&scoped("test-uid", "INBOX"), iuid(1))
                 .await
                 .unwrap()
                 .as_deref(),
@@ -5560,12 +5708,20 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &[String::from("\\Deleted")],
+            )
             .await
             .unwrap();
 
@@ -5584,7 +5740,7 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids, vec![uid]);
@@ -5611,7 +5767,11 @@ mod tests {
         .await;
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &[String::from("\\Deleted")],
+            )
             .await
             .unwrap();
 
@@ -5630,10 +5790,10 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_view
-                .list_uids("test-uid::INBOX")
+                .list_uids(&scoped("test-uid", "INBOX"))
                 .await
                 .unwrap(),
-            vec![1, 2]
+            vec![iuid(1), iuid(2)]
         );
     }
 
@@ -5650,12 +5810,20 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &[String::from("\\Deleted")])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &[String::from("\\Deleted")],
+            )
             .await
             .unwrap();
 
@@ -5677,7 +5845,7 @@ mod tests {
 
         let inbox_uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(inbox_uids, vec![uid]);
@@ -5694,12 +5862,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 0))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 0),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -5725,7 +5901,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .set_flags("test-uid::INBOX", 1, vec!["\\Seen".to_string()])
+            .set_flags(
+                &scoped("test-uid", "INBOX"),
+                iuid(1),
+                vec!["\\Seen".to_string()],
+            )
             .await
             .unwrap();
         seed_gluon_backend_message(
@@ -5778,7 +5958,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -5832,13 +6016,17 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
             .store_rfc822(
-                "test-uid::INBOX",
+                &scoped("test-uid", "INBOX"),
                 uid,
                 b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nbody".to_vec(),
             )
@@ -5861,7 +6049,7 @@ mod tests {
 
         let flags = config
             .mailbox_view
-            .get_flags("test-uid::INBOX", uid)
+            .get_flags(&scoped("test-uid", "INBOX"), uid)
             .await
             .unwrap();
         assert!(flags.iter().any(|f| f == "\\Seen"));
@@ -5880,12 +6068,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .store_metadata("test-uid::Drafts", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "Drafts"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -5950,7 +6146,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -6007,13 +6207,17 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
             .store_rfc822(
-                "test-uid::INBOX",
+                &scoped("test-uid", "INBOX"),
                 uid,
                 b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nbody".to_vec(),
             )
@@ -6040,7 +6244,7 @@ mod tests {
 
         let flags = config
             .mailbox_view
-            .get_flags("test-uid::INBOX", uid)
+            .get_flags(&scoped("test-uid", "INBOX"), uid)
             .await
             .unwrap();
         assert!(
@@ -6100,7 +6304,7 @@ mod tests {
 
         let flags = config
             .mailbox_view
-            .get_flags("test-uid::INBOX", 1)
+            .get_flags(&scoped("test-uid", "INBOX"), iuid(1))
             .await
             .unwrap();
         assert!(
@@ -6123,7 +6327,11 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -6153,7 +6361,11 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -6207,7 +6419,7 @@ mod tests {
         assert_eq!(
             config
                 .mailbox_mutation
-                .get_flags("test-uid::INBOX", uid)
+                .get_flags(&scoped("test-uid", "INBOX"), uid)
                 .await
                 .unwrap(),
             vec!["\\Seen".to_string()]
@@ -6226,13 +6438,17 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
             .store_rfc822(
-                "test-uid::INBOX",
+                &scoped("test-uid", "INBOX"),
                 uid,
                 b"From: Alice <alice@proton.me>\r\nSubject: Subject msg-1\r\n\r\nsearch-hit-body"
                     .to_vec(),
@@ -6377,7 +6593,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
 
@@ -6445,12 +6665,20 @@ mod tests {
 
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 0))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 0),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-2", make_meta("msg-2", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-2"),
+                make_meta("msg-2", 1),
+            )
             .await
             .unwrap();
 
@@ -6480,7 +6708,11 @@ mod tests {
 
         config
             .mailbox_mutation
-            .set_flags("test-uid::INBOX", 1, vec!["\\Seen".to_string()])
+            .set_flags(
+                &scoped("test-uid", "INBOX"),
+                iuid(1),
+                vec!["\\Seen".to_string()],
+            )
             .await
             .unwrap();
         seed_gluon_backend_message(
@@ -6512,10 +6744,10 @@ mod tests {
         let flags = vec![];
         assert!(evaluate_search_key(
             &SearchKey::All,
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
     }
@@ -6526,18 +6758,18 @@ mod tests {
         let flags = vec!["\\Seen".to_string()];
         assert!(evaluate_search_key(
             &SearchKey::Seen,
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
         assert!(!evaluate_search_key(
             &SearchKey::Unseen,
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
     }
@@ -6548,18 +6780,18 @@ mod tests {
         let flags = vec![];
         assert!(evaluate_search_key(
             &SearchKey::Subject("Subject".to_string()),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
         assert!(!evaluate_search_key(
             &SearchKey::Subject("NotFound".to_string()),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
     }
@@ -6570,10 +6802,10 @@ mod tests {
         let flags = vec![];
         assert!(evaluate_search_key(
             &SearchKey::From("alice".to_string()),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
     }
@@ -6584,10 +6816,10 @@ mod tests {
         let flags = vec![];
         assert!(!evaluate_search_key(
             &SearchKey::Not(Box::new(SearchKey::All)),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
     }
@@ -6595,14 +6827,21 @@ mod tests {
     #[test]
     fn test_format_copyuid() {
         assert_eq!(
-            format_copyuid(1700000000, &[1, 2, 3], &[10, 11, 12]),
+            format_copyuid(
+                1700000000,
+                &[iuid(1), iuid(2), iuid(3)],
+                &[iuid(10), iuid(11), iuid(12)]
+            ),
             "COPYUID 1700000000 1,2,3 10,11,12"
         );
     }
 
     #[test]
     fn test_format_copyuid_single() {
-        assert_eq!(format_copyuid(42, &[5], &[100]), "COPYUID 42 5 100");
+        assert_eq!(
+            format_copyuid(42, &[iuid(5)], &[iuid(100)]),
+            "COPYUID 42 5 100"
+        );
     }
 
     #[test]
@@ -6654,19 +6893,19 @@ mod tests {
         // SENTON should match the Date header day, not meta.time
         assert!(evaluate_search_key(
             &SearchKey::SentOn(day_before_ts),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             Some(rfc822)
         ));
         // Should NOT match meta.time day
         assert!(!evaluate_search_key(
             &SearchKey::SentOn(1700000000),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             Some(rfc822)
         ));
     }
@@ -6678,10 +6917,10 @@ mod tests {
         // No RFC822 data available - should fall back to meta.time
         assert!(evaluate_search_key(
             &SearchKey::SentOn(1700000000),
-            1,
+            iuid(1),
             &meta,
             &flags,
-            1,
+            iuid(1),
             None
         ));
     }
@@ -6743,12 +6982,20 @@ mod tests {
 
         let uid = config
             .mailbox_mutation
-            .store_metadata("test-uid::INBOX", "msg-1", make_meta("msg-1", 1))
+            .store_metadata(
+                &scoped("test-uid", "INBOX"),
+                &pid("msg-1"),
+                make_meta("msg-1", 1),
+            )
             .await
             .unwrap();
         config
             .mailbox_mutation
-            .add_flags("test-uid::INBOX", uid, &["\\Deleted".to_string()])
+            .add_flags(
+                &scoped("test-uid", "INBOX"),
+                uid,
+                &["\\Deleted".to_string()],
+            )
             .await
             .unwrap();
 
@@ -6773,7 +7020,7 @@ mod tests {
         // Message should still exist in the store
         let uids = config
             .mailbox_view
-            .list_uids("test-uid::INBOX")
+            .list_uids(&scoped("test-uid", "INBOX"))
             .await
             .unwrap();
         assert_eq!(uids.len(), 1, "message must not be expunged");

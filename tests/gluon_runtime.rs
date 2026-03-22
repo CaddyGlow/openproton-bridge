@@ -15,6 +15,7 @@ use openproton_bridge::bridge::session_manager::SessionManager;
 use openproton_bridge::bridge::types::{
     AccountId, CheckpointSyncState, EventCheckpoint, EventCheckpointStore,
 };
+use openproton_bridge::imap::types::{ImapUid, ScopedMailboxId};
 use openproton_bridge::paths::RuntimePaths;
 use openproton_bridge::vault;
 use sequoia_openpgp as openpgp;
@@ -499,7 +500,7 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
     .expect("start mail runtime");
     seed_runtime_auth(&runtime, &session).await;
 
-    let scoped_mailbox = format!("{}::INBOX", session.uid);
+    let scoped_mailbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     let uid = runtime
         .imap_connector()
         .list_uids(&scoped_mailbox)
@@ -618,7 +619,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
     .expect("start mail runtime");
     seed_runtime_auth(&runtime, &session).await;
 
-    let scoped_mailbox = format!("{}::INBOX", session.uid);
+    let scoped_mailbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     let uid = runtime
         .imap_connector()
         .list_uids(&scoped_mailbox)
@@ -696,7 +697,7 @@ async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
     .expect("start mail runtime");
     seed_runtime_auth(&runtime, &session).await;
 
-    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let scoped_inbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     let inbox_uid = runtime
         .imap_connector()
         .list_uids(&scoped_inbox)
@@ -705,7 +706,7 @@ async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
         .into_iter()
         .next()
         .expect("seeded inbox uid");
-    assert_eq!(inbox_uid, 1);
+    assert_eq!(inbox_uid, ImapUid::from(1u32));
 
     let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
 
@@ -718,14 +719,14 @@ async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
     assert!(copy.contains("[COPYUID"), "{copy}");
     assert!(copy.contains("COPY completed"), "{copy}");
 
-    let scoped_archive = format!("{}::Archive", session.uid);
+    let scoped_archive = ScopedMailboxId::from_parts(Some(&session.uid), "Archive");
     assert_eq!(
         runtime
             .imap_connector()
             .list_uids(&scoped_inbox)
             .await
             .expect("list inbox after copy"),
-        vec![1]
+        vec![ImapUid::from(1u32)]
     );
     assert_eq!(
         runtime
@@ -733,11 +734,11 @@ async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
             .list_uids(&scoped_archive)
             .await
             .expect("list archive after copy"),
-        vec![1]
+        vec![ImapUid::from(1u32)]
     );
     let archive_literal = runtime
         .imap_connector()
-        .get_message_literal(&scoped_archive, 1)
+        .get_message_literal(&scoped_archive, ImapUid::from(1u32))
         .await
         .expect("archive literal result")
         .expect("archive literal");
@@ -792,7 +793,7 @@ async fn be030_mail_runtime_expunge_syncs_upstream_with_gluon_defaults() {
     .expect("start mail runtime");
     seed_runtime_auth(&runtime, &session).await;
 
-    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let scoped_inbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     let inbox_uid = runtime
         .imap_connector()
         .list_uids(&scoped_inbox)
@@ -885,7 +886,7 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
     .expect("start mail runtime");
     seed_runtime_auth(&runtime, &session).await;
 
-    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let scoped_inbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     let inbox_uid = runtime
         .imap_connector()
         .list_uids(&scoped_inbox)
@@ -894,7 +895,7 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
         .into_iter()
         .next()
         .expect("seeded inbox uid");
-    assert_eq!(inbox_uid, 1);
+    assert_eq!(inbox_uid, ImapUid::from(1u32));
 
     let (mut reader, mut write) = login_and_select_inbox(imap_port).await;
 
@@ -907,7 +908,7 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
     assert!(move_response.contains("* 1 EXPUNGE"), "{move_response}");
     assert!(move_response.contains("MOVE completed"), "{move_response}");
 
-    let scoped_archive = format!("{}::Archive", session.uid);
+    let scoped_archive = ScopedMailboxId::from_parts(Some(&session.uid), "Archive");
     assert!(runtime
         .imap_connector()
         .list_uids(&scoped_inbox)
@@ -920,11 +921,11 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
             .list_uids(&scoped_archive)
             .await
             .expect("list archive after move"),
-        vec![1]
+        vec![ImapUid::from(1u32)]
     );
     let archive_literal = runtime
         .imap_connector()
-        .get_message_literal(&scoped_archive, 1)
+        .get_message_literal(&scoped_archive, ImapUid::from(1u32))
         .await
         .expect("archive literal result")
         .expect("archive literal");
@@ -1033,14 +1034,14 @@ async fn be030_mail_runtime_event_update_reaches_idle_with_gluon_defaults() {
     }
     assert!(idle_output.contains("2 EXISTS"), "{idle_output}");
 
-    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let scoped_inbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     assert_eq!(
         runtime
             .imap_connector()
             .list_uids(&scoped_inbox)
             .await
             .expect("list inbox after event"),
-        vec![1, 2]
+        vec![ImapUid::from(1u32), ImapUid::from(2u32)]
     );
 
     write.write_all(b"DONE\r\n").await.expect("write done");
@@ -1147,7 +1148,7 @@ async fn be030_mail_runtime_event_delete_surfaces_via_noop_with_gluon_defaults()
     assert!(noop.contains("* 0 EXISTS"), "{noop}");
     assert!(noop.contains("a003 OK NOOP completed"), "{noop}");
 
-    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let scoped_inbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     assert!(runtime
         .imap_connector()
         .list_uids(&scoped_inbox)
@@ -1269,14 +1270,14 @@ async fn be030_mail_runtime_refresh_resync_surfaces_via_noop_with_gluon_defaults
     assert!(noop.contains("* 2 EXISTS"), "{noop}");
     assert!(noop.contains("a003 OK NOOP completed"), "{noop}");
 
-    let scoped_inbox = format!("{}::INBOX", session.uid);
+    let scoped_inbox = ScopedMailboxId::from_parts(Some(&session.uid), "INBOX");
     assert_eq!(
         runtime
             .imap_connector()
             .list_uids(&scoped_inbox)
             .await
             .expect("list inbox after refresh resync"),
-        vec![1, 2]
+        vec![ImapUid::from(1u32), ImapUid::from(2u32)]
     );
 
     server.verify().await;

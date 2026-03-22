@@ -1,7 +1,7 @@
+pub mod convert;
 pub mod dav;
 pub mod incremental;
 pub mod query;
-pub mod schema;
 pub mod store;
 pub mod sync_calendar;
 pub mod sync_contacts;
@@ -16,8 +16,10 @@ use thiserror::Error;
 pub enum PimError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("contacts store error: {0}")]
+    Contacts(#[from] gluon_rs_contacts::ContactsStoreError),
+    #[error("calendar store error: {0}")]
+    Calendar(#[from] gluon_rs_calendar::CalendarStoreError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid state: {0}")]

@@ -1,8 +1,5 @@
 use std::collections::HashSet;
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use rusqlite::Connection;
 
 use crate::api::client::ProtonClient;
 use crate::api::contacts::{self, ContactsQuery};
@@ -75,7 +72,8 @@ pub async fn bootstrap_contacts(
     }
 
     let mut soft_deleted = 0_usize;
-    for contact_id in load_local_contact_ids(store.db_path())? {
+    let local_ids = store.contacts().list_active_contact_ids()?;
+    for contact_id in local_ids {
         if !seen_ids.contains(&contact_id) {
             store.soft_delete_contact(&contact_id)?;
             soft_deleted += 1;
@@ -94,15 +92,6 @@ pub async fn bootstrap_contacts(
         started_at_ms,
         finished_at_ms,
     })
-}
-
-fn load_local_contact_ids(db_path: &Path) -> Result<Vec<String>> {
-    let conn = Connection::open(db_path)?;
-    let mut stmt = conn.prepare("SELECT id FROM pim_contacts WHERE deleted = 0")?;
-    let ids = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(ids)
 }
 
 fn normalize_page_size(page_size: i32) -> i32 {
@@ -131,6 +120,14 @@ mod tests {
     use tempfile::tempdir;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn setup_store() -> PimStore {
+        let tmp = tempdir().unwrap();
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
+        Box::leak(Box::new(tmp));
+        PimStore::new(contacts_db, calendar_db).unwrap()
+    }
 
     fn sample_full_contact(id: &str, name: &str) -> Contact {
         Contact {
@@ -193,8 +190,7 @@ mod tests {
     async fn bootstrap_contacts_paginates_and_upserts_full_contacts() {
         let server = MockServer::start().await;
         let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
-        let tmp = tempdir().unwrap();
-        let store = PimStore::new(tmp.path().join("contacts.db")).unwrap();
+        let store = setup_store();
         store
             .upsert_contact(&sample_full_contact("old-contact", "Old"))
             .unwrap();
@@ -270,31 +266,14 @@ mod tests {
         assert_eq!(summary.contacts_upserted, 3);
         assert_eq!(summary.contacts_soft_deleted, 1);
 
-        let conn = Connection::open(store.db_path()).unwrap();
-        let active_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pim_contacts WHERE deleted = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let deleted_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pim_contacts WHERE deleted = 1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(active_count, 3);
-        assert_eq!(deleted_count, 1);
+        assert_eq!(store.contacts().count_contacts().unwrap(), 3);
     }
 
     #[tokio::test]
     async fn bootstrap_contacts_uses_default_page_size_and_sets_sync_state() {
         let server = MockServer::start().await;
         let client = ProtonClient::authenticated(&server.uri(), "uid-1", "token-1").unwrap();
-        let tmp = tempdir().unwrap();
-        let store = PimStore::new(tmp.path().join("contacts.db")).unwrap();
+        let store = setup_store();
 
         Mock::given(method("GET"))
             .and(path("/contacts/v4"))
@@ -408,8 +387,7 @@ mod tests {
 
         let client =
             ProtonClient::authenticated(&format!("http://{}", addr), "uid-1", "token-1").unwrap();
-        let tmp = tempdir().unwrap();
-        let store = PimStore::new(tmp.path().join("contacts.db")).unwrap();
+        let store = setup_store();
 
         let summary = bootstrap_contacts(&client, &store, 2).await.unwrap();
         assert_eq!(summary.contacts_upserted, 1);

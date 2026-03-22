@@ -71,6 +71,8 @@ uuid = { version = "1", features = ["v4"] }
 sha1 = "0.10"
 base32 = "0.5"
 gluon-rs-mail = { path = "crates/gluon-rs-mail" }
+gluon-rs-contacts = { path = "crates/gluon-rs-contacts" }
+gluon-rs-calendar = { path = "crates/gluon-rs-calendar" }
 
 [dev-dependencies]
 wiremock = "0.6"
@@ -119,5 +121,7 @@ opt-level = 2
 members = [
     "crates/gluon-rs-core",
     "crates/gluon-rs-mail",
+    "crates/gluon-rs-contacts",
+    "crates/gluon-rs-calendar",
     "apps/bridge-ui/src-tauri",
 ]

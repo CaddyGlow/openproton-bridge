@@ -2028,6 +2028,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
+name = "gluon-rs-calendar"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "gluon-rs-contacts"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "gluon-rs-core"
 version = "0.1.0"
 dependencies = [
@@ -3481,6 +3500,8 @@ dependencies = [
  "dirs 5.0.1",
  "flate2",
  "fs2",
+ "gluon-rs-calendar",
+ "gluon-rs-contacts",
  "gluon-rs-mail",
  "hmac",
  "keyring",

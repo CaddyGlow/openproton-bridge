@@ -868,7 +868,13 @@ mod tests {
     #[tokio::test]
     async fn propfind_with_prop_body_filters_response() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         store
             .upsert_calendar(&crate::api::calendar::Calendar {
                 id: "work".to_string(),
@@ -923,7 +929,13 @@ mod tests {
     #[tokio::test]
     async fn carddav_put_get_delete_roundtrip() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         let mut pim_stores = HashMap::new();
         pim_stores.insert("uid-1".to_string(), store);
 
@@ -984,7 +996,13 @@ mod tests {
     #[tokio::test]
     async fn caldav_put_get_delete_roundtrip() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         let mut pim_stores = HashMap::new();
         pim_stores.insert("uid-1".to_string(), store);
 
@@ -1045,7 +1063,13 @@ mod tests {
     #[tokio::test]
     async fn report_addressbook_query_lists_contacts() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         let mut pim_stores = HashMap::new();
         pim_stores.insert("uid-1".to_string(), store);
 
@@ -1100,7 +1124,13 @@ mod tests {
     #[tokio::test]
     async fn caldav_sync_collection_accepts_uri_sync_tokens() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         let mut pim_stores = HashMap::new();
         pim_stores.insert("uid-1".to_string(), store);
 
@@ -1176,7 +1206,13 @@ mod tests {
     #[tokio::test]
     async fn caldav_sync_collection_replays_on_first_report_after_propfind_token() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         let mut pim_stores = HashMap::new();
         pim_stores.insert("uid-1".to_string(), store);
 
@@ -1258,7 +1294,13 @@ mod tests {
     #[tokio::test]
     async fn mkcalendar_creates_named_calendar_collection() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         let mut pim_stores = HashMap::new();
         pim_stores.insert("uid-1".to_string(), store);
 
@@ -1307,7 +1349,13 @@ mod tests {
     #[tokio::test]
     async fn proppatch_updates_calendar_metadata() -> Result<()> {
         let tmp = tempfile::tempdir()?;
-        let store = Arc::new(PimStore::new(tmp.path().join("account.db")).expect("store"));
+        let store = Arc::new(
+            PimStore::new(
+                tmp.path().join("contacts.db"),
+                tmp.path().join("calendar.db"),
+            )
+            .expect("store"),
+        );
         store
             .upsert_calendar(&crate::api::calendar::Calendar {
                 id: "work".to_string(),

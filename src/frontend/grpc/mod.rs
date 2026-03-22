@@ -1280,12 +1280,20 @@ mod tests {
         )
         .unwrap();
         let account = bootstrap.accounts.first().unwrap();
-        let db_path = service
+        let gluon = service
             .state
             .runtime_paths
-            .gluon_paths(Some(bootstrap.gluon_dir.as_str()))
-            .account_db_path(&account.storage_user_id);
-        crate::pim::store::PimStore::new(db_path).unwrap()
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()));
+        let gluon_root = gluon.root().to_path_buf();
+        let contacts_root = gluon_root.parent().unwrap().join("gluon-contacts");
+        let calendar_root = gluon_root.parent().unwrap().join("gluon-calendar");
+        let contacts_paths = crate::paths::GluonPaths::new(contacts_root);
+        let calendar_paths = crate::paths::GluonPaths::new(calendar_root);
+        let contacts_db = contacts_paths.account_db_path(&account.storage_user_id);
+        let calendar_db = calendar_paths.account_db_path(&account.storage_user_id);
+        std::fs::create_dir_all(contacts_db.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(calendar_db.parent().unwrap()).unwrap();
+        crate::pim::store::PimStore::new(contacts_db, calendar_db).unwrap()
     }
 
     #[tokio::test]
@@ -1599,12 +1607,20 @@ mod tests {
         )
         .unwrap();
         let account = bootstrap.accounts.first().unwrap();
-        let db_path = service
+        let gluon = service
             .state
             .runtime_paths
-            .gluon_paths(Some(bootstrap.gluon_dir.as_str()))
-            .account_db_path(&account.storage_user_id);
-        let store = crate::pim::store::PimStore::new(db_path).unwrap();
+            .gluon_paths(Some(bootstrap.gluon_dir.as_str()));
+        let gluon_root = gluon.root().to_path_buf();
+        let contacts_root = gluon_root.parent().unwrap().join("gluon-contacts");
+        let calendar_root = gluon_root.parent().unwrap().join("gluon-calendar");
+        let contacts_paths = crate::paths::GluonPaths::new(contacts_root);
+        let calendar_paths = crate::paths::GluonPaths::new(calendar_root);
+        let contacts_db = contacts_paths.account_db_path(&account.storage_user_id);
+        let calendar_db = calendar_paths.account_db_path(&account.storage_user_id);
+        std::fs::create_dir_all(contacts_db.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(calendar_db.parent().unwrap()).unwrap();
+        let store = crate::pim::store::PimStore::new(contacts_db, calendar_db).unwrap();
         store
             .upsert_calendar(&pim_test_calendar("cal-1", "Primary"))
             .unwrap();

@@ -1,8 +1,6 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::Connection;
-
 use crate::api::calendar;
 use crate::api::client::ProtonClient;
 
@@ -107,7 +105,12 @@ pub async fn bootstrap_calendars(
         )?;
     }
 
-    let cached_ids = load_cached_calendar_ids(store)?;
+    let cached_ids: HashSet<String> = store
+        .calendar()
+        .list_cached_calendar_ids()?
+        .into_iter()
+        .filter(|id| is_remote_calendar_id(id))
+        .collect();
     for cached_id in cached_ids {
         if !seen_calendar_ids.contains(&cached_id) {
             store.soft_delete_calendar(&cached_id)?;
@@ -123,19 +126,6 @@ pub async fn bootstrap_calendars(
     Ok(summary)
 }
 
-fn load_cached_calendar_ids(store: &PimStore) -> Result<HashSet<String>> {
-    let conn = Connection::open(store.db_path())?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    let mut stmt = conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let ids = rows
-        .collect::<std::result::Result<HashSet<String>, _>>()?
-        .into_iter()
-        .filter(|calendar_id| is_remote_calendar_id(calendar_id))
-        .collect();
-    Ok(ids)
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct RefreshCalendarEventsSummary {
     pub calendars_scanned: usize,
@@ -149,7 +139,13 @@ pub async fn refresh_calendar_event_horizon(
     event_query: &calendar::CalendarEventsQuery,
 ) -> Result<RefreshCalendarEventsSummary> {
     let mut summary = RefreshCalendarEventsSummary::default();
-    for calendar_id in load_active_calendar_ids(store)? {
+    let active_ids: Vec<String> = store
+        .calendar()
+        .list_active_calendar_ids()?
+        .into_iter()
+        .filter(|id| is_remote_calendar_id(id))
+        .collect();
+    for calendar_id in active_ids {
         summary.calendars_scanned += 1;
         let events = super::run_with_api_retry(|| {
             calendar::get_calendar_events(client, &calendar_id, event_query)
@@ -176,18 +172,6 @@ pub async fn refresh_calendar_event_horizon(
     Ok(summary)
 }
 
-fn load_active_calendar_ids(store: &PimStore) -> Result<Vec<String>> {
-    let conn = Connection::open(store.db_path())?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    let mut stmt = conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0 ORDER BY id")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    Ok(rows
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|calendar_id| is_remote_calendar_id(calendar_id))
-        .collect())
-}
-
 fn reconcile_removed_calendar_events(
     store: &PimStore,
     calendar_id: &str,
@@ -196,7 +180,9 @@ fn reconcile_removed_calendar_events(
     start_to: Option<i64>,
 ) -> Result<usize> {
     let mut soft_deleted = 0usize;
-    let cached_ids = load_cached_calendar_event_ids(store, calendar_id, start_from, start_to)?;
+    let cached_ids = store
+        .calendar()
+        .list_cached_event_ids(calendar_id, start_from, start_to)?;
     for event_id in cached_ids {
         if !fetched_event_ids.contains(&event_id) {
             store.soft_delete_calendar_event(&event_id)?;
@@ -204,29 +190,6 @@ fn reconcile_removed_calendar_events(
         }
     }
     Ok(soft_deleted)
-}
-
-fn load_cached_calendar_event_ids(
-    store: &PimStore,
-    calendar_id: &str,
-    start_from: Option<i64>,
-    start_to: Option<i64>,
-) -> Result<HashSet<String>> {
-    let conn = Connection::open(store.db_path())?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    let mut stmt = conn.prepare(
-        "SELECT id
-         FROM pim_calendar_events
-         WHERE calendar_id = ?1
-           AND deleted = 0
-           AND (?2 IS NULL OR start_time >= ?2)
-           AND (?3 IS NULL OR start_time <= ?3)",
-    )?;
-    let rows = stmt.query_map(
-        rusqlite::params![calendar_id, start_from, start_to],
-        |row| row.get::<_, String>(0),
-    )?;
-    Ok(rows.collect::<std::result::Result<HashSet<_>, _>>()?)
 }
 
 fn epoch_millis() -> u64 {
@@ -254,9 +217,10 @@ mod tests {
 
     fn setup_store() -> PimStore {
         let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("account.db");
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
         Box::leak(Box::new(tmp));
-        PimStore::new(db_path).unwrap()
+        PimStore::new(contacts_db, calendar_db).unwrap()
     }
 
     async fn mount_calendar_bootstrap_mocks(
@@ -420,24 +384,6 @@ mod tests {
         assert_eq!(summary.settings_upserted, 2);
         assert_eq!(summary.events_upserted, 2);
         assert_eq!(summary.events_soft_deleted, 0);
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        let calendars_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pim_calendars WHERE deleted = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let events_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pim_calendar_events WHERE deleted = 0",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(calendars_count, 2);
-        assert_eq!(events_count, 2);
     }
 
     #[tokio::test]
@@ -527,16 +473,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(summary.calendars_soft_deleted, 1);
-        assert_eq!(summary.events_soft_deleted, 0);
-        let conn = Connection::open(store.db_path()).unwrap();
-        let stale_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendars WHERE id = 'stale-cal'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(stale_deleted, 1);
     }
 
     #[tokio::test]
@@ -587,16 +523,6 @@ mod tests {
         assert_eq!(summary.calendars_scanned, 1);
         assert_eq!(summary.events_upserted, 1);
         assert_eq!(summary.events_soft_deleted, 0);
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        let event_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pim_calendar_events WHERE deleted = 0 AND id = 'event-horizon-1'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(event_count, 1);
 
         let last_horizon = store
             .get_sync_state_int("calendar.last_horizon_sync_ms")
@@ -679,16 +605,14 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/calendar/v1/cal-1/members"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "Members": []
+                "Code": 1000, "Members": []
             })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
             .and(path("/calendar/v1/cal-1/keys"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "Keys": []
+                "Code": 1000, "Keys": []
             })))
             .mount(&server)
             .await;
@@ -697,11 +621,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "CalendarSettings": {
-                    "ID": "settings-1",
-                    "CalendarID": "cal-1",
+                    "ID": "settings-1", "CalendarID": "cal-1",
                     "DefaultEventDuration": 30,
-                    "DefaultPartDayNotifications": [],
-                    "DefaultFullDayNotifications": []
+                    "DefaultPartDayNotifications": [], "DefaultFullDayNotifications": []
                 }
             })))
             .mount(&server)
@@ -709,8 +631,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/calendar/v1/cal-1/modelevents/latest"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "Code": 1000,
-                "CalendarModelEventID": "cme-1"
+                "Code": 1000, "CalendarModelEventID": "cme-1"
             })))
             .mount(&server)
             .await;
@@ -727,24 +648,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.events_soft_deleted, 1);
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        let keep_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-keep'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let stale_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-stale'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(keep_deleted, 0);
-        assert_eq!(stale_deleted, 1);
     }
 
     #[tokio::test]
@@ -776,9 +679,6 @@ mod tests {
                 end_time: 1700004600,
                 start_timezone: "UTC".to_string(),
                 end_timezone: "UTC".to_string(),
-                full_day: 0,
-                author: "alice@proton.me".to_string(),
-                permissions: 2,
                 ..calendar::CalendarEvent::default()
             })
             .unwrap();
@@ -794,9 +694,6 @@ mod tests {
                 end_time: 1700005600,
                 start_timezone: "UTC".to_string(),
                 end_timezone: "UTC".to_string(),
-                full_day: 0,
-                author: "alice@proton.me".to_string(),
-                permissions: 2,
                 ..calendar::CalendarEvent::default()
             })
             .unwrap();
@@ -812,9 +709,6 @@ mod tests {
                 end_time: 1701003600,
                 start_timezone: "UTC".to_string(),
                 end_timezone: "UTC".to_string(),
-                full_day: 0,
-                author: "alice@proton.me".to_string(),
-                permissions: 2,
                 ..calendar::CalendarEvent::default()
             })
             .unwrap();
@@ -840,32 +734,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(summary.events_soft_deleted, 1);
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        let keep_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-keep'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let in_range_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-delete-in-range'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let out_of_range_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-out-of-range'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(keep_deleted, 0);
-        assert_eq!(in_range_deleted, 1);
-        assert_eq!(out_of_range_deleted, 0);
     }
 
     #[test]

@@ -314,8 +314,14 @@ impl BridgeService {
             .state
             .runtime_paths
             .gluon_paths(Some(bootstrap.gluon_dir.as_str()));
-        let db_path = gluon_paths.account_db_path(&account.storage_user_id);
-        crate::pim::store::PimStore::new(db_path)
+        let gluon_root = gluon_paths.root().to_path_buf();
+        let contacts_root = gluon_root.parent().unwrap().join("gluon-contacts");
+        let calendar_root = gluon_root.parent().unwrap().join("gluon-calendar");
+        let contacts_paths = crate::paths::GluonPaths::new(contacts_root);
+        let calendar_paths = crate::paths::GluonPaths::new(calendar_root);
+        let contacts_db = contacts_paths.account_db_path(&account.storage_user_id);
+        let calendar_db = calendar_paths.account_db_path(&account.storage_user_id);
+        crate::pim::store::PimStore::new(contacts_db, calendar_db)
             .map_err(|err| Status::internal(format!("failed to open pim store: {err}")))
     }
 

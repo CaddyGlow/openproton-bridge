@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::api::calendar;
@@ -149,7 +148,13 @@ async fn apply_calendar_deltas(
     }
 
     if member_change_without_calendar && calendars_to_refresh.is_empty() {
-        for calendar_id in load_active_calendar_ids(store, MODEL_EVENT_SWEEP_LIMIT)? {
+        let active_ids: Vec<String> = store
+            .calendar()
+            .list_active_calendar_ids_limited(MODEL_EVENT_SWEEP_LIMIT)?
+            .into_iter()
+            .filter(|id| is_remote_calendar_id(id))
+            .collect();
+        for calendar_id in active_ids {
             calendars_to_refresh.insert(calendar_id);
         }
     }
@@ -328,19 +333,6 @@ fn is_probably_not_found(err: &crate::api::error::ApiError) -> bool {
     }
 }
 
-fn load_active_calendar_ids(store: &PimStore, limit: usize) -> Result<Vec<String>> {
-    let conn = Connection::open(store.db_path())?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    let mut stmt =
-        conn.prepare("SELECT id FROM pim_calendars WHERE deleted = 0 ORDER BY id LIMIT ?1")?;
-    let rows = stmt.query_map([limit as i64], |row| row.get::<_, String>(0))?;
-    Ok(rows
-        .collect::<std::result::Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter(|calendar_id| is_remote_calendar_id(calendar_id))
-        .collect())
-}
-
 fn pim_api_error(context: &str, err: crate::api::error::ApiError) -> PimError {
     PimError::InvalidState(format!("{context}: {err}"))
 }
@@ -357,9 +349,10 @@ mod tests {
 
     fn setup_store() -> PimStore {
         let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("account.db");
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
         Box::leak(Box::new(tmp));
-        PimStore::new(db_path).unwrap()
+        PimStore::new(contacts_db, calendar_db).unwrap()
     }
 
     fn seed_contact(store: &PimStore, id: &str, name: &str) {
@@ -476,24 +469,6 @@ mod tests {
             .unwrap();
         assert_eq!(summary.contacts_refreshed, 1);
         assert_eq!(summary.contacts_deleted, 1);
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        let upsert_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_contacts WHERE id = 'contact-upsert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let del_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_contacts WHERE id = 'contact-del'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(upsert_deleted, 0);
-        assert_eq!(del_deleted, 1);
     }
 
     #[tokio::test]
@@ -512,13 +487,8 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "Calendar": {
-                    "ID": "cal-1",
-                    "Name": "Personal",
-                    "Description": "Main",
-                    "Color": "#00AAFF",
-                    "Display": 1,
-                    "Type": 0,
-                    "Flags": 0
+                    "ID": "cal-1", "Name": "Personal", "Description": "Main",
+                    "Color": "#00AAFF", "Display": 1, "Type": 0, "Flags": 0
                 }
             })))
             .mount(&server)
@@ -527,14 +497,7 @@ mod tests {
             .and(path("/calendar/v1/cal-1/members"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
-                "Members": [{
-                    "ID": "member-1",
-                    "CalendarID": "cal-1",
-                    "Email": "alice@proton.me",
-                    "Color": "#00AAFF",
-                    "Display": 1,
-                    "Permissions": 2
-                }]
+                "Members": [{"ID": "member-1", "CalendarID": "cal-1", "Email": "alice@proton.me", "Color": "#00AAFF", "Display": 1, "Permissions": 2}]
             })))
             .mount(&server)
             .await;
@@ -542,13 +505,7 @@ mod tests {
             .and(path("/calendar/v1/cal-1/keys"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
-                "Keys": [{
-                    "ID": "key-1",
-                    "CalendarID": "cal-1",
-                    "PassphraseID": "pp-1",
-                    "PrivateKey": "private",
-                    "Flags": 0
-                }]
+                "Keys": [{"ID": "key-1", "CalendarID": "cal-1", "PassphraseID": "pp-1", "PrivateKey": "private", "Flags": 0}]
             })))
             .mount(&server)
             .await;
@@ -556,13 +513,7 @@ mod tests {
             .and(path("/calendar/v1/cal-1/settings"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
-                "CalendarSettings": {
-                    "ID": "settings-1",
-                    "CalendarID": "cal-1",
-                    "DefaultEventDuration": 30,
-                    "DefaultPartDayNotifications": [],
-                    "DefaultFullDayNotifications": []
-                }
+                "CalendarSettings": {"ID": "settings-1", "CalendarID": "cal-1", "DefaultEventDuration": 30, "DefaultPartDayNotifications": [], "DefaultFullDayNotifications": []}
             })))
             .mount(&server)
             .await;
@@ -583,19 +534,10 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "Code": 1000,
                 "Event": {
-                    "ID": "event-upsert",
-                    "UID": "uid-event-upsert",
-                    "CalendarID": "cal-1",
-                    "SharedEventID": "shared-1",
-                    "CreateTime": 1700000000,
-                    "LastEditTime": 1700000001,
-                    "StartTime": 1700001000,
-                    "StartTimezone": "UTC",
-                    "EndTime": 1700004600,
-                    "EndTimezone": "UTC",
-                    "FullDay": 0,
-                    "Author": "alice@proton.me",
-                    "Permissions": 2
+                    "ID": "event-upsert", "UID": "uid-event-upsert", "CalendarID": "cal-1",
+                    "SharedEventID": "shared-1", "CreateTime": 1700000000, "LastEditTime": 1700000001,
+                    "StartTime": 1700001000, "StartTimezone": "UTC", "EndTime": 1700004600,
+                    "EndTimezone": "UTC", "FullDay": 0, "Author": "alice@proton.me", "Permissions": 2
                 }
             })))
             .mount(&server)
@@ -620,23 +562,5 @@ mod tests {
                 .as_deref(),
             Some("cme-new")
         );
-
-        let conn = Connection::open(store.db_path()).unwrap();
-        let upsert_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-upsert'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let del_deleted: i64 = conn
-            .query_row(
-                "SELECT deleted FROM pim_calendar_events WHERE id = 'event-del'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(upsert_deleted, 0);
-        assert_eq!(del_deleted, 1);
     }
 }

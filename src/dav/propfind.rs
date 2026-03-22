@@ -610,9 +610,10 @@ mod tests {
 
     fn store() -> Arc<PimStore> {
         let tmp = tempfile::tempdir().expect("tmpdir");
-        let db_path = tmp.path().join("account.db");
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
         Box::leak(Box::new(tmp));
-        Arc::new(PimStore::new(db_path).expect("store"))
+        Arc::new(PimStore::new(contacts_db, calendar_db).expect("store"))
     }
 
     #[test]

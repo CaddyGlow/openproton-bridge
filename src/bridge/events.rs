@@ -3151,9 +3151,10 @@ mod tests {
 
     fn setup_pim_store() -> Arc<PimStore> {
         let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("account.db");
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
         Box::leak(Box::new(tmp));
-        Arc::new(PimStore::new(db_path).unwrap())
+        Arc::new(PimStore::new(contacts_db, calendar_db).unwrap())
     }
 
     #[derive(Debug, Deserialize)]
@@ -3668,10 +3669,10 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.last_event_id, "event-1");
 
-        let conn = Connection::open(pim_store.db_path()).unwrap();
+        let conn = Connection::open(pim_store.contacts().db_path()).unwrap();
         let deleted: i64 = conn
             .query_row(
-                "SELECT deleted FROM pim_contacts WHERE id = 'contact-1'",
+                "SELECT deleted FROM contacts WHERE id = 'contact-1'",
                 [],
                 |row| row.get(0),
             )
@@ -3729,9 +3730,9 @@ mod tests {
             .unwrap()
             .is_none());
 
-        let conn = Connection::open(pim_store.db_path()).unwrap();
+        let conn = Connection::open(pim_store.contacts().db_path()).unwrap();
         let contacts_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pim_contacts", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(contacts_count, 0);
     }

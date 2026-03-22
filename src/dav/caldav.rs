@@ -1176,9 +1176,10 @@ END:VCALENDAR\r
 
     fn store() -> Arc<PimStore> {
         let tmp = tempdir().unwrap();
-        let db_path = tmp.path().join("account.db");
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
         Box::leak(Box::new(tmp));
-        Arc::new(PimStore::new(db_path).unwrap())
+        Arc::new(PimStore::new(contacts_db, calendar_db).unwrap())
     }
 
     fn auth() -> AuthRoute {

@@ -24,7 +24,9 @@ async fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let store = Arc::new(PimStore::new(db_path.clone())?);
+    let contacts_db = db_path.parent().unwrap().join("contacts.db");
+    let calendar_db = db_path.parent().unwrap().join("calendar.db");
+    let store = Arc::new(PimStore::new(contacts_db, calendar_db)?);
     let session = Session {
         uid: "uid-1".to_string(),
         access_token: String::new(),

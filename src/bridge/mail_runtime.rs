@@ -527,15 +527,29 @@ async fn prepare_runtime_context(
         }
     }
 
+    let contacts_paths = {
+        let mut root = gluon_paths.root().to_path_buf();
+        root.pop();
+        crate::paths::GluonPaths::new(root.join("gluon-contacts"))
+    };
+    let calendar_paths = {
+        let mut root = gluon_paths.root().to_path_buf();
+        root.pop();
+        crate::paths::GluonPaths::new(root.join("gluon-calendar"))
+    };
+    std::fs::create_dir_all(contacts_paths.backend_db_dir())?;
+    std::fs::create_dir_all(calendar_paths.backend_db_dir())?;
+
     let mut pim_stores = HashMap::new();
     for account in &gluon_bootstrap.accounts {
-        let pim_store = PimStore::new(gluon_paths.account_db_path(&account.storage_user_id))
-            .with_context(|| {
-                format!(
-                    "failed to initialize PIM store for account {}",
-                    account.account_id
-                )
-            })?;
+        let contacts_db = contacts_paths.account_db_path(&account.storage_user_id);
+        let calendar_db = calendar_paths.account_db_path(&account.storage_user_id);
+        let pim_store = PimStore::new(contacts_db, calendar_db).with_context(|| {
+            format!(
+                "failed to initialize PIM store for account {}",
+                account.account_id
+            )
+        })?;
         pim_stores.insert(account.account_id.clone(), Arc::new(pim_store));
     }
 
@@ -1171,6 +1185,23 @@ async fn run_pim_reconcile_periodically(
             };
             metrics.accounts_with_store += 1;
 
+            if first_sweep {
+                if let Ok(true) = store.contacts().is_synced() {
+                    tracing::info!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        "contacts sync state exists; skipping bootstrap on startup"
+                    );
+                }
+                if let Ok(true) = store.calendar().is_synced() {
+                    tracing::info!(
+                        account_id = %account.account_id.0,
+                        email = %account.email,
+                        "calendar sync state exists; skipping bootstrap on startup"
+                    );
+                }
+            }
+
             let raw_contacts_due = match is_pim_contacts_due(store, contacts_reconcile_interval) {
                 Ok(due) => due,
                 Err(err) => {
@@ -1702,9 +1733,10 @@ mod tests {
 
     fn pim_store() -> PimStore {
         let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("account.db");
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
         Box::leak(Box::new(tmp));
-        PimStore::new(db_path).unwrap()
+        PimStore::new(contacts_db, calendar_db).unwrap()
     }
 
     #[test]

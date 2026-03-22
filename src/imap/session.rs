@@ -3102,15 +3102,12 @@ mod tests {
     use crate::bridge::accounts::AccountHealth;
     use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
     use crate::bridge::auth_router::AuthRouter;
-    use crate::imap::gluon_connector::{GluonMailConnector, StoreBackedConnector};
+    use crate::imap::gluon_connector::GluonMailConnector;
     use crate::imap::gluon_mailbox_mutation::GluonMailMailboxMutation;
     use crate::imap::gluon_mailbox_view::GluonMailMailboxView;
     use crate::imap::mailbox;
     use crate::imap::mailbox_catalog::RuntimeMailboxCatalog;
-    use crate::imap::mailbox_mutation::{GluonMailboxMutation, StoreBackedMailboxMutation};
-    use crate::imap::mailbox_view::{GluonMailboxView, StoreBackedMailboxView};
     use crate::imap::rfc822;
-    use crate::imap::store::InMemoryStore;
     use gluon_rs_mail::{
         AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, NewMailbox,
         NewMessage, StoreBootstrap,
@@ -3132,40 +3129,38 @@ mod tests {
         }
     }
 
-    fn test_store_backed_config() -> Arc<SessionConfig> {
+    fn test_gluon_config() -> (Arc<SessionConfig>, TempDir) {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
-        let store = InMemoryStore::new();
         let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
-        Arc::new(SessionConfig {
+        let tempdir = tempdir().expect("tempdir");
+        let gluon_store = Arc::new(
+            CompatibleStore::open(StoreBootstrap::new(
+                CacheLayout::new(tempdir.path().join("gluon")),
+                CompatibilityTarget::pinned("2046c95ca745"),
+                vec![AccountBootstrap::new(
+                    "test-uid",
+                    "test-uid",
+                    GluonKey::try_from_slice(&[7u8; 32]).expect("key"),
+                )],
+            ))
+            .expect("open store"),
+        );
+        let config = Arc::new(SessionConfig {
             api_base_url: "https://mail-api.proton.me".to_string(),
             auth_router: AuthRouter::new(accounts),
             runtime_accounts: runtime_accounts.clone(),
-            gluon_connector: StoreBackedConnector::new(store.clone()),
+            gluon_connector: GluonMailConnector::new(gluon_store.clone()),
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
-            mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
-            mailbox_view: StoreBackedMailboxView::new(store.clone()),
-        })
+            mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
+            mailbox_view: GluonMailMailboxView::new(gluon_store),
+        });
+        (config, tempdir)
     }
 
-    struct TestGluonMailFixture {
-        _tempdir: TempDir,
-    }
-
-    fn test_gluon_mail_view_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_config(false)
-    }
-
-    fn test_gluon_mail_backend_config() -> (Arc<SessionConfig>, TestGluonMailFixture) {
-        test_gluon_mail_config(true)
-    }
-
-    fn test_gluon_mail_config(
-        use_gluon_mutation_backend: bool,
-    ) -> (Arc<SessionConfig>, TestGluonMailFixture) {
+    fn test_gluon_mail_config() -> (Arc<SessionConfig>, TempDir) {
         let session = test_session();
         let accounts = AccountRegistry::from_single_session(session.clone());
-        let store = InMemoryStore::new();
         let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
 
         let tempdir = tempdir().expect("tempdir");
@@ -3228,30 +3223,17 @@ mod tests {
             )
             .expect("append message");
 
-        let mailbox_mutation: Arc<dyn GluonMailboxMutation> = if use_gluon_mutation_backend {
-            GluonMailMailboxMutation::new(gluon_store.clone())
-        } else {
-            StoreBackedMailboxMutation::new(store.clone())
-        };
-        let mailbox_view: Arc<dyn GluonMailboxView> =
-            GluonMailMailboxView::new(gluon_store.clone());
-        let gluon_connector: Arc<dyn GluonImapConnector> = if use_gluon_mutation_backend {
-            GluonMailConnector::new(gluon_store.clone())
-        } else {
-            StoreBackedConnector::new(store.clone())
-        };
-
         let config = Arc::new(SessionConfig {
             api_base_url: "https://mail-api.proton.me".to_string(),
             auth_router: AuthRouter::new(accounts),
             runtime_accounts: runtime_accounts.clone(),
-            gluon_connector,
+            gluon_connector: GluonMailConnector::new(gluon_store.clone()),
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
-            mailbox_mutation,
-            mailbox_view,
+            mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
+            mailbox_view: GluonMailMailboxView::new(gluon_store),
         });
 
-        (config, TestGluonMailFixture { _tempdir: tempdir })
+        (config, tempdir)
     }
 
     fn failing_client() -> ProtonClient {
@@ -3363,7 +3345,7 @@ mod tests {
         }
     }
 
-    fn multi_account_compat_config(api_base_url: &str) -> Arc<SessionConfig> {
+    fn multi_account_compat_config(api_base_url: &str) -> (Arc<SessionConfig>, TempDir) {
         let account_a = crate::api::types::Session {
             uid: "uid-a".to_string(),
             access_token: "access-a".to_string(),
@@ -3388,21 +3370,41 @@ mod tests {
         let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![
             account_a, account_b,
         ]));
-        let store = InMemoryStore::new();
-        Arc::new(SessionConfig {
+        let tempdir = tempdir().expect("tempdir");
+        let gluon_store = Arc::new(
+            CompatibleStore::open(StoreBootstrap::new(
+                CacheLayout::new(tempdir.path().join("gluon")),
+                CompatibilityTarget::pinned("2046c95ca745"),
+                vec![
+                    AccountBootstrap::new(
+                        "uid-a",
+                        "uid-a",
+                        GluonKey::try_from_slice(&[7u8; 32]).expect("key"),
+                    ),
+                    AccountBootstrap::new(
+                        "uid-b",
+                        "uid-b",
+                        GluonKey::try_from_slice(&[8u8; 32]).expect("key"),
+                    ),
+                ],
+            ))
+            .expect("open store"),
+        );
+        let config = Arc::new(SessionConfig {
             api_base_url: api_base_url.to_string(),
             auth_router: AuthRouter::new(accounts),
             runtime_accounts: runtime_accounts.clone(),
-            gluon_connector: StoreBackedConnector::new(store.clone()),
-            mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts.clone()),
-            mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
-            mailbox_view: StoreBackedMailboxView::new(store.clone()),
-        })
+            gluon_connector: GluonMailConnector::new(gluon_store.clone()),
+            mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
+            mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
+            mailbox_view: GluonMailMailboxView::new(gluon_store),
+        });
+        (config, tempdir)
     }
 
     #[tokio::test]
     async fn test_greet() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.greet().await.unwrap();
@@ -3417,7 +3419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_capability() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 CAPABILITY").await.unwrap();
@@ -3437,7 +3439,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 NOOP").await.unwrap();
@@ -3452,7 +3454,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_selected_emits_exists_on_store_change() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3480,7 +3482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_selected_emits_exists_on_gluon_connector_create() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3508,7 +3510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_selected_waits_for_done_and_emits_exists() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3561,7 +3563,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_exists_when_new_message_arrives_after_start() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3612,7 +3614,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_exists_when_new_message_arrives_after_start_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3663,7 +3665,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_expunge_and_exists_on_delete() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3725,7 +3727,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_expunge_and_exists_on_gluon_connector_delete() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3794,7 +3796,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_flag_fetch_on_flag_only_change() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3861,7 +3863,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_flag_fetch_on_gluon_connector_flag_change() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3925,7 +3927,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_logout() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         let action = session.handle_line("a001 LOGOUT").await.unwrap();
@@ -3942,7 +3944,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_login_bad_password() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session
@@ -3979,7 +3981,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = multi_account_compat_config(&server.uri());
+        let (config, _tempdir) = multi_account_compat_config(&server.uri());
         config
             .runtime_accounts
             .set_health(
@@ -4023,7 +4025,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_not_authenticated() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 LIST \"\" \"*\"").await.unwrap();
@@ -4038,7 +4040,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_not_authenticated() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 SELECT INBOX").await.unwrap();
@@ -4053,7 +4055,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_authenticated() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4087,7 +4089,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_authenticated_with_gluon_mail_view() {
-        let (config, _fixture) = test_gluon_mail_view_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Authenticated;
@@ -4120,7 +4122,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_selected_mailbox() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -4140,7 +4142,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bad_command() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.handle_line("a001 BOGUS").await.unwrap();
@@ -4155,7 +4157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_starttls() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         let action = session.handle_line("a001 STARTTLS").await.unwrap();
@@ -4197,7 +4199,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4235,7 +4237,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_returns_body_item_not_bodystructure() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4272,7 +4274,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_returns_body_item_not_bodystructure_with_gluon_mail_view() {
-        let (config, _fixture) = test_gluon_mail_view_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -4296,7 +4298,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_section_returns_empty_literal_when_content_missing() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4344,7 +4346,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4409,7 +4411,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4482,7 +4484,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4555,7 +4557,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4623,7 +4625,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_copies_local_message_without_api_client() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4669,7 +4671,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_copies_local_message_without_api_client_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4731,7 +4733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_fails_when_upstream_fails() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4769,7 +4771,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4830,7 +4832,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4920,7 +4922,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4987,7 +4989,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_moves_local_message_without_api_client() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5045,7 +5047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_moves_local_message_without_api_client_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5108,7 +5110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_fails_when_upstream_fails() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5158,7 +5160,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5227,7 +5229,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5299,7 +5301,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_move_without_api_client_uses_uid_selection() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5371,7 +5373,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5435,7 +5437,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5492,7 +5494,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expunge_without_api_client_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5547,7 +5549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expunge_fails_when_upstream_fails() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5590,7 +5592,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expunge_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5637,7 +5639,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_expunge_fails_when_upstream_fails() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5683,7 +5685,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_examine_reports_first_unseen_sequence_number() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5714,7 +5716,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_examine_reports_first_unseen_sequence_number_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5757,7 +5759,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5811,7 +5813,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5869,7 +5871,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_after_examine_resets_read_only_mode() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5905,7 +5907,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_after_examine_resets_read_only_mode_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5939,7 +5941,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_close_after_examine_deselects_mailbox() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5987,7 +5989,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6062,7 +6064,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6111,7 +6113,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_fetch_flags_always_includes_uid() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6141,7 +6143,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_store_flags_response_includes_uid() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6172,7 +6174,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_store_flags_response_includes_uid_with_gluon_mail_backend() {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6214,7 +6216,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_cached_rfc822() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6270,7 +6272,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_gluon_mail_rfc822() {
-        let (config, _fixture) = test_gluon_mail_view_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -6309,7 +6311,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_gluon_mail_view() {
-        let (config, _fixture) = test_gluon_mail_view_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -6357,7 +6359,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6403,7 +6405,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6434,7 +6436,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_reports_first_unseen_sequence_and_permanentflags() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6469,7 +6471,7 @@ mod tests {
     #[tokio::test]
     async fn test_select_reports_first_unseen_sequence_and_permanentflags_with_gluon_mail_backend()
     {
-        let (config, _fixture) = test_gluon_mail_backend_config();
+        let (config, _tempdir) = test_gluon_mail_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6691,7 +6693,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_exits_on_done() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6731,7 +6733,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unselect_does_not_expunge() {
-        let config = test_store_backed_config();
+        let (config, _tempdir) = test_gluon_config();
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 

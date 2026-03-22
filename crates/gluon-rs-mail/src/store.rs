@@ -760,6 +760,208 @@ impl CompatibleStore {
         })
     }
 
+    pub fn open_connection(&self, storage_user_id: &str) -> Result<Connection> {
+        self.open_upstream_db(storage_user_id)
+    }
+
+    pub fn open_connection_rw(&self, storage_user_id: &str) -> Result<Connection> {
+        self.open_upstream_db_rw(storage_user_id)
+    }
+
+    pub fn batch_find_uids_by_remote_id(
+        &self,
+        conn: &Connection,
+        mailbox_internal_id: u64,
+        remote_ids: &[&str],
+    ) -> Result<HashMap<String, u32>> {
+        if remote_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let placeholders = remote_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql = format!(
+            "SELECT mm.message_remote_id, mm.uid
+             FROM {table_name} AS mm
+             WHERE mm.message_remote_id IN ({placeholders})"
+        );
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = remote_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut result = HashMap::new();
+
+        while let Some(row) = rows.next()? {
+            let remote_id: String = row.get(0)?;
+            let uid: u32 = row.get(1)?;
+            result.insert(remote_id, uid);
+        }
+
+        Ok(result)
+    }
+
+    pub fn batch_find_internal_ids_by_remote_id(
+        &self,
+        conn: &Connection,
+        remote_ids: &[&str],
+    ) -> Result<HashMap<String, String>> {
+        if remote_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let placeholders = remote_ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let sql =
+            format!("SELECT remote_id, id FROM messages_v2 WHERE remote_id IN ({placeholders})");
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = remote_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        let mut result = HashMap::new();
+
+        while let Some(row) = rows.next()? {
+            let remote_id: String = row.get(0)?;
+            let internal_id: String = row.get(1)?;
+            result.insert(remote_id, internal_id);
+        }
+
+        Ok(result)
+    }
+
+    pub fn batch_set_message_flags_on_conn(
+        &self,
+        conn: &Connection,
+        entries: &[(&str, &[String])],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        for (internal_message_id, flags) in entries {
+            tx.execute(
+                "DELETE FROM message_flags_v2 WHERE message_id = ?1",
+                (internal_message_id,),
+            )?;
+            insert_message_flags_ignore_duplicates(&tx, internal_message_id, flags)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn batch_add_existing_messages_to_mailbox(
+        &self,
+        conn: &Connection,
+        mailbox_internal_id: u64,
+        internal_message_ids: &[&str],
+    ) -> Result<()> {
+        if internal_message_ids.is_empty() {
+            return Ok(());
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        for internal_message_id in internal_message_ids {
+            let remote_id: String = tx.query_row(
+                "SELECT remote_id FROM messages_v2 WHERE id = ?1",
+                (internal_message_id,),
+                |row| row.get(0),
+            )?;
+
+            tx.execute(
+                "INSERT OR IGNORE INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
+                (internal_message_id, mailbox_internal_id),
+            )?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id)
+                     VALUES(?1, ?2)"
+                ),
+                (internal_message_id, &remote_id),
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn batch_append_messages(
+        &self,
+        storage_user_id: &str,
+        conn: &Connection,
+        mailbox_internal_id: u64,
+        messages: &[NewMessage],
+    ) -> Result<Vec<UpstreamMessageSummary>> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let account_paths = self.account_paths(storage_user_id)?;
+        let account = self.account(storage_user_id)?;
+        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
+
+        for message in messages {
+            let blob_path = account_paths.blob_path(&message.internal_id)?;
+            let encoded = encode_blob(&account.key, &message.blob)?;
+            std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        for message in messages {
+            tx.execute(
+                "INSERT INTO messages_v2(id, remote_id, date, size, body, body_structure, envelope, deleted)
+                 VALUES(?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, FALSE)",
+                (
+                    &message.internal_id,
+                    &message.remote_id,
+                    message.size,
+                    &message.body,
+                    &message.body_structure,
+                    &message.envelope,
+                ),
+            )?;
+            tx.execute(
+                "INSERT INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
+                (&message.internal_id, mailbox_internal_id),
+            )?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id, recent, deleted)
+                     VALUES(?1, ?2, ?3, FALSE)"
+                ),
+                (&message.internal_id, &message.remote_id, message.recent),
+            )?;
+            insert_message_flags(&tx, &message.internal_id, &message.flags)?;
+        }
+        tx.commit()?;
+
+        let all_messages =
+            self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
+        let appended_ids: std::collections::HashSet<&str> = messages
+            .iter()
+            .map(|message| message.internal_id.as_str())
+            .collect();
+        Ok(all_messages
+            .into_iter()
+            .filter(|summary| appended_ids.contains(summary.internal_id.as_str()))
+            .collect())
+    }
+
     fn open_upstream_db(&self, storage_user_id: &str) -> Result<Connection> {
         let account_paths = self.account_paths(storage_user_id)?;
         let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
@@ -1869,6 +2071,170 @@ mod tests {
                 .read_message_blob("user-1", &updated.internal_id)
                 .expect("blob"),
             b"Subject: new\r\n\r\nnew-body"
+        );
+    }
+
+    #[test]
+    fn batch_find_uids_returns_uid_map_for_known_remote_ids() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[10u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+
+        let mailbox = store
+            .create_mailbox(
+                "user-1",
+                &NewMailbox {
+                    remote_id: "0".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 5001,
+                    subscribed: true,
+                    attributes: vec![],
+                    flags: vec![],
+                    permanent_flags: vec![],
+                },
+            )
+            .expect("create mailbox");
+
+        store
+            .append_message(
+                "user-1",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "aaa-1".to_string(),
+                    remote_id: "remote-1".to_string(),
+                    flags: vec!["\\Seen".to_string()],
+                    blob: b"body-1".to_vec(),
+                    body: String::new(),
+                    body_structure: String::new(),
+                    envelope: String::new(),
+                    size: 6,
+                    recent: false,
+                },
+            )
+            .expect("append 1");
+        store
+            .append_message(
+                "user-1",
+                mailbox.internal_id,
+                &NewMessage {
+                    internal_id: "aaa-2".to_string(),
+                    remote_id: "remote-2".to_string(),
+                    flags: vec![],
+                    blob: b"body-2".to_vec(),
+                    body: String::new(),
+                    body_structure: String::new(),
+                    envelope: String::new(),
+                    size: 6,
+                    recent: false,
+                },
+            )
+            .expect("append 2");
+
+        let conn = store.open_connection("user-1").expect("open conn");
+        let result = store
+            .batch_find_uids_by_remote_id(
+                &conn,
+                mailbox.internal_id,
+                &["remote-1", "remote-2", "remote-missing"],
+            )
+            .expect("batch find");
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("remote-1"), Some(&1));
+        assert_eq!(result.get("remote-2"), Some(&2));
+        assert!(result.get("remote-missing").is_none());
+    }
+
+    #[test]
+    fn batch_append_and_set_flags_in_single_transaction() {
+        let temp = tempdir().expect("tempdir");
+        let store = CompatibleStore::open(StoreBootstrap::new(
+            CacheLayout::new(temp.path().join("gluon")),
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "account-1",
+                "user-1",
+                GluonKey::try_from_slice(&[11u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store");
+
+        let mailbox = store
+            .create_mailbox(
+                "user-1",
+                &NewMailbox {
+                    remote_id: "0".to_string(),
+                    name: "INBOX".to_string(),
+                    uid_validity: 6001,
+                    subscribed: true,
+                    attributes: vec![],
+                    flags: vec![],
+                    permanent_flags: vec![],
+                },
+            )
+            .expect("create mailbox");
+
+        let conn = store.open_connection_rw("user-1").expect("open conn rw");
+        let messages = vec![
+            NewMessage {
+                internal_id: "batch-1".to_string(),
+                remote_id: "r-1".to_string(),
+                flags: vec!["\\Seen".to_string()],
+                blob: b"body-1".to_vec(),
+                body: String::new(),
+                body_structure: String::new(),
+                envelope: String::new(),
+                size: 6,
+                recent: false,
+            },
+            NewMessage {
+                internal_id: "batch-2".to_string(),
+                remote_id: "r-2".to_string(),
+                flags: vec![],
+                blob: b"body-2".to_vec(),
+                body: String::new(),
+                body_structure: String::new(),
+                envelope: String::new(),
+                size: 6,
+                recent: false,
+            },
+        ];
+
+        let summaries = store
+            .batch_append_messages("user-1", &conn, mailbox.internal_id, &messages)
+            .expect("batch append");
+        assert_eq!(summaries.len(), 2);
+
+        store
+            .batch_set_message_flags_on_conn(
+                &conn,
+                &[
+                    ("batch-1", &["\\Flagged".to_string()]),
+                    ("batch-2", &["\\Seen".to_string(), "\\Answered".to_string()]),
+                ],
+            )
+            .expect("batch set flags");
+        drop(conn);
+
+        let snapshot = store
+            .mailbox_snapshot("user-1", mailbox.internal_id)
+            .expect("snapshot");
+        assert_eq!(snapshot.message_count, 2);
+        assert_eq!(
+            snapshot.messages[0].summary.flags,
+            vec!["\\Flagged".to_string()]
+        );
+        assert_eq!(
+            snapshot.messages[1].summary.flags,
+            vec!["\\Answered".to_string(), "\\Seen".to_string()]
         );
     }
 }

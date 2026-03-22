@@ -289,6 +289,142 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
     async fn uid_to_seq(&self, mailbox: &str, uid: u32) -> Result<Option<u32>> {
         self.view.uid_to_seq(mailbox, uid).await
     }
+
+    async fn batch_store_metadata(
+        &self,
+        mailbox: &str,
+        entries: &[(&str, MessageMetadata)],
+    ) -> Result<Vec<u32>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let (account_id, mailbox_name) = Self::scoped_mailbox_parts(mailbox);
+        let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
+        let mailbox_state = match self.mailbox_by_name(&storage_user_id, mailbox_name)? {
+            Some(m) => m,
+            None => {
+                return self.default_batch_store_metadata(mailbox, entries).await;
+            }
+        };
+
+        let conn = self
+            .store
+            .open_connection_rw(&storage_user_id)
+            .map_err(map_mail_error)?;
+
+        let remote_ids: Vec<&str> = entries.iter().map(|(pid, _)| *pid).collect();
+
+        let existing_uids = self
+            .store
+            .batch_find_uids_by_remote_id(&conn, mailbox_state.internal_id, &remote_ids)
+            .map_err(map_mail_error)?;
+
+        let known_internal_ids = self
+            .store
+            .batch_find_internal_ids_by_remote_id(&conn, &remote_ids)
+            .map_err(map_mail_error)?;
+
+        let mut uids = Vec::with_capacity(entries.len());
+        let mut flag_updates: Vec<(String, Vec<String>)> = Vec::new();
+        let mut add_to_mailbox: Vec<(String, Vec<String>)> = Vec::new();
+        let mut new_messages: Vec<NewMessage> = Vec::new();
+
+        for (proton_id, meta) in entries {
+            if let Some(&uid) = existing_uids.get(*proton_id) {
+                let flags: Vec<String> = mailbox::message_flags(meta)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                if let Some(internal_id) = known_internal_ids.get(*proton_id) {
+                    flag_updates.push((internal_id.clone(), flags));
+                }
+                uids.push(uid);
+            } else if let Some(internal_id) = known_internal_ids.get(*proton_id) {
+                let flags: Vec<String> = mailbox::message_flags(meta)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                add_to_mailbox.push((internal_id.clone(), flags));
+                uids.push(0);
+            } else {
+                new_messages.push(self.placeholder_message(proton_id, meta));
+                uids.push(0);
+            }
+        }
+
+        if !flag_updates.is_empty() {
+            let flag_refs: Vec<(&str, &[String])> = flag_updates
+                .iter()
+                .map(|(id, flags)| (id.as_str(), flags.as_slice()))
+                .collect();
+            self.store
+                .batch_set_message_flags_on_conn(&conn, &flag_refs)
+                .map_err(map_mail_error)?;
+        }
+
+        if !add_to_mailbox.is_empty() {
+            let ids: Vec<&str> = add_to_mailbox.iter().map(|(id, _)| id.as_str()).collect();
+            self.store
+                .batch_add_existing_messages_to_mailbox(&conn, mailbox_state.internal_id, &ids)
+                .map_err(map_mail_error)?;
+
+            let flag_refs: Vec<(&str, &[String])> = add_to_mailbox
+                .iter()
+                .map(|(id, flags)| (id.as_str(), flags.as_slice()))
+                .collect();
+            self.store
+                .batch_set_message_flags_on_conn(&conn, &flag_refs)
+                .map_err(map_mail_error)?;
+        }
+
+        if !new_messages.is_empty() {
+            self.store
+                .batch_append_messages(
+                    &storage_user_id,
+                    &conn,
+                    mailbox_state.internal_id,
+                    &new_messages,
+                )
+                .map_err(map_mail_error)?;
+        }
+
+        drop(conn);
+
+        let snapshot_messages = self
+            .store
+            .list_upstream_mailbox_messages(&storage_user_id, mailbox_state.internal_id)
+            .map_err(map_mail_error)?;
+        let uid_by_remote: std::collections::HashMap<&str, u32> = snapshot_messages
+            .iter()
+            .map(|m| (m.remote_id.as_str(), m.uid))
+            .collect();
+
+        for (i, (proton_id, _)) in entries.iter().enumerate() {
+            if uids[i] == 0 {
+                uids[i] = uid_by_remote.get(proton_id).copied().unwrap_or(0);
+            }
+        }
+
+        Ok(uids)
+    }
+}
+
+impl GluonMailMailboxMutation {
+    async fn default_batch_store_metadata(
+        &self,
+        mailbox: &str,
+        entries: &[(&str, MessageMetadata)],
+    ) -> Result<Vec<u32>> {
+        let mut uids = Vec::with_capacity(entries.len());
+        for (proton_id, meta) in entries {
+            uids.push(
+                self.store_metadata(mailbox, proton_id, meta.clone())
+                    .await?,
+            );
+        }
+        Ok(uids)
+    }
 }
 
 fn current_uid_validity() -> u32 {

@@ -132,11 +132,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{change_set_from_gluon_update, JmapDataType, JmapStateTracker};
-    use crate::api::types::{EmailAddress, MessageMetadata};
     use crate::imap::gluon_connector::{
-        GluonImapConnector, GluonMailbox, GluonMessageRef, GluonUpdate, StoreBackedConnector,
+        GluonImapConnector, GluonMailConnector, GluonMailbox, GluonMessageRef, GluonUpdate,
     };
-    use crate::imap::store::InMemoryStore;
+    use gluon_rs_mail::{
+        AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey,
+        StoreBootstrap,
+    };
+    use tempfile::TempDir;
 
     #[test]
     fn maps_gluon_updates_into_jmap_change_sets() {
@@ -203,10 +206,27 @@ mod tests {
         .is_none());
     }
 
+    fn test_gluon_connector() -> (Arc<dyn GluonImapConnector>, TempDir) {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layout = CacheLayout::new(tempdir.path().join("gluon"));
+        let gluon_store = Arc::new(
+            CompatibleStore::open(StoreBootstrap::new(
+                layout,
+                CompatibilityTarget::pinned("2046c95ca745"),
+                vec![AccountBootstrap::new(
+                    "uid-1",
+                    "uid-1",
+                    GluonKey::try_from_slice(&[7u8; 32]).expect("key"),
+                )],
+            ))
+            .expect("open store"),
+        );
+        (GluonMailConnector::new(gluon_store), tempdir)
+    }
+
     #[tokio::test]
     async fn connector_subscription_applies_updates_to_jmap_tracker() {
-        let store = InMemoryStore::new();
-        let connector = StoreBackedConnector::new(store.clone());
+        let (connector, _tempdir) = test_gluon_connector();
         let tracker = Arc::new(JmapStateTracker::new());
         let _task = tracker
             .clone()
@@ -217,13 +237,13 @@ mod tests {
             .upsert_metadata(
                 "uid-1::Labels/Projects",
                 "msg-1",
-                MessageMetadata {
+                crate::api::types::MessageMetadata {
                     id: "msg-1".to_string(),
                     address_id: "addr-1".to_string(),
                     external_id: None,
                     label_ids: vec!["label-1".to_string()],
                     subject: "hello".to_string(),
-                    sender: EmailAddress {
+                    sender: crate::api::types::EmailAddress {
                         name: "Alice".to_string(),
                         address: "alice@example.com".to_string(),
                     },

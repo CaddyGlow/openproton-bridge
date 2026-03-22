@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
+use gluon_rs_mail::{
+    AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, StoreBootstrap,
+};
 use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
 use openproton_bridge::bridge::auth_router::AuthRouter;
-use openproton_bridge::imap::gluon_connector::StoreBackedConnector;
+use openproton_bridge::imap::gluon_connector::GluonMailConnector;
+use openproton_bridge::imap::gluon_mailbox_mutation::GluonMailMailboxMutation;
+use openproton_bridge::imap::gluon_mailbox_view::GluonMailMailboxView;
 use openproton_bridge::imap::mailbox_catalog::RuntimeMailboxCatalog;
-use openproton_bridge::imap::mailbox_mutation::StoreBackedMailboxMutation;
-use openproton_bridge::imap::mailbox_view::StoreBackedMailboxView;
 use openproton_bridge::imap::server::{run_server_with_tls_config as run_imap_server, ImapServer};
 use openproton_bridge::imap::session::SessionConfig;
-use openproton_bridge::imap::store::InMemoryStore;
 use openproton_bridge::smtp::server::{run_server_with_tls_config as run_smtp_server, SmtpServer};
 use openproton_bridge::smtp::session::SmtpSessionConfig;
+use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsConnector;
@@ -32,20 +35,36 @@ fn test_session() -> Session {
     }
 }
 
-fn test_imap_config() -> Arc<SessionConfig> {
+fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
     let session = test_session();
     let accounts = AccountRegistry::from_single_session(session.clone());
-    let store = InMemoryStore::new();
     let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
-    Arc::new(SessionConfig {
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let layout = CacheLayout::new(tempdir.path().join("gluon"));
+    let gluon_store = Arc::new(
+        CompatibleStore::open(StoreBootstrap::new(
+            layout,
+            CompatibilityTarget::pinned("2046c95ca745"),
+            vec![AccountBootstrap::new(
+                "test-uid",
+                "test-uid",
+                GluonKey::try_from_slice(&[7u8; 32]).expect("key"),
+            )],
+        ))
+        .expect("open store"),
+    );
+
+    let config = Arc::new(SessionConfig {
         api_base_url: "https://mail-api.proton.me".to_string(),
         auth_router: AuthRouter::new(accounts),
         runtime_accounts: runtime_accounts.clone(),
-        gluon_connector: StoreBackedConnector::new(store.clone()),
+        gluon_connector: GluonMailConnector::new(gluon_store.clone()),
         mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
-        mailbox_mutation: StoreBackedMailboxMutation::new(store.clone()),
-        mailbox_view: StoreBackedMailboxView::new(store.clone()),
-    })
+        mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
+        mailbox_view: GluonMailMailboxView::new(gluon_store),
+    });
+    (config, tempdir)
 }
 
 fn test_smtp_config() -> Arc<SmtpSessionConfig> {
@@ -118,7 +137,7 @@ async fn imap_starttls_upgrade_and_capability_reflects_tls_state() {
 
     let port = find_available_port().await;
     let addr = format!("127.0.0.1:{port}");
-    let config = test_imap_config();
+    let (config, _gluon_dir) = test_imap_config();
     let addr_clone = addr.clone();
     let server_handle = tokio::spawn(async move {
         let _ = run_imap_server(&addr_clone, config, tls_config).await;
@@ -331,7 +350,7 @@ async fn capabilities_without_tls_do_not_advertise_starttls() {
     let smtp_addr = format!("127.0.0.1:{smtp_port}");
 
     let imap_handle = {
-        let config = test_imap_config();
+        let (config, _gluon_dir) = test_imap_config();
         let addr = imap_addr.clone();
         tokio::spawn(async move {
             let _ = run_imap_server(&addr, config, None).await;

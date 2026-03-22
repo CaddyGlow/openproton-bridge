@@ -2840,6 +2840,8 @@ mod tests {
     async fn configure_user_apple_mail_enables_smtp_ssl_and_emits_settings_changed() {
         let dir = tempfile::tempdir().unwrap();
         let service = build_test_service(dir.path().to_path_buf());
+        // Start with use_ssl_for_smtp=false so the RPC actually toggles it and emits an event.
+        service.state.mail_settings.lock().await.use_ssl_for_smtp = false;
         let mut events = service.state.event_tx.subscribe();
         let session = Session {
             uid: "uid-apple-mail-2".to_string(),

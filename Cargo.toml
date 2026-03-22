@@ -83,6 +83,38 @@ lettre = { version = "0.11", default-features = false, features = ["builder", "s
 tonic-build = "0.12"
 protoc-bin-vendored = "3"
 
+# Compile crypto dependencies with optimizations even in dev/test to avoid
+# 30+ second S2K key derivation per test cert (pure-Rust backend is unusable
+# without opt-level >= 2).
+[profile.dev.package.sequoia-openpgp]
+opt-level = 2
+[profile.dev.package.idea]
+opt-level = 2
+[profile.dev.package.des]
+opt-level = 2
+[profile.dev.package.cast5]
+opt-level = 2
+[profile.dev.package.aes]
+opt-level = 2
+[profile.dev.package.sha2]
+opt-level = 2
+[profile.dev.package.sha1]
+opt-level = 2
+[profile.dev.package.md-5]
+opt-level = 2
+[profile.dev.package.rsa]
+opt-level = 2
+[profile.dev.package.ed25519-dalek]
+opt-level = 2
+[profile.dev.package.curve25519-dalek]
+opt-level = 2
+[profile.dev.package.x25519-dalek]
+opt-level = 2
+[profile.dev.package.num-bigint-dig]
+opt-level = 2
+[profile.dev.package.bcrypt]
+opt-level = 2
+
 [workspace]
 members = [
     "crates/gluon-rs-core",

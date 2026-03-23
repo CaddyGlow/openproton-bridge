@@ -96,7 +96,6 @@ impl ImapConnector for StubConnector {
 
 fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
     let session = test_session();
-    let accounts = AccountRegistry::from_single_session(session.clone());
     let runtime_accounts = Arc::new(RuntimeAccountRegistry::in_memory(vec![session]));
 
     let tempdir = tempfile::tempdir().expect("tempdir");
@@ -115,9 +114,6 @@ fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
     );
 
     let config = Arc::new(SessionConfig {
-        api_base_url: "https://mail-api.proton.me".to_string(),
-        auth_router: AuthRouter::new(accounts),
-        runtime_accounts: runtime_accounts.clone(),
         connector: Arc::new(StubConnector),
         gluon_connector: GluonMailConnector::new(gluon_store.clone()),
         mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),

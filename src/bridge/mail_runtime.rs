@@ -559,9 +559,6 @@ async fn prepare_runtime_context(
         runtime_accounts.clone(),
     );
     let imap_config = Arc::new(imap::session::SessionConfig {
-        api_base_url: api_base_url.clone(),
-        auth_router: auth_router.clone(),
-        runtime_accounts: runtime_accounts.clone(),
         connector,
         gluon_connector,
         mailbox_catalog,

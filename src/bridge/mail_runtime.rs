@@ -553,10 +553,16 @@ async fn prepare_runtime_context(
         pim_stores.insert(account.account_id.clone(), Arc::new(pim_store));
     }
 
+    let connector = super::imap_connector::ProtonImapConnector::new(
+        api_base_url.clone(),
+        auth_router.clone(),
+        runtime_accounts.clone(),
+    );
     let imap_config = Arc::new(imap::session::SessionConfig {
         api_base_url: api_base_url.clone(),
         auth_router: auth_router.clone(),
         runtime_accounts: runtime_accounts.clone(),
+        connector,
         gluon_connector,
         mailbox_catalog,
         mailbox_mutation,

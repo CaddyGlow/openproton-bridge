@@ -3,6 +3,7 @@ use std::sync::Arc;
 use gluon_rs_mail::{
     AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, StoreBootstrap,
 };
+use gluon_rs_mail::{AuthResult, ImapConnector, ImapResult, MailboxInfo, MetadataPage};
 use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
 use openproton_bridge::bridge::auth_router::AuthRouter;
@@ -35,6 +36,64 @@ fn test_session() -> Session {
     }
 }
 
+struct StubConnector;
+
+#[async_trait::async_trait]
+impl ImapConnector for StubConnector {
+    async fn authorize(&self, _u: &str, _p: &str) -> ImapResult<AuthResult> {
+        Ok(AuthResult {
+            account_id: "test-uid".into(),
+            primary_email: "test@proton.me".into(),
+            mailboxes: vec![],
+        })
+    }
+    async fn get_message_literal(&self, _a: &str, _m: &str) -> ImapResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    async fn mark_messages_read(&self, _a: &str, _i: &[&str], _r: bool) -> ImapResult<()> {
+        Ok(())
+    }
+    async fn mark_messages_starred(&self, _a: &str, _i: &[&str], _s: bool) -> ImapResult<()> {
+        Ok(())
+    }
+    async fn label_messages(&self, _a: &str, _i: &[&str], _l: &str) -> ImapResult<()> {
+        Ok(())
+    }
+    async fn unlabel_messages(&self, _a: &str, _i: &[&str], _l: &str) -> ImapResult<()> {
+        Ok(())
+    }
+    async fn trash_messages(&self, _a: &str, _i: &[&str]) -> ImapResult<()> {
+        Ok(())
+    }
+    async fn delete_messages(&self, _a: &str, _i: &[&str]) -> ImapResult<()> {
+        Ok(())
+    }
+    async fn import_message(
+        &self,
+        _a: &str,
+        _l: &str,
+        _f: i64,
+        _d: &[u8],
+    ) -> ImapResult<Option<String>> {
+        Ok(None)
+    }
+    async fn fetch_message_metadata_page(
+        &self,
+        _a: &str,
+        _l: &str,
+        _p: i32,
+        _s: i32,
+    ) -> ImapResult<MetadataPage> {
+        Ok(MetadataPage {
+            messages: vec![],
+            total: 0,
+        })
+    }
+    async fn fetch_user_labels(&self, _a: &str) -> ImapResult<Vec<MailboxInfo>> {
+        Ok(vec![])
+    }
+}
+
 fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
     let session = test_session();
     let accounts = AccountRegistry::from_single_session(session.clone());
@@ -59,6 +118,7 @@ fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
         api_base_url: "https://mail-api.proton.me".to_string(),
         auth_router: AuthRouter::new(accounts),
         runtime_accounts: runtime_accounts.clone(),
+        connector: Arc::new(StubConnector),
         gluon_connector: GluonMailConnector::new(gluon_store.clone()),
         mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
         mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::imap_error::ImapResult as Result;
-use crate::imap_types::{EmailAddress, MailboxInfo, MessageEnvelope};
+use crate::imap_types::{MailboxInfo, MessageEnvelope};
 
 /// Result of a successful IMAP LOGIN.
 pub struct AuthResult {
@@ -61,18 +61,10 @@ pub trait ImapConnector: Send + Sync {
     ) -> Result<()>;
 
     /// Move messages to trash.
-    async fn trash_messages(
-        &self,
-        account_id: &str,
-        message_ids: &[&str],
-    ) -> Result<()>;
+    async fn trash_messages(&self, account_id: &str, message_ids: &[&str]) -> Result<()>;
 
     /// Permanently delete messages.
-    async fn delete_messages(
-        &self,
-        account_id: &str,
-        message_ids: &[&str],
-    ) -> Result<()>;
+    async fn delete_messages(&self, account_id: &str, message_ids: &[&str]) -> Result<()>;
 
     /// Encrypt and import a message upstream (APPEND).
     /// Returns the Proton message ID on success.

@@ -2,6 +2,7 @@ pub mod accounts;
 pub mod auth_router;
 pub mod calendar_notify;
 pub mod events;
+pub mod imap_connector;
 pub mod mail_runtime;
 pub mod runtime_supervisor;
 pub mod session_manager;

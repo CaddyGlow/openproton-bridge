@@ -6,7 +6,7 @@ use gluon_rs_mail::{
 };
 use mailparse::{addrparse, dateparse, DispositionType, MailAddr, MailHeaderMap, ParsedMail};
 
-use crate::api::types::{EmailAddress, MessageMetadata};
+use gluon_rs_mail::{EmailAddress, MessageEnvelope};
 
 use super::mailbox;
 use super::mailbox_view::GluonMailboxView;
@@ -79,7 +79,7 @@ impl GluonMailMailboxView {
         &self,
         mailbox: &ScopedMailboxId,
         message: &UpstreamMailboxMessage,
-    ) -> MessageMetadata {
+    ) -> MessageEnvelope {
         let (account_id, _) = Self::resolve_parts(mailbox);
         let parsed = self
             .store
@@ -100,7 +100,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         &self,
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
-    ) -> Result<Option<MessageMetadata>> {
+    ) -> Result<Option<MessageEnvelope>> {
         let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
             return Ok(None);
         };
@@ -253,6 +253,70 @@ impl GluonMailboxView for GluonMailMailboxView {
             .position(|message| message.summary.uid == uid.value())
             .map(|index| index as u32 + 1))
     }
+
+    async fn select_mailbox_data(
+        &self,
+        mailbox: &ScopedMailboxId,
+    ) -> Result<super::store::SelectMailboxData> {
+        let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
+            return Ok(super::store::SelectMailboxData {
+                status: MailboxStatus {
+                    uid_validity: 1,
+                    next_uid: 1,
+                    exists: 0,
+                    unseen: 0,
+                },
+                snapshot: super::store::MailboxSnapshot {
+                    exists: 0,
+                    mod_seq: 0,
+                },
+                uids: Vec::new(),
+                flags: std::collections::HashMap::new(),
+                first_unseen_seq: None,
+            });
+        };
+
+        let unseen = snapshot
+            .messages
+            .iter()
+            .filter(|m| !has_seen_flag(&m.summary.flags))
+            .count() as u32;
+
+        let status = MailboxStatus {
+            uid_validity: snapshot.mailbox.uid_validity,
+            next_uid: snapshot.next_uid,
+            exists: snapshot.message_count as u32,
+            unseen,
+        };
+
+        let mod_seq = computed_mod_seq(&snapshot);
+        let mb_snapshot = super::store::MailboxSnapshot {
+            exists: snapshot.message_count as u32,
+            mod_seq,
+        };
+
+        let mut uids = Vec::with_capacity(snapshot.messages.len());
+        let mut flags = std::collections::HashMap::with_capacity(snapshot.messages.len());
+        let mut first_unseen_seq = None;
+
+        for (index, message) in snapshot.messages.iter().enumerate() {
+            let uid = ImapUid::from(message.summary.uid);
+            uids.push(uid);
+            let msg_flags = message.summary.flags.clone();
+            if first_unseen_seq.is_none() && !has_seen_flag(&msg_flags) {
+                first_unseen_seq = Some(index as u32 + 1);
+            }
+            flags.insert(uid, msg_flags);
+        }
+
+        Ok(super::store::SelectMailboxData {
+            status,
+            snapshot: mb_snapshot,
+            uids,
+            flags,
+            first_unseen_seq,
+        })
+    }
 }
 
 fn map_mail_error(err: gluon_rs_mail::GluonError) -> ImapError {
@@ -283,7 +347,7 @@ fn parse_metadata_from_rfc822(
     mailbox: &ScopedMailboxId,
     summary: &gluon_rs_mail::UpstreamMessageSummary,
     data: &[u8],
-) -> Option<MessageMetadata> {
+) -> Option<MessageEnvelope> {
     let parsed = mailparse::parse_mail(data).ok()?;
     let header = parsed.get_headers();
     let label_id = mailbox_label_id(mailbox, &summary.remote_id);
@@ -293,7 +357,7 @@ fn parse_metadata_from_rfc822(
         .and_then(|value| dateparse(value).ok())
         .unwrap_or(0);
 
-    Some(MessageMetadata {
+    Some(MessageEnvelope {
         id: summary.remote_id.clone(),
         address_id: String::new(),
         label_ids: vec![label_id],
@@ -318,8 +382,8 @@ fn parse_metadata_from_rfc822(
 fn fallback_metadata(
     mailbox: &ScopedMailboxId,
     message: &UpstreamMailboxMessage,
-) -> MessageMetadata {
-    MessageMetadata {
+) -> MessageEnvelope {
+    MessageEnvelope {
         id: message.summary.remote_id.clone(),
         address_id: String::new(),
         label_ids: vec![mailbox_label_id(mailbox, &message.summary.remote_id)],
@@ -416,10 +480,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::GluonMailMailboxView;
-    use crate::api::types::{EmailAddress, MessageMetadata};
     use crate::imap::mailbox_view::GluonMailboxView;
     use crate::imap::rfc822;
     use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
+    use gluon_rs_mail::{EmailAddress, MessageEnvelope};
 
     fn open_store() -> Arc<CompatibleStore> {
         let temp = tempdir().expect("tempdir");
@@ -451,8 +515,8 @@ mod tests {
         }
     }
 
-    fn metadata() -> MessageMetadata {
-        MessageMetadata {
+    fn metadata() -> MessageEnvelope {
+        MessageEnvelope {
             id: "msg-1".to_string(),
             address_id: "addr-1".to_string(),
             label_ids: vec!["0".to_string()],
@@ -480,7 +544,7 @@ mod tests {
         }
     }
 
-    fn message_with_blob(meta: &MessageMetadata, blob: Vec<u8>) -> NewMessage {
+    fn message_with_blob(meta: &MessageEnvelope, blob: Vec<u8>) -> NewMessage {
         let header = String::from_utf8_lossy(&blob)
             .split("\r\n\r\n")
             .next()

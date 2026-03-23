@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
-use crate::api::types::MessageMetadata;
+use gluon_rs_mail::MessageEnvelope;
 
-use super::store::{MailboxSnapshot, MailboxStatus};
+use super::store::{MailboxSnapshot, MailboxStatus, SelectMailboxData};
 use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::Result;
 
@@ -12,7 +12,7 @@ pub trait GluonMailboxView: Send + Sync {
         &self,
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
-    ) -> Result<Option<MessageMetadata>>;
+    ) -> Result<Option<MessageEnvelope>>;
     async fn get_proton_id(
         &self,
         mailbox: &ScopedMailboxId,
@@ -30,4 +30,5 @@ pub trait GluonMailboxView: Send + Sync {
     async fn get_flags(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Vec<String>>;
     async fn seq_to_uid(&self, mailbox: &ScopedMailboxId, seq: u32) -> Result<Option<ImapUid>>;
     async fn uid_to_seq(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<u32>>;
+    async fn select_mailbox_data(&self, mailbox: &ScopedMailboxId) -> Result<SelectMailboxData>;
 }

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use crate::api::types::MessageMetadata;
+use gluon_rs_mail::MessageEnvelope;
 
 use super::store::MailboxStatus;
 use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
@@ -12,7 +12,7 @@ pub trait GluonMailboxMutation: Send + Sync {
         &self,
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
-    ) -> Result<Option<MessageMetadata>>;
+    ) -> Result<Option<MessageEnvelope>>;
     async fn get_proton_id(
         &self,
         mailbox: &ScopedMailboxId,
@@ -22,7 +22,7 @@ pub trait GluonMailboxMutation: Send + Sync {
         &self,
         mailbox: &ScopedMailboxId,
         proton_id: &ProtonMessageId,
-        meta: MessageMetadata,
+        meta: MessageEnvelope,
     ) -> Result<ImapUid>;
     async fn store_rfc822(
         &self,
@@ -57,7 +57,7 @@ pub trait GluonMailboxMutation: Send + Sync {
     async fn batch_store_metadata(
         &self,
         mailbox: &ScopedMailboxId,
-        entries: &[(&ProtonMessageId, crate::api::types::MessageMetadata)],
+        entries: &[(&ProtonMessageId, MessageEnvelope)],
     ) -> Result<Vec<ImapUid>> {
         let mut uids = Vec::with_capacity(entries.len());
         for (proton_id, meta) in entries {

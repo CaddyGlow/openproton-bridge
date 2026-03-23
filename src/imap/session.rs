@@ -1061,7 +1061,7 @@ where
                         .store_metadata(
                             &scoped_mailbox,
                             &ProtonMessageId::from(meta.id.as_str()),
-                            meta.clone(),
+                            super::convert::to_envelope(meta.clone()),
                         )
                         .await?;
                 }
@@ -1084,31 +1084,14 @@ where
             );
         }
 
-        let status = mutation.mailbox_status(&scoped_mailbox).await?;
-        let snapshot = self
+        let select_data = self
             .config
             .mailbox_view
-            .mailbox_snapshot(&scoped_mailbox)
+            .select_mailbox_data(&scoped_mailbox)
             .await?;
-        let selected_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
-        let first_unseen_seq = {
-            let mut first = None;
-            for (index, uid) in selected_uids.iter().enumerate() {
-                let flags = self
-                    .config
-                    .mailbox_view
-                    .get_flags(&scoped_mailbox, *uid)
-                    .await?;
-                if !flags.iter().any(|flag| flag == "\\Seen") {
-                    first = Some(index as u32 + 1);
-                    break;
-                }
-            }
-            first
-        };
 
         self.writer
-            .untagged(&format!("{} EXISTS", status.exists))
+            .untagged(&format!("{} EXISTS", select_data.status.exists))
             .await?;
         self.writer.untagged("0 RECENT").await?;
         self.writer
@@ -1118,30 +1101,24 @@ where
             .untagged("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]")
             .await?;
         self.writer
-            .untagged(&format!("OK [UIDVALIDITY {}]", status.uid_validity))
+            .untagged(&format!(
+                "OK [UIDVALIDITY {}]",
+                select_data.status.uid_validity
+            ))
             .await?;
         self.writer
-            .untagged(&format!("OK [UIDNEXT {}]", status.next_uid))
+            .untagged(&format!("OK [UIDNEXT {}]", select_data.status.next_uid))
             .await?;
-        if let Some(first_unseen_seq) = first_unseen_seq {
+        if let Some(first_unseen_seq) = select_data.first_unseen_seq {
             self.writer
                 .untagged(&format!("OK [UNSEEN {}]", first_unseen_seq))
                 .await?;
         }
 
         self.selected_mailbox = Some(mb.name.to_string());
-        self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
-        self.selected_mailbox_uids = selected_uids.clone();
-        self.selected_mailbox_flags.clear();
-        for uid in &selected_uids {
-            self.selected_mailbox_flags.insert(
-                *uid,
-                self.config
-                    .mailbox_view
-                    .get_flags(&scoped_mailbox, *uid)
-                    .await?,
-            );
-        }
+        self.selected_mailbox_mod_seq = Some(select_data.snapshot.mod_seq);
+        self.selected_mailbox_uids = select_data.uids.clone();
+        self.selected_mailbox_flags = select_data.flags;
         self.selected_read_only = false;
         self.state = State::Selected;
 
@@ -1149,7 +1126,7 @@ where
             service = "imap",
             msg = "mailbox selected",
             mailbox = %mb.name,
-            messages = status.exists,
+            messages = select_data.status.exists,
             "mailbox selected"
         );
 
@@ -1300,7 +1277,7 @@ where
                         .store_metadata(
                             &scoped_mailbox,
                             &ProtonMessageId::from(meta.id.as_str()),
-                            meta.clone(),
+                            super::convert::to_envelope(meta.clone()),
                         )
                         .await?;
                 }
@@ -1314,61 +1291,38 @@ where
             }
         }
 
-        let status = mutation.mailbox_status(&scoped_mailbox).await?;
-        let snapshot = self
+        let select_data = self
             .config
             .mailbox_view
-            .mailbox_snapshot(&scoped_mailbox)
+            .select_mailbox_data(&scoped_mailbox)
             .await?;
-        let selected_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
-        let first_unseen_seq = {
-            let mut first = None;
-            for (index, uid) in selected_uids.iter().enumerate() {
-                let flags = self
-                    .config
-                    .mailbox_view
-                    .get_flags(&scoped_mailbox, *uid)
-                    .await?;
-                if !flags.iter().any(|flag| flag == "\\Seen") {
-                    first = Some(index as u32 + 1);
-                    break;
-                }
-            }
-            first
-        };
 
         self.writer
-            .untagged(&format!("{} EXISTS", status.exists))
+            .untagged(&format!("{} EXISTS", select_data.status.exists))
             .await?;
         self.writer.untagged("0 RECENT").await?;
         self.writer
             .untagged("FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
             .await?;
         self.writer
-            .untagged(&format!("OK [UIDVALIDITY {}]", status.uid_validity))
+            .untagged(&format!(
+                "OK [UIDVALIDITY {}]",
+                select_data.status.uid_validity
+            ))
             .await?;
         self.writer
-            .untagged(&format!("OK [UIDNEXT {}]", status.next_uid))
+            .untagged(&format!("OK [UIDNEXT {}]", select_data.status.next_uid))
             .await?;
-        if let Some(first_unseen_seq) = first_unseen_seq {
+        if let Some(first_unseen_seq) = select_data.first_unseen_seq {
             self.writer
                 .untagged(&format!("OK [UNSEEN {}]", first_unseen_seq))
                 .await?;
         }
 
         self.selected_mailbox = Some(mb.name.to_string());
-        self.selected_mailbox_mod_seq = Some(snapshot.mod_seq);
-        self.selected_mailbox_uids = selected_uids.clone();
-        self.selected_mailbox_flags.clear();
-        for uid in &selected_uids {
-            self.selected_mailbox_flags.insert(
-                *uid,
-                self.config
-                    .mailbox_view
-                    .get_flags(&scoped_mailbox, *uid)
-                    .await?,
-            );
-        }
+        self.selected_mailbox_mod_seq = Some(select_data.snapshot.mod_seq);
+        self.selected_mailbox_uids = select_data.uids.clone();
+        self.selected_mailbox_flags = select_data.flags;
         self.selected_read_only = true;
         self.state = State::Selected;
 
@@ -1376,7 +1330,7 @@ where
             service = "imap",
             msg = "mailbox examined (read-only)",
             mailbox = %mb.name,
-            messages = status.exists,
+            messages = select_data.status.exists,
             "mailbox examined (read-only)"
         );
 
@@ -2547,13 +2501,13 @@ where
             format!("local-append-{ts}")
         });
 
-        let meta = types::MessageMetadata {
+        let meta = gluon_rs_mail::MessageEnvelope {
             id: proton_id.clone(),
             address_id: String::new(),
             label_ids: vec![mb.label_id.clone()],
             external_id: None,
             subject,
-            sender: types::EmailAddress {
+            sender: gluon_rs_mail::EmailAddress {
                 name: String::new(),
                 address: from,
             },
@@ -2708,7 +2662,7 @@ fn expand_fetch_items(items: &[FetchItem]) -> Vec<FetchItem> {
 fn evaluate_search_key(
     key: &SearchKey,
     uid: ImapUid,
-    meta: &Option<types::MessageMetadata>,
+    meta: &Option<gluon_rs_mail::MessageEnvelope>,
     flags: &[String],
     max_uid: ImapUid,
     rfc822_data: Option<&[u8]>,
@@ -2972,7 +2926,7 @@ fn body_section_is_header_only(section: Option<&str>) -> bool {
     upper == "HEADER" || upper.starts_with("HEADER.FIELDS")
 }
 
-fn build_metadata_header_section(meta: &types::MessageMetadata) -> String {
+fn build_metadata_header_section(meta: &gluon_rs_mail::MessageEnvelope) -> String {
     let mut out = String::new();
 
     out.push_str("Date: ");
@@ -3018,7 +2972,7 @@ fn build_metadata_header_section(meta: &types::MessageMetadata) -> String {
     out
 }
 
-fn format_header_addresses(addrs: &[types::EmailAddress]) -> String {
+fn format_header_addresses(addrs: &[gluon_rs_mail::EmailAddress]) -> String {
     addrs
         .iter()
         .map(format_header_address)
@@ -3026,7 +2980,7 @@ fn format_header_addresses(addrs: &[types::EmailAddress]) -> String {
         .join(", ")
 }
 
-fn format_header_address(addr: &types::EmailAddress) -> String {
+fn format_header_address(addr: &gluon_rs_mail::EmailAddress) -> String {
     let address = sanitize_header_value(&addr.address);
     let name = sanitize_header_value(&addr.name);
     if name.trim().is_empty() {
@@ -3109,7 +3063,6 @@ fn extract_header_section(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::types::{EmailAddress, MessageMetadata};
     use crate::bridge::accounts::AccountHealth;
     use crate::bridge::accounts::{AccountRegistry, RuntimeAccountRegistry};
     use crate::bridge::auth_router::AuthRouter;
@@ -3123,6 +3076,7 @@ mod tests {
         AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, NewMailbox,
         NewMessage, StoreBootstrap,
     };
+    use gluon_rs_mail::{EmailAddress, MessageEnvelope};
     use tempfile::{tempdir, TempDir};
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3269,8 +3223,8 @@ mod tests {
         .unwrap()
     }
 
-    fn make_meta(id: &str, unread: i32) -> MessageMetadata {
-        MessageMetadata {
+    fn make_meta(id: &str, unread: i32) -> MessageEnvelope {
+        MessageEnvelope {
             id: id.to_string(),
             address_id: "addr-1".to_string(),
             label_ids: vec!["0".to_string()],
@@ -3298,10 +3252,12 @@ mod tests {
         }
     }
 
-    fn metadata_page_response(messages: Vec<MessageMetadata>, total: i64) -> serde_json::Value {
+    fn metadata_page_response(messages: Vec<MessageEnvelope>, total: i64) -> serde_json::Value {
+        let api_messages: Vec<crate::api::types::MessageMetadata> =
+            messages.into_iter().map(Into::into).collect();
         serde_json::json!({
             "Code": 1000,
-            "Messages": messages,
+            "Messages": api_messages,
             "Total": total
         })
     }

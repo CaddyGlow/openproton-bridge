@@ -7,7 +7,7 @@ use gluon_rs_mail::{
 };
 use uuid::Uuid;
 
-use crate::api::types::{EmailAddress, MessageMetadata};
+use gluon_rs_mail::{EmailAddress, MessageEnvelope};
 
 use super::gluon_mailbox_view::GluonMailMailboxView;
 use super::mailbox;
@@ -118,7 +118,7 @@ impl GluonMailMailboxMutation {
     fn placeholder_message(
         &self,
         proton_id: &ProtonMessageId,
-        meta: &MessageMetadata,
+        meta: &MessageEnvelope,
     ) -> NewMessage {
         let blob = metadata_blob(meta);
         let header = extract_header_section(&blob);
@@ -145,7 +145,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         &self,
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
-    ) -> Result<Option<MessageMetadata>> {
+    ) -> Result<Option<MessageEnvelope>> {
         self.view.get_metadata(mailbox, uid).await
     }
 
@@ -161,7 +161,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         &self,
         mailbox: &ScopedMailboxId,
         proton_id: &ProtonMessageId,
-        meta: MessageMetadata,
+        meta: MessageEnvelope,
     ) -> Result<ImapUid> {
         if let Some(uid) = self.view.get_uid(mailbox, proton_id).await? {
             self.set_flags(
@@ -319,7 +319,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
     async fn batch_store_metadata(
         &self,
         mailbox: &ScopedMailboxId,
-        entries: &[(&ProtonMessageId, MessageMetadata)],
+        entries: &[(&ProtonMessageId, MessageEnvelope)],
     ) -> Result<Vec<ImapUid>> {
         if entries.is_empty() {
             return Ok(Vec::new());
@@ -440,7 +440,7 @@ impl GluonMailMailboxMutation {
     async fn default_batch_store_metadata(
         &self,
         mailbox: &ScopedMailboxId,
-        entries: &[(&ProtonMessageId, MessageMetadata)],
+        entries: &[(&ProtonMessageId, MessageEnvelope)],
     ) -> Result<Vec<ImapUid>> {
         let mut uids = Vec::with_capacity(entries.len());
         for (proton_id, meta) in entries {
@@ -460,7 +460,7 @@ fn current_uid_validity() -> u32 {
         .as_secs() as u32
 }
 
-fn metadata_blob(meta: &MessageMetadata) -> Vec<u8> {
+fn metadata_blob(meta: &MessageEnvelope) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("From: ");
     out.push_str(&format_header_address(&meta.sender));
@@ -518,8 +518,8 @@ fn extract_text_section(data: &[u8]) -> Vec<u8> {
     }
 }
 
-fn fallback_metadata(proton_id: &str) -> MessageMetadata {
-    MessageMetadata {
+fn fallback_metadata(proton_id: &str) -> MessageEnvelope {
+    MessageEnvelope {
         id: proton_id.to_string(),
         address_id: "addr-1".to_string(),
         label_ids: vec!["0".to_string()],
@@ -558,9 +558,9 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::GluonMailMailboxMutation;
-    use crate::api::types::{EmailAddress, MessageMetadata};
     use crate::imap::mailbox_mutation::GluonMailboxMutation;
     use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
+    use gluon_rs_mail::{EmailAddress, MessageEnvelope};
 
     struct TestFixture {
         _tempdir: TempDir,
@@ -604,8 +604,8 @@ mod tests {
             .expect("create mailbox");
     }
 
-    fn metadata() -> MessageMetadata {
-        MessageMetadata {
+    fn metadata() -> MessageEnvelope {
+        MessageEnvelope {
             id: "msg-1".to_string(),
             address_id: "addr-1".to_string(),
             label_ids: vec!["0".to_string()],

@@ -21,8 +21,10 @@ use crate::api::types::{
 };
 use crate::api::users;
 use crate::bridge::auth_router::AuthRouter;
+use crate::bridge::calendar_notify::SharedCalendarChangeNotifier;
 use crate::bridge::sync_state;
 use crate::crypto::keys::{self, Keyring};
+use crate::imap::convert::to_envelope;
 use crate::imap::gluon_connector::GluonImapConnector;
 use crate::imap::mailbox;
 use crate::imap::mailbox_view::GluonMailboxView;
@@ -31,6 +33,7 @@ use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use crate::pim::incremental as pim_incremental;
 use crate::pim::store::PimStore;
 use crate::vault;
+use gluon_rs_mail::MessageEnvelope;
 
 use super::accounts::{
     AccountHealth, AccountRuntimeError, RuntimeAccountInfo, RuntimeAccountRegistry,
@@ -404,6 +407,7 @@ pub struct EventWorkerConfig {
     pub checkpoint_store: SharedCheckpointStore,
     pub sync_progress_callback: Option<SyncProgressCallback>,
     pub settings_dir: Option<PathBuf>,
+    pub calendar_notifier: Option<SharedCalendarChangeNotifier>,
 }
 
 impl EventWorkerConfig {
@@ -430,6 +434,7 @@ impl EventWorkerConfig {
             checkpoint_store,
             sync_progress_callback: None,
             settings_dir: None,
+            calendar_notifier: None,
         }
     }
 
@@ -445,6 +450,11 @@ impl EventWorkerConfig {
 
     pub fn with_settings_dir(mut self, dir: PathBuf) -> Self {
         self.settings_dir = Some(dir);
+        self
+    }
+
+    pub fn with_calendar_notifier(mut self, notifier: SharedCalendarChangeNotifier) -> Self {
+        self.calendar_notifier = Some(notifier);
         self
     }
 }
@@ -484,7 +494,7 @@ fn format_ids_for_update(ids: &[String]) -> String {
     ids.join(" ")
 }
 
-fn format_flags_for_update(metadata: &MessageMetadata) -> String {
+fn format_flags_for_update(metadata: &MessageEnvelope) -> String {
     mailbox::message_flags(metadata).join(" ")
 }
 
@@ -887,7 +897,8 @@ async fn apply_message_upsert(
     expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
     let already_present = message_exists_in_store(config, message_id, expected_generation).await?;
-    let metadata = fetch_message_metadata_with_retry(config, session, client, message_id).await?;
+    let metadata =
+        to_envelope(fetch_message_metadata_with_retry(config, session, client, message_id).await?);
     let subject = redacted_subject_for_log(&metadata.subject);
     let mailbox_ids = format_ids_for_update(&metadata.label_ids);
     let flags = format_flags_for_update(&metadata);
@@ -938,7 +949,7 @@ async fn apply_message_upsert(
 
 async fn apply_metadata_to_store(
     config: &EventWorkerConfig,
-    metadata: &MessageMetadata,
+    metadata: &MessageEnvelope,
     expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
     let label_ids: HashSet<&str> = metadata.label_ids.iter().map(String::as_str).collect();
@@ -996,7 +1007,7 @@ async fn apply_metadata_to_store(
 /// Returns the UIDs assigned to each message in the target `scoped_mailbox`.
 async fn batch_apply_metadata_to_store(
     config: &EventWorkerConfig,
-    messages: &[MessageMetadata],
+    messages: &[MessageEnvelope],
     scoped_mailbox: &ScopedMailboxId,
     target_label_id: &str,
     expected_generation: u64,
@@ -1008,7 +1019,7 @@ async fn batch_apply_metadata_to_store(
         .iter()
         .map(|m| ProtonMessageId::from(m.id.as_str()))
         .collect();
-    let mut batch_entries: Vec<(&ProtonMessageId, MessageMetadata)> = Vec::new();
+    let mut batch_entries: Vec<(&ProtonMessageId, MessageEnvelope)> = Vec::new();
     let mut remove_ids: Vec<usize> = Vec::new();
 
     for (i, metadata) in messages.iter().enumerate() {
@@ -1223,6 +1234,29 @@ async fn bounded_resync_account_for_generation(
     client: &mut ProtonClient,
     expected_generation: u64,
 ) -> Result<(), EventWorkerError> {
+    bounded_resync_account_inner(config, session, client, expected_generation, false).await
+}
+
+/// Like [`bounded_resync_account_for_generation`] but forces a full message
+/// re-sync even when the sync state is already marked complete. Used after
+/// cursor expiration or Proton refresh flags where the event stream has a gap
+/// that cannot be filled incrementally.
+async fn bounded_resync_account_force(
+    config: &EventWorkerConfig,
+    session: &mut Session,
+    client: &mut ProtonClient,
+    expected_generation: u64,
+) -> Result<(), EventWorkerError> {
+    bounded_resync_account_inner(config, session, client, expected_generation, true).await
+}
+
+async fn bounded_resync_account_inner(
+    config: &EventWorkerConfig,
+    session: &mut Session,
+    client: &mut ProtonClient,
+    expected_generation: u64,
+    force_message_sync: bool,
+) -> Result<(), EventWorkerError> {
     ensure_account_generation(config, expected_generation, "bounded_resync_start").await?;
     let resync_started_at = Instant::now();
     let sync_start = unix_now();
@@ -1376,7 +1410,9 @@ async fn bounded_resync_account_for_generation(
     );
 
     // Go bridge: if syncStatus.IsComplete() { sync labels only; return }
-    if sync_status.has_labels && sync_status.has_messages {
+    // When force_message_sync is set (cursor reset / refresh flag), skip this
+    // short-circuit so we reconcile messages against the API.
+    if sync_status.has_labels && sync_status.has_messages && !force_message_sync {
         info!(
             service = "imap",
             user = %config.account_id.0,
@@ -1401,6 +1437,15 @@ async fn bounded_resync_account_for_generation(
         );
         progress_guard.finish();
         return Ok(());
+    }
+    if force_message_sync && sync_status.has_labels && sync_status.has_messages {
+        info!(
+            service = "imap",
+            user = %config.account_id.0,
+            account_id = %config.account_id.0,
+            account_email = %config.account_email,
+            "Sync was complete but forcing message reconciliation due to event gap"
+        );
     }
 
     // Fetch total message count from AllMail label (same as Go bridge)
@@ -1576,8 +1621,10 @@ async fn bounded_resync_account_for_generation(
                 .collect();
             total_applied += new_messages.len();
 
-            let new_owned: Vec<MessageMetadata> =
-                new_messages.iter().map(|m| (*m).clone()).collect();
+            let new_owned: Vec<MessageEnvelope> = new_messages
+                .iter()
+                .map(|m| to_envelope((*m).clone()))
+                .collect();
             let uid_map = batch_apply_metadata_to_store(
                 config,
                 &new_owned,
@@ -2244,7 +2291,7 @@ async fn poll_account_once_for_generation(
                         msg = "Event loop reset",
                         "Event loop reset"
                     );
-                    bounded_resync_account_for_generation(
+                    bounded_resync_account_force(
                         config,
                         &mut session,
                         &mut client,
@@ -2272,13 +2319,8 @@ async fn poll_account_once_for_generation(
                 msg = "Received refresh event",
                 "Received refresh event"
             );
-            bounded_resync_account_for_generation(
-                config,
-                &mut session,
-                &mut client,
-                expected_generation,
-            )
-            .await?;
+            bounded_resync_account_force(config, &mut session, &mut client, expected_generation)
+                .await?;
             resync_state = Some(CheckpointSyncState::RefreshResync);
         }
         for event in &response.events {
@@ -2339,6 +2381,14 @@ async fn poll_account_once_for_generation(
                         calendar_events_deleted = pim_summary.calendar_events_deleted,
                         "applied pim incremental event changes"
                     );
+                    if pim_summary.calendar_events_upserted > 0
+                        || pim_summary.calendar_events_deleted > 0
+                        || pim_summary.calendars_refreshed > 0
+                    {
+                        if let Some(ref notifier) = config.calendar_notifier {
+                            notifier.notify_account(&config.account_id.0);
+                        }
+                    }
                 }
             }
         }
@@ -2777,6 +2827,7 @@ fn build_event_worker_configs(
     pim_stores: HashMap<String, Arc<PimStore>>,
     sync_progress_callback: Option<SyncProgressCallback>,
     settings_dir: Option<PathBuf>,
+    calendar_notifier: Option<SharedCalendarChangeNotifier>,
 ) -> Vec<EventWorkerConfig> {
     accounts
         .into_iter()
@@ -2802,6 +2853,9 @@ fn build_event_worker_configs(
             if let Some(ref dir) = settings_dir {
                 config = config.with_settings_dir(dir.clone());
             }
+            if let Some(ref notifier) = calendar_notifier {
+                config = config.with_calendar_notifier(notifier.clone());
+            }
             config
         })
         .collect()
@@ -2820,6 +2874,7 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
     sync_progress_callback: Option<SyncProgressCallback>,
     poll_interval: Duration,
     settings_dir: Option<PathBuf>,
+    calendar_notifier: Option<SharedCalendarChangeNotifier>,
 ) -> EventWorkerGroup {
     let (shutdown_tx, _shutdown_rx) = watch::channel(false);
     let handles = build_event_worker_configs(
@@ -2833,6 +2888,7 @@ pub fn start_event_worker_group_with_sync_progress_and_pim_and_connector(
         pim_stores,
         sync_progress_callback,
         settings_dir,
+        calendar_notifier,
     )
     .into_iter()
     .map(|account| {
@@ -2876,6 +2932,7 @@ pub fn start_event_workers_with_sync_progress_and_pim_and_connector(
         pim_stores,
         sync_progress_callback,
         settings_dir,
+        None,
     )
     .into_iter()
     .map(|config| tokio::spawn(run_event_worker(config, poll_interval)))
@@ -3086,6 +3143,7 @@ mod tests {
             HashMap::new(),
             None,
             None,
+            None,
         );
 
         assert_eq!(configs.len(), 2);
@@ -3136,6 +3194,7 @@ mod tests {
             checkpoints,
             pim_stores,
             Some(callback),
+            None,
             None,
         );
 
@@ -3769,7 +3828,7 @@ mod tests {
             .upsert_metadata(
                 &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
                 &ProtonMessageId::from("msg-1"),
-                crate::api::types::MessageMetadata {
+                to_envelope(crate::api::types::MessageMetadata {
                     id: "msg-1".to_string(),
                     address_id: "addr-1".to_string(),
                     label_ids: vec!["0".to_string()],
@@ -3791,7 +3850,7 @@ mod tests {
                     is_replied_all: 0,
                     is_forwarded: 0,
                     num_attachments: 0,
-                },
+                }),
             )
             .await
             .unwrap();
@@ -4557,7 +4616,7 @@ mod tests {
             .upsert_metadata(
                 &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/Old Projects"),
                 &ProtonMessageId::from("msg-label-1"),
-                MessageMetadata {
+                to_envelope(MessageMetadata {
                     id: "msg-label-1".to_string(),
                     address_id: "addr-1".to_string(),
                     label_ids: vec!["label-custom-1".to_string()],
@@ -4579,7 +4638,7 @@ mod tests {
                     is_replied_all: 0,
                     is_forwarded: 0,
                     num_attachments: 0,
-                },
+                }),
             )
             .await
             .unwrap();
@@ -4667,7 +4726,7 @@ mod tests {
             .upsert_metadata(
                 &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/Obsolete"),
                 &ProtonMessageId::from("msg-obsolete-1"),
-                MessageMetadata {
+                to_envelope(MessageMetadata {
                     id: "msg-obsolete-1".to_string(),
                     address_id: "addr-1".to_string(),
                     label_ids: vec!["label-custom-1".to_string()],
@@ -4689,7 +4748,7 @@ mod tests {
                     is_replied_all: 0,
                     is_forwarded: 0,
                     num_attachments: 0,
-                },
+                }),
             )
             .await
             .unwrap();
@@ -4961,6 +5020,7 @@ mod tests {
             None,
             Duration::from_secs(3600),
             None,
+            None,
         );
         assert_eq!(group.len(), 2);
         group.shutdown().await;
@@ -5048,6 +5108,7 @@ mod tests {
             HashMap::new(),
             None,
             Duration::from_millis(50),
+            None,
             None,
         );
 
@@ -5247,6 +5308,7 @@ mod tests {
             HashMap::new(),
             Some(callback),
             Duration::from_millis(50),
+            None,
             None,
         );
 
@@ -5498,7 +5560,7 @@ mod tests {
                 .upsert_metadata(
                     &ScopedMailboxId::from_parts(Some("uid-1"), "INBOX"),
                     &ProtonMessageId::from("msg-1"),
-                    MessageMetadata {
+                    to_envelope(MessageMetadata {
                         id: "msg-1".to_string(),
                         address_id: "addr-1".to_string(),
                         label_ids: vec!["0".to_string()],
@@ -5520,7 +5582,7 @@ mod tests {
                         is_replied_all: 0,
                         is_forwarded: 0,
                         num_attachments: 0,
-                    },
+                    }),
                 )
                 .await
                 .unwrap();

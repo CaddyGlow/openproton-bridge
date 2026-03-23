@@ -14,7 +14,7 @@ use super::mailbox_view::GluonMailboxView;
 use super::store::{StoreEvent, StoreEventKind};
 use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::{ImapError, Result};
-use crate::api::types::MessageMetadata;
+use gluon_rs_mail::MessageEnvelope;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GluonMailbox {
@@ -165,7 +165,7 @@ pub trait GluonImapConnector: Send + Sync {
         &self,
         mailbox: &ScopedMailboxId,
         proton_id: &ProtonMessageId,
-        metadata: MessageMetadata,
+        metadata: MessageEnvelope,
     ) -> Result<ImapUid>;
     async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>>;
     fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()>;
@@ -209,7 +209,7 @@ pub trait GluonImapConnector: Send + Sync {
     async fn batch_upsert_metadata(
         &self,
         mailbox: &ScopedMailboxId,
-        entries: &[(&ProtonMessageId, MessageMetadata)],
+        entries: &[(&ProtonMessageId, MessageEnvelope)],
     ) -> Result<Vec<ImapUid>> {
         let mut uids = Vec::with_capacity(entries.len());
         for (proton_id, metadata) in entries {
@@ -355,7 +355,7 @@ impl GluonImapConnector for GluonMailConnector {
         &self,
         mailbox: &ScopedMailboxId,
         proton_id: &ProtonMessageId,
-        metadata: MessageMetadata,
+        metadata: MessageEnvelope,
     ) -> Result<ImapUid> {
         let existing_uid = self.view.get_uid(mailbox, proton_id).await?;
         let uid = self
@@ -632,7 +632,7 @@ impl GluonImapConnector for GluonMailConnector {
     async fn batch_upsert_metadata(
         &self,
         mailbox: &ScopedMailboxId,
-        entries: &[(&ProtonMessageId, MessageMetadata)],
+        entries: &[(&ProtonMessageId, MessageEnvelope)],
     ) -> Result<Vec<ImapUid>> {
         use super::mailbox as mailbox_mod;
 

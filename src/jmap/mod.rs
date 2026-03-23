@@ -132,6 +132,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::{change_set_from_gluon_update, JmapDataType, JmapStateTracker};
+    use crate::imap::convert::to_envelope;
     use crate::imap::gluon_connector::{
         GluonImapConnector, GluonMailConnector, GluonMailbox, GluonMessageRef, GluonUpdate,
     };
@@ -239,7 +240,7 @@ mod tests {
             .upsert_metadata(
                 &ScopedMailboxId::from_parts(Some("uid-1"), "Labels/Projects"),
                 &ProtonMessageId::from("msg-1"),
-                crate::api::types::MessageMetadata {
+                to_envelope(crate::api::types::MessageMetadata {
                     id: "msg-1".to_string(),
                     address_id: "addr-1".to_string(),
                     external_id: None,
@@ -261,7 +262,7 @@ mod tests {
                     is_replied_all: 0,
                     is_forwarded: 0,
                     num_attachments: 0,
-                },
+                }),
             )
             .await
             .unwrap();

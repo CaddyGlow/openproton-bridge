@@ -1,8 +1,9 @@
 use crate::api::client::ProtonClient;
 use crate::api::messages;
-use crate::api::types::{EmailAddress, Message, MessageMetadata};
+use crate::api::types::Message;
 use crate::crypto::decrypt;
 use crate::crypto::keys::Keyring;
+use gluon_rs_mail::{EmailAddress, MessageEnvelope};
 
 use super::Result;
 
@@ -611,7 +612,7 @@ fn navigate_to_part(text: &str, numbers: &[usize]) -> Option<String> {
 ///
 /// Format per RFC 3501 section 7.4.2:
 /// ("date" "subject" ((from)) ((sender)) ((reply-to)) ((to)) ((cc)) (NIL) "in-reply-to" "message-id")
-pub fn build_envelope(meta: &MessageMetadata, header: &str) -> String {
+pub fn build_envelope(meta: &MessageEnvelope, header: &str) -> String {
     let date = format_imap_date(meta.time);
     let subject = imap_quote(&meta.subject);
     let from = format_address_list(std::slice::from_ref(&meta.sender));
@@ -779,7 +780,7 @@ mod tests {
 
     #[test]
     fn test_build_envelope() {
-        let meta = MessageMetadata {
+        let meta = MessageEnvelope {
             id: "msg-1".to_string(),
             address_id: "addr-1".to_string(),
             label_ids: vec!["0".to_string()],
@@ -821,7 +822,7 @@ mod tests {
 
     #[test]
     fn test_build_envelope_nil_fields() {
-        let meta = MessageMetadata {
+        let meta = MessageEnvelope {
             id: "msg-1".to_string(),
             address_id: "addr-1".to_string(),
             label_ids: vec!["0".to_string()],

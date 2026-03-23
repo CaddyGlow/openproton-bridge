@@ -1,8 +1,10 @@
-use crate::api::types::{
-    self, MessageMetadata, ProtonLabel, ALL_DRAFTS_LABEL, DRAFTS_LABEL, LABEL_TYPE_FOLDER,
+use crate::api::types::ProtonLabel;
+use gluon_rs_mail::well_known::{
+    ALL_DRAFTS_LABEL, ALL_MAIL_LABEL, ARCHIVE_LABEL, DRAFTS_LABEL, INBOX_LABEL, LABEL_TYPE_FOLDER,
     LABEL_TYPE_LABEL, MESSAGE_FLAG_FORWARDED, MESSAGE_FLAG_REPLIED, MESSAGE_FLAG_REPLIED_ALL,
-    STARRED_LABEL,
+    SENT_LABEL, SPAM_LABEL, STARRED_LABEL, TRASH_LABEL,
 };
+use gluon_rs_mail::MessageEnvelope;
 
 #[derive(Clone, Copy)]
 pub struct ImapMailbox {
@@ -121,49 +123,49 @@ fn short_label_suffix(label_id: &str) -> String {
 const SYSTEM_MAILBOXES: [ImapMailbox; 8] = [
     ImapMailbox {
         name: "INBOX",
-        label_id: types::INBOX_LABEL,
+        label_id: INBOX_LABEL,
         special_use: None,
         selectable: true,
     },
     ImapMailbox {
         name: "Sent",
-        label_id: types::SENT_LABEL,
+        label_id: SENT_LABEL,
         special_use: Some("\\Sent"),
         selectable: true,
     },
     ImapMailbox {
         name: "Drafts",
-        label_id: types::DRAFTS_LABEL,
+        label_id: DRAFTS_LABEL,
         special_use: Some("\\Drafts"),
         selectable: true,
     },
     ImapMailbox {
         name: "Trash",
-        label_id: types::TRASH_LABEL,
+        label_id: TRASH_LABEL,
         special_use: Some("\\Trash"),
         selectable: true,
     },
     ImapMailbox {
         name: "Spam",
-        label_id: types::SPAM_LABEL,
+        label_id: SPAM_LABEL,
         special_use: Some("\\Junk"),
         selectable: true,
     },
     ImapMailbox {
         name: "Archive",
-        label_id: types::ARCHIVE_LABEL,
+        label_id: ARCHIVE_LABEL,
         special_use: Some("\\Archive"),
         selectable: true,
     },
     ImapMailbox {
         name: "Starred",
-        label_id: types::STARRED_LABEL,
+        label_id: STARRED_LABEL,
         special_use: Some("\\Flagged"),
         selectable: true,
     },
     ImapMailbox {
         name: "All Mail",
-        label_id: types::ALL_MAIL_LABEL,
+        label_id: ALL_MAIL_LABEL,
         special_use: None,
         selectable: false,
     },
@@ -180,7 +182,7 @@ pub fn find_mailbox(name: &str) -> Option<ImapMailbox> {
         .find(|m| m.name.eq_ignore_ascii_case(name))
 }
 
-pub fn message_flags(meta: &MessageMetadata) -> Vec<&'static str> {
+pub fn message_flags(meta: &MessageEnvelope) -> Vec<&'static str> {
     let mut flags = Vec::new();
 
     if meta.unread == 0 {
@@ -216,10 +218,10 @@ pub fn message_flags(meta: &MessageMetadata) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::types::EmailAddress;
+    use gluon_rs_mail::EmailAddress;
 
-    fn make_meta(unread: i32, label_ids: Vec<&str>) -> MessageMetadata {
-        MessageMetadata {
+    fn make_meta(unread: i32, label_ids: Vec<&str>) -> MessageEnvelope {
+        MessageEnvelope {
             id: "msg-1".to_string(),
             address_id: "addr-1".to_string(),
             label_ids: label_ids.into_iter().map(|s| s.to_string()).collect(),
@@ -410,7 +412,7 @@ mod tests {
                 id: "l2".to_string(),
                 name: "Friends".to_string(),
                 path: "Friends".to_string(),
-                label_type: types::LABEL_TYPE_CONTACT_GROUP,
+                label_type: gluon_rs_mail::well_known::LABEL_TYPE_CONTACT_GROUP,
                 parent_id: None,
                 color: None,
             },

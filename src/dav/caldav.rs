@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::calendar::CalendarEvent;
+use crate::api::calendar::{self, CalendarEvent, SyncEventOperation, SyncMultipleEventsRequest};
 use crate::api::calendar::{Calendar, CalendarEventPart};
 use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRoute;
@@ -208,9 +208,11 @@ pub async fn handle_request(
 
             let payload = std::str::from_utf8(body)
                 .map_err(|_| DavError::InvalidRequest("CalDAV PUT body is not utf-8"))?;
-            if calendar_crypto::extract_inline_ics_payload(payload).is_none() {
+            let normalized_ics = calendar_crypto::extract_inline_ics_payload(payload);
+            if normalized_ics.is_none() {
                 return Ok(Some(invalid_ics_payload_response()));
             }
+            let normalized_ics = normalized_ics.unwrap();
 
             ensure_calendar_exists(&adapter, &calendar_id)?;
             let now = epoch_seconds();
@@ -221,9 +223,109 @@ pub async fn handle_request(
                 .filter(|create_time| *create_time > 0)
                 .unwrap_or(now);
             let event = parse_ics(&event_id, &calendar_id, payload, create_time, now);
+            let event_uid = event.uid.clone();
             adapter
                 .upsert_calendar_event(&event)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
+
+            // Push upstream to Proton Calendar API.
+            if let Some(ra) = runtime_accounts {
+                let is_update = existing.is_some();
+                // Look up the Proton event ID from the existing event (for updates).
+                let proton_event_id = existing
+                    .as_ref()
+                    .map(|e| e.id.as_str())
+                    .filter(|id| !id.is_empty() && !calendar_crypto::is_local_id(id))
+                    .map(String::from);
+
+                match calendar_crypto::build_calendar_encrypt_context(
+                    ra,
+                    &auth.account_id.0,
+                    &calendar_id,
+                )
+                .await
+                {
+                    Some(ctx) => {
+                        if let Some(payload) = calendar_crypto::encrypt_calendar_event(
+                            &ctx,
+                            &normalized_ics,
+                            &event_uid,
+                        ) {
+                            let op = if is_update {
+                                if let Some(ref pid) = proton_event_id {
+                                    SyncEventOperation::Update {
+                                        id: pid.clone(),
+                                        event: payload,
+                                    }
+                                } else {
+                                    SyncEventOperation::Create {
+                                        overwrite: Some(1),
+                                        event: payload,
+                                    }
+                                }
+                            } else {
+                                SyncEventOperation::Create {
+                                    overwrite: Some(1),
+                                    event: payload,
+                                }
+                            };
+                            let sync_req = SyncMultipleEventsRequest {
+                                member_id: ctx.member_id.clone(),
+                                is_import: Some(1),
+                                events: vec![op],
+                            };
+                            match calendar::sync_calendar_events(
+                                &ctx.client,
+                                &calendar_id,
+                                &sync_req,
+                            )
+                            .await
+                            {
+                                Ok(sync_res) => {
+                                    if let Some(result) = sync_res.responses.first() {
+                                        if result.response.code == 1000 {
+                                            if let Some(ref upstream_event) = result.response.event
+                                            {
+                                                let _ =
+                                                    adapter.upsert_calendar_event(upstream_event);
+                                                tracing::info!(
+                                                    event_id = %upstream_event.id,
+                                                    calendar_id = %calendar_id,
+                                                    is_update = is_update,
+                                                    "caldav event pushed upstream via sync"
+                                                );
+                                            }
+                                        } else {
+                                            tracing::warn!(
+                                                event_id = %event_id,
+                                                calendar_id = %calendar_id,
+                                                code = result.response.code,
+                                                error = ?result.response.error,
+                                                "caldav upstream sync returned error"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        event_id = %event_id,
+                                        calendar_id = %calendar_id,
+                                        error = %err,
+                                        "caldav upstream push failed; event stored locally only"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            calendar_id = %calendar_id,
+                            "no encrypt context available; event stored locally only"
+                        );
+                    }
+                }
+            }
+
             let stored = adapter
                 .get_calendar_event(&event_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?
@@ -253,6 +355,68 @@ pub async fn handle_request(
             if !etag::if_match_satisfied(headers.get("if-match"), Some(current_etag.as_str())) {
                 return Ok(Some(precondition_failed_response()));
             }
+
+            // Delete upstream from Proton Calendar API.
+            let proton_event_id =
+                if !existing.id.is_empty() && !calendar_crypto::is_local_id(&existing.id) {
+                    Some(existing.id.as_str())
+                } else {
+                    None
+                };
+            if let (Some(ra), Some(pid)) = (runtime_accounts, proton_event_id) {
+                if let Some(ctx) = calendar_crypto::build_calendar_encrypt_context(
+                    ra,
+                    &auth.account_id.0,
+                    &calendar_id,
+                )
+                .await
+                {
+                    let sync_req = SyncMultipleEventsRequest {
+                        member_id: ctx.member_id.clone(),
+                        is_import: None,
+                        events: vec![SyncEventOperation::Delete {
+                            id: pid.to_string(),
+                            deletion_reason: None,
+                        }],
+                    };
+                    match calendar::sync_calendar_events(&ctx.client, &calendar_id, &sync_req).await
+                    {
+                        Ok(sync_res) => {
+                            let ok = sync_res
+                                .responses
+                                .first()
+                                .map_or(false, |r| r.response.code == 1000);
+                            if ok {
+                                tracing::info!(
+                                    event_id = %pid,
+                                    calendar_id = %calendar_id,
+                                    "caldav event deleted upstream via sync"
+                                );
+                            } else {
+                                let err_msg = sync_res
+                                    .responses
+                                    .first()
+                                    .and_then(|r| r.response.error.as_deref());
+                                tracing::warn!(
+                                    event_id = %pid,
+                                    calendar_id = %calendar_id,
+                                    error = ?err_msg,
+                                    "caldav upstream delete sync returned error"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                event_id = %pid,
+                                calendar_id = %calendar_id,
+                                error = %err,
+                                "caldav upstream delete failed; deleted locally only"
+                            );
+                        }
+                    }
+                }
+            }
+
             adapter
                 .delete_calendar_event(&event_id, DeleteMode::Soft)
                 .map_err(|err| DavError::Backend(err.to_string()))?;

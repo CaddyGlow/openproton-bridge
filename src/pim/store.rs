@@ -165,6 +165,13 @@ impl PimStore {
         Ok(self.calendar.calendar_collection_version(calendar_id)?)
     }
 
+    pub fn get_calendar_member_name(&self, calendar_id: &str) -> Option<String> {
+        self.calendar
+            .get_calendar_member_name(calendar_id)
+            .ok()
+            .flatten()
+    }
+
     pub fn list_calendar_events(
         &self,
         calendar_id: &str,

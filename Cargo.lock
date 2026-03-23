@@ -1410,6 +1410,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b5e6043086bf7973472e0c7dff2142ea0b680d30e18d9cc40f267efbf222bd47"
 dependencies = [
  "base16ct",
+ "base64ct",
  "crypto-bigint",
  "digest",
  "ff",
@@ -1420,6 +1421,8 @@ dependencies = [
  "pkcs8",
  "rand_core 0.6.4",
  "sec1",
+ "serde_json",
+ "serdect",
  "subtle",
  "zeroize",
 ]
@@ -2068,6 +2071,7 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
@@ -3503,6 +3507,7 @@ dependencies = [
  "gluon-rs-calendar",
  "gluon-rs-contacts",
  "gluon-rs-mail",
+ "hkdf",
  "hmac",
  "keyring",
  "lettre",
@@ -3510,6 +3515,7 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
+ "p256",
  "prost",
  "prost-types",
  "protoc-bin-vendored",
@@ -4882,6 +4888,7 @@ dependencies = [
  "der",
  "generic-array",
  "pkcs8",
+ "serdect",
  "subtle",
  "zeroize",
 ]
@@ -5172,6 +5179,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "serdect"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a84f14a19e9a014bb9f4512488d9829a68e04ecabffb0f9904cd1ace94598177"
+dependencies = [
+ "base16ct",
+ "serde",
 ]
 
 [[package]]

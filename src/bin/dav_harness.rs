@@ -53,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         auth_router: AuthRouter::new(AccountRegistry::from_single_session(session)),
         pim_stores,
         runtime_accounts: None,
+        push_subscriptions: None,
+        vapid_keys: None,
     };
 
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;

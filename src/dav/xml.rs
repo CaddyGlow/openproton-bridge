@@ -38,6 +38,13 @@ pub struct DavPropResource {
     pub sync_token: Option<String>,
     pub supported_calendar_components: Vec<&'static str>,
     pub supported_reports: Vec<&'static str>,
+    pub push_config: Option<WebDavPushConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavPushConfig {
+    pub vapid_public_key: String,
+    pub topic: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,7 +63,7 @@ pub fn multistatus_xml_for_propfind(
     mode: &DavPropfindMode,
 ) -> Vec<u8> {
     let mut xml = String::from(
-        r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/">"#,
+        r#"<?xml version="1.0" encoding="utf-8"?><d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav" xmlns:cal="urn:ietf:params:xml:ns:caldav" xmlns:cs="http://calendarserver.org/ns/" xmlns:ical="http://apple.com/ns/ical/" xmlns:push="https://bitfire.at/webdav-push">"#,
     );
     for resource in resources {
         let mut ok_props = String::new();
@@ -438,6 +445,39 @@ pub fn multistatus_xml_for_propfind(
             supported_reports.as_deref(),
         );
 
+        let push_transports_xml = resource.push_config.as_ref().map(|pc| {
+            format!(
+                "<push:web-push>\
+                 <push:vapid-public-key type=\"p256ecdsa\">{}</push:vapid-public-key>\
+                 </push:web-push>",
+                escape_xml(&pc.vapid_public_key),
+            )
+        });
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "transports",
+            "<push:transports>",
+            "</push:transports>",
+            "<push:transports/>",
+            push_transports_xml.as_deref(),
+        );
+        let push_topic = resource
+            .push_config
+            .as_ref()
+            .map(|pc| escape_xml(&pc.topic));
+        write_named_or_valued_property(
+            &mut ok_props,
+            &mut missing_props,
+            mode,
+            "topic",
+            "<push:topic>",
+            "</push:topic>",
+            "<push:topic/>",
+            push_topic.as_deref(),
+        );
+
         if !ok_props.is_empty() {
             xml.push_str("<d:propstat><d:prop>");
             xml.push_str(&ok_props);
@@ -590,6 +630,7 @@ mod tests {
                 "principal-property-search",
                 "principal-search-property-set",
             ],
+            push_config: None,
         }]);
         let xml = String::from_utf8(payload).expect("xml is utf8");
         assert!(xml.contains(r#"xmlns:d="DAV:""#));
@@ -632,6 +673,7 @@ mod tests {
             sync_token: Some("https://openproton.local/sync/work-10".to_string()),
             supported_calendar_components: vec!["VEVENT"],
             supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
+            push_config: None,
         }]);
         let xml = String::from_utf8(payload).expect("xml is utf8");
         assert!(xml.contains("<cs:getctag>work-10</cs:getctag>"));
@@ -681,6 +723,7 @@ mod tests {
                 sync_token: Some("https://openproton.local/sync/work-10".to_string()),
                 supported_calendar_components: vec!["VEVENT"],
                 supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
+                push_config: None,
             }],
             &DavPropfindMode::Prop(requested),
         );
@@ -724,6 +767,7 @@ mod tests {
                 sync_token: None,
                 supported_calendar_components: Vec::new(),
                 supported_reports: Vec::new(),
+                push_config: None,
             }],
             &DavPropfindMode::Prop(requested),
         );
@@ -764,6 +808,7 @@ mod tests {
                 sync_token: None,
                 supported_calendar_components: Vec::new(),
                 supported_reports: Vec::new(),
+                push_config: None,
             }],
             &DavPropfindMode::AllProp,
         );

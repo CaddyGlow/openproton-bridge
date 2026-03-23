@@ -80,6 +80,10 @@ pub struct CalendarMember {
     pub id: String,
     #[serde(rename = "CalendarID")]
     pub calendar_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub email: String,
     pub color: String,
     pub display: i32,

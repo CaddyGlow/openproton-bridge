@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::api;
 use crate::api::types::Session;
+use crate::bridge::calendar_notify::{CalendarChangeNotifier, SharedCalendarChangeNotifier};
 use crate::dav;
 use crate::imap;
 use crate::paths::RuntimePaths;
@@ -281,7 +282,6 @@ pub async fn start(
     } else {
         None
     };
-
     log_protocol_start(MailProtocol::Imap, &config, transition);
     log_protocol_start(MailProtocol::Smtp, &config, transition);
     if config.dav_enable {
@@ -759,10 +759,13 @@ async fn run_runtime(
         }
     });
 
+    let calendar_notifier: SharedCalendarChangeNotifier = Arc::new(CalendarChangeNotifier::new());
+
     let pim_stores_for_reconcile = pim_stores.clone();
     let dav_pim_stores = pim_stores.clone();
     let dav_auth_router = auth_router.clone();
-    let event_workers =
+    let event_workers = {
+        let notifier = calendar_notifier.clone();
         super::events::start_event_worker_group_with_sync_progress_and_pim_and_connector(
             runtime_accounts.clone(),
             runtime_snapshot,
@@ -775,7 +778,9 @@ async fn run_runtime(
             Some(sync_progress_callback),
             poll_interval,
             Some(settings_dir),
-        );
+            Some(notifier),
+        )
+    };
 
     let pim_reconcile_task = tokio::spawn(run_pim_reconcile_periodically(
         runtime_accounts.clone(),
@@ -787,6 +792,11 @@ async fn run_runtime(
         config.dav_enable,
         notify_tx.clone(),
         pim_reconcile_metrics,
+        if config.dav_enable {
+            Some(calendar_notifier.clone())
+        } else {
+            None
+        },
     ));
     let health_task = tokio::spawn(report_runtime_health_periodically(
         runtime_accounts.clone(),
@@ -812,16 +822,37 @@ async fn run_runtime(
             smtp::server::run_server_with_listener_implicit_tls(listener, smtp_config).await
         })
     });
+    let push_subscription_store = dav::push::PushSubscriptionStore::new();
+    let vapid_keys = Arc::new(dav::push_crypto::VapidKeyPair::generate());
+
     let mut dav_task = dav_listener.map(|listener| {
         let config = dav::server::DavServerConfig {
             auth_router: dav_auth_router,
             pim_stores: dav_pim_stores,
             runtime_accounts: Some(runtime_accounts.clone()),
+            push_subscriptions: Some(push_subscription_store.clone()),
+            vapid_keys: Some(vapid_keys.clone()),
         };
         tokio::spawn(async move {
             dav::server::run_server_with_listener_and_config(listener, config).await
         })
     });
+
+    // WebDAV-Push notification sender task
+    let push_sender_task = if config.dav_enable {
+        let push_rx = calendar_notifier.subscribe();
+        let push_store = push_subscription_store.clone();
+        let push_vapid = vapid_keys.clone();
+        let push_http = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+        Some(tokio::spawn(dav::push_send::run_push_sender(
+            push_rx, push_store, push_vapid, push_http,
+        )))
+    } else {
+        None
+    };
 
     let mut shutdown_rx = shutdown_rx;
     let serve_result: anyhow::Result<()> = tokio::select! {
@@ -1166,6 +1197,7 @@ async fn run_pim_reconcile_periodically(
     eager_calendar_warmup: bool,
     notify_tx: Option<mpsc::UnboundedSender<String>>,
     metrics_snapshot: Arc<std::sync::RwLock<PimReconcileMetricsSnapshot>>,
+    calendar_notifier: Option<SharedCalendarChangeNotifier>,
 ) {
     use tokio::time::{interval, MissedTickBehavior};
 
@@ -1184,23 +1216,6 @@ async fn run_pim_reconcile_periodically(
                 continue;
             };
             metrics.accounts_with_store += 1;
-
-            if first_sweep {
-                if let Ok(true) = store.contacts().is_synced() {
-                    tracing::info!(
-                        account_id = %account.account_id.0,
-                        email = %account.email,
-                        "contacts sync state exists; skipping bootstrap on startup"
-                    );
-                }
-                if let Ok(true) = store.calendar().is_synced() {
-                    tracing::info!(
-                        account_id = %account.account_id.0,
-                        email = %account.email,
-                        "calendar sync state exists; skipping bootstrap on startup"
-                    );
-                }
-            }
 
             let raw_contacts_due = match is_pim_contacts_due(store, contacts_reconcile_interval) {
                 Ok(due) => due,
@@ -1241,13 +1256,13 @@ async fn run_pim_reconcile_periodically(
                     }
                 };
             let force_calendar_full_due =
-                should_force_startup_calendar_warmup(first_sweep, eager_calendar_warmup);
+                should_force_startup_calendar_warmup(first_sweep, eager_calendar_warmup, store);
             let raw_calendar_full_due = raw_calendar_full_due || force_calendar_full_due;
             if force_calendar_full_due {
                 tracing::info!(
                     account_id = %account.account_id.0,
                     email = %account.email,
-                    "forcing startup calendar warmup because DAV is enabled"
+                    "forcing startup calendar warmup because DAV is enabled and no prior sync"
                 );
             }
             if !raw_contacts_due && !raw_calendar_full_due && !raw_calendar_horizon_due {
@@ -1421,6 +1436,11 @@ async fn run_pim_reconcile_periodically(
                                 account.email, account.account_id.0
                             ));
                         }
+                        if summary.events_upserted > 0 || summary.events_soft_deleted > 0 {
+                            if let Some(ref notifier) = calendar_notifier {
+                                notifier.notify_account(&account.account_id.0);
+                            }
+                        }
                     }
                     Err(err) => {
                         metrics.calendar_full_failures += 1;
@@ -1457,6 +1477,11 @@ async fn run_pim_reconcile_periodically(
                             events_upserted = summary.events_upserted,
                             "periodic calendar event horizon refresh completed"
                         );
+                        if summary.events_upserted > 0 || summary.events_soft_deleted > 0 {
+                            if let Some(ref notifier) = calendar_notifier {
+                                notifier.notify_account(&account.account_id.0);
+                            }
+                        }
                     }
                     Err(err) => {
                         metrics.calendar_horizon_failures += 1;
@@ -1558,8 +1583,15 @@ async fn run_pim_reconcile_periodically(
     }
 }
 
-fn should_force_startup_calendar_warmup(first_sweep: bool, eager_calendar_warmup: bool) -> bool {
-    first_sweep && eager_calendar_warmup
+fn should_force_startup_calendar_warmup(
+    first_sweep: bool,
+    eager_calendar_warmup: bool,
+    store: &PimStore,
+) -> bool {
+    if !first_sweep || !eager_calendar_warmup {
+        return false;
+    }
+    !store.calendar().is_synced().unwrap_or(false)
 }
 
 #[derive(Debug, Default)]
@@ -1886,6 +1918,7 @@ mod tests {
             false,
             None,
             metrics.clone(),
+            None,
         ));
 
         tokio::time::sleep(Duration::from_millis(90)).await;
@@ -1929,6 +1962,7 @@ mod tests {
             false,
             None,
             metrics.clone(),
+            None,
         ));
 
         tokio::time::sleep(Duration::from_millis(90)).await;
@@ -1949,9 +1983,30 @@ mod tests {
     }
 
     #[test]
-    fn startup_calendar_warmup_is_forced_only_on_first_sweep_when_enabled() {
-        assert!(super::should_force_startup_calendar_warmup(true, true));
-        assert!(!super::should_force_startup_calendar_warmup(false, true));
-        assert!(!super::should_force_startup_calendar_warmup(true, false));
+    fn startup_calendar_warmup_is_forced_only_on_first_sweep_when_not_synced() {
+        let store = pim_store();
+
+        // First sweep + eager + not synced -> force
+        assert!(super::should_force_startup_calendar_warmup(
+            true, true, &store
+        ));
+        // Not first sweep -> no force
+        assert!(!super::should_force_startup_calendar_warmup(
+            false, true, &store
+        ));
+        // Not eager -> no force
+        assert!(!super::should_force_startup_calendar_warmup(
+            true, false, &store
+        ));
+
+        // Mark calendar as synced
+        store
+            .set_sync_state_int("calendar.last_full_sync_ms", 1700000000)
+            .unwrap();
+
+        // First sweep + eager + already synced -> no force
+        assert!(!super::should_force_startup_calendar_warmup(
+            true, true, &store
+        ));
     }
 }

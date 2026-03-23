@@ -170,6 +170,31 @@ impl CalendarStore {
             None => Ok(None),
         }
     }
+
+    /// Look up the display name for a calendar from its first member's raw_json.
+    /// Returns None if no member exists or the name is empty.
+    pub fn get_calendar_member_name(&self, calendar_id: &str) -> Result<Option<String>> {
+        let conn = open_read_connection(self)?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT raw_json FROM calendar_members WHERE calendar_id = ?1 LIMIT 1",
+                [calendar_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(json_str) = raw {
+            if let Ok(val) = serde_json::from_str::<Value>(&json_str) {
+                if let Some(name) = val.get("Name").or_else(|| val.get("name")) {
+                    if let Some(s) = name.as_str() {
+                        if !s.is_empty() {
+                            return Ok(Some(s.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 fn normalize_page(page: QueryPage) -> (i64, i64) {

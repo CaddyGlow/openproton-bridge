@@ -48,20 +48,6 @@ const KEYCHAIN_HELPER_PASS_APP: &str = "pass-app";
 const OPTIMIZE_CACHE_CONCURRENCY: usize = 4;
 const OPTIMIZE_CACHE_CONCURRENCY_MAX: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InterruptAction {
-    InitiateShutdown,
-    ForceExit,
-}
-
-fn next_interrupt_action(shutdown_requested: bool) -> InterruptAction {
-    if shutdown_requested {
-        InterruptAction::ForceExit
-    } else {
-        InterruptAction::InitiateShutdown
-    }
-}
-
 #[allow(clippy::all)]
 pub mod pb {
     tonic::include_proto!("grpc");
@@ -468,6 +454,7 @@ async fn maybe_start_grpc_sync_workers(
             Some(sync_progress_callback),
             std::time::Duration::from_secs(30),
             Some(runtime_paths.settings_dir().to_path_buf()),
+            None,
         ),
     ))
 }
@@ -1145,15 +1132,6 @@ mod tests {
         include_bytes!("../../../tests/fixtures/proton_profile_golden/vault.key");
     const PROTON_FIXTURE_DEFAULT_EMAIL: &str =
         include_str!("../../../tests/fixtures/proton_profile_golden/default_email");
-
-    #[test]
-    fn next_interrupt_action_transitions_after_first_signal() {
-        assert_eq!(
-            next_interrupt_action(false),
-            InterruptAction::InitiateShutdown
-        );
-        assert_eq!(next_interrupt_action(true), InterruptAction::ForceExit);
-    }
 
     fn write_proton_golden_fixture(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();

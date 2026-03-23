@@ -13,7 +13,11 @@ use crate::pim::types::StoredCalendar;
 use super::discovery;
 use super::error::{DavError, Result};
 use super::http::DavResponse;
-use super::xml::{multistatus_xml_for_propfind, DavPropResource, DavPropfindMode, DavResourceKind};
+use super::push_crypto::VapidKeyPair;
+use super::xml::{
+    multistatus_xml_for_propfind, DavPropResource, DavPropfindMode, DavResourceKind,
+    WebDavPushConfig,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavDepth {
@@ -51,7 +55,7 @@ pub fn handle_propfind(
     headers: &HashMap<String, String>,
     auth: &AuthRoute,
 ) -> Result<DavResponse> {
-    handle_propfind_with_store(raw_path, body, headers, auth, None)
+    handle_propfind_with_store(raw_path, body, headers, auth, None, None)
 }
 
 pub fn handle_propfind_with_store(
@@ -60,6 +64,7 @@ pub fn handle_propfind_with_store(
     headers: &HashMap<String, String>,
     auth: &AuthRoute,
     store: Option<&Arc<PimStore>>,
+    vapid_keys: Option<&VapidKeyPair>,
 ) -> Result<DavResponse> {
     let depth = parse_depth(headers)?;
     let path = normalize_path(raw_path);
@@ -87,7 +92,7 @@ pub fn handle_propfind_with_store(
         AccountResource::ScheduleOutbox => vec![schedule_outbox_resource(auth)],
         AccountResource::AddressbooksHome => addressbook_home_resources(auth, depth),
         AccountResource::AddressbookDefault => vec![default_addressbook_resource(auth)],
-        AccountResource::CalendarsHome => calendar_home_resources(auth, depth, store),
+        AccountResource::CalendarsHome => calendar_home_resources(auth, depth, store, vapid_keys),
         AccountResource::CalendarCollection(calendar_id) => {
             let calendar = store.and_then(|store| {
                 let adapter = crate::pim::dav::StoreBackedDavAdapter::new(store.clone());
@@ -98,6 +103,7 @@ pub fn handle_propfind_with_store(
                 &calendar_id,
                 calendar.as_ref(),
                 store.map(Arc::as_ref),
+                vapid_keys,
             )]
         }
     };
@@ -125,6 +131,7 @@ fn calendar_home_resources(
     auth: &AuthRoute,
     depth: DavDepth,
     store: Option<&Arc<PimStore>>,
+    vapid_keys: Option<&VapidKeyPair>,
 ) -> Vec<DavPropResource> {
     let mut resources = vec![calendar_home_resource(auth)];
     if depth != DavDepth::Zero {
@@ -148,6 +155,7 @@ fn calendar_home_resources(
                         &calendar.id,
                         Some(&calendar),
                         Some(store.as_ref()),
+                        vapid_keys,
                     ));
                 }
             }
@@ -200,6 +208,7 @@ fn principal_resource(auth: &AuthRoute) -> DavPropResource {
             "principal-property-search",
             "principal-search-property-set",
         ],
+        push_config: None,
     }
 }
 
@@ -230,6 +239,7 @@ fn schedule_inbox_resource(auth: &AuthRoute) -> DavPropResource {
         sync_token: None,
         supported_calendar_components: Vec::new(),
         supported_reports: Vec::new(),
+        push_config: None,
     }
 }
 
@@ -260,6 +270,7 @@ fn schedule_outbox_resource(auth: &AuthRoute) -> DavPropResource {
         sync_token: None,
         supported_calendar_components: Vec::new(),
         supported_reports: Vec::new(),
+        push_config: None,
     }
 }
 
@@ -290,6 +301,7 @@ fn addressbook_home_resource(auth: &AuthRoute) -> DavPropResource {
         sync_token: None,
         supported_calendar_components: Vec::new(),
         supported_reports: Vec::new(),
+        push_config: None,
     }
 }
 
@@ -320,6 +332,7 @@ fn default_addressbook_resource(auth: &AuthRoute) -> DavPropResource {
         sync_token: None,
         supported_calendar_components: Vec::new(),
         supported_reports: Vec::new(),
+        push_config: None,
     }
 }
 
@@ -350,11 +363,12 @@ fn calendar_home_resource(auth: &AuthRoute) -> DavPropResource {
         sync_token: None,
         supported_calendar_components: Vec::new(),
         supported_reports: Vec::new(),
+        push_config: None,
     }
 }
 
 fn default_calendar_resource(auth: &AuthRoute) -> DavPropResource {
-    calendar_collection_resource(auth, "default", None, None)
+    calendar_collection_resource(auth, "default", None, None, None)
 }
 
 fn calendar_collection_resource(
@@ -362,8 +376,9 @@ fn calendar_collection_resource(
     calendar_id: &str,
     calendar: Option<&StoredCalendar>,
     store: Option<&PimStore>,
+    vapid_keys: Option<&VapidKeyPair>,
 ) -> DavPropResource {
-    let display_name = calendar_display_name(calendar_id, calendar);
+    let display_name = calendar_display_name(calendar_id, calendar, store);
     let href = format!("/dav/{}/calendars/{calendar_id}/", auth.account_id.0);
     let version = calendar_collection_version(calendar_id, calendar, store);
     DavPropResource {
@@ -402,6 +417,10 @@ fn calendar_collection_resource(
         )),
         supported_calendar_components: vec!["VEVENT"],
         supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
+        push_config: vapid_keys.map(|vk| WebDavPushConfig {
+            vapid_public_key: vk.public_key_base64url.clone(),
+            topic: format!("{}/{calendar_id}", auth.account_id.0),
+        }),
     }
 }
 
@@ -419,14 +438,21 @@ fn calendar_collection_version(
     base_version.max(store_version)
 }
 
-fn calendar_display_name(calendar_id: &str, calendar: Option<&StoredCalendar>) -> String {
+fn calendar_display_name(
+    calendar_id: &str,
+    calendar: Option<&StoredCalendar>,
+    store: Option<&PimStore>,
+) -> String {
     if let Some(calendar) = calendar {
         if let Some(display_name) = non_empty_display_name(calendar.name.clone()) {
             return display_name;
         }
+    }
 
-        if calendar.calendar_type == 2 {
-            return "Primary Calendar".to_string();
+    // Calendar name lives on the member, not the calendar. Look it up as fallback.
+    if let Some(store) = store {
+        if let Some(member_name) = store.get_calendar_member_name(calendar_id) {
+            return member_name;
         }
     }
 
@@ -597,6 +623,7 @@ mod tests {
     use crate::api::calendar::{Calendar, CalendarEvent, CalendarEventPart};
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
+    use crate::pim::dav::CalDavRepository;
     use crate::pim::store::PimStore;
 
     use super::{handle_propfind, handle_propfind_with_store, parse_depth, DavDepth};
@@ -674,6 +701,7 @@ mod tests {
             &headers,
             &auth(),
             Some(&store),
+            None,
         )
         .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
@@ -706,6 +734,7 @@ mod tests {
             &headers,
             &auth(),
             Some(&store),
+            None,
         )
         .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
@@ -748,6 +777,7 @@ mod tests {
             &headers,
             &auth(),
             Some(&store),
+            None,
         )
         .expect("response");
         let body = String::from_utf8(response.body).expect("utf8");
@@ -779,6 +809,7 @@ mod tests {
             &headers,
             &auth(),
             Some(&store),
+            None,
         )
         .expect("response");
         let initial_body = String::from_utf8(initial.body).expect("utf8");
@@ -821,6 +852,7 @@ mod tests {
             &headers,
             &auth(),
             Some(&store),
+            None,
         )
         .expect("response");
         let updated_body = String::from_utf8(updated.body).expect("utf8");
@@ -854,6 +886,7 @@ mod tests {
             &headers,
             &auth(),
             Some(&store),
+            None,
         )
         .expect("response");
         let wire = String::from_utf8(response.body).expect("utf8");

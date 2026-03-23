@@ -45,14 +45,28 @@ pub async fn bootstrap_calendars(
     let mut seen_calendar_ids = HashSet::new();
     let mut summary = BootstrapCalendarsSummary::default();
 
-    for cal in calendars {
+    for mut cal in calendars {
         seen_calendar_ids.insert(cal.id.clone());
-        store.upsert_calendar(&cal)?;
-        summary.calendars_seen += 1;
 
         let members = super::run_with_api_retry(|| calendar::get_calendar_members(client, &cal.id))
             .await
             .map_err(map_api_error)?;
+
+        // The calendar name lives on the member, not the calendar itself.
+        if cal.name.is_empty() {
+            if let Some(member) = members.first() {
+                if !member.name.is_empty() {
+                    cal.name = member.name.clone();
+                }
+                if cal.description.is_empty() && !member.description.is_empty() {
+                    cal.description = member.description.clone();
+                }
+            }
+        }
+
+        store.upsert_calendar(&cal)?;
+        summary.calendars_seen += 1;
+
         for member in members {
             store.upsert_calendar_member(&member)?;
             summary.members_upserted += 1;

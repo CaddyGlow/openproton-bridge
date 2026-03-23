@@ -4,16 +4,30 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 
-use crate::api::calendar::{self, CalendarBootstrap, CalendarEvent, CalendarEventPart};
+use sequoia_openpgp as openpgp;
+
+use crate::api::calendar::{
+    self, CalendarBootstrap, CalendarEvent, CalendarEventPart, SyncCalendarEventPart,
+    SyncCalendarEventPayload,
+};
 use crate::api::client::ProtonClient;
 use crate::api::types::Address;
 use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::types::AccountId;
 use crate::crypto::decrypt;
+use crate::crypto::encrypt;
 use crate::crypto::keys::{self, Keyring};
 
 pub struct CalendarDecryptContext {
     keyring: Keyring,
+}
+
+pub struct CalendarEncryptContext {
+    pub calendar_keyring: Keyring,
+    pub address_keyring: Keyring,
+    pub member_id: String,
+    pub client: ProtonClient,
+    pub calendar_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -124,6 +138,299 @@ pub async fn build_calendar_decrypt_context(
     )
     .ok()?;
     Some(CalendarDecryptContext { keyring })
+}
+
+pub async fn build_calendar_encrypt_context(
+    runtime_accounts: &Arc<RuntimeAccountRegistry>,
+    account_id: &str,
+    calendar_id: &str,
+) -> Option<CalendarEncryptContext> {
+    if looks_like_local_uuid(calendar_id) {
+        return None;
+    }
+    let account_id_typed = AccountId(account_id.to_string());
+    let session = runtime_accounts.get_session(&account_id_typed).await?;
+    let auth_material = runtime_accounts
+        .get_auth_material(&account_id_typed)
+        .await?;
+    let passphrase_b64 = session.key_passphrase.as_deref()?;
+    let passphrase = BASE64.decode(passphrase_b64).ok()?;
+
+    let user_keyring = keys::unlock_user_keys(&auth_material.user_keys, &passphrase).ok()?;
+    let mut address_keyrings =
+        build_address_keyrings(&auth_material.addresses, &passphrase, &user_keyring);
+    if address_keyrings.is_empty() {
+        return None;
+    }
+
+    let client = ProtonClient::authenticated_with_mode(
+        session.api_mode.base_url(),
+        session.api_mode,
+        &session.uid,
+        &session.access_token,
+    )
+    .ok()?;
+    let bootstrap = calendar::get_calendar_bootstrap(&client, calendar_id)
+        .await
+        .ok()?;
+    let calendar_passphrase = decrypt_calendar_passphrase(&bootstrap, &address_keyrings)?;
+    let calendar_keyring = keys::unlock_private_keys(
+        bootstrap.keys.iter().map(|key| key.private_key.as_str()),
+        &calendar_passphrase,
+    )
+    .ok()?;
+
+    // Find our member and take ownership of the matching address keyring for signing.
+    let member = bootstrap.members.first()?;
+    let member_email = member.email.trim().to_ascii_lowercase();
+    let address_keyring = address_keyrings.remove(&member_email).or_else(|| {
+        let first_key = address_keyrings.keys().next()?.to_string();
+        address_keyrings.remove(&first_key)
+    })?;
+
+    Some(CalendarEncryptContext {
+        calendar_keyring,
+        address_keyring,
+        member_id: member.id.clone(),
+        client,
+        calendar_id: calendar_id.to_string(),
+    })
+}
+
+pub fn encrypt_calendar_event(
+    ctx: &CalendarEncryptContext,
+    ics: &str,
+    _uid: &str,
+) -> Option<SyncCalendarEventPayload> {
+    let cards = split_ics_for_proton(ics);
+
+    // SharedEventContent Type 2: signed cleartext.
+    let signed_part = sign_cleartext_card(&ctx.address_keyring, &cards.shared_cleartext)?;
+
+    // SharedEventContent Type 3: signed+encrypted.
+    let (key_packets, encrypted_part) = encrypt_and_sign_card(
+        &ctx.calendar_keyring,
+        &ctx.address_keyring,
+        &cards.shared_encrypted,
+    )?;
+
+    // CalendarEventContent Type 2: signed cleartext (STATUS, TRANSP).
+    let calendar_event_content = if let Some(ref cal_card) = cards.calendar_cleartext {
+        Some(vec![sign_cleartext_card(&ctx.address_keyring, cal_card)?])
+    } else {
+        None
+    };
+
+    Some(SyncCalendarEventPayload {
+        permissions: Some(1),
+        is_organizer: Some(1),
+        removed_attendee_addresses: None,
+        calendar_key_packet: None,
+        calendar_event_content,
+        shared_key_packet: Some(BASE64.encode(&key_packets)),
+        shared_event_content: Some(vec![signed_part, encrypted_part]),
+        personal_event_content: None,
+        attendees_event_content: None,
+        attendees: None,
+        uid: None,
+        shared_event_id: None,
+    })
+}
+
+fn sign_cleartext_card(address_keyring: &Keyring, card: &str) -> Option<SyncCalendarEventPart> {
+    let sig_raw = encrypt::sign_detached(address_keyring, card.as_bytes())
+        .map_err(|err| tracing::warn!(error = %err, "calendar cleartext signing failed"))
+        .ok()?;
+    Some(SyncCalendarEventPart {
+        kind: 2,
+        data: card.to_string(),
+        signature: Some(armor_signature(&sig_raw)?),
+        author: None,
+    })
+}
+
+fn encrypt_and_sign_card(
+    calendar_keyring: &Keyring,
+    address_keyring: &Keyring,
+    card: &str,
+) -> Option<(Vec<u8>, SyncCalendarEventPart)> {
+    let card_bytes = card.as_bytes();
+    let (key_packets, data_packets) = encrypt::encrypt_attachment(calendar_keyring, card_bytes)
+        .map_err(|err| tracing::warn!(error = %err, "calendar event encryption failed"))
+        .ok()?;
+    let sig_raw = encrypt::sign_detached(address_keyring, card_bytes)
+        .map_err(|err| tracing::warn!(error = %err, "calendar event signing failed"))
+        .ok()?;
+    let part = SyncCalendarEventPart {
+        kind: 3,
+        data: BASE64.encode(&data_packets),
+        signature: Some(armor_signature(&sig_raw)?),
+        author: None,
+    };
+    Some((key_packets, part))
+}
+
+/// SharedEventContent Type 2 (signed cleartext): indexable properties.
+const SHARED_CLEARTEXT_PROPERTIES: &[&str] = &[
+    "DTSTART",
+    "DTEND",
+    "DURATION",
+    "RRULE",
+    "RDATE",
+    "EXDATE",
+    "RECURRENCE-ID",
+    "SEQUENCE",
+    "ORGANIZER",
+    "CREATED",
+    "LAST-MODIFIED",
+];
+
+/// SharedEventContent Type 3 (signed+encrypted): private properties.
+const SHARED_ENCRYPTED_PROPERTIES: &[&str] = &["SUMMARY", "DESCRIPTION", "LOCATION"];
+
+/// CalendarEventContent Type 2 (signed cleartext): calendar-specific metadata.
+const CALENDAR_CLEARTEXT_PROPERTIES: &[&str] = &["STATUS", "TRANSP"];
+
+/// Proton event card split result.
+struct ProtonEventCards {
+    /// SharedEventContent Type 2 card (signed cleartext).
+    shared_cleartext: String,
+    /// SharedEventContent Type 3 card (signed+encrypted).
+    shared_encrypted: String,
+    /// CalendarEventContent Type 2 card, if STATUS or TRANSP present.
+    calendar_cleartext: Option<String>,
+}
+
+/// Split an iCalendar payload into Proton event cards.
+///
+/// Follows the Android reference: SharedEventContent gets two cards (cleartext
+/// indexable props + encrypted private props), CalendarEventContent gets STATUS
+/// and TRANSP. UID and DTSTAMP are included in every card.
+fn split_ics_for_proton(ics: &str) -> ProtonEventCards {
+    let lines = unfold_ics_lines(ics);
+    let mut uid_line: Option<&str> = None;
+    let mut dtstamp_line: Option<&str> = None;
+    let mut shared_cleartext_props = Vec::new();
+    let mut shared_encrypted_props = Vec::new();
+    let mut calendar_cleartext_props = Vec::new();
+    let mut vtimezone_lines: Vec<&str> = Vec::new();
+    let mut in_vevent = false;
+    let mut in_vtimezone = false;
+    let mut depth: i32 = 0;
+
+    for line in &lines {
+        let upper = line.to_ascii_uppercase();
+
+        // Capture VTIMEZONE blocks for the shared cleartext card.
+        if upper.starts_with("BEGIN:VTIMEZONE") {
+            in_vtimezone = true;
+            vtimezone_lines.push(line);
+            continue;
+        }
+        if in_vtimezone {
+            vtimezone_lines.push(line);
+            if upper.starts_with("END:VTIMEZONE") {
+                in_vtimezone = false;
+            }
+            continue;
+        }
+
+        if upper.starts_with("BEGIN:VEVENT") && depth == 0 {
+            in_vevent = true;
+            continue;
+        }
+        if upper.starts_with("END:VEVENT") && depth == 0 {
+            in_vevent = false;
+            continue;
+        }
+        if !in_vevent {
+            continue;
+        }
+        if upper.starts_with("BEGIN:") {
+            depth += 1;
+            continue;
+        }
+        if upper.starts_with("END:") {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth > 0 {
+            continue;
+        }
+
+        let prop_name = upper
+            .split(|c: char| c == ':' || c == ';')
+            .next()
+            .unwrap_or("");
+
+        // UID and DTSTAMP go in every card.
+        if prop_name == "UID" {
+            uid_line = Some(line);
+        } else if prop_name == "DTSTAMP" {
+            dtstamp_line = Some(line);
+        } else if SHARED_CLEARTEXT_PROPERTIES.contains(&prop_name) {
+            shared_cleartext_props.push(line.as_str());
+        } else if SHARED_ENCRYPTED_PROPERTIES.contains(&prop_name) {
+            shared_encrypted_props.push(line.as_str());
+        } else if CALENDAR_CLEARTEXT_PROPERTIES.contains(&prop_name) {
+            calendar_cleartext_props.push(line.as_str());
+        }
+    }
+
+    let common: Vec<&str> = [uid_line, dtstamp_line].into_iter().flatten().collect();
+
+    let shared_cleartext = wrap_vevent_card(&common, &shared_cleartext_props, &vtimezone_lines);
+    let shared_encrypted = wrap_vevent_card(&common, &shared_encrypted_props, &[]);
+    let calendar_cleartext = if calendar_cleartext_props.is_empty() {
+        None
+    } else {
+        Some(wrap_vevent_card(&common, &calendar_cleartext_props, &[]))
+    };
+
+    ProtonEventCards {
+        shared_cleartext,
+        shared_encrypted,
+        calendar_cleartext,
+    }
+}
+
+fn wrap_vevent_card(common: &[&str], props: &[&str], extra_components: &[&str]) -> String {
+    let mut out = String::new();
+    out.push_str("BEGIN:VCALENDAR\r\n");
+    out.push_str("VERSION:2.0\r\n");
+    out.push_str("PRODID:-//OpenProton Bridge//EN\r\n");
+    for line in extra_components {
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    out.push_str("BEGIN:VEVENT\r\n");
+    for prop in common {
+        out.push_str(prop);
+        out.push_str("\r\n");
+    }
+    for prop in props {
+        out.push_str(prop);
+        out.push_str("\r\n");
+    }
+    out.push_str("END:VEVENT\r\n");
+    out.push_str("END:VCALENDAR\r\n");
+    out
+}
+
+fn armor_signature(raw: &[u8]) -> Option<String> {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    let mut writer = openpgp::armor::Writer::new(&mut buf, openpgp::armor::Kind::Signature).ok()?;
+    writer.write_all(raw).ok()?;
+    writer.finalize().ok()?;
+    String::from_utf8(buf).ok()
+}
+
+/// Returns true if the ID looks like it was locally generated rather than
+/// assigned by the Proton API. Proton IDs are long base64url strings (88 chars
+/// with `==` suffix). Local IDs are typically UUIDs or `shared-*` prefixed.
+pub fn is_local_id(id: &str) -> bool {
+    looks_like_local_uuid(id) || id.starts_with("shared-") || id.starts_with("uid-")
 }
 
 fn looks_like_local_uuid(value: &str) -> bool {
@@ -872,7 +1179,7 @@ mod tests {
 
     use super::{
         best_event_ics, extract_clearsigned_body, extract_inline_ics_payload, first_property_value,
-        normalize_ics_payload,
+        normalize_ics_payload, split_ics_for_proton,
     };
 
     #[test]
@@ -974,5 +1281,56 @@ mod tests {
         assert!(normalized.contains("DESCRIPTION:Line 1\r\n"));
         assert!(!normalized.contains("QUOTED-PRINTABLE"));
         assert!(!normalized.contains("CHARSET="));
+    }
+
+    #[test]
+    fn split_ics_separates_shared_and_calendar_cards() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:test-123\r\nDTSTAMP:20260307T070000Z\r\nDTSTART:20260307T080000Z\r\nDTEND:20260307T090000Z\r\nSUMMARY:Team Meeting\r\nLOCATION:Room 42\r\nDESCRIPTION:Weekly sync\r\nSEQUENCE:0\r\nSTATUS:CONFIRMED\r\nTRANSP:OPAQUE\r\nRRULE:FREQ=WEEKLY\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let cards = split_ics_for_proton(ics);
+
+        // Shared cleartext has indexable properties + UID/DTSTAMP
+        assert!(cards.shared_cleartext.contains("UID:test-123"));
+        assert!(cards.shared_cleartext.contains("DTSTAMP:"));
+        assert!(cards.shared_cleartext.contains("DTSTART:20260307T080000Z"));
+        assert!(cards.shared_cleartext.contains("DTEND:20260307T090000Z"));
+        assert!(cards.shared_cleartext.contains("SEQUENCE:0"));
+        assert!(cards.shared_cleartext.contains("RRULE:FREQ=WEEKLY"));
+
+        // Shared cleartext must NOT have private or calendar-specific properties
+        assert!(!cards.shared_cleartext.contains("SUMMARY"));
+        assert!(!cards.shared_cleartext.contains("LOCATION"));
+        assert!(!cards.shared_cleartext.contains("STATUS"));
+        assert!(!cards.shared_cleartext.contains("TRANSP"));
+
+        // Shared encrypted has private properties + UID/DTSTAMP
+        assert!(cards.shared_encrypted.contains("UID:test-123"));
+        assert!(cards.shared_encrypted.contains("DTSTAMP:"));
+        assert!(cards.shared_encrypted.contains("SUMMARY:Team Meeting"));
+        assert!(cards.shared_encrypted.contains("LOCATION:Room 42"));
+        assert!(cards.shared_encrypted.contains("DESCRIPTION:Weekly sync"));
+        assert!(!cards.shared_encrypted.contains("DTSTART"));
+
+        // Calendar cleartext has STATUS and TRANSP + UID/DTSTAMP
+        let cal = cards.calendar_cleartext.unwrap();
+        assert!(cal.contains("UID:test-123"));
+        assert!(cal.contains("STATUS:CONFIRMED"));
+        assert!(cal.contains("TRANSP:OPAQUE"));
+        assert!(!cal.contains("SUMMARY"));
+
+        // All cards are valid VCALENDAR/VEVENT wrappers
+        for card in [&cards.shared_cleartext, &cards.shared_encrypted, &cal] {
+            assert!(card.contains("BEGIN:VCALENDAR"));
+            assert!(card.contains("BEGIN:VEVENT"));
+            assert!(card.contains("END:VEVENT"));
+            assert!(card.contains("END:VCALENDAR"));
+        }
+    }
+
+    #[test]
+    fn split_ics_no_calendar_card_when_no_status_or_transp() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:x\r\nDTSTART:20260307T080000Z\r\nSUMMARY:Simple\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let cards = split_ics_for_proton(ics);
+        assert!(cards.calendar_cleartext.is_none());
+        assert!(cards.shared_encrypted.contains("SUMMARY:Simple"));
     }
 }

@@ -27,7 +27,8 @@ use super::propfind;
 use super::report;
 
 const MAX_DAV_BODY_BYTES: usize = 1_048_576;
-const DAV_CAPABILITIES_HEADER: &str = "1, 2, calendar-access, addressbook, sync-collection";
+const DAV_CAPABILITIES_HEADER: &str =
+    "1, 2, calendar-access, addressbook, sync-collection, webdav-push";
 
 static DAV_METRICS: LazyLock<DavServerMetrics> = LazyLock::new(DavServerMetrics::default);
 static RUNTIME_TLS_CONFIG: OnceLock<RwLock<Option<Arc<rustls::ServerConfig>>>> = OnceLock::new();
@@ -195,6 +196,8 @@ pub struct DavServerConfig {
     pub auth_router: AuthRouter,
     pub pim_stores: HashMap<String, Arc<PimStore>>,
     pub runtime_accounts: Option<Arc<RuntimeAccountRegistry>>,
+    pub push_subscriptions: Option<super::push::PushSubscriptionStore>,
+    pub vapid_keys: Option<Arc<super::push_crypto::VapidKeyPair>>,
 }
 
 pub struct DavServer {
@@ -434,7 +437,8 @@ async fn route_request(
 
     match method.as_str() {
         "OPTIONS" => Ok(options_response()),
-        "PROPFIND" | "PROPPATCH" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" | "MKCALENDAR" => {
+        "PROPFIND" | "PROPPATCH" | "REPORT" | "GET" | "HEAD" | "PUT" | "DELETE" | "POST"
+        | "MKCALENDAR" => {
             if !path_without_query.starts_with("/dav") {
                 return Ok(not_found_response());
             }
@@ -463,7 +467,25 @@ async fn route_request(
                     &request.headers,
                     &auth,
                     store,
+                    config.vapid_keys.as_deref(),
                 );
+            }
+
+            // WebDAV-Push: POST push-register
+            if method == "POST" {
+                if let Some(ref push_store) = config.push_subscriptions {
+                    let body_str = std::str::from_utf8(body).unwrap_or("");
+                    if body_str.contains("push-register") {
+                        return super::push::handle_push_register(&request.path, body, push_store);
+                    }
+                }
+            }
+
+            // WebDAV-Push: DELETE subscription
+            if method == "DELETE" && request.path.contains(".push-subscriptions/") {
+                if let Some(ref push_store) = config.push_subscriptions {
+                    return super::push::handle_push_unsubscribe(&request.path, push_store);
+                }
             }
 
             let Some(store) = config.pim_stores.get(&auth.account_id.0) else {
@@ -520,7 +542,7 @@ fn options_response() -> DavResponse {
             ("DAV", DAV_CAPABILITIES_HEADER.to_string()),
             (
                 "Allow",
-                "OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE"
+                "OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE, POST"
                     .to_string(),
             ),
             ("Content-Type", "text/plain; charset=utf-8".to_string()),
@@ -711,6 +733,8 @@ mod tests {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
                 runtime_accounts: None,
+                push_subscriptions: None,
+                vapid_keys: None,
             },
         );
         let addr = server.local_addr()?;
@@ -745,6 +769,8 @@ mod tests {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
                 runtime_accounts: None,
+                push_subscriptions: None,
+                vapid_keys: None,
             },
         )
         .await
@@ -765,6 +791,8 @@ mod tests {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
                 runtime_accounts: None,
+                push_subscriptions: None,
+                vapid_keys: None,
             },
         )
         .await
@@ -785,6 +813,8 @@ mod tests {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
                 runtime_accounts: None,
+                push_subscriptions: None,
+                vapid_keys: None,
             },
         )
         .await
@@ -805,6 +835,8 @@ mod tests {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
                 runtime_accounts: None,
+                push_subscriptions: None,
+                vapid_keys: None,
             },
         )
         .await
@@ -825,6 +857,8 @@ mod tests {
                 auth_router: auth_router(),
                 pim_stores: HashMap::new(),
                 runtime_accounts: None,
+                push_subscriptions: None,
+                vapid_keys: None,
             },
         )
         .await
@@ -840,6 +874,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores: HashMap::new(),
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -895,6 +931,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -945,6 +983,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1012,6 +1052,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1079,6 +1121,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1140,6 +1184,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1222,6 +1268,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1310,6 +1358,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1376,6 +1426,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores,
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
 
         let server = tokio::spawn(async move {
@@ -1416,6 +1468,8 @@ mod tests {
             auth_router: auth_router(),
             pim_stores: HashMap::new(),
             runtime_accounts: None,
+            push_subscriptions: None,
+            vapid_keys: None,
         });
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");

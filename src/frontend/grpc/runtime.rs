@@ -187,16 +187,13 @@ pub async fn run_server_with_options(
                 break;
             }
 
-            match next_interrupt_action(shutdown_requested) {
-                InterruptAction::InitiateShutdown => {
-                    shutdown_requested = true;
-                    info!("Ctrl-C received, initiating graceful shutdown");
-                    let _ = shutdown_tx_ctrlc.send(true);
-                }
-                InterruptAction::ForceExit => {
-                    warn!("second Ctrl-C received, forcing process exit");
-                    std::process::exit(130);
-                }
+            if !shutdown_requested {
+                shutdown_requested = true;
+                info!("Ctrl-C received, initiating graceful shutdown");
+                let _ = shutdown_tx_ctrlc.send(true);
+            } else {
+                warn!("second Ctrl-C received, forcing process exit");
+                std::process::exit(130);
             }
         }
     });

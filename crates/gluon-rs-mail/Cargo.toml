@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-trait = "0.1"
 gluon-rs-core = { path = "../gluon-rs-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "2"

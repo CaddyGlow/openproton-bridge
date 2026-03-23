@@ -6,6 +6,7 @@ pub mod types;
 
 // IMAP protocol modules.
 pub mod command;
+pub mod imap_connector;
 pub mod imap_error;
 pub mod imap_store;
 pub mod imap_types;
@@ -26,6 +27,7 @@ pub use store::{
 pub use target::CompatibilityTarget;
 pub use types::StoreBootstrap;
 
+pub use imap_connector::{AuthResult, ImapConnector, MetadataPage};
 pub use imap_error::{ImapError, ImapResult};
 pub use imap_store::{
     MailboxSnapshot, MailboxStatus, SelectMailboxData, StoreEvent, StoreEventKind,

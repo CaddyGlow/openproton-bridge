@@ -10,6 +10,7 @@ pub mod imap_error;
 pub mod imap_store;
 pub mod imap_types;
 pub mod response;
+pub mod rfc822;
 pub mod well_known;
 
 pub use db::{SchemaFamily, SchemaProbe};

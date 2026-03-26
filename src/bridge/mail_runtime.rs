@@ -915,7 +915,7 @@ async fn run_runtime(
     });
 
     // WebDAV-Push notification sender task
-    let push_sender_task = if config.dav_enable {
+    let _push_sender_task = if config.dav_enable {
         let push_rx = calendar_notifier.subscribe();
         let push_store = push_subscription_store.clone();
         let push_vapid = vapid_keys.clone();

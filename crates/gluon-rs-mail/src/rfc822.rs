@@ -463,8 +463,7 @@ fn navigate_to_part(text: &str, numbers: &[usize]) -> Option<String> {
 /// ("date" "subject" ((from)) ((sender)) ((reply-to)) ((to)) ((cc)) (NIL) "in-reply-to" "message-id")
 pub fn build_envelope(meta: &MessageEnvelope, header: &str) -> String {
     // Date: use the Date header if available, fall back to internal timestamp
-    let date = extract_header(header, "Date")
-        .unwrap_or_else(|| format_imap_date(meta.time));
+    let date = extract_header(header, "Date").unwrap_or_else(|| format_imap_date(meta.time));
     let subject = imap_quote(&meta.subject);
     let from = format_address_list(std::slice::from_ref(&meta.sender));
 
@@ -520,10 +519,7 @@ fn parse_header_address(value: &str) -> Option<EmailAddress> {
     }
     if let Some(lt) = value.find('<') {
         let name = value[..lt].trim().trim_matches('"').to_string();
-        let addr = value[lt + 1..]
-            .trim_end_matches('>')
-            .trim()
-            .to_string();
+        let addr = value[lt + 1..].trim_end_matches('>').trim().to_string();
         Some(EmailAddress {
             name,
             address: addr,

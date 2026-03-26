@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -61,9 +61,7 @@ impl RecentTracker {
         let claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
         let set = claimed.get(mailbox);
         uids.iter()
-            .filter(|uid| {
-                set.map(|s| !s.contains(&uid.value())).unwrap_or(true)
-            })
+            .filter(|uid| set.map(|s| !s.contains(&uid.value())).unwrap_or(true))
             .count() as u32
     }
 
@@ -106,12 +104,15 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     selected_mailbox_mod_seq: Option<u64>,
     selected_mailbox_uids: Vec<ImapUid>,
     selected_mailbox_flags: HashMap<ImapUid, Vec<String>>,
+    selected_mailbox_internal_id: Option<u64>,
+    storage_user_id: Option<String>,
     selected_read_only: bool,
     authenticated_account_id: Option<String>,
     user_labels: Vec<mailbox::ResolvedMailbox>,
     starttls_available: bool,
     connection_id: u64,
     recent_uids: HashSet<ImapUid>,
+    store_session: Option<gluon_rs_mail::StoreSession>,
 }
 
 impl<R, W> ImapSession<R, W>
@@ -138,12 +139,15 @@ where
             selected_mailbox_mod_seq: None,
             selected_mailbox_uids: Vec::new(),
             selected_mailbox_flags: HashMap::new(),
+            selected_mailbox_internal_id: None,
+            storage_user_id: None,
             selected_read_only: false,
             authenticated_account_id: None,
             user_labels: Vec::new(),
             starttls_available,
             connection_id: NEXT_IMAP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
             recent_uids: HashSet::new(),
+            store_session: None,
         }
     }
 
@@ -368,7 +372,25 @@ where
             .collect();
 
         self.authenticated_account_id = Some(auth_result.account_id.clone());
+        self.storage_user_id = Some(
+            self.config
+                .gluon_connector
+                .resolve_storage_user_id(Some(&auth_result.account_id))
+                .to_string(),
+        );
         self.state = State::Authenticated;
+
+        match self
+            .config
+            .gluon_connector
+            .acquire_store_session(Some(&auth_result.account_id))
+            .await
+        {
+            Ok(session) => self.store_session = Some(session),
+            Err(e) => {
+                warn!(error = %e, "failed to acquire pinned store session, falling back to pool");
+            }
+        }
 
         info!(
             service = "imap",
@@ -384,10 +406,13 @@ where
         self.writer.untagged("BYE server logging out").await?;
         self.state = State::Logout;
         self.authenticated_account_id = None;
+        self.storage_user_id = None;
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
+        self.selected_mailbox_internal_id = None;
         self.selected_mailbox_uids.clear();
         self.selected_mailbox_flags.clear();
+        self.store_session = None;
         self.writer.tagged_ok(tag, None, "LOGOUT completed").await
     }
 
@@ -475,7 +500,7 @@ where
         ScopedMailboxId::from_parts(self.authenticated_account_id.as_deref(), mailbox)
     }
 
-    fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
+    async fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
         if let Some(mb) = self.config.mailbox_catalog.resolve_mailbox(
             self.authenticated_account_id.as_deref(),
             &self.user_labels,
@@ -485,7 +510,7 @@ where
         }
         // Fall back to checking the gluon store for dynamically created mailboxes
         let scoped = self.scoped_mailbox_name(name);
-        if self.config.gluon_connector.mailbox_exists(&scoped) {
+        if self.config.gluon_connector.mailbox_exists(&scoped).await {
             return Some(mailbox::ResolvedMailbox {
                 name: name.to_string(),
                 label_id: name.to_string(),
@@ -569,12 +594,17 @@ where
         let Some(mailbox) = self.selected_mailbox.clone() else {
             return Ok(());
         };
-        let scoped = self.scoped_mailbox_name(&mailbox);
-        let data = self
-            .config
-            .mailbox_view
-            .select_mailbox_data(&scoped)
-            .await?;
+        let data = if let (Some(ref mut ss), Some(mb_id)) =
+            (&mut self.store_session, self.selected_mailbox_internal_id)
+        {
+            select_data_from_session(ss, mb_id).await?
+        } else {
+            let scoped = self.scoped_mailbox_name(&mailbox);
+            self.config
+                .mailbox_view
+                .select_mailbox_data_fast(&scoped)
+                .await?
+        };
         self.selected_mailbox_uids = data.uids;
         self.selected_mailbox_flags = data.flags;
         self.selected_mailbox_mod_seq = Some(data.snapshot.mod_seq);
@@ -589,12 +619,17 @@ where
             return Ok(());
         };
 
-        let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let select_data = self
-            .config
-            .mailbox_view
-            .select_mailbox_data(&scoped_mailbox)
-            .await?;
+        let select_data = if let (Some(ref mut ss), Some(mb_id)) =
+            (&mut self.store_session, self.selected_mailbox_internal_id)
+        {
+            select_data_from_session(ss, mb_id).await?
+        } else {
+            let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
+            self.config
+                .mailbox_view
+                .select_mailbox_data_fast(&scoped_mailbox)
+                .await?
+        };
 
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
         let previous_exists = self.selected_mailbox_uids.len() as u32;
@@ -669,8 +704,7 @@ where
 
         while ni < name.len() {
             if pi < pattern.len()
-                && (pattern[pi] == b'*'
-                    || (pattern[pi] == b'%' && name[ni] != b'/'))
+                && (pattern[pi] == b'*' || (pattern[pi] == b'%' && name[ni] != b'/'))
             {
                 if pattern[pi] == b'*' {
                     star_pi = pi;
@@ -687,8 +721,7 @@ where
             }
 
             if pi < pattern.len()
-                && (pattern[pi].eq_ignore_ascii_case(&name[ni])
-                    || pattern[pi] == b'?')
+                && (pattern[pi].eq_ignore_ascii_case(&name[ni]) || pattern[pi] == b'?')
             {
                 ni += 1;
                 pi += 1;
@@ -745,8 +778,7 @@ where
 
             let all = self.all_mailboxes();
             // Collect parent paths that need \Noselect entries
-            let mut parents: std::collections::BTreeSet<String> =
-                std::collections::BTreeSet::new();
+            let mut parents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for mb in &all {
                 let mut path = String::new();
                 for (i, seg) in mb.name.split('/').enumerate() {
@@ -755,9 +787,7 @@ where
                     }
                     path.push_str(seg);
                     // Only add as parent if it's not a real mailbox
-                    if path != mb.name
-                        && !all.iter().any(|m| m.name.eq_ignore_ascii_case(&path))
-                    {
+                    if path != mb.name && !all.iter().any(|m| m.name.eq_ignore_ascii_case(&path)) {
                         parents.insert(path.clone());
                     }
                 }
@@ -776,10 +806,7 @@ where
             for parent in &parents {
                 if Self::matches_list_pattern(parent, &full_pattern) {
                     self.writer
-                        .untagged(&format!(
-                            "LIST (\\Noselect) \"/\" \"{}\"",
-                            parent
-                        ))
+                        .untagged(&format!("LIST (\\Noselect) \"/\" \"{}\"", parent))
                         .await?;
                 }
             }
@@ -820,12 +847,12 @@ where
 
         // If mailbox already exists, return OK for idempotent behavior.
         // imaptest expects CREATE to succeed even if the mailbox exists.
-        if self.resolve_mailbox(mailbox_name).is_some() {
+        if self.resolve_mailbox(mailbox_name).await.is_some() {
             return self.writer.tagged_ok(tag, None, "CREATE completed").await;
         }
 
         let scoped = self.scoped_mailbox_name(mailbox_name);
-        if let Err(e) = self.config.gluon_connector.create_mailbox(&scoped) {
+        if let Err(e) = self.config.gluon_connector.create_mailbox(&scoped).await {
             return self
                 .writer
                 .tagged_no(tag, &format!("CREATE failed: {e}"))
@@ -889,7 +916,7 @@ where
         }
 
         // Check if mailbox exists - if so, silently succeed (all mailboxes are subscribed)
-        if self.resolve_mailbox(mailbox_name).is_some() {
+        if self.resolve_mailbox(mailbox_name).await.is_some() {
             return self
                 .writer
                 .tagged_ok(tag, None, "SUBSCRIBE completed")
@@ -908,7 +935,7 @@ where
         }
 
         // Check if mailbox exists - if so, silently succeed (we don't actually unsubscribe)
-        if self.resolve_mailbox(mailbox_name).is_some() {
+        if self.resolve_mailbox(mailbox_name).await.is_some() {
             return self
                 .writer
                 .tagged_ok(tag, None, "UNSUBSCRIBE completed")
@@ -926,7 +953,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match self.resolve_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name).await {
             Some(m) => m,
             None => {
                 return self
@@ -1001,11 +1028,24 @@ where
             );
         }
 
-        let select_data = self
-            .config
-            .mailbox_view
-            .select_mailbox_data(&scoped_mailbox)
-            .await?;
+        let select_data = if let Some(ref mut ss) = self.store_session {
+            if let Some(mb_internal_id) = resolve_mailbox_internal_id(ss, &mb.name).await {
+                self.selected_mailbox_internal_id = Some(mb_internal_id);
+                select_data_from_session(ss, mb_internal_id).await?
+            } else {
+                self.selected_mailbox_internal_id = None;
+                self.config
+                    .mailbox_view
+                    .select_mailbox_data_fast(&scoped_mailbox)
+                    .await?
+            }
+        } else {
+            self.selected_mailbox_internal_id = None;
+            self.config
+                .mailbox_view
+                .select_mailbox_data_fast(&scoped_mailbox)
+                .await?
+        };
 
         // Collect custom keywords from all messages in the mailbox
         let mut keywords: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1017,8 +1057,7 @@ where
             }
         }
 
-        let mut flags_list =
-            "\\Seen \\Answered \\Flagged \\Deleted \\Draft".to_string();
+        let mut flags_list = "\\Seen \\Answered \\Flagged \\Deleted \\Draft".to_string();
         for kw in &keywords {
             flags_list.push(' ');
             flags_list.push_str(kw);
@@ -1093,7 +1132,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match self.resolve_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name).await {
             Some(m) => m,
             None => {
                 return self
@@ -1128,7 +1167,11 @@ where
         }
 
         self.writer
-            .untagged(&format!("STATUS \"{}\" ({})", mb.name, attrs.join(" ")))
+            .untagged(&format!(
+                "STATUS {} ({})",
+                format_mailbox_name(&mb.name),
+                attrs.join(" ")
+            ))
             .await?;
         self.writer.tagged_ok(tag, None, "STATUS completed").await
     }
@@ -1144,6 +1187,7 @@ where
 
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
+        self.selected_mailbox_internal_id = None;
         self.selected_mailbox_uids.clear();
         self.selected_mailbox_flags.clear();
         self.selected_read_only = false;
@@ -1158,6 +1202,7 @@ where
         // Unlike CLOSE, do NOT expunge deleted messages
         self.selected_mailbox = None;
         self.selected_mailbox_mod_seq = None;
+        self.selected_mailbox_internal_id = None;
         self.selected_mailbox_uids.clear();
         self.selected_mailbox_flags.clear();
         self.selected_read_only = false;
@@ -1178,7 +1223,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match self.resolve_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name).await {
             Some(m) => m,
             None => {
                 return self
@@ -1247,7 +1292,7 @@ where
         let select_data = self
             .config
             .mailbox_view
-            .select_mailbox_data(&scoped_mailbox)
+            .select_mailbox_data_fast(&scoped_mailbox)
             .await?;
 
         self.writer
@@ -1371,9 +1416,55 @@ where
         let mut cache_hits = 0u32;
         let mut cache_misses = 0u32;
 
+        // Take the pinned store session for the duration of the fetch loop to
+        // avoid per-message pool.acquire() overhead.
+        let mut pinned_session = self.store_session.take();
+        let pinned_mb_id = self.selected_mailbox_internal_id;
+        let pinned_account_paths = if pinned_session.is_some() {
+            self.storage_user_id
+                .as_deref()
+                .and_then(|suid| self.config.gluon_connector.account_paths(suid).ok())
+        } else {
+            None
+        };
+
         for (uid, seq) in target_messages {
             let meta = if needs_metadata {
-                mailbox_view.get_metadata(&scoped_mailbox, uid).await?
+                if let (Some(ref mut ss), Some(mb_id), Some(ref ap)) =
+                    (&mut pinned_session, pinned_mb_id, &pinned_account_paths)
+                {
+                    match ss.message_by_uid(mb_id, uid.value(), ap) {
+                        Ok(Some(message)) => {
+                            let blob_data = if message.blob_exists {
+                                self.storage_user_id.as_deref().and_then(|suid| {
+                                    self.config
+                                        .gluon_connector
+                                        .read_message_blob(suid, &message.summary.internal_id)
+                                        .ok()
+                                })
+                            } else {
+                                None
+                            };
+                            let parsed = blob_data.as_deref().and_then(|data| {
+                                super::gluon_mailbox_view::parse_metadata_from_rfc822(
+                                    &scoped_mailbox,
+                                    &message.summary,
+                                    data,
+                                )
+                            });
+                            Some(parsed.unwrap_or_else(|| {
+                                super::gluon_mailbox_view::fallback_metadata(
+                                    &scoped_mailbox,
+                                    &message,
+                                )
+                            }))
+                        }
+                        Ok(None) => None,
+                        Err(_) => mailbox_view.get_metadata(&scoped_mailbox, uid).await?,
+                    }
+                } else {
+                    mailbox_view.get_metadata(&scoped_mailbox, uid).await?
+                }
             } else {
                 None
             };
@@ -1646,6 +1737,9 @@ where
             }
         }
 
+        // Restore the pinned store session after the fetch loop.
+        self.store_session = pinned_session;
+
         if needs_body_sections {
             if header_only_body_fetch {
                 // Match bridge behavior: header index fetch should avoid RFC822 disk/blob reads.
@@ -1754,103 +1848,235 @@ where
                 | StoreAction::RemoveFlagsSilent
         );
 
+        // Take pinned session for the store loop to avoid per-message pool.acquire().
+        let mut pinned_session = self.store_session.take();
+        let pinned_mb_id = self.selected_mailbox_internal_id;
+
         for &uid in &target_uids {
-            let previous_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
-            let had_seen = previous_flags.iter().any(|flag| flag == "\\Seen");
-            let had_flagged = previous_flags.iter().any(|flag| flag == "\\Flagged");
+            // Fast path: use pinned session for flag reads/writes.
+            let used_pinned = if let (Some(ref mut ss), Some(mb_id)) =
+                (&mut pinned_session, pinned_mb_id)
+            {
+                if let Ok(Some(internal_id)) = ss.message_internal_id_by_uid(mb_id, uid.value()) {
+                    let previous_flags =
+                        ss.message_flags_by_internal_id(&internal_id).map_err(|e| {
+                            super::ImapError::Protocol(format!("store session flags: {e}"))
+                        })?;
+                    let had_seen = previous_flags.iter().any(|flag| flag == "\\Seen");
+                    let had_flagged = previous_flags.iter().any(|flag| flag == "\\Flagged");
 
-            match action {
-                StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
-                    mutation
-                        .set_flags(&scoped_mailbox, uid, flag_strings.clone())
-                        .await?;
-                }
-                StoreAction::AddFlags | StoreAction::AddFlagsSilent => {
-                    mutation
-                        .add_flags(&scoped_mailbox, uid, &flag_strings)
-                        .await?;
-                }
-                StoreAction::RemoveFlags | StoreAction::RemoveFlagsSilent => {
-                    mutation
-                        .remove_flags(&scoped_mailbox, uid, &flag_strings)
-                        .await?;
-                }
-            }
-
-            // Sync flag changes to Proton API via connector
-            if let Some(ref account_id) = self.authenticated_account_id {
-                if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
-                    let id_ref = proton_id.as_str();
-                    let current_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
-                    let has_seen = current_flags.iter().any(|flag| flag == "\\Seen");
-                    let has_flagged = current_flags.iter().any(|flag| flag == "\\Flagged");
-
-                    if had_seen != has_seen {
-                        if let Err(err) = self
-                            .config
-                            .connector
-                            .mark_messages_read(account_id, &[id_ref], has_seen)
-                            .await
-                        {
-                            warn!(
-                                error = %err,
-                                mailbox = %mailbox,
-                                uid = uid.value(),
-                                proton_id = %proton_id,
-                                "failed to sync seen flag upstream"
-                            );
-                            return self
-                                .writer
-                                .tagged_no(tag, "STORE failed: upstream mutation failed")
-                                .await;
+                    match action {
+                        StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
+                            ss.set_message_flags(&internal_id, &flag_strings)
+                                .map_err(|e| {
+                                    super::ImapError::Protocol(format!(
+                                        "store session set_flags: {e}"
+                                    ))
+                                })?;
+                        }
+                        StoreAction::AddFlags | StoreAction::AddFlagsSilent => {
+                            ss.add_message_flags(&internal_id, &flag_strings)
+                                .map_err(|e| {
+                                    super::ImapError::Protocol(format!(
+                                        "store session add_flags: {e}"
+                                    ))
+                                })?;
+                        }
+                        StoreAction::RemoveFlags | StoreAction::RemoveFlagsSilent => {
+                            ss.remove_message_flags(&internal_id, &flag_strings)
+                                .map_err(|e| {
+                                    super::ImapError::Protocol(format!(
+                                        "store session remove_flags: {e}"
+                                    ))
+                                })?;
                         }
                     }
 
-                    // \Answered is stored locally but not synced upstream. The Proton
-                    // API has no endpoint for toggling the replied flag on existing
-                    // messages. The Go bridge also omits this in its STORE handler.
-
-                    if had_flagged != has_flagged {
-                        if let Err(err) = self
-                            .config
-                            .connector
-                            .mark_messages_starred(account_id, &[id_ref], has_flagged)
-                            .await
+                    if let Some(ref account_id) = self.authenticated_account_id {
+                        if let Ok(Some(proton_id)) = ss.message_remote_id_by_uid(mb_id, uid.value())
                         {
-                            warn!(
-                                error = %err,
-                                mailbox = %mailbox,
-                                uid = uid.value(),
-                                proton_id = %proton_id,
-                                "failed to sync flagged state upstream"
-                            );
-                            return self
-                                .writer
-                                .tagged_no(tag, "STORE failed: upstream mutation failed")
-                                .await;
+                            let current_flags =
+                                ss.message_flags_by_internal_id(&internal_id).map_err(|e| {
+                                    super::ImapError::Protocol(format!("store session flags: {e}"))
+                                })?;
+                            let has_seen = current_flags.iter().any(|flag| flag == "\\Seen");
+                            let has_flagged = current_flags.iter().any(|flag| flag == "\\Flagged");
+
+                            if had_seen != has_seen {
+                                if let Err(err) = self
+                                    .config
+                                    .connector
+                                    .mark_messages_read(account_id, &[proton_id.as_str()], has_seen)
+                                    .await
+                                {
+                                    warn!(
+                                        error = %err,
+                                        mailbox = %mailbox,
+                                        uid = uid.value(),
+                                        proton_id = %proton_id,
+                                        "failed to sync seen flag upstream"
+                                    );
+                                    self.store_session = pinned_session;
+                                    return self
+                                        .writer
+                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                        .await;
+                                }
+                            }
+
+                            if had_flagged != has_flagged {
+                                if let Err(err) = self
+                                    .config
+                                    .connector
+                                    .mark_messages_starred(
+                                        account_id,
+                                        &[proton_id.as_str()],
+                                        has_flagged,
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        error = %err,
+                                        mailbox = %mailbox,
+                                        uid = uid.value(),
+                                        proton_id = %proton_id,
+                                        "failed to sync flagged state upstream"
+                                    );
+                                    self.store_session = pinned_session;
+                                    return self
+                                        .writer
+                                        .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                        .await;
+                                }
+                            }
                         }
                     }
-                }
-            }
 
-            if !silent {
-                let seq = mutation
-                    .uid_to_seq(&scoped_mailbox, uid)
-                    .await?
-                    .unwrap_or(0);
-                let current_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
-                let flag_str = current_flags.join(" ");
-                let fetch_items = if uid_mode {
-                    format!("UID {uid} FLAGS ({flag_str})")
+                    if !silent {
+                        let seq = all_uids
+                            .iter()
+                            .position(|&u| u == uid)
+                            .map(|i| i as u32 + 1)
+                            .unwrap_or(0);
+                        let current_flags =
+                            ss.message_flags_by_internal_id(&internal_id).map_err(|e| {
+                                super::ImapError::Protocol(format!("store session flags: {e}"))
+                            })?;
+                        let flag_str = current_flags.join(" ");
+                        let fetch_items = if uid_mode {
+                            format!("UID {uid} FLAGS ({flag_str})")
+                        } else {
+                            format!("FLAGS ({flag_str})")
+                        };
+                        self.writer
+                            .untagged(&format!("{seq} FETCH ({fetch_items})"))
+                            .await?;
+                    }
+                    true
                 } else {
-                    format!("FLAGS ({flag_str})")
-                };
-                self.writer
-                    .untagged(&format!("{seq} FETCH ({fetch_items})"))
-                    .await?;
+                    false
+                }
+            } else {
+                false
+            };
+
+            // Fallback: use trait-based mutation path.
+            if !used_pinned {
+                let previous_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
+                let had_seen = previous_flags.iter().any(|flag| flag == "\\Seen");
+                let had_flagged = previous_flags.iter().any(|flag| flag == "\\Flagged");
+
+                match action {
+                    StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
+                        mutation
+                            .set_flags(&scoped_mailbox, uid, flag_strings.clone())
+                            .await?;
+                    }
+                    StoreAction::AddFlags | StoreAction::AddFlagsSilent => {
+                        mutation
+                            .add_flags(&scoped_mailbox, uid, &flag_strings)
+                            .await?;
+                    }
+                    StoreAction::RemoveFlags | StoreAction::RemoveFlagsSilent => {
+                        mutation
+                            .remove_flags(&scoped_mailbox, uid, &flag_strings)
+                            .await?;
+                    }
+                }
+
+                if let Some(ref account_id) = self.authenticated_account_id {
+                    if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
+                        let id_ref = proton_id.as_str();
+                        let current_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
+                        let has_seen = current_flags.iter().any(|flag| flag == "\\Seen");
+                        let has_flagged = current_flags.iter().any(|flag| flag == "\\Flagged");
+
+                        if had_seen != has_seen {
+                            if let Err(err) = self
+                                .config
+                                .connector
+                                .mark_messages_read(account_id, &[id_ref], has_seen)
+                                .await
+                            {
+                                warn!(
+                                    error = %err,
+                                    mailbox = %mailbox,
+                                    uid = uid.value(),
+                                    proton_id = %proton_id,
+                                    "failed to sync seen flag upstream"
+                                );
+                                self.store_session = pinned_session;
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                    .await;
+                            }
+                        }
+
+                        if had_flagged != has_flagged {
+                            if let Err(err) = self
+                                .config
+                                .connector
+                                .mark_messages_starred(account_id, &[id_ref], has_flagged)
+                                .await
+                            {
+                                warn!(
+                                    error = %err,
+                                    mailbox = %mailbox,
+                                    uid = uid.value(),
+                                    proton_id = %proton_id,
+                                    "failed to sync flagged state upstream"
+                                );
+                                self.store_session = pinned_session;
+                                return self
+                                    .writer
+                                    .tagged_no(tag, "STORE failed: upstream mutation failed")
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                if !silent {
+                    let seq = mutation
+                        .uid_to_seq(&scoped_mailbox, uid)
+                        .await?
+                        .unwrap_or(0);
+                    let current_flags = mutation.get_flags(&scoped_mailbox, uid).await?;
+                    let flag_str = current_flags.join(" ");
+                    let fetch_items = if uid_mode {
+                        format!("UID {uid} FLAGS ({flag_str})")
+                    } else {
+                        format!("FLAGS ({flag_str})")
+                    };
+                    self.writer
+                        .untagged(&format!("{seq} FETCH ({fetch_items})"))
+                        .await?;
+                }
             }
         }
 
+        self.store_session = pinned_session;
         self.writer.tagged_ok(tag, None, "STORE completed").await
     }
 
@@ -1867,7 +2093,7 @@ where
         self.refresh_selected_snapshot().await?;
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let mailbox_view = self.config.mailbox_view.clone();
+        let _mailbox_view = self.config.mailbox_view.clone();
         let all_uids = self.selected_mailbox_uids.clone();
         let needs_rfc822 = criteria.iter().any(search_key_needs_rfc822);
 
@@ -1952,62 +2178,86 @@ where
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let mutation = &self.config.mailbox_mutation;
         let all_uids = self.selected_mailbox_uids.clone();
+        let cached_flags = &self.selected_mailbox_flags;
+
+        // Identify deleted UIDs from cached flags (avoids per-message get_flags calls).
+        let deleted_uids: Vec<ImapUid> = all_uids
+            .iter()
+            .filter(|uid| {
+                cached_flags
+                    .get(uid)
+                    .map(|flags| flags.iter().any(|f| f == "\\Deleted"))
+                    .unwrap_or(false)
+            })
+            .copied()
+            .collect();
+
+        if deleted_uids.is_empty() {
+            return Ok(true);
+        }
 
         let mut expunged_seqs = Vec::new();
         let mut offset = 0u32;
+        let mut successfully_expunged_uids = Vec::new();
 
         for (i, &uid) in all_uids.iter().enumerate() {
-            let flags = mutation.get_flags(&scoped_mailbox, uid).await?;
-            if flags.iter().any(|f| f == "\\Deleted") {
-                let seq = i as u32 + 1 - offset;
+            if !deleted_uids.contains(&uid) {
+                continue;
+            }
+            let seq = i as u32 + 1 - offset;
 
-                // Permanently delete if already in Trash or Spam, otherwise move to Trash
-                if let Some(ref account_id) = self.authenticated_account_id {
-                    if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
-                        let is_trash_or_spam = self
-                            .resolve_mailbox(&mailbox)
-                            .map(|mb| {
-                                mb.label_id == gluon_rs_mail::well_known::TRASH_LABEL
-                                    || mb.label_id == gluon_rs_mail::well_known::SPAM_LABEL
-                            })
-                            .unwrap_or(false);
+            // Sync upstream: permanently delete if in Trash or Spam, otherwise move to Trash.
+            if let Some(ref account_id) = self.authenticated_account_id {
+                if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
+                    let is_trash_or_spam = self
+                        .resolve_mailbox(&mailbox)
+                        .await
+                        .map(|mb| {
+                            mb.label_id == gluon_rs_mail::well_known::TRASH_LABEL
+                                || mb.label_id == gluon_rs_mail::well_known::SPAM_LABEL
+                        })
+                        .unwrap_or(false);
 
-                        let result = if is_trash_or_spam {
-                            self.config
-                                .connector
-                                .delete_messages(account_id, &[proton_id.as_str()])
-                                .await
-                        } else {
-                            self.config
-                                .connector
-                                .trash_messages(account_id, &[proton_id.as_str()])
-                                .await
-                        };
+                    let result = if is_trash_or_spam {
+                        self.config
+                            .connector
+                            .delete_messages(account_id, &[proton_id.as_str()])
+                            .await
+                    } else {
+                        self.config
+                            .connector
+                            .trash_messages(account_id, &[proton_id.as_str()])
+                            .await
+                    };
 
-                        if let Err(err) = result {
-                            warn!(
-                                error = %err,
-                                mailbox = %mailbox,
-                                uid = uid.value(),
-                                proton_id = %proton_id,
-                                permanent = is_trash_or_spam,
-                                "failed to sync expunge mutation upstream"
-                            );
-                            if let Some(tag) = tag {
-                                self.writer
-                                    .tagged_no(tag, "EXPUNGE failed: upstream mutation failed")
-                                    .await?;
-                                return Ok(false);
-                            }
+                    if let Err(err) = result {
+                        warn!(
+                            error = %err,
+                            mailbox = %mailbox,
+                            uid = uid.value(),
+                            proton_id = %proton_id,
+                            permanent = is_trash_or_spam,
+                            "failed to sync expunge mutation upstream"
+                        );
+                        if let Some(tag) = tag {
+                            self.writer
+                                .tagged_no(tag, "EXPUNGE failed: upstream mutation failed")
+                                .await?;
+                            return Ok(false);
                         }
                     }
                 }
-
-                mutation.remove_message(&scoped_mailbox, uid).await?;
-                expunged_seqs.push(seq);
-                offset += 1;
             }
+
+            successfully_expunged_uids.push(uid);
+            expunged_seqs.push(seq);
+            offset += 1;
         }
+
+        // Batch remove all successfully expunged messages from local store.
+        mutation
+            .batch_remove_messages(&scoped_mailbox, &successfully_expunged_uids)
+            .await?;
 
         if !silent {
             for seq in &expunged_seqs {
@@ -2044,7 +2294,9 @@ where
         }
 
         let max_uid = *all_uids.last().unwrap();
+        let cached_flags = &self.selected_mailbox_flags;
         let mut expunged_seqs = Vec::new();
+        let mut successfully_expunged_uids = Vec::new();
         let mut offset = 0u32;
 
         for (i, &uid) in all_uids.iter().enumerate() {
@@ -2053,8 +2305,12 @@ where
                 continue;
             }
 
-            let flags = mutation.get_flags(&scoped_mailbox, uid).await?;
-            if flags.iter().any(|f| f == "\\Deleted") {
+            let is_deleted = cached_flags
+                .get(&uid)
+                .map(|flags| flags.iter().any(|f| f == "\\Deleted"))
+                .unwrap_or(false);
+
+            if is_deleted {
                 let seq = i as u32 + 1 - offset;
 
                 // Permanently delete if in Trash or Spam, otherwise move to Trash
@@ -2062,6 +2318,7 @@ where
                     if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
                         let is_trash_or_spam = self
                             .resolve_mailbox(&mailbox)
+                            .await
                             .map(|mb| {
                                 mb.label_id == gluon_rs_mail::well_known::TRASH_LABEL
                                     || mb.label_id == gluon_rs_mail::well_known::SPAM_LABEL
@@ -2097,11 +2354,16 @@ where
                     }
                 }
 
-                mutation.remove_message(&scoped_mailbox, uid).await?;
+                successfully_expunged_uids.push(uid);
                 expunged_seqs.push(seq);
                 offset += 1;
             }
         }
+
+        // Batch remove all successfully expunged messages from local store.
+        mutation
+            .batch_remove_messages(&scoped_mailbox, &successfully_expunged_uids)
+            .await?;
 
         for seq in &expunged_seqs {
             self.writer.untagged(&format!("{} EXPUNGE", seq)).await?;
@@ -2123,7 +2385,7 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
-        let dest_mb = match self.resolve_mailbox(dest_name) {
+        let dest_mb = match self.resolve_mailbox(dest_name).await {
             Some(m) => m,
             None => {
                 return self
@@ -2212,7 +2474,7 @@ where
             return self.writer.tagged_no(tag, "mailbox is read-only").await;
         }
 
-        let dest_mb = match self.resolve_mailbox(dest_name) {
+        let dest_mb = match self.resolve_mailbox(dest_name).await {
             Some(m) => m,
             None => {
                 return self
@@ -2228,6 +2490,7 @@ where
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let source_mb = self
             .resolve_mailbox(&mailbox)
+            .await
             .unwrap_or_else(|| dest_mb.clone());
         self.refresh_selected_snapshot().await?;
         let scoped_source_mailbox = self.scoped_mailbox_name(&mailbox);
@@ -2344,7 +2607,7 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        let mb = match self.resolve_mailbox(mailbox_name) {
+        let mb = match self.resolve_mailbox(mailbox_name).await {
             Some(m) => m,
             None => {
                 // Consume and discard the literal before responding
@@ -2408,8 +2671,7 @@ where
         let reply_tos = extract_hdr("Reply-To")
             .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let external_id = extract_hdr("Message-Id")
-            .or_else(|| extract_hdr("Message-ID"));
+        let external_id = extract_hdr("Message-Id").or_else(|| extract_hdr("Message-ID"));
 
         // Use APPEND date argument if provided, else Date header, else now
         let time = append_date
@@ -2496,8 +2758,7 @@ where
         // If the target is the currently selected mailbox, update local state and notify
         if self.selected_mailbox.as_deref() == Some(&mb.name) {
             self.selected_mailbox_uids.push(uid);
-            self.selected_mailbox_flags
-                .insert(uid, flag_strs.clone());
+            self.selected_mailbox_flags.insert(uid, flag_strs.clone());
             self.writer
                 .untagged(&format!("{} EXISTS", status.exists))
                 .await?;
@@ -2960,14 +3221,19 @@ fn extract_text_section(data: &[u8]) -> Vec<u8> {
     }
 }
 
+fn format_mailbox_name(name: &str) -> String {
+    if name.contains(' ') || name.contains('"') || name.contains('\\') || name.is_empty() {
+        format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        name.to_string()
+    }
+}
+
 fn parse_append_address(value: &str) -> gluon_rs_mail::EmailAddress {
     let value = value.trim();
     if let Some(lt) = value.find('<') {
         let name = value[..lt].trim().trim_matches('"').to_string();
-        let addr = value[lt + 1..]
-            .trim_end_matches('>')
-            .trim()
-            .to_string();
+        let addr = value[lt + 1..].trim_end_matches('>').trim().to_string();
         gluon_rs_mail::EmailAddress {
             name,
             address: addr,
@@ -2997,6 +3263,76 @@ fn extract_header_section(data: &[u8]) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Resolve a mailbox name to its internal_id using a pinned StoreSession.
+async fn resolve_mailbox_internal_id(
+    session: &mut gluon_rs_mail::StoreSession,
+    mailbox_name: &str,
+) -> Option<u64> {
+    let mailboxes = session.list_upstream_mailboxes().ok()?;
+    mailboxes
+        .into_iter()
+        .find(|mb| mb.name.eq_ignore_ascii_case(mailbox_name))
+        .map(|mb| mb.internal_id)
+}
+
+/// Build SelectMailboxData from a pinned StoreSession, mirroring the logic in
+/// GluonMailMailboxView::select_mailbox_data_fast.
+async fn select_data_from_session(
+    session: &mut gluon_rs_mail::StoreSession,
+    mailbox_internal_id: u64,
+) -> Result<super::store::SelectMailboxData> {
+    use super::store::{MailboxSnapshot, MailboxStatus, SelectMailboxData};
+
+    let select = session
+        .mailbox_select_data(mailbox_internal_id)
+        .map_err(|e| super::ImapError::Protocol(format!("store session select: {e}")))?;
+
+    let count = select.entries.len() as u32;
+    let mut unseen = 0u32;
+    let mut first_unseen_seq = None;
+    let mut uids = Vec::with_capacity(select.entries.len());
+    let mut flags = HashMap::with_capacity(select.entries.len());
+    let mut mod_seq_hash = select.next_uid as u64;
+
+    for (index, entry) in select.entries.iter().enumerate() {
+        let uid = ImapUid::from(entry.uid);
+        let seen = entry.flags.iter().any(|f| f.eq_ignore_ascii_case("\\Seen"));
+        if !seen {
+            unseen += 1;
+            if first_unseen_seq.is_none() {
+                first_unseen_seq = Some(index as u32 + 1);
+            }
+        }
+        mod_seq_hash = mod_seq_hash.wrapping_mul(1_099_511_628_211);
+        mod_seq_hash ^= entry.uid as u64;
+        mod_seq_hash ^= entry.flags.len() as u64;
+        for flag in &entry.flags {
+            for byte in flag.as_bytes() {
+                mod_seq_hash = mod_seq_hash.wrapping_mul(1_099_511_628_211);
+                mod_seq_hash ^= u64::from(*byte);
+            }
+        }
+        uids.push(uid);
+        flags.insert(uid, entry.flags.clone());
+    }
+
+    Ok(SelectMailboxData {
+        status: MailboxStatus {
+            uid_validity: select.uid_validity,
+            next_uid: select.next_uid,
+            exists: count,
+            unseen,
+        },
+        snapshot: MailboxSnapshot {
+            exists: count,
+            mod_seq: mod_seq_hash,
+        },
+        uids,
+        flags,
+        first_unseen_seq,
+    })
 }
 
 #[cfg(test)]
@@ -3342,7 +3678,7 @@ mod tests {
         (config, tempdir, auth_router, runtime_accounts)
     }
 
-    fn test_gluon_mail_config() -> (
+    async fn test_gluon_mail_config() -> (
         Arc<SessionConfig>,
         TempDir,
         AuthRouter,
@@ -3381,6 +3717,7 @@ mod tests {
                     permanent_flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
                 },
             )
+            .await
             .expect("create mailbox");
 
         let mut meta = make_meta("msg-1", 1);
@@ -3411,6 +3748,7 @@ mod tests {
                     recent: false,
                 },
             )
+            .await
             .expect("append message");
 
         let config = Arc::new(SessionConfig {
@@ -3675,7 +4013,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_noop_selected_emits_exists_on_gluon_connector_create() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3819,7 +4157,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_exists_when_new_message_arrives_after_start_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -3944,7 +4282,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_expunge_and_exists_on_gluon_connector_delete() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4088,7 +4426,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_idle_emits_flag_fetch_on_gluon_connector_flag_change() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, mut client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4326,7 +4664,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_status_authenticated_with_gluon_mail_view() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Authenticated;
@@ -4501,7 +4839,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_body_returns_body_item_not_bodystructure_with_gluon_mail_view() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -4638,7 +4976,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4761,7 +5099,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4871,7 +5209,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_copies_local_message_without_api_client_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -4975,7 +5313,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_copy_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let fail_config = with_failing_connector(&config, &_auth_router, &_runtime_accounts);
         let (mut session, mut client_read, _client_write) = create_session_pair(fail_config).await;
 
@@ -5126,7 +5464,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5251,7 +5589,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_moves_local_message_without_api_client_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5371,7 +5709,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_move_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let fail_config = with_failing_connector(&config, &_auth_router, &_runtime_accounts);
         let (mut session, mut client_read, _client_write) = create_session_pair(fail_config).await;
 
@@ -5655,7 +5993,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5708,7 +6046,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expunge_without_api_client_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -5818,7 +6156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expunge_fails_when_upstream_fails_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let fail_config = with_failing_connector(&config, &_auth_router, &_runtime_accounts);
         let (mut session, mut client_read, _client_write) = create_session_pair(fail_config).await;
 
@@ -5962,7 +6300,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_examine_reports_first_unseen_sequence_number_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6157,7 +6495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_select_after_examine_resets_read_only_mode_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6314,7 +6652,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6424,7 +6762,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_uid_store_flags_response_includes_uid_with_gluon_mail_backend() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6526,7 +6864,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_gluon_mail_rfc822() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -6565,7 +6903,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_text_and_header_use_gluon_mail_view() {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) = create_session_pair(config).await;
 
         session.state = State::Selected;
@@ -6655,7 +6993,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6712,8 +7050,9 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("2 EXISTS"));
-        assert!(response
-            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Flags permitted"));
+        assert!(response.contains(
+            "OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Flags permitted"
+        ));
         assert!(response.contains("OK [UNSEEN 2] First unseen"));
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
     }
@@ -6721,7 +7060,7 @@ mod tests {
     #[tokio::test]
     async fn test_select_reports_first_unseen_sequence_and_permanentflags_with_gluon_mail_backend()
     {
-        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config();
+        let (config, _tempdir, _auth_router, _runtime_accounts) = test_gluon_mail_config().await;
         let (mut session, mut client_read, _client_write) =
             create_session_pair(config.clone()).await;
 
@@ -6754,8 +7093,9 @@ mod tests {
             .unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("2 EXISTS"));
-        assert!(response
-            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Flags permitted"));
+        assert!(response.contains(
+            "OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Flags permitted"
+        ));
         assert!(response.contains("OK [UNSEEN 2] First unseen"));
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
     }

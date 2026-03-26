@@ -54,6 +54,17 @@ pub trait GluonMailboxMutation: Send + Sync {
     async fn mailbox_status(&self, mailbox: &ScopedMailboxId) -> Result<MailboxStatus>;
     async fn uid_to_seq(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<u32>>;
 
+    async fn batch_remove_messages(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uids: &[ImapUid],
+    ) -> Result<()> {
+        for &uid in uids {
+            self.remove_message(mailbox, uid).await?;
+        }
+        Ok(())
+    }
+
     async fn batch_store_metadata(
         &self,
         mailbox: &ScopedMailboxId,

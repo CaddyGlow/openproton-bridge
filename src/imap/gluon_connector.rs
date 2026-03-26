@@ -168,8 +168,8 @@ pub trait GluonImapConnector: Send + Sync {
         metadata: MessageEnvelope,
     ) -> Result<ImapUid>;
     async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>>;
-    fn mailbox_exists(&self, mailbox: &ScopedMailboxId) -> bool;
-    fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()>;
+    async fn mailbox_exists(&self, mailbox: &ScopedMailboxId) -> bool;
+    async fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()>;
     async fn rename_mailbox(
         &self,
         source_mailbox: &ScopedMailboxId,
@@ -206,6 +206,21 @@ pub trait GluonImapConnector: Send + Sync {
         uid: ImapUid,
         data: Vec<u8>,
     ) -> Result<()>;
+
+    async fn acquire_store_session(
+        &self,
+        account_id: Option<&str>,
+    ) -> Result<gluon_rs_mail::StoreSession>;
+
+    fn resolve_storage_user_id<'a>(&'a self, account_id: Option<&'a str>) -> &'a str;
+
+    fn read_message_blob(
+        &self,
+        storage_user_id: &str,
+        internal_message_id: &str,
+    ) -> Result<Vec<u8>>;
+
+    fn account_paths(&self, storage_user_id: &str) -> Result<gluon_rs_mail::AccountPaths>;
 
     async fn batch_upsert_metadata(
         &self,
@@ -261,7 +276,7 @@ impl GluonMailConnector {
             .unwrap_or(account_id)
     }
 
-    fn mailbox_by_name(
+    async fn mailbox_by_name(
         &self,
         storage_user_id: &str,
         mailbox_name: &str,
@@ -279,7 +294,7 @@ impl GluonMailConnector {
         }
     }
 
-    fn mailbox_by_name_rw(
+    async fn mailbox_by_name_rw(
         &self,
         storage_user_id: &str,
         mailbox_name: &str,
@@ -297,7 +312,7 @@ impl GluonMailConnector {
         }
     }
 
-    fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
+    async fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
         let account_id = mailbox.account_id();
         let mailbox_name = mailbox.mailbox_name();
         let mailbox_name = if mailbox_name.is_empty() {
@@ -306,7 +321,7 @@ impl GluonMailConnector {
             mailbox_name
         };
         let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
-        if let Some(mailbox_state) = self.mailbox_by_name(&storage_user_id, mailbox_name)? {
+        if let Some(mailbox_state) = self.mailbox_by_name(&storage_user_id, mailbox_name).await? {
             debug!(
                 service = "imap",
                 pkg = "gluon/user",
@@ -339,7 +354,10 @@ impl GluonMailConnector {
             Ok(m) => m,
             Err(_) => {
                 // UNIQUE constraint: mailbox was created concurrently, retry lookup via RW conn
-                if let Some(mb) = self.mailbox_by_name_rw(&storage_user_id, mailbox_name)? {
+                if let Some(mb) = self
+                    .mailbox_by_name_rw(&storage_user_id, mailbox_name)
+                    .await?
+                {
                     return Ok((storage_user_id, mb));
                 }
                 return Err(ImapError::Protocol(format!(
@@ -404,16 +422,17 @@ impl GluonImapConnector for GluonMailConnector {
         self.view.list_uids(mailbox).await
     }
 
-    fn mailbox_exists(&self, mailbox: &ScopedMailboxId) -> bool {
+    async fn mailbox_exists(&self, mailbox: &ScopedMailboxId) -> bool {
         let storage_user_id = self.storage_user_id_for_account(mailbox.account_id());
         self.mailbox_by_name(storage_user_id, mailbox.mailbox_name())
+            .await
             .ok()
             .flatten()
             .is_some()
     }
 
-    fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()> {
-        let _ = self.ensure_mailbox(mailbox)?;
+    async fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()> {
+        let _ = self.ensure_mailbox(mailbox).await?;
         self.publish_authored(GluonUpdate::MailboxCreated {
             mailbox: GluonMailbox::new(mailbox.clone(), 0),
         });
@@ -433,8 +452,9 @@ impl GluonImapConnector for GluonMailConnector {
             .storage_user_id_for_account(source_mailbox.account_id())
             .to_string();
 
-        if let Some(source_mailbox_state) =
-            self.mailbox_by_name(&source_storage_user_id, source_mailbox.mailbox_name())?
+        if let Some(source_mailbox_state) = self
+            .mailbox_by_name(&source_storage_user_id, source_mailbox.mailbox_name())
+            .await?
         {
             self.store
                 .rename_mailbox(
@@ -444,7 +464,7 @@ impl GluonImapConnector for GluonMailConnector {
                 )
                 .map_err(map_mail_error)?;
         } else {
-            let _ = self.ensure_mailbox(dest_mailbox)?;
+            let _ = self.ensure_mailbox(dest_mailbox).await?;
         }
 
         self.publish_authored(GluonUpdate::MailboxUpdated {
@@ -460,8 +480,9 @@ impl GluonImapConnector for GluonMailConnector {
         let storage_user_id = self
             .storage_user_id_for_account(mailbox.account_id())
             .to_string();
-        if let Some(mailbox_state) =
-            self.mailbox_by_name(&storage_user_id, mailbox.mailbox_name())?
+        if let Some(mailbox_state) = self
+            .mailbox_by_name(&storage_user_id, mailbox.mailbox_name())
+            .await?
         {
             self.store
                 .delete_mailbox(&storage_user_id, mailbox_state.internal_id)
@@ -700,6 +721,34 @@ impl GluonImapConnector for GluonMailConnector {
         tracing::debug!(mailbox = %mailbox, total = entries.len(), "batch_upsert_metadata");
 
         Ok(uids)
+    }
+
+    async fn acquire_store_session(
+        &self,
+        account_id: Option<&str>,
+    ) -> Result<gluon_rs_mail::StoreSession> {
+        let storage_user_id = self.storage_user_id_for_account(account_id);
+        self.store.session(storage_user_id).map_err(map_mail_error)
+    }
+
+    fn resolve_storage_user_id<'a>(&'a self, account_id: Option<&'a str>) -> &'a str {
+        self.storage_user_id_for_account(account_id)
+    }
+
+    fn read_message_blob(
+        &self,
+        storage_user_id: &str,
+        internal_message_id: &str,
+    ) -> Result<Vec<u8>> {
+        self.store
+            .read_message_blob(storage_user_id, internal_message_id)
+            .map_err(map_mail_error)
+    }
+
+    fn account_paths(&self, storage_user_id: &str) -> Result<gluon_rs_mail::AccountPaths> {
+        self.store
+            .account_paths(storage_user_id)
+            .map_err(map_mail_error)
     }
 }
 

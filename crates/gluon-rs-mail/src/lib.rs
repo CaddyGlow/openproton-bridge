@@ -21,9 +21,9 @@ pub use gluon_rs_core::{
     GluonCoreError, GluonKey,
 };
 pub use store::{
-    CompatibleStore, DeletedSubscription, NewMailbox, NewMessage, SelectSnapshot,
-    SelectSnapshotEntry, UpstreamMailbox, UpstreamMailboxMessage, UpstreamMailboxSnapshot,
-    UpstreamMessageSummary,
+    CompatibleStore, ConnHandle, DeletedSubscription, NewMailbox, NewMessage, SelectSnapshot,
+    SelectSnapshotEntry, StoreSession, UpstreamMailbox, UpstreamMailboxMessage,
+    UpstreamMailboxSnapshot, UpstreamMessageSummary,
 };
 pub use target::CompatibilityTarget;
 pub use types::StoreBootstrap;

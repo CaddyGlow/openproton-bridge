@@ -1148,6 +1148,7 @@ async fn reconcile_user_label_topology(
             config
                 .connector
                 .create_mailbox(&scoped_mailbox_name(&config.account_id, &next.name))
+                .await
                 .map_err(|e| EventWorkerError::Payload(e.to_string()))?;
         }
     }

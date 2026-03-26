@@ -1,62 +1,16 @@
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
 use gluon_rs_core::{
     decode_blob, encode_blob, AccountBootstrap, AccountPaths, DeferredDeleteManager, GluonCoreError,
 };
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
-
-/// A connection that returns itself to the pool on drop.
-pub struct PooledConnection {
-    conn: Option<Connection>,
-    pool: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
-    key: String,
-}
-
-impl Deref for PooledConnection {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        self.conn.as_ref().unwrap()
-    }
-}
-
-impl DerefMut for PooledConnection {
-    fn deref_mut(&mut self) -> &mut Connection {
-        self.conn.as_mut().unwrap()
-    }
-}
-
-impl Drop for PooledConnection {
-    fn drop(&mut self) {
-        if let Some(conn) = self.conn.take() {
-            if let Ok(mut pool) = self.pool.lock() {
-                let conns = pool.entry(self.key.clone()).or_default();
-                if conns.len() < 4 {
-                    conns.push(conn);
-                }
-            }
-        }
-    }
-}
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::{
     db::SchemaProbe,
     error::{GluonError, Result},
     types::StoreBootstrap,
 };
-
-#[derive(Debug, Clone)]
-pub struct CompatibleStore {
-    bootstrap: StoreBootstrap,
-    accounts_by_storage_user_id: HashMap<String, AccountBootstrap>,
-    /// Cached read-write connections per storage_user_id.
-    rw_pool: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
-    /// Cached read-only connections per storage_user_id (unused, kept for compatibility).
-    ro_pool: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
-    /// Cached schema probe results per storage_user_id (avoids re-inspecting on pool miss).
-    schema_cache: Arc<Mutex<HashMap<String, crate::db::SchemaFamily>>>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamMailbox {
@@ -144,6 +98,17 @@ pub struct DeletedSubscription {
     pub remote_id: String,
 }
 
+/// A shared handle to a single rusqlite `Connection` for one account.
+/// Callers that previously accepted `&SqlitePool` now accept `&ConnHandle`.
+pub type ConnHandle = Arc<Mutex<Connection>>;
+
+#[derive(Debug, Clone)]
+pub struct CompatibleStore {
+    bootstrap: StoreBootstrap,
+    accounts_by_storage_user_id: HashMap<String, AccountBootstrap>,
+    connections: Arc<Mutex<HashMap<String, ConnHandle>>>,
+}
+
 impl CompatibleStore {
     pub fn open(bootstrap: StoreBootstrap) -> Result<Self> {
         Self::open_with_mode(bootstrap, true)
@@ -180,9 +145,7 @@ impl CompatibleStore {
         Ok(Self {
             bootstrap,
             accounts_by_storage_user_id,
-            rw_pool: Arc::new(Mutex::new(HashMap::new())),
-            ro_pool: Arc::new(Mutex::new(HashMap::new())),
-            schema_cache: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -206,26 +169,85 @@ impl CompatibleStore {
         Ok(self.bootstrap.layout.account_paths(storage_user_id)?)
     }
 
+    /// Return the shared connection handle for this account, creating it on
+    /// first access with all pragmas and schema initialization.
+    pub fn conn_for(&self, storage_user_id: &str) -> Result<ConnHandle> {
+        // Fast path: clone existing handle under a brief lock.
+        {
+            let conns = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(handle) = conns.get(storage_user_id) {
+                return Ok(handle.clone());
+            }
+        }
+
+        // Slow path: open new connection (happens once per account per process).
+        let account_paths = self.account_paths(storage_user_id)?;
+        let db_path = account_paths.primary_db_path();
+
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+
+        conn.pragma_update(None, "journal_mode", "wal")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", -8000)?;
+        conn.pragma_update(None, "mmap_size", 67_108_864)?;
+
+        // Initialize schema.
+        for stmt in UPSTREAM_SCHEMA_STATEMENTS {
+            conn.execute_batch(stmt)?;
+        }
+        conn.execute(
+            "INSERT INTO connector_settings(id, value) VALUES(0, NULL) ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO gluon_version(id, version) VALUES(0, 3) ON CONFLICT(id) DO NOTHING",
+            [],
+        )?;
+
+        let handle = Arc::new(Mutex::new(conn));
+        let mut conns = self.connections.lock().unwrap_or_else(|e| e.into_inner());
+        conns.insert(storage_user_id.to_string(), handle.clone());
+        Ok(handle)
+    }
+
     pub fn schema_probe(&self, storage_user_id: &str) -> Result<SchemaProbe> {
         let account_paths = self.account_paths(storage_user_id)?;
         SchemaProbe::inspect(&account_paths.primary_db_path())
     }
 
+    /// Acquire a pre-connected session for batching multiple queries.
+    pub fn session(&self, storage_user_id: &str) -> Result<StoreSession> {
+        let handle = self.conn_for(storage_user_id)?;
+        Ok(StoreSession { conn: handle })
+    }
+
     pub fn initialize_upstream_schema(&self, storage_user_id: &str) -> Result<()> {
-        let account_paths = self.account_paths(storage_user_id)?;
-        let conn = Connection::open(account_paths.primary_db_path())?;
-        configure_upstream_db_connection(&conn)?;
-        conn.execute_batch(UPSTREAM_BASE_SCHEMA)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+
+        for stmt in UPSTREAM_SCHEMA_STATEMENTS {
+            conn.execute_batch(stmt)?;
+        }
+
         conn.execute(
             "INSERT INTO connector_settings(id, value) VALUES(0, NULL)
              ON CONFLICT(id) DO NOTHING",
             [],
         )?;
+
         conn.execute(
             "INSERT INTO gluon_version(id, version) VALUES(0, 3)
              ON CONFLICT(id) DO NOTHING",
             [],
         )?;
+
         Ok(())
     }
 
@@ -235,22 +257,26 @@ impl CompatibleStore {
         mailbox: &NewMailbox,
     ) -> Result<UpstreamMailbox> {
         self.initialize_upstream_schema(storage_user_id)?;
-        let account_paths = self.account_paths(storage_user_id)?;
-        let conn = Connection::open(account_paths.primary_db_path())?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+
         let tx = conn.unchecked_transaction()?;
 
         tx.execute(
             "INSERT INTO mailboxes_v2(remote_id, name, uid_validity, subscribed)
              VALUES(?1, ?2, ?3, ?4)",
-            (
+            params![
                 &mailbox.remote_id,
                 &mailbox.name,
                 mailbox.uid_validity,
-                mailbox.subscribed,
-            ),
+                mailbox.subscribed
+            ],
         )?;
+
         let internal_id = tx.last_insert_rowid() as u64;
-        tx.execute_batch(&create_mailbox_message_table_sql(internal_id))?;
+
+        let create_table_sql = create_mailbox_message_table_sql(internal_id);
+        tx.execute_batch(&create_table_sql)?;
 
         insert_mailbox_flags(&tx, "mailbox_flags_v2", internal_id, &mailbox.flags)?;
         insert_mailbox_flags(
@@ -262,8 +288,7 @@ impl CompatibleStore {
         insert_mailbox_flags(&tx, "mailbox_attrs_v2", internal_id, &mailbox.attributes)?;
         tx.commit()?;
 
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
-        self.get_upstream_mailbox(&conn, internal_id)
+        get_upstream_mailbox(&conn, internal_id)
     }
 
     pub fn append_message(
@@ -279,39 +304,44 @@ impl CompatibleStore {
         let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
         std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
 
-        let conn = Connection::open(account_paths.primary_db_path())?;
-        configure_upstream_db_connection(&conn)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
+
         tx.execute(
             "INSERT INTO messages_v2(id, remote_id, date, size, body, body_structure, envelope, deleted)
              VALUES(?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, FALSE)",
-            (
+            params![
                 &message.internal_id,
                 &message.remote_id,
                 message.size,
                 &message.body,
                 &message.body_structure,
                 &message.envelope,
-            ),
+            ],
         )?;
+
         tx.execute(
             "INSERT INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
-            (&message.internal_id, mailbox_internal_id),
+            params![&message.internal_id, mailbox_internal_id as i64],
         )?;
+
         tx.execute(
             &format!(
                 "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id, recent, deleted)
                  VALUES(?1, ?2, ?3, FALSE)"
             ),
-            (&message.internal_id, &message.remote_id, message.recent),
+            params![&message.internal_id, &message.remote_id, message.recent],
         )?;
+
         insert_message_flags(&tx, &message.internal_id, &message.flags)?;
         tx.commit()?;
+        drop(conn);
 
-        let mut listed =
-            self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
+        let listed = self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
         listed
-            .pop()
+            .into_iter()
+            .last()
             .ok_or_else(|| GluonError::MissingRequiredTable {
                 table: format!("mailbox_message_{mailbox_internal_id}"),
             })
@@ -334,13 +364,15 @@ impl CompatibleStore {
         let encoded = encode_blob(&self.account(storage_user_id)?.key, blob)?;
         std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
 
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE messages_v2
              SET size = ?2, body = ?3, body_structure = ?4, envelope = ?5
              WHERE id = ?1",
-            (internal_message_id, size, body, body_structure, envelope),
+            params![internal_message_id, size, body, body_structure, envelope],
         )?;
+
         Ok(())
     }
 
@@ -360,7 +392,8 @@ impl CompatibleStore {
         internal_message_id: &str,
         flags: &[String],
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         insert_message_flags_ignore_duplicates(&tx, internal_message_id, flags)?;
         tx.commit()?;
@@ -373,12 +406,13 @@ impl CompatibleStore {
         internal_message_id: &str,
         flags: &[String],
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         for flag in flags {
             tx.execute(
                 "DELETE FROM message_flags_v2 WHERE message_id = ?1 AND value = ?2",
-                (internal_message_id, flag),
+                params![internal_message_id, flag],
             )?;
         }
         tx.commit()?;
@@ -391,12 +425,13 @@ impl CompatibleStore {
         internal_message_id: &str,
         flags: &[String],
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
         tx.execute(
             "DELETE FROM message_flags_v2 WHERE message_id = ?1",
-            (internal_message_id,),
+            params![internal_message_id],
         )?;
         insert_message_flags_ignore_duplicates(&tx, internal_message_id, flags)?;
         tx.commit()?;
@@ -410,14 +445,15 @@ impl CompatibleStore {
         internal_message_id: &str,
         deleted: bool,
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             &format!(
                 "UPDATE mailbox_message_{mailbox_internal_id}
                  SET deleted = ?1
                  WHERE message_id = ?2"
             ),
-            (deleted, internal_message_id),
+            params![deleted, internal_message_id],
         )?;
         Ok(())
     }
@@ -428,12 +464,13 @@ impl CompatibleStore {
         internal_message_id: &str,
         deleted: bool,
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE messages_v2
              SET deleted = ?1
              WHERE id = ?2",
-            (deleted, internal_message_id),
+            params![deleted, internal_message_id],
         )?;
         Ok(())
     }
@@ -444,26 +481,32 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
         internal_message_id: &str,
     ) -> Result<UpstreamMessageSummary> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
-        let tx = conn.unchecked_transaction()?;
-        let remote_id = tx.query_row(
-            "SELECT remote_id FROM messages_v2 WHERE id = ?1",
-            (internal_message_id,),
-            |row| row.get::<_, String>(0),
-        )?;
+        let handle = self.conn_for(storage_user_id)?;
+        {
+            let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.unchecked_transaction()?;
 
-        tx.execute(
-            "INSERT OR IGNORE INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
-            (internal_message_id, mailbox_internal_id),
-        )?;
-        tx.execute(
-            &format!(
-                "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id)
-                 VALUES(?1, ?2)"
-            ),
-            (internal_message_id, &remote_id),
-        )?;
-        tx.commit()?;
+            let remote_id: String = tx.query_row(
+                "SELECT remote_id FROM messages_v2 WHERE id = ?1",
+                params![internal_message_id],
+                |row| row.get(0),
+            )?;
+
+            tx.execute(
+                "INSERT OR IGNORE INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
+                params![internal_message_id, mailbox_internal_id as i64],
+            )?;
+
+            tx.execute(
+                &format!(
+                    "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id)
+                     VALUES(?1, ?2)"
+                ),
+                params![internal_message_id, &remote_id],
+            )?;
+
+            tx.commit()?;
+        }
 
         let messages = self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
         messages
@@ -479,14 +522,16 @@ impl CompatibleStore {
         storage_user_id: &str,
         remote_id: &str,
     ) -> Result<Option<String>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
-        conn.query_row(
-            "SELECT id FROM messages_v2 WHERE remote_id = ?1 LIMIT 1",
-            (remote_id,),
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(Into::into)
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT id FROM messages_v2 WHERE remote_id = ?1 LIMIT 1",
+                params![remote_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
     }
 
     pub fn update_message_content(
@@ -501,20 +546,22 @@ impl CompatibleStore {
         let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
         std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
 
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE messages_v2
              SET remote_id = ?1, size = ?2, body = ?3, body_structure = ?4, envelope = ?5
              WHERE id = ?6",
-            (
+            params![
                 &message.remote_id,
                 message.size,
                 &message.body,
                 &message.body_structure,
                 &message.envelope,
                 internal_message_id,
-            ),
+            ],
         )?;
+
         Ok(())
     }
 
@@ -524,7 +571,8 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
         internal_message_id: &str,
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
         tx.execute(
@@ -532,13 +580,15 @@ impl CompatibleStore {
                 "DELETE FROM mailbox_message_{mailbox_internal_id}
                  WHERE message_id = ?1"
             ),
-            (internal_message_id,),
+            params![internal_message_id],
         )?;
+
         tx.execute(
             "DELETE FROM message_to_mailbox
              WHERE message_id = ?1 AND mailbox_id = ?2",
-            (internal_message_id, mailbox_internal_id),
+            params![internal_message_id, mailbox_internal_id as i64],
         )?;
+
         tx.commit()?;
         Ok(())
     }
@@ -549,12 +599,13 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
         new_name: &str,
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE mailboxes_v2
              SET name = ?1
              WHERE id = ?2",
-            (new_name, mailbox_internal_id),
+            params![new_name, mailbox_internal_id as i64],
         )?;
         Ok(())
     }
@@ -565,32 +616,28 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
         subscribed: bool,
     ) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
             "UPDATE mailboxes_v2
              SET subscribed = ?1
              WHERE id = ?2",
-            (subscribed, mailbox_internal_id),
+            params![subscribed, mailbox_internal_id as i64],
         )?;
         Ok(())
     }
 
     pub fn delete_mailbox(&self, storage_user_id: &str, mailbox_internal_id: u64) -> Result<()> {
-        let conn = self.open_upstream_db_rw(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
 
-        let (remote_id, name, subscribed) = tx.query_row(
+        let (remote_id, name, subscribed): (String, String, bool) = tx.query_row(
             "SELECT remote_id, name, subscribed
              FROM mailboxes_v2
              WHERE id = ?1",
-            (mailbox_internal_id,),
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
+            params![mailbox_internal_id as i64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
 
         if subscribed {
@@ -598,44 +645,51 @@ impl CompatibleStore {
                 "UPDATE deleted_subscriptions
                  SET remote_id = ?1
                  WHERE name = ?2",
-                (&remote_id, &name),
+                params![&remote_id, &name],
             )?;
+
             tx.execute(
                 "INSERT INTO deleted_subscriptions(name, remote_id)
                  SELECT ?1, ?2
                  WHERE NOT EXISTS (
                      SELECT 1 FROM deleted_subscriptions WHERE name = ?1
                  )",
-                (&name, &remote_id),
+                params![&name, &remote_id],
             )?;
         }
 
         tx.execute(
             "DELETE FROM message_to_mailbox
              WHERE mailbox_id = ?1",
-            (mailbox_internal_id,),
+            params![mailbox_internal_id as i64],
         )?;
+
         tx.execute(
             "DELETE FROM mailbox_flags_v2
              WHERE mailbox_id = ?1",
-            (mailbox_internal_id,),
+            params![mailbox_internal_id as i64],
         )?;
+
         tx.execute(
             "DELETE FROM mailbox_perm_flags_v2
              WHERE mailbox_id = ?1",
-            (mailbox_internal_id,),
+            params![mailbox_internal_id as i64],
         )?;
+
         tx.execute(
             "DELETE FROM mailbox_attrs_v2
              WHERE mailbox_id = ?1",
-            (mailbox_internal_id,),
+            params![mailbox_internal_id as i64],
         )?;
+
         tx.execute(
             "DELETE FROM mailboxes_v2
              WHERE id = ?1",
-            (mailbox_internal_id,),
+            params![mailbox_internal_id as i64],
         )?;
+
         tx.execute_batch(&format!("DROP TABLE mailbox_message_{mailbox_internal_id}"))?;
+
         tx.commit()?;
         Ok(())
     }
@@ -644,74 +698,40 @@ impl CompatibleStore {
         &self,
         storage_user_id: &str,
     ) -> Result<Vec<DeletedSubscription>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
             "SELECT name, remote_id
              FROM deleted_subscriptions
              ORDER BY name",
         )?;
-        let mut rows = stmt.query([])?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DeletedSubscription {
+                name: row.get(0)?,
+                remote_id: row.get(1)?,
+            })
+        })?;
+
         let mut deleted = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            deleted.push(DeletedSubscription {
-                name: row.get::<_, String>(0)?,
-                remote_id: row.get::<_, String>(1)?,
-            });
+        for row in rows {
+            deleted.push(row?);
         }
-
         Ok(deleted)
     }
 
     pub fn list_upstream_mailboxes(&self, storage_user_id: &str) -> Result<Vec<UpstreamMailbox>> {
-        self.list_upstream_mailboxes_on(self.open_upstream_db(storage_user_id)?)
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        list_upstream_mailboxes_on(&conn)
     }
 
-    pub fn list_upstream_mailboxes_rw(&self, storage_user_id: &str) -> Result<Vec<UpstreamMailbox>> {
-        self.list_upstream_mailboxes_on(self.open_upstream_db_rw(storage_user_id)?)
-    }
-
-    fn list_upstream_mailboxes_on(&self, conn: PooledConnection) -> Result<Vec<UpstreamMailbox>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, remote_id, name, uid_validity, subscribed
-             FROM mailboxes_v2
-             ORDER BY id",
-        )?;
-        let mut rows = stmt.query([])?;
-        let mut mailboxes = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            let internal_id = row.get::<_, u64>(0)?;
-            let remote_id = row.get::<_, String>(1)?;
-            let name = row.get::<_, String>(2)?;
-            let uid_validity = row.get::<_, u32>(3)?;
-            let subscribed = row.get::<_, bool>(4)?;
-
-            mailboxes.push(UpstreamMailbox {
-                internal_id,
-                remote_id,
-                name,
-                uid_validity,
-                subscribed,
-                attributes: query_string_vec(
-                    &conn,
-                    "SELECT value FROM mailbox_attrs_v2 WHERE mailbox_id = ? ORDER BY value",
-                    (internal_id,),
-                )?,
-                flags: query_string_vec(
-                    &conn,
-                    "SELECT value FROM mailbox_flags_v2 WHERE mailbox_id = ? ORDER BY value",
-                    (internal_id,),
-                )?,
-                permanent_flags: query_string_vec(
-                    &conn,
-                    "SELECT value FROM mailbox_perm_flags_v2 WHERE mailbox_id = ? ORDER BY value",
-                    (internal_id,),
-                )?,
-            });
-        }
-
-        Ok(mailboxes)
+    pub fn list_upstream_mailboxes_rw(
+        &self,
+        storage_user_id: &str,
+    ) -> Result<Vec<UpstreamMailbox>> {
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        list_upstream_mailboxes_on(&conn)
     }
 
     pub fn list_upstream_mailbox_messages(
@@ -719,39 +739,9 @@ impl CompatibleStore {
         storage_user_id: &str,
         mailbox_internal_id: u64,
     ) -> Result<Vec<UpstreamMessageSummary>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
-        let table_name = format!("mailbox_message_{mailbox_internal_id}");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
-                    m.size, m.deleted,
-                    GROUP_CONCAT(mf.value) AS flags_csv
-             FROM {table_name} AS mm
-             JOIN messages_v2 AS m ON m.id = mm.message_id
-             LEFT JOIN message_flags_v2 AS mf ON mf.message_id = mm.message_id
-             GROUP BY mm.message_id
-             ORDER BY mm.uid"
-        ))?;
-        let mut rows = stmt.query([])?;
-        let mut messages = Vec::new();
-
-        while let Some(row) = rows.next()? {
-            let flags_csv: Option<String> = row.get(7)?;
-            let flags = flags_csv
-                .map(|csv| csv.split(',').map(String::from).collect())
-                .unwrap_or_default();
-            messages.push(UpstreamMessageSummary {
-                internal_id: row.get::<_, String>(0)?,
-                remote_id: row.get::<_, String>(1)?,
-                uid: row.get::<_, u32>(2)?,
-                recent: row.get::<_, bool>(3)?,
-                mailbox_deleted: row.get::<_, bool>(4)?,
-                size: row.get::<_, i64>(5)?,
-                message_deleted: row.get::<_, bool>(6)?,
-                flags,
-            });
-        }
-
-        Ok(messages)
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        list_upstream_mailbox_messages_on(&conn, mailbox_internal_id)
     }
 
     pub fn read_message_blob(
@@ -771,8 +761,9 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
     ) -> Result<UpstreamMailboxSnapshot> {
         let account_paths = self.account_paths(storage_user_id)?;
-        let conn = self.open_upstream_db(storage_user_id)?;
-        let mailbox = self.get_upstream_mailbox(&conn, mailbox_internal_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mailbox = get_upstream_mailbox(&conn, mailbox_internal_id)?;
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
         let next_uid = next_uid_for_mailbox(&conn, &table_name)?;
         let recent_count = query_count(
@@ -787,32 +778,58 @@ impl CompatibleStore {
              JOIN messages_v2 AS m ON m.id = mm.message_id
              ORDER BY mm.uid"
         ))?;
-        let mut rows = stmt.query([])?;
-        let mut messages = Vec::new();
 
-        while let Some(row) = rows.next()? {
-            let internal_id = row.get::<_, String>(0)?;
-            let summary = UpstreamMessageSummary {
-                internal_id: internal_id.clone(),
-                remote_id: row.get::<_, String>(1)?,
-                uid: row.get::<_, u32>(2)?,
-                recent: row.get::<_, bool>(3)?,
-                mailbox_deleted: row.get::<_, bool>(4)?,
-                size: row.get::<_, i64>(5)?,
-                message_deleted: row.get::<_, bool>(6)?,
-                flags: query_string_vec(
-                    &conn,
-                    "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
-                    (&internal_id,),
-                )?,
-            };
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, bool>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
+            ))
+        })?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let (
+                internal_id,
+                remote_id,
+                uid,
+                recent,
+                mailbox_deleted,
+                size,
+                message_deleted,
+                body,
+                body_structure,
+                envelope,
+            ) = row?;
+
+            let flags = query_string_vec_on(
+                &conn,
+                "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
+                &internal_id,
+            )?;
             let blob_path = account_paths.blob_path(&internal_id)?;
 
             messages.push(UpstreamMailboxMessage {
-                summary,
-                body: row.get::<_, String>(7)?,
-                body_structure: row.get::<_, String>(8)?,
-                envelope: row.get::<_, String>(9)?,
+                summary: UpstreamMessageSummary {
+                    internal_id,
+                    remote_id,
+                    uid,
+                    recent,
+                    mailbox_deleted,
+                    message_deleted,
+                    size,
+                    flags,
+                },
+                body,
+                body_structure,
+                envelope,
                 blob_exists: blob_path.exists(),
                 blob_path,
             });
@@ -832,8 +849,9 @@ impl CompatibleStore {
         storage_user_id: &str,
         mailbox_internal_id: u64,
     ) -> Result<SelectSnapshot> {
-        let conn = self.open_upstream_db(storage_user_id)?;
-        let mailbox = self.get_upstream_mailbox(&conn, mailbox_internal_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        let mailbox = get_upstream_mailbox(&conn, mailbox_internal_id)?;
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
         let next_uid = next_uid_for_mailbox(&conn, &table_name)?;
 
@@ -844,12 +862,14 @@ impl CompatibleStore {
              GROUP BY mm.message_id
              ORDER BY mm.uid"
         ))?;
-        let mut rows = stmt.query([])?;
-        let mut entries = Vec::new();
 
-        while let Some(row) = rows.next()? {
-            let uid = row.get::<_, u32>(0)?;
-            let flags_concat: Option<String> = row.get(1)?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (uid, flags_concat) = row?;
             let flags = flags_concat
                 .map(|s| s.split('\0').map(String::from).collect())
                 .unwrap_or_default();
@@ -870,33 +890,35 @@ impl CompatibleStore {
         uid: u32,
     ) -> Result<Option<UpstreamMailboxMessage>> {
         let account_paths = self.account_paths(storage_user_id)?;
-        let conn = self.open_upstream_db(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
 
-        let mut stmt = conn.prepare(&format!(
-            "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
-                    m.size, m.deleted, m.body, m.body_structure, m.envelope
-             FROM {table_name} AS mm
-             JOIN messages_v2 AS m ON m.id = mm.message_id
-             WHERE mm.uid = ?1"
-        ))?;
-
-        let result = stmt
-            .query_row([uid], |row| {
-                let internal_id: String = row.get(0)?;
-                Ok((
-                    internal_id,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, u32>(2)?,
-                    row.get::<_, bool>(3)?,
-                    row.get::<_, bool>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, bool>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                ))
-            })
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
+                            m.size, m.deleted, m.body, m.body_structure, m.envelope
+                     FROM {table_name} AS mm
+                     JOIN messages_v2 AS m ON m.id = mm.message_id
+                     WHERE mm.uid = ?1"
+                ),
+                params![uid],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
             .optional()?;
 
         let Some((
@@ -915,10 +937,10 @@ impl CompatibleStore {
             return Ok(None);
         };
 
-        let flags = query_string_vec(
+        let flags = query_string_vec_on(
             &conn,
             "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
-            (&internal_id,),
+            &internal_id,
         )?;
         let blob_path = account_paths.blob_path(&internal_id)?;
 
@@ -947,15 +969,17 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
         uid: u32,
     ) -> Result<Option<String>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
-        conn.query_row(
-            &format!("SELECT message_id FROM {table_name} WHERE uid = ?1"),
-            [uid],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
+        let result: Option<String> = conn
+            .query_row(
+                &format!("SELECT message_id FROM {table_name} WHERE uid = ?1"),
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
     }
 
     pub fn message_flags_by_internal_id(
@@ -963,11 +987,12 @@ impl CompatibleStore {
         storage_user_id: &str,
         internal_id: &str,
     ) -> Result<Vec<String>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
-        query_string_vec(
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+        query_string_vec_on(
             &conn,
             "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
-            (internal_id,),
+            internal_id,
         )
     }
 
@@ -977,28 +1002,32 @@ impl CompatibleStore {
         mailbox_internal_id: u64,
         uid: u32,
     ) -> Result<Option<String>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
+        let handle = self.conn_for(storage_user_id)?;
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
-        conn.query_row(
-            &format!("SELECT message_remote_id FROM {table_name} WHERE uid = ?1"),
-            [uid],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(Into::into)
+        let result: Option<String> = conn
+            .query_row(
+                &format!("SELECT message_remote_id FROM {table_name} WHERE uid = ?1"),
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
     }
 
-    pub fn open_connection(&self, storage_user_id: &str) -> Result<PooledConnection> {
-        self.open_upstream_db(storage_user_id)
+    /// Return the shared connection handle for this account. Callers that
+    /// previously received a `SqlitePool` now get a `ConnHandle`.
+    pub fn open_connection(&self, storage_user_id: &str) -> Result<ConnHandle> {
+        self.conn_for(storage_user_id)
     }
 
-    pub fn open_connection_rw(&self, storage_user_id: &str) -> Result<PooledConnection> {
-        self.open_upstream_db_rw(storage_user_id)
+    pub fn open_connection_rw(&self, storage_user_id: &str) -> Result<ConnHandle> {
+        self.conn_for(storage_user_id)
     }
 
     pub fn batch_find_uids_by_remote_id(
         &self,
-        conn: &Connection,
+        handle: &ConnHandle,
         mailbox_internal_id: u64,
         remote_ids: &[&str],
     ) -> Result<HashMap<String, u32>> {
@@ -1006,6 +1035,7 @@ impl CompatibleStore {
             return Ok(HashMap::new());
         }
 
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
         let placeholders = remote_ids
             .iter()
@@ -1021,16 +1051,17 @@ impl CompatibleStore {
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = remote_ids
+        let param_values: Vec<&dyn rusqlite::types::ToSql> = remote_ids
             .iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
-        let mut rows = stmt.query(params.as_slice())?;
-        let mut result = HashMap::new();
+        let rows = stmt.query_map(param_values.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+        })?;
 
-        while let Some(row) = rows.next()? {
-            let remote_id: String = row.get(0)?;
-            let uid: u32 = row.get(1)?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (remote_id, uid) = row?;
             result.insert(remote_id, uid);
         }
 
@@ -1039,13 +1070,14 @@ impl CompatibleStore {
 
     pub fn batch_find_internal_ids_by_remote_id(
         &self,
-        conn: &Connection,
+        handle: &ConnHandle,
         remote_ids: &[&str],
     ) -> Result<HashMap<String, String>> {
         if remote_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let placeholders = remote_ids
             .iter()
             .enumerate()
@@ -1057,16 +1089,17 @@ impl CompatibleStore {
             format!("SELECT remote_id, id FROM messages_v2 WHERE remote_id IN ({placeholders})");
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::types::ToSql> = remote_ids
+        let param_values: Vec<&dyn rusqlite::types::ToSql> = remote_ids
             .iter()
             .map(|id| id as &dyn rusqlite::types::ToSql)
             .collect();
-        let mut rows = stmt.query(params.as_slice())?;
-        let mut result = HashMap::new();
+        let rows = stmt.query_map(param_values.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
 
-        while let Some(row) = rows.next()? {
-            let remote_id: String = row.get(0)?;
-            let internal_id: String = row.get(1)?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (remote_id, internal_id) = row?;
             result.insert(remote_id, internal_id);
         }
 
@@ -1075,18 +1108,19 @@ impl CompatibleStore {
 
     pub fn batch_set_message_flags_on_conn(
         &self,
-        conn: &Connection,
+        handle: &ConnHandle,
         entries: &[(&str, &[String])],
     ) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         for (internal_message_id, flags) in entries {
             tx.execute(
                 "DELETE FROM message_flags_v2 WHERE message_id = ?1",
-                (internal_message_id,),
+                params![*internal_message_id],
             )?;
             insert_message_flags_ignore_duplicates(&tx, internal_message_id, flags)?;
         }
@@ -1096,7 +1130,7 @@ impl CompatibleStore {
 
     pub fn batch_add_existing_messages_to_mailbox(
         &self,
-        conn: &Connection,
+        handle: &ConnHandle,
         mailbox_internal_id: u64,
         internal_message_ids: &[&str],
     ) -> Result<()> {
@@ -1104,24 +1138,26 @@ impl CompatibleStore {
             return Ok(());
         }
 
+        let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
         let tx = conn.unchecked_transaction()?;
         for internal_message_id in internal_message_ids {
             let remote_id: String = tx.query_row(
                 "SELECT remote_id FROM messages_v2 WHERE id = ?1",
-                (internal_message_id,),
+                params![*internal_message_id],
                 |row| row.get(0),
             )?;
 
             tx.execute(
                 "INSERT OR IGNORE INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
-                (internal_message_id, mailbox_internal_id),
+                params![*internal_message_id, mailbox_internal_id as i64],
             )?;
+
             tx.execute(
                 &format!(
                     "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id)
                      VALUES(?1, ?2)"
                 ),
-                (internal_message_id, &remote_id),
+                params![*internal_message_id, &remote_id],
             )?;
         }
         tx.commit()?;
@@ -1131,7 +1167,7 @@ impl CompatibleStore {
     pub fn batch_append_messages(
         &self,
         storage_user_id: &str,
-        conn: &Connection,
+        handle: &ConnHandle,
         mailbox_internal_id: u64,
         messages: &[NewMessage],
     ) -> Result<Vec<UpstreamMessageSummary>> {
@@ -1149,34 +1185,40 @@ impl CompatibleStore {
             std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
         }
 
-        let tx = conn.unchecked_transaction()?;
-        for message in messages {
-            tx.execute(
-                "INSERT INTO messages_v2(id, remote_id, date, size, body, body_structure, envelope, deleted)
-                 VALUES(?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, FALSE)",
-                (
-                    &message.internal_id,
-                    &message.remote_id,
-                    message.size,
-                    &message.body,
-                    &message.body_structure,
-                    &message.envelope,
-                ),
-            )?;
-            tx.execute(
-                "INSERT INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
-                (&message.internal_id, mailbox_internal_id),
-            )?;
-            tx.execute(
-                &format!(
-                    "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id, recent, deleted)
-                     VALUES(?1, ?2, ?3, FALSE)"
-                ),
-                (&message.internal_id, &message.remote_id, message.recent),
-            )?;
-            insert_message_flags(&tx, &message.internal_id, &message.flags)?;
+        {
+            let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
+            let tx = conn.unchecked_transaction()?;
+            for message in messages {
+                tx.execute(
+                    "INSERT INTO messages_v2(id, remote_id, date, size, body, body_structure, envelope, deleted)
+                     VALUES(?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, FALSE)",
+                    params![
+                        &message.internal_id,
+                        &message.remote_id,
+                        message.size,
+                        &message.body,
+                        &message.body_structure,
+                        &message.envelope,
+                    ],
+                )?;
+
+                tx.execute(
+                    "INSERT INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, ?2)",
+                    params![&message.internal_id, mailbox_internal_id as i64],
+                )?;
+
+                tx.execute(
+                    &format!(
+                        "INSERT INTO mailbox_message_{mailbox_internal_id}(message_id, message_remote_id, recent, deleted)
+                         VALUES(?1, ?2, ?3, FALSE)"
+                    ),
+                    params![&message.internal_id, &message.remote_id, message.recent],
+                )?;
+
+                insert_message_flags(&tx, &message.internal_id, &message.flags)?;
+            }
+            tx.commit()?;
         }
-        tx.commit()?;
 
         let all_messages =
             self.list_upstream_mailbox_messages(storage_user_id, mailbox_internal_id)?;
@@ -1189,238 +1231,410 @@ impl CompatibleStore {
             .filter(|summary| appended_ids.contains(summary.internal_id.as_str()))
             .collect())
     }
+}
 
-    fn cached_schema_family(&self, storage_user_id: &str) -> Option<crate::db::SchemaFamily> {
-        self.schema_cache
-            .lock()
-            .ok()
-            .and_then(|c| c.get(storage_user_id).copied())
-    }
+/// A pre-connected session for batching multiple queries with a single connection.
+pub struct StoreSession {
+    conn: ConnHandle,
+}
 
-    fn cache_schema_family(&self, storage_user_id: &str, family: crate::db::SchemaFamily) {
-        // Only cache stable families; Missing/Empty will change once the DB is created.
-        if matches!(
-            family,
-            crate::db::SchemaFamily::UpstreamCore
-                | crate::db::SchemaFamily::OpenProtonCustom
-                | crate::db::SchemaFamily::Mixed
-                | crate::db::SchemaFamily::Unknown
-        ) {
-            if let Ok(mut c) = self.schema_cache.lock() {
-                c.insert(storage_user_id.to_string(), family);
-            }
-        }
-    }
-
-    fn open_upstream_db(&self, storage_user_id: &str) -> Result<PooledConnection> {
-        // Use cached schema family to skip SchemaProbe::inspect.
-        let family = if let Some(f) = self.cached_schema_family(storage_user_id) {
-            f
-        } else {
-            let account_paths = self.account_paths(storage_user_id)?;
-            let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
-            self.cache_schema_family(storage_user_id, probe.family);
-            probe.family
-        };
-
-        if !matches!(family, crate::SchemaFamily::UpstreamCore) {
-            return Err(GluonError::IncompatibleSchema {
-                family: format!("{family:?}"),
-            });
-        }
-
-        // Open a fresh RO connection each time (no pooling) to always see latest WAL state.
-        // Schema probe caching makes this cheap.
-        let account_paths = self.account_paths(storage_user_id)?;
-        let conn = Connection::open_with_flags(
-            account_paths.primary_db_path(),
-            OpenFlags::SQLITE_OPEN_READ_ONLY,
+impl StoreSession {
+    pub fn mailbox_select_data(&self, mailbox_internal_id: u64) -> Result<SelectSnapshot> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let uid_validity: u32 = conn.query_row(
+            "SELECT uid_validity FROM mailboxes_v2 WHERE id = ?",
+            params![mailbox_internal_id as i64],
+            |row| row.get(0),
         )?;
-        configure_readonly_connection(&conn)?;
-        Ok(PooledConnection {
-            conn: Some(conn),
-            pool: self.ro_pool.clone(),
-            key: storage_user_id.to_string(),
+
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let next_uid = next_uid_for_mailbox(&conn, &table_name)?;
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT mm.uid, GROUP_CONCAT(f.value, char(0)) AS flags
+             FROM {table_name} AS mm
+             LEFT JOIN message_flags_v2 AS f ON f.message_id = mm.message_id
+             GROUP BY mm.message_id
+             ORDER BY mm.uid"
+        ))?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let (uid, flags_concat) = row?;
+            let flags = flags_concat
+                .map(|s| s.split('\0').map(String::from).collect())
+                .unwrap_or_default();
+            entries.push(SelectSnapshotEntry { uid, flags });
+        }
+
+        Ok(SelectSnapshot {
+            uid_validity,
+            next_uid,
+            entries,
         })
     }
 
-    fn open_upstream_db_rw(&self, storage_user_id: &str) -> Result<PooledConnection> {
-        // Try to reuse a cached read-write connection.
-        if let Ok(mut pool) = self.rw_pool.lock() {
-            if let Some(conns) = pool.get_mut(storage_user_id) {
-                if let Some(conn) = conns.pop() {
-                    return Ok(PooledConnection {
-                        conn: Some(conn),
-                        pool: self.rw_pool.clone(),
-                        key: storage_user_id.to_string(),
-                    });
-                }
-            }
-        }
-
-        // Use cached schema family to skip SchemaProbe::inspect.
-        let family = if let Some(f) = self.cached_schema_family(storage_user_id) {
-            f
-        } else {
-            let account_paths = self.account_paths(storage_user_id)?;
-            let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
-            self.cache_schema_family(storage_user_id, probe.family);
-            probe.family
-        };
-
-        if !matches!(
-            family,
-            crate::SchemaFamily::UpstreamCore
-                | crate::SchemaFamily::Missing
-                | crate::SchemaFamily::Empty
-        ) {
-            return Err(GluonError::IncompatibleSchema {
-                family: format!("{family:?}"),
-            });
-        }
-
-        let account_paths = self.account_paths(storage_user_id)?;
-        let conn = Connection::open(account_paths.primary_db_path())?;
-        configure_upstream_db_connection(&conn)?;
-        Ok(PooledConnection {
-            conn: Some(conn),
-            pool: self.rw_pool.clone(),
-            key: storage_user_id.to_string(),
-        })
-    }
-
-    fn get_upstream_mailbox(
+    pub fn message_internal_id_by_uid(
         &self,
-        conn: &Connection,
         mailbox_internal_id: u64,
-    ) -> Result<UpstreamMailbox> {
-        let (internal_id, remote_id, name, uid_validity, subscribed) = conn.query_row(
-            "SELECT id, remote_id, name, uid_validity, subscribed
-             FROM mailboxes_v2
-             WHERE id = ?",
-            (mailbox_internal_id,),
-            |row| {
-                Ok((
-                    row.get::<_, u64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, bool>(4)?,
-                ))
-            },
-        )?;
+        uid: u32,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        Ok(conn
+            .query_row(
+                &format!("SELECT message_id FROM {table_name} WHERE uid = ?"),
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
 
-        Ok(UpstreamMailbox {
+    pub fn message_flags_by_internal_id(&self, internal_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        query_string_vec_on(
+            &conn,
+            "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
+            internal_id,
+        )
+    }
+
+    pub fn set_message_flags(&self, internal_message_id: &str, flags: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "DELETE FROM message_flags_v2 WHERE message_id = ?",
+            params![internal_message_id],
+        )?;
+        for flag in flags {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_flags_v2(message_id, value) VALUES(?, ?)",
+                params![internal_message_id, flag],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn add_message_flags(&self, internal_message_id: &str, flags: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        for flag in flags {
+            conn.execute(
+                "INSERT OR IGNORE INTO message_flags_v2(message_id, value) VALUES(?, ?)",
+                params![internal_message_id, flag],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_message_flags(&self, internal_message_id: &str, flags: &[String]) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        for flag in flags {
+            conn.execute(
+                "DELETE FROM message_flags_v2 WHERE message_id = ? AND value = ?",
+                params![internal_message_id, flag],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_message_from_mailbox(
+        &self,
+        mailbox_internal_id: u64,
+        internal_message_id: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        conn.execute(
+            &format!("DELETE FROM {table_name} WHERE message_id = ?"),
+            params![internal_message_id],
+        )?;
+        conn.execute(
+            "DELETE FROM message_to_mailbox WHERE message_id = ? AND mailbox_id = ?",
+            params![internal_message_id, mailbox_internal_id as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn message_remote_id_by_uid(
+        &self,
+        mailbox_internal_id: u64,
+        uid: u32,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        Ok(conn
+            .query_row(
+                &format!("SELECT message_remote_id FROM {table_name} WHERE uid = ?"),
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn message_by_uid(
+        &self,
+        mailbox_internal_id: u64,
+        uid: u32,
+        account_paths: &AccountPaths,
+    ) -> Result<Option<UpstreamMailboxMessage>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let result = conn
+            .query_row(
+                &format!(
+                    "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
+                            m.size, m.deleted, m.body, m.body_structure, m.envelope
+                     FROM {table_name} AS mm
+                     JOIN messages_v2 AS m ON m.id = mm.message_id
+                     WHERE mm.uid = ?"
+                ),
+                params![uid],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, bool>(3)?,
+                        row.get::<_, bool>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        let Some((
             internal_id,
             remote_id,
-            name,
-            uid_validity,
-            subscribed,
-            attributes: query_string_vec(
-                conn,
-                "SELECT value FROM mailbox_attrs_v2 WHERE mailbox_id = ? ORDER BY value",
-                (internal_id,),
-            )?,
-            flags: query_string_vec(
-                conn,
-                "SELECT value FROM mailbox_flags_v2 WHERE mailbox_id = ? ORDER BY value",
-                (internal_id,),
-            )?,
-            permanent_flags: query_string_vec(
-                conn,
-                "SELECT value FROM mailbox_perm_flags_v2 WHERE mailbox_id = ? ORDER BY value",
-                (internal_id,),
-            )?,
-        })
+            uid_val,
+            recent,
+            mailbox_deleted,
+            size,
+            message_deleted,
+            body,
+            body_structure,
+            envelope,
+        )) = result
+        else {
+            return Ok(None);
+        };
+
+        let flags = query_string_vec_on(
+            &conn,
+            "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
+            &internal_id,
+        )?;
+
+        let blob_path = account_paths.blob_path(&internal_id)?;
+
+        Ok(Some(UpstreamMailboxMessage {
+            summary: UpstreamMessageSummary {
+                internal_id,
+                remote_id,
+                uid: uid_val,
+                recent,
+                mailbox_deleted,
+                message_deleted,
+                size,
+                flags,
+            },
+            body,
+            body_structure,
+            envelope,
+            blob_exists: blob_path.exists(),
+            blob_path,
+        }))
+    }
+
+    pub fn list_uids(&self, mailbox_internal_id: u64) -> Result<Vec<u32>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(&format!(
+            "SELECT uid FROM mailbox_message_{mailbox_internal_id} ORDER BY uid"
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, u32>(0))?;
+        let mut uids = Vec::new();
+        for row in rows {
+            uids.push(row?);
+        }
+        Ok(uids)
+    }
+
+    pub fn mailbox_status(&self, mailbox_internal_id: u64) -> Result<(u32, u32, u32)> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let exists: u32 =
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table_name}"), [], |row| {
+                row.get(0)
+            })?;
+        let next_uid = next_uid_for_mailbox(&conn, &table_name)?;
+        let uid_validity: u32 = conn.query_row(
+            "SELECT uid_validity FROM mailboxes_v2 WHERE id = ?",
+            params![mailbox_internal_id as i64],
+            |row| row.get(0),
+        )?;
+        Ok((uid_validity, next_uid, exists))
+    }
+
+    pub fn read_rfc822(
+        &self,
+        mailbox_internal_id: u64,
+        uid: u32,
+        account_paths: &AccountPaths,
+        key: &gluon_rs_core::GluonKey,
+    ) -> Result<Option<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let internal_id: Option<String> = conn
+            .query_row(
+                &format!("SELECT message_id FROM {table_name} WHERE uid = ?"),
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(internal_id) = internal_id else {
+            return Ok(None);
+        };
+        let blob_path = account_paths.blob_path(&internal_id)?;
+        if !blob_path.exists() {
+            return Ok(None);
+        }
+        let encoded = std::fs::read(&blob_path).map_err(gluon_rs_core::GluonCoreError::from)?;
+        Ok(Some(decode_blob(key, &encoded)?))
+    }
+
+    pub fn store_rfc822(
+        &self,
+        mailbox_internal_id: u64,
+        uid: u32,
+        data: &[u8],
+        account_paths: &AccountPaths,
+        key: &gluon_rs_core::GluonKey,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let internal_id: Option<String> = conn
+            .query_row(
+                &format!("SELECT message_id FROM {table_name} WHERE uid = ?"),
+                params![uid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(internal_id) = internal_id else {
+            return Ok(());
+        };
+        std::fs::create_dir_all(account_paths.store_dir())
+            .map_err(gluon_rs_core::GluonCoreError::from)?;
+        let blob_path = account_paths.blob_path(&internal_id)?;
+        let encoded = encode_blob(key, data)?;
+        std::fs::write(&blob_path, encoded).map_err(gluon_rs_core::GluonCoreError::from)?;
+        Ok(())
+    }
+
+    pub fn list_upstream_mailboxes(&self) -> Result<Vec<UpstreamMailbox>> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT id, remote_id, name, uid_validity, subscribed FROM mailboxes_v2 ORDER BY id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+
+        let mut mailboxes = Vec::new();
+        for row in rows {
+            let (id, remote_id, name, uid_validity, subscribed) = row?;
+            mailboxes.push(UpstreamMailbox {
+                internal_id: id as u64,
+                remote_id,
+                name,
+                uid_validity,
+                subscribed,
+                attributes: Vec::new(),
+                flags: Vec::new(),
+                permanent_flags: Vec::new(),
+            });
+        }
+        Ok(mailboxes)
     }
 }
 
-fn query_string_vec<P>(conn: &Connection, sql: &str, param: P) -> Result<Vec<String>>
-where
-    P: rusqlite::Params,
-{
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn query_string_vec_on(conn: &Connection, sql: &str, param: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query(param)?;
-    let mut values = Vec::new();
-    while let Some(row) = rows.next()? {
-        values.push(row.get::<_, String>(0)?);
+    let rows = stmt.query_map(params![param], |row| row.get::<_, String>(0))?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
     }
-    Ok(values)
+    Ok(result)
 }
 
 fn query_count(conn: &Connection, sql: &str) -> Result<u32> {
-    Ok(conn.query_row(sql, [], |row| row.get::<_, u32>(0))?)
-}
-
-fn configure_upstream_db_connection(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "PRAGMA foreign_keys = ON; \
-         PRAGMA journal_mode = WAL; \
-         PRAGMA synchronous = NORMAL; \
-         PRAGMA busy_timeout = 5000; \
-         PRAGMA cache_size = -8000; \
-         PRAGMA mmap_size = 67108864;",
-    )?;
-    Ok(())
-}
-
-fn configure_readonly_connection(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "PRAGMA cache_size = -8000; \
-         PRAGMA mmap_size = 67108864;",
-    )?;
-    Ok(())
+    let count: u32 = conn.query_row(sql, [], |row| row.get(0))?;
+    Ok(count)
 }
 
 fn next_uid_for_mailbox(conn: &Connection, table_name: &str) -> Result<u32> {
-    let uid = conn.query_row(
-        "SELECT seq FROM sqlite_sequence WHERE name = ?",
-        (table_name,),
-        |row| row.get::<_, u32>(0),
-    );
-    match uid {
-        Ok(seq) => Ok(seq.saturating_add(1)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(1),
-        Err(err) => Err(err.into()),
+    let result: Option<u32> = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?",
+            params![table_name],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match result {
+        Some(seq) => Ok(seq.saturating_add(1)),
+        None => Ok(1),
     }
 }
 
 fn insert_mailbox_flags(
-    tx: &rusqlite::Transaction<'_>,
+    conn: &Connection,
     table_name: &str,
     mailbox_id: u64,
     values: &[String],
 ) -> Result<()> {
     let sql = format!("INSERT INTO {table_name}(mailbox_id, value) VALUES(?1, ?2)");
     for value in values {
-        tx.execute(&sql, (mailbox_id, value))?;
+        conn.execute(&sql, params![mailbox_id as i64, value])?;
     }
     Ok(())
 }
 
-fn insert_message_flags(
-    tx: &rusqlite::Transaction<'_>,
-    message_id: &str,
-    values: &[String],
-) -> Result<()> {
+fn insert_message_flags(conn: &Connection, message_id: &str, values: &[String]) -> Result<()> {
     for value in values {
-        tx.execute(
+        conn.execute(
             "INSERT INTO message_flags_v2(message_id, value) VALUES(?1, ?2)",
-            (message_id, value),
+            params![message_id, value],
         )?;
     }
     Ok(())
 }
 
 fn insert_message_flags_ignore_duplicates(
-    tx: &rusqlite::Transaction<'_>,
+    conn: &Connection,
     message_id: &str,
     values: &[String],
 ) -> Result<()> {
     for value in values {
-        tx.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO message_flags_v2(message_id, value) VALUES(?1, ?2)",
-            (message_id, value),
+            params![message_id, value],
         )?;
     }
     Ok(())
@@ -1440,34 +1654,191 @@ fn create_mailbox_message_table_sql(mailbox_internal_id: u64) -> String {
     )
 }
 
-const UPSTREAM_BASE_SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS deleted_subscriptions(
+fn get_upstream_mailbox(conn: &Connection, mailbox_internal_id: u64) -> Result<UpstreamMailbox> {
+    let (internal_id, remote_id, name, uid_validity, subscribed): (i64, String, String, u32, bool) =
+        conn.query_row(
+            "SELECT id, remote_id, name, uid_validity, subscribed
+         FROM mailboxes_v2
+         WHERE id = ?",
+            params![mailbox_internal_id as i64],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+
+    let internal_id = internal_id as u64;
+
+    Ok(UpstreamMailbox {
+        internal_id,
+        remote_id,
+        name,
+        uid_validity,
+        subscribed,
+        attributes: query_string_vec_on(
+            conn,
+            "SELECT value FROM mailbox_attrs_v2 WHERE mailbox_id = ? ORDER BY value",
+            &(internal_id as i64).to_string(),
+        )
+        .unwrap_or_default(),
+        flags: query_string_vec_on(
+            conn,
+            "SELECT value FROM mailbox_flags_v2 WHERE mailbox_id = ? ORDER BY value",
+            &(internal_id as i64).to_string(),
+        )
+        .unwrap_or_default(),
+        permanent_flags: query_string_vec_on(
+            conn,
+            "SELECT value FROM mailbox_perm_flags_v2 WHERE mailbox_id = ? ORDER BY value",
+            &(internal_id as i64).to_string(),
+        )
+        .unwrap_or_default(),
+    })
+}
+
+fn list_upstream_mailboxes_on(conn: &Connection) -> Result<Vec<UpstreamMailbox>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, remote_id, name, uid_validity, subscribed
+         FROM mailboxes_v2
+         ORDER BY id",
+    )?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, u32>(3)?,
+            row.get::<_, bool>(4)?,
+        ))
+    })?;
+
+    let mut mailboxes = Vec::new();
+    for row in rows {
+        let (id, remote_id, name, uid_validity, subscribed) = row?;
+        let internal_id = id as u64;
+        mailboxes.push(UpstreamMailbox {
+            internal_id,
+            remote_id,
+            name,
+            uid_validity,
+            subscribed,
+            attributes: query_string_vec_on(
+                conn,
+                "SELECT value FROM mailbox_attrs_v2 WHERE mailbox_id = ? ORDER BY value",
+                &(internal_id as i64).to_string(),
+            )
+            .unwrap_or_default(),
+            flags: query_string_vec_on(
+                conn,
+                "SELECT value FROM mailbox_flags_v2 WHERE mailbox_id = ? ORDER BY value",
+                &(internal_id as i64).to_string(),
+            )
+            .unwrap_or_default(),
+            permanent_flags: query_string_vec_on(
+                conn,
+                "SELECT value FROM mailbox_perm_flags_v2 WHERE mailbox_id = ? ORDER BY value",
+                &(internal_id as i64).to_string(),
+            )
+            .unwrap_or_default(),
+        });
+    }
+
+    Ok(mailboxes)
+}
+
+fn list_upstream_mailbox_messages_on(
+    conn: &Connection,
+    mailbox_internal_id: u64,
+) -> Result<Vec<UpstreamMessageSummary>> {
+    let table_name = format!("mailbox_message_{mailbox_internal_id}");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
+                m.size, m.deleted,
+                GROUP_CONCAT(mf.value) AS flags_csv
+         FROM {table_name} AS mm
+         JOIN messages_v2 AS m ON m.id = mm.message_id
+         LEFT JOIN message_flags_v2 AS mf ON mf.message_id = mm.message_id
+         GROUP BY mm.message_id
+         ORDER BY mm.uid"
+    ))?;
+
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, u32>(2)?,
+            row.get::<_, bool>(3)?,
+            row.get::<_, bool>(4)?,
+            row.get::<_, i64>(5)?,
+            row.get::<_, bool>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
+    })?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        let (
+            internal_id,
+            remote_id,
+            uid,
+            recent,
+            mailbox_deleted,
+            size,
+            message_deleted,
+            flags_csv,
+        ) = row?;
+        let flags = flags_csv
+            .map(|csv| csv.split(',').map(String::from).collect())
+            .unwrap_or_default();
+        messages.push(UpstreamMessageSummary {
+            internal_id,
+            remote_id,
+            uid,
+            recent,
+            mailbox_deleted,
+            size,
+            message_deleted,
+            flags,
+        });
+    }
+
+    Ok(messages)
+}
+
+const UPSTREAM_SCHEMA_STATEMENTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS deleted_subscriptions(
         name TEXT NOT NULL,
         remote_id TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS mailboxes_v2(
+    )",
+    "CREATE TABLE IF NOT EXISTS mailboxes_v2(
         id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
         remote_id TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL UNIQUE,
         uid_validity INTEGER NOT NULL,
         subscribed BOOLEAN NOT NULL DEFAULT TRUE
-    );
-    CREATE TABLE IF NOT EXISTS mailbox_flags_v2(
+    )",
+    "CREATE TABLE IF NOT EXISTS mailbox_flags_v2(
         value TEXT NOT NULL,
         mailbox_id INTEGER NOT NULL,
         PRIMARY KEY(value, mailbox_id)
-    );
-    CREATE TABLE IF NOT EXISTS mailbox_attrs_v2(
+    )",
+    "CREATE TABLE IF NOT EXISTS mailbox_attrs_v2(
         value TEXT NOT NULL,
         mailbox_id INTEGER NOT NULL,
         PRIMARY KEY(value, mailbox_id)
-    );
-    CREATE TABLE IF NOT EXISTS mailbox_perm_flags_v2(
+    )",
+    "CREATE TABLE IF NOT EXISTS mailbox_perm_flags_v2(
         value TEXT NOT NULL,
         mailbox_id INTEGER NOT NULL,
         PRIMARY KEY(value, mailbox_id)
-    );
-    CREATE TABLE IF NOT EXISTS messages_v2(
+    )",
+    "CREATE TABLE IF NOT EXISTS messages_v2(
         id TEXT NOT NULL PRIMARY KEY,
         remote_id TEXT NOT NULL UNIQUE,
         date TEXT,
@@ -1476,34 +1847,34 @@ const UPSTREAM_BASE_SCHEMA: &str = "
         body_structure TEXT NOT NULL,
         envelope TEXT NOT NULL,
         deleted BOOLEAN NOT NULL DEFAULT FALSE
-    );
-    CREATE TABLE IF NOT EXISTS message_flags_v2(
+    )",
+    "CREATE TABLE IF NOT EXISTS message_flags_v2(
         value TEXT NOT NULL,
         message_id TEXT NOT NULL,
         PRIMARY KEY(value, message_id)
-    );
-    CREATE INDEX IF NOT EXISTS message_flags_message_id_index ON message_flags_v2(message_id);
-    CREATE TABLE IF NOT EXISTS message_to_mailbox(
+    )",
+    "CREATE INDEX IF NOT EXISTS message_flags_message_id_index ON message_flags_v2(message_id)",
+    "CREATE TABLE IF NOT EXISTS message_to_mailbox(
         message_id TEXT NOT NULL,
         mailbox_id INTEGER NOT NULL,
         PRIMARY KEY(message_id, mailbox_id)
-    );
-    CREATE TABLE IF NOT EXISTS connector_settings(
+    )",
+    "CREATE TABLE IF NOT EXISTS connector_settings(
         id INTEGER NOT NULL PRIMARY KEY,
         value TEXT
-    );
-    CREATE TABLE IF NOT EXISTS gluon_version(
+    )",
+    "CREATE TABLE IF NOT EXISTS gluon_version(
         id INTEGER NOT NULL PRIMARY KEY CHECK(id = 0),
         version INTEGER NOT NULL
-    );
-";
+    )",
+];
 
 #[cfg(test)]
 mod tests {
     use std::fs;
 
     use gluon_rs_core::{CacheLayout, DeferredDeleteManager, GluonKey};
-    use rusqlite::{params, Connection};
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     use crate::{encode_blob, target::CompatibilityTarget, AccountBootstrap, StoreBootstrap};
@@ -1553,33 +1924,35 @@ mod tests {
         )
         .expect("blob");
 
-        let conn = Connection::open(account_paths.primary_db_path()).expect("open db");
-        conn.execute_batch(
-            "
-            CREATE TABLE deleted_subscriptions(name TEXT, remote_id TEXT);
-            CREATE TABLE mailboxes_v2(
+        // Set up schema using rusqlite directly.
+        let db_path = account_paths.primary_db_path();
+        let conn = Connection::open(&db_path).expect("open db");
+
+        let schema_stmts = [
+            "CREATE TABLE deleted_subscriptions(name TEXT, remote_id TEXT)",
+            "CREATE TABLE mailboxes_v2(
                 id INTEGER PRIMARY KEY,
                 remote_id TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL UNIQUE,
                 uid_validity INTEGER NOT NULL,
                 subscribed BOOLEAN NOT NULL
-            );
-            CREATE TABLE mailbox_flags_v2(
+            )",
+            "CREATE TABLE mailbox_flags_v2(
                 value TEXT NOT NULL,
                 mailbox_id INTEGER NOT NULL,
                 PRIMARY KEY(value, mailbox_id)
-            );
-            CREATE TABLE mailbox_attrs_v2(
+            )",
+            "CREATE TABLE mailbox_attrs_v2(
                 value TEXT NOT NULL,
                 mailbox_id INTEGER NOT NULL,
                 PRIMARY KEY(value, mailbox_id)
-            );
-            CREATE TABLE mailbox_perm_flags_v2(
+            )",
+            "CREATE TABLE mailbox_perm_flags_v2(
                 value TEXT NOT NULL,
                 mailbox_id INTEGER NOT NULL,
                 PRIMARY KEY(value, mailbox_id)
-            );
-            CREATE TABLE messages_v2(
+            )",
+            "CREATE TABLE messages_v2(
                 id TEXT NOT NULL PRIMARY KEY,
                 remote_id TEXT NOT NULL UNIQUE,
                 date TEXT,
@@ -1588,72 +1961,69 @@ mod tests {
                 body_structure TEXT,
                 envelope TEXT,
                 deleted BOOLEAN NOT NULL DEFAULT false
-            );
-            CREATE TABLE message_flags_v2(
+            )",
+            "CREATE TABLE message_flags_v2(
                 value TEXT NOT NULL,
                 message_id TEXT NOT NULL,
                 PRIMARY KEY(value, message_id)
-            );
-            CREATE TABLE message_to_mailbox(
+            )",
+            "CREATE TABLE message_to_mailbox(
                 message_id TEXT NOT NULL,
                 mailbox_id INTEGER NOT NULL,
                 PRIMARY KEY(message_id, mailbox_id)
-            );
-            CREATE TABLE connector_settings(
+            )",
+            "CREATE TABLE connector_settings(
                 id INTEGER NOT NULL PRIMARY KEY,
                 value TEXT
-            );
-            CREATE TABLE gluon_version(
+            )",
+            "CREATE TABLE gluon_version(
                 id INTEGER NOT NULL PRIMARY KEY,
                 version INTEGER NOT NULL
-            );
-            CREATE TABLE mailbox_message_1(
+            )",
+            "CREATE TABLE mailbox_message_1(
                 uid INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
                 deleted BOOLEAN NOT NULL DEFAULT false,
                 recent BOOLEAN NOT NULL DEFAULT true,
                 message_id TEXT NOT NULL UNIQUE,
                 message_remote_id TEXT NOT NULL UNIQUE
-            );
-            ",
-        )
-        .expect("create schema");
+            )",
+        ];
+        for stmt in schema_stmts {
+            conn.execute_batch(stmt).expect("schema");
+        }
+
         conn.execute(
             "INSERT INTO mailboxes_v2(id, remote_id, name, uid_validity, subscribed) VALUES(1, ?1, ?2, ?3, ?4)",
-            params!["mbox-remote-1", "INBOX", 777u32, true],
-        )
-        .expect("insert mailbox");
+            rusqlite::params!["mbox-remote-1", "INBOX", 777u32, true],
+        ).expect("insert mailbox");
         conn.execute(
             "INSERT INTO mailbox_attrs_v2(value, mailbox_id) VALUES(?1, 1)",
-            params!["\\HasNoChildren"],
+            rusqlite::params!["\\HasNoChildren"],
         )
         .expect("insert attr");
         conn.execute(
             "INSERT INTO mailbox_flags_v2(value, mailbox_id) VALUES(?1, 1)",
-            params!["\\Draft"],
+            rusqlite::params!["\\Draft"],
         )
         .expect("insert mailbox flag");
         conn.execute(
             "INSERT INTO mailbox_perm_flags_v2(value, mailbox_id) VALUES(?1, 1)",
-            params!["\\Seen"],
+            rusqlite::params!["\\Seen"],
         )
         .expect("insert mailbox perm flag");
         conn.execute(
             "INSERT INTO messages_v2(id, remote_id, date, size, body, body_structure, envelope, deleted)
              VALUES(?1, ?2, '2026-03-11T10:00:00Z', 123, '', '', '', false)",
-            params![
-                "11111111-1111-1111-1111-111111111111",
-                "msg-remote-1"
-            ],
-        )
-        .expect("insert message");
+            rusqlite::params!["11111111-1111-1111-1111-111111111111", "msg-remote-1"],
+        ).expect("insert message");
         conn.execute(
             "INSERT INTO message_flags_v2(value, message_id) VALUES(?1, ?2)",
-            params!["\\Seen", "11111111-1111-1111-1111-111111111111"],
+            rusqlite::params!["\\Seen", "11111111-1111-1111-1111-111111111111"],
         )
         .expect("insert message flag");
         conn.execute(
             "INSERT INTO message_to_mailbox(message_id, mailbox_id) VALUES(?1, 1)",
-            params!["11111111-1111-1111-1111-111111111111"],
+            rusqlite::params!["11111111-1111-1111-1111-111111111111"],
         )
         .expect("insert message map");
         conn.execute(
@@ -1665,12 +2035,8 @@ mod tests {
             .expect("insert version");
         conn.execute(
             "INSERT INTO mailbox_message_1(message_id, message_remote_id, recent, deleted) VALUES(?1, ?2, true, false)",
-            params![
-                "11111111-1111-1111-1111-111111111111",
-                "msg-remote-1"
-            ],
-        )
-        .expect("insert mailbox message");
+            rusqlite::params!["11111111-1111-1111-1111-111111111111", "msg-remote-1"],
+        ).expect("insert mailbox message");
         drop(conn);
 
         let store = CompatibleStore::open_read_only(StoreBootstrap::new(

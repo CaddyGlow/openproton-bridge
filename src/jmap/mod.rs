@@ -235,6 +235,7 @@ mod tests {
                 Some("uid-1"),
                 "Labels/Projects",
             ))
+            .await
             .unwrap();
         let _ = connector
             .upsert_metadata(

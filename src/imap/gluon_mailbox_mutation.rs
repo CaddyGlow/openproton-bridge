@@ -49,7 +49,7 @@ impl GluonMailMailboxMutation {
             .unwrap_or(account_id)
     }
 
-    fn mailbox_by_name(
+    async fn mailbox_by_name(
         &self,
         storage_user_id: &str,
         mailbox_name: &str,
@@ -67,10 +67,10 @@ impl GluonMailMailboxMutation {
         }
     }
 
-    fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
+    async fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
         let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
-        if let Some(mailbox) = self.mailbox_by_name(&storage_user_id, mailbox_name)? {
+        if let Some(mailbox) = self.mailbox_by_name(&storage_user_id, mailbox_name).await? {
             return Ok((storage_user_id, mailbox));
         }
 
@@ -98,12 +98,12 @@ impl GluonMailMailboxMutation {
         Ok((storage_user_id, created))
     }
 
-    fn message_by_uid(
+    async fn message_by_uid(
         &self,
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
     ) -> Result<Option<(String, UpstreamMailbox, UpstreamMailboxMessage)>> {
-        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
         let message = self
             .store
             .message_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
@@ -172,7 +172,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             return Ok(uid);
         }
 
-        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
         if let Some(internal_message_id) = self
             .store
             .find_message_internal_id_by_remote_id(&storage_user_id, proton_id.as_str())
@@ -212,7 +212,8 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         data: Vec<u8>,
     ) -> Result<()> {
-        let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
+        let Some((storage_user_id, _mailbox_state, message)) =
+            self.message_by_uid(mailbox, uid).await?
         else {
             return Ok(());
         };
@@ -247,7 +248,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         flags: Vec<String>,
     ) -> Result<()> {
-        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
         let Some(internal_id) = self
             .store
             .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
@@ -266,7 +267,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         flags: &[String],
     ) -> Result<()> {
-        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
         let Some(internal_id) = self
             .store
             .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
@@ -285,7 +286,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         flags: &[String],
     ) -> Result<()> {
-        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
         let Some(internal_id) = self
             .store
             .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
@@ -303,7 +304,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
     }
 
     async fn remove_message(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<()> {
-        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
         let Some(internal_id) = self
             .store
             .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
@@ -324,6 +325,32 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         self.view.uid_to_seq(mailbox, uid).await
     }
 
+    async fn batch_remove_messages(
+        &self,
+        mailbox: &ScopedMailboxId,
+        uids: &[ImapUid],
+    ) -> Result<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox).await?;
+        let session = self
+            .store
+            .session(&storage_user_id)
+            .map_err(map_mail_error)?;
+        for &uid in uids {
+            if let Some(internal_id) = session
+                .message_internal_id_by_uid(mailbox_state.internal_id, uid.value())
+                .map_err(map_mail_error)?
+            {
+                session
+                    .remove_message_from_mailbox(mailbox_state.internal_id, &internal_id)
+                    .map_err(map_mail_error)?;
+            }
+        }
+        Ok(())
+    }
+
     async fn batch_store_metadata(
         &self,
         mailbox: &ScopedMailboxId,
@@ -335,7 +362,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
 
         let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
-        let mailbox_state = match self.mailbox_by_name(&storage_user_id, mailbox_name)? {
+        let mailbox_state = match self.mailbox_by_name(&storage_user_id, mailbox_name).await? {
             Some(m) => m,
             None => {
                 return self.default_batch_store_metadata(mailbox, entries).await;
@@ -595,7 +622,7 @@ mod tests {
         }
     }
 
-    fn create_mailbox(store: &gluon_rs_mail::CompatibleStore, name: &str, remote_id: &str) {
+    async fn create_mailbox(store: &gluon_rs_mail::CompatibleStore, name: &str, remote_id: &str) {
         store
             .create_mailbox(
                 "user-1",
@@ -609,6 +636,7 @@ mod tests {
                     permanent_flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
                 },
             )
+            .await
             .expect("create mailbox");
     }
 
@@ -652,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn gluon_mailbox_mutation_writes_flags_and_rfc822() {
         let fixture = open_store();
-        create_mailbox(&fixture.store, "INBOX", "0");
+        create_mailbox(&fixture.store, "INBOX", "0").await;
         let mutation = GluonMailMailboxMutation::new(fixture.store.clone());
 
         let scoped = scoped("account-1", "INBOX");
@@ -689,8 +717,8 @@ mod tests {
     #[tokio::test]
     async fn gluon_mailbox_mutation_copies_existing_message_between_mailboxes() {
         let fixture = open_store();
-        create_mailbox(&fixture.store, "INBOX", "0");
-        create_mailbox(&fixture.store, "Archive", "archive");
+        create_mailbox(&fixture.store, "INBOX", "0").await;
+        create_mailbox(&fixture.store, "Archive", "archive").await;
         let mutation = GluonMailMailboxMutation::new(fixture.store.clone());
 
         let inbox = scoped("account-1", "INBOX");

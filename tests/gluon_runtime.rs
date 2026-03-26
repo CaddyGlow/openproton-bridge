@@ -143,7 +143,7 @@ fn runtime_auth_material_fixture(passphrase: &str, email: &str) -> RuntimeAuthMa
     }
 }
 
-fn seed_runtime_gluon_store_with_flags(
+async fn seed_runtime_gluon_store_with_flags(
     runtime_paths: &RuntimePaths,
     session: &Session,
     flags: &[&str],
@@ -176,6 +176,7 @@ fn seed_runtime_gluon_store_with_flags(
                 permanent_flags: vec!["\\Seen".to_string(), "\\Flagged".to_string()],
             },
         )
+        .await
         .expect("create runtime inbox");
 
     let blob = b"Date: Tue, 14 Nov 2023 22:13:20 +0000\r\nFrom: Alice <alice@proton.me>\r\nTo: Runtime <runtime@proton.me>\r\nSubject: Runtime Subject\r\nMessage-ID: <runtime-msg-1@example.test>\r\n\r\nruntime-body".to_vec();
@@ -196,11 +197,12 @@ fn seed_runtime_gluon_store_with_flags(
                 recent: false,
             },
         )
+        .await
         .expect("append runtime message");
 }
 
-fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
-    seed_runtime_gluon_store_with_flags(runtime_paths, session, &["\\Seen"]);
+async fn seed_runtime_gluon_store(runtime_paths: &RuntimePaths, session: &Session) {
+    seed_runtime_gluon_store_with_flags(runtime_paths, session, &["\\Seen"]).await;
 }
 
 async fn free_port() -> u16 {
@@ -371,7 +373,7 @@ async fn be030_mail_runtime_supports_offline_login_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -471,7 +473,7 @@ async fn be030_mail_runtime_idle_emits_flag_fetch_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -594,7 +596,7 @@ async fn be030_mail_runtime_store_syncs_upstream_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -672,7 +674,7 @@ async fn be030_mail_runtime_copy_syncs_upstream_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -768,7 +770,7 @@ async fn be030_mail_runtime_expunge_syncs_upstream_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -861,7 +863,7 @@ async fn be030_mail_runtime_move_syncs_upstream_with_gluon_defaults() {
     vault::save_session(&session, runtime_paths.settings_dir()).expect("save session");
     vault::set_gluon_key_by_account_id(runtime_paths.settings_dir(), &session.uid, vec![7u8; 32])
         .expect("save gluon key");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -991,7 +993,7 @@ async fn be030_mail_runtime_event_update_reaches_idle_with_gluon_defaults() {
             },
         )
         .expect("save runtime checkpoint");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -1112,7 +1114,7 @@ async fn be030_mail_runtime_event_delete_surfaces_via_noop_with_gluon_defaults()
             },
         )
         .expect("save runtime checkpoint");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;
@@ -1235,7 +1237,7 @@ async fn be030_mail_runtime_refresh_resync_surfaces_via_noop_with_gluon_defaults
             },
         )
         .expect("save runtime checkpoint");
-    seed_runtime_gluon_store(&runtime_paths, &session);
+    seed_runtime_gluon_store(&runtime_paths, &session).await;
 
     let imap_port = free_port().await;
     let smtp_port = free_port_excluding(&[imap_port]).await;

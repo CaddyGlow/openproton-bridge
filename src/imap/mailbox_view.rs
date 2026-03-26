@@ -31,4 +31,13 @@ pub trait GluonMailboxView: Send + Sync {
     async fn seq_to_uid(&self, mailbox: &ScopedMailboxId, seq: u32) -> Result<Option<ImapUid>>;
     async fn uid_to_seq(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<u32>>;
     async fn select_mailbox_data(&self, mailbox: &ScopedMailboxId) -> Result<SelectMailboxData>;
+
+    /// Fast path: single connection for SELECT data instead of multiple pool.acquire() calls.
+    /// Default falls back to `select_mailbox_data`.
+    async fn select_mailbox_data_fast(
+        &self,
+        mailbox: &ScopedMailboxId,
+    ) -> Result<SelectMailboxData> {
+        self.select_mailbox_data(mailbox).await
+    }
 }

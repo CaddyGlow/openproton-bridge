@@ -464,7 +464,7 @@ fn navigate_to_part(text: &str, numbers: &[usize]) -> Option<String> {
 pub fn build_envelope(meta: &MessageEnvelope, header: &str) -> String {
     // Date: use the Date header if available, fall back to internal timestamp
     let date = extract_header(header, "Date").unwrap_or_else(|| format_imap_date(meta.time));
-    let subject = imap_quote(&meta.subject);
+    let subject = imap_quote_nil(&meta.subject);
     let from = format_address_list(std::slice::from_ref(&meta.sender));
 
     // Sender: extract from header; RFC 3501 says NIL means same as From
@@ -547,13 +547,20 @@ fn format_address_list(addrs: &[EmailAddress]) -> String {
             };
             format!(
                 "({} NIL {} {})",
-                imap_quote(&a.name),
+                imap_quote_nil(&a.name),
                 imap_quote(local),
                 imap_quote(domain),
             )
         })
         .collect();
     format!("({})", parts.join(""))
+}
+
+fn imap_quote_nil(s: &str) -> String {
+    if s.is_empty() {
+        return "NIL".to_string();
+    }
+    imap_quote(s)
 }
 
 fn imap_quote(s: &str) -> String {

@@ -143,6 +143,7 @@ pub enum FetchItem {
     Flags,
     Uid,
     Envelope,
+    Rfc822,
     Rfc822Size,
     Rfc822Header,
     Rfc822Text,
@@ -219,6 +220,7 @@ pub enum SearchKey {
     From(String),
     To(String),
     Uid(SequenceSet),
+    Sequence(SequenceSet),
     Not(Box<SearchKey>),
     Or(Box<SearchKey>, Box<SearchKey>),
     // Date criteria (unix timestamps)
@@ -709,6 +711,9 @@ fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
         } else if starts_fetch_item_keyword(&upper_rem, "RFC822.SIZE") {
             items.push(FetchItem::Rfc822Size);
             remaining = remaining[11..].trim_start();
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822") {
+            items.push(FetchItem::Rfc822);
+            remaining = remaining[6..].trim_start();
         } else if starts_fetch_item_keyword(&upper_rem, "INTERNALDATE") {
             items.push(FetchItem::InternalDate);
             remaining = remaining[12..].trim_start();

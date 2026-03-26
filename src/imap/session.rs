@@ -945,12 +945,21 @@ where
                 .await;
         }
 
-        // Verify dest doesn't already exist
+        // If dest exists, delete it first (allow overwrite for RENAME)
         if self.resolve_mailbox(dest).await.is_some() {
-            return self
-                .writer
-                .tagged_no(tag, "destination mailbox already exists")
+            if mailbox::find_mailbox(dest).is_some() {
+                return self
+                    .writer
+                    .tagged_no(tag, "destination mailbox already exists")
+                    .await;
+            }
+            let scoped_dest = self.scoped_mailbox_name(dest);
+            let _ = self
+                .config
+                .gluon_connector
+                .delete_mailbox(&scoped_dest, true)
                 .await;
+            self.user_labels.retain(|l| l.name != dest);
         }
 
         let scoped_source = self.scoped_mailbox_name(source);
@@ -1441,7 +1450,8 @@ where
             FetchItem::BodySection { section, .. } => {
                 !body_section_is_header_only(section.as_deref())
             }
-            FetchItem::Rfc822Text
+            FetchItem::Rfc822
+            | FetchItem::Rfc822Text
             | FetchItem::BodyStructure
             | FetchItem::Body
             | FetchItem::Envelope => true,
@@ -1638,6 +1648,16 @@ where
                         let idx = parts.len();
                         parts.push(format!("RFC822.TEXT {{{}}}", text_data.len()));
                         part_literals.insert(idx, text_data);
+                    }
+                    FetchItem::Rfc822 => {
+                        let full_data = rfc822_data.clone().unwrap_or_default();
+                        let idx = parts.len();
+                        parts.push(format!("RFC822 {{{}}}", full_data.len()));
+                        part_literals.insert(idx, full_data);
+                        // RFC822 (bare) implicitly sets \Seen
+                        if !self.selected_read_only && !has_seen {
+                            has_seen = true;
+                        }
                     }
                     FetchItem::InternalDate => {
                         if let Some(ref meta) = meta {
@@ -2200,8 +2220,18 @@ where
                 }
             }
 
+            let max_seq = all_uids.len() as u32;
             let matches = criteria.iter().all(|c| {
-                evaluate_search_key(c, uid, &meta, &flags, max_uid, rfc822_data.as_deref())
+                evaluate_search_key(
+                    c,
+                    uid,
+                    seq,
+                    max_seq,
+                    &meta,
+                    &flags,
+                    max_uid,
+                    rfc822_data.as_deref(),
+                )
             });
 
             if matches {
@@ -2928,6 +2958,8 @@ fn expand_fetch_items(items: &[FetchItem]) -> Vec<FetchItem> {
 fn evaluate_search_key(
     key: &SearchKey,
     uid: ImapUid,
+    seq: u32,
+    max_seq: u32,
     meta: &Option<gluon_rs_mail::MessageEnvelope>,
     flags: &[String],
     max_uid: ImapUid,
@@ -3094,13 +3126,14 @@ fn evaluate_search_key(
         }
         SearchKey::Larger(size) => meta.as_ref().map(|m| m.size > *size).unwrap_or(false),
         SearchKey::Smaller(size) => meta.as_ref().map(|m| m.size < *size).unwrap_or(false),
-        SearchKey::Uid(seq) => seq.contains(uid.value(), max_uid.value()),
+        SearchKey::Uid(s) => s.contains(uid.value(), max_uid.value()),
+        SearchKey::Sequence(s) => s.contains(seq, max_seq),
         SearchKey::Not(inner) => {
-            !evaluate_search_key(inner, uid, meta, flags, max_uid, rfc822_data)
+            !evaluate_search_key(inner, uid, seq, max_seq, meta, flags, max_uid, rfc822_data)
         }
         SearchKey::Or(a, b) => {
-            evaluate_search_key(a, uid, meta, flags, max_uid, rfc822_data)
-                || evaluate_search_key(b, uid, meta, flags, max_uid, rfc822_data)
+            evaluate_search_key(a, uid, seq, max_seq, meta, flags, max_uid, rfc822_data)
+                || evaluate_search_key(b, uid, seq, max_seq, meta, flags, max_uid, rfc822_data)
         }
     }
 }

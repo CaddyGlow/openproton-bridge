@@ -1373,7 +1373,7 @@ where
             FetchItem::BodySection { section, .. } => {
                 !body_section_is_header_only(section.as_deref())
             }
-            FetchItem::Rfc822Text => true,
+            FetchItem::Rfc822Text | FetchItem::BodyStructure | FetchItem::Body => true,
             _ => false,
         });
         let needs_metadata = expanded.iter().any(|i| {
@@ -2200,6 +2200,10 @@ where
         let mut offset = 0u32;
         let mut successfully_expunged_uids = Vec::new();
 
+        // Use pinned session for proton_id lookups if available.
+        let mailbox_internal_id = self.selected_mailbox_internal_id;
+        let mut session = self.store_session.take();
+
         for (i, &uid) in all_uids.iter().enumerate() {
             if !deleted_uids.contains(&uid) {
                 continue;
@@ -2208,7 +2212,16 @@ where
 
             // Sync upstream: permanently delete if in Trash or Spam, otherwise move to Trash.
             if let Some(ref account_id) = self.authenticated_account_id {
-                if let Some(proton_id) = mutation.get_proton_id(&scoped_mailbox, uid).await? {
+                let proton_id = if let (Some(ref mut sess), Some(mb_id)) =
+                    (&mut session, mailbox_internal_id)
+                {
+                    sess.message_remote_id_by_uid(mb_id, uid.value())
+                        .ok()
+                        .flatten()
+                } else {
+                    mutation.get_proton_id(&scoped_mailbox, uid).await?
+                };
+                if let Some(proton_id) = proton_id {
                     let is_trash_or_spam = self
                         .resolve_mailbox(&mailbox)
                         .await
@@ -2254,10 +2267,20 @@ where
             offset += 1;
         }
 
-        // Batch remove all successfully expunged messages from local store.
-        mutation
-            .batch_remove_messages(&scoped_mailbox, &successfully_expunged_uids)
-            .await?;
+        // Batch remove using pinned session if available, else trait path.
+        if let (Some(ref mut sess), Some(mb_id)) = (&mut session, mailbox_internal_id) {
+            for &uid in &successfully_expunged_uids {
+                if let Ok(Some(internal_id)) = sess.message_internal_id_by_uid(mb_id, uid.value()) {
+                    let _ = sess.remove_message_from_mailbox(mb_id, &internal_id);
+                }
+            }
+        } else {
+            mutation
+                .batch_remove_messages(&scoped_mailbox, &successfully_expunged_uids)
+                .await?;
+        }
+
+        self.store_session = session;
 
         if !silent {
             for seq in &expunged_seqs {

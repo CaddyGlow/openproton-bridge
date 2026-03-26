@@ -104,15 +104,11 @@ impl GluonMailMailboxMutation {
         uid: ImapUid,
     ) -> Result<Option<(String, UpstreamMailbox, UpstreamMailboxMessage)>> {
         let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
-        let snapshot = self
+        let message = self
             .store
-            .mailbox_snapshot(&storage_user_id, mailbox_state.internal_id)
+            .message_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
             .map_err(map_mail_error)?;
-        Ok(snapshot
-            .messages
-            .into_iter()
-            .find(|message| message.summary.uid == uid.value())
-            .map(|message| (storage_user_id, mailbox_state, message)))
+        Ok(message.map(|m| (storage_user_id, mailbox_state, m)))
     }
 
     fn placeholder_message(
@@ -251,12 +247,16 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         flags: Vec<String>,
     ) -> Result<()> {
-        let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let Some(internal_id) = self
+            .store
+            .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
+            .map_err(map_mail_error)?
         else {
             return Ok(());
         };
         self.store
-            .set_message_flags(&storage_user_id, &message.summary.internal_id, &flags)
+            .set_message_flags(&storage_user_id, &internal_id, &flags)
             .map_err(map_mail_error)
     }
 
@@ -266,12 +266,16 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         flags: &[String],
     ) -> Result<()> {
-        let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let Some(internal_id) = self
+            .store
+            .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
+            .map_err(map_mail_error)?
         else {
             return Ok(());
         };
         self.store
-            .add_message_flags(&storage_user_id, &message.summary.internal_id, flags)
+            .add_message_flags(&storage_user_id, &internal_id, flags)
             .map_err(map_mail_error)
     }
 
@@ -281,12 +285,16 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
         uid: ImapUid,
         flags: &[String],
     ) -> Result<()> {
-        let Some((storage_user_id, _mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let Some(internal_id) = self
+            .store
+            .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
+            .map_err(map_mail_error)?
         else {
             return Ok(());
         };
         self.store
-            .remove_message_flags(&storage_user_id, &message.summary.internal_id, flags)
+            .remove_message_flags(&storage_user_id, &internal_id, flags)
             .map_err(map_mail_error)
     }
 
@@ -295,16 +303,16 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
     }
 
     async fn remove_message(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<()> {
-        let Some((storage_user_id, mailbox_state, message)) = self.message_by_uid(mailbox, uid)?
+        let (storage_user_id, mailbox_state) = self.ensure_mailbox(mailbox)?;
+        let Some(internal_id) = self
+            .store
+            .message_internal_id_by_uid(&storage_user_id, mailbox_state.internal_id, uid.value())
+            .map_err(map_mail_error)?
         else {
             return Ok(());
         };
         self.store
-            .remove_message_from_mailbox(
-                &storage_user_id,
-                mailbox_state.internal_id,
-                &message.summary.internal_id,
-            )
+            .remove_message_from_mailbox(&storage_user_id, mailbox_state.internal_id, &internal_id)
             .map_err(map_mail_error)
     }
 

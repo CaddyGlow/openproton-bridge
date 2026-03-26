@@ -179,24 +179,32 @@ pub async fn run_server_with_options(
     #[cfg(unix)]
     let key_pem_unix = key_pem.clone();
     let shutdown_tx_ctrlc = shutdown_tx.clone();
-    tokio::spawn(async move {
-        let mut shutdown_requested = false;
-        loop {
-            if let Err(err) = tokio::signal::ctrl_c().await {
-                warn!(error = %err, "failed to listen for Ctrl-C");
-                break;
-            }
+    std::thread::Builder::new()
+        .name("signal-handler".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .build()
+                .expect("failed to create signal handler runtime");
+            rt.block_on(async move {
+                let mut shutdown_requested = false;
+                loop {
+                    if tokio::signal::ctrl_c().await.is_err() {
+                        break;
+                    }
 
-            if !shutdown_requested {
-                shutdown_requested = true;
-                info!("Ctrl-C received, initiating graceful shutdown");
-                let _ = shutdown_tx_ctrlc.send(true);
-            } else {
-                warn!("second Ctrl-C received, forcing process exit");
-                std::process::exit(130);
-            }
-        }
-    });
+                    if !shutdown_requested {
+                        shutdown_requested = true;
+                        info!("Ctrl-C received, initiating graceful shutdown");
+                        let _ = shutdown_tx_ctrlc.send(true);
+                    } else {
+                        warn!("second Ctrl-C received, forcing process exit");
+                        std::process::exit(130);
+                    }
+                }
+            });
+        })
+        .expect("failed to spawn signal handler thread");
 
     #[cfg(unix)]
     info!(

@@ -462,9 +462,28 @@ fn navigate_to_part(text: &str, numbers: &[usize]) -> Option<String> {
 /// Format per RFC 3501 section 7.4.2:
 /// ("date" "subject" ((from)) ((sender)) ((reply-to)) ((to)) ((cc)) (NIL) "in-reply-to" "message-id")
 pub fn build_envelope(meta: &MessageEnvelope, header: &str) -> String {
-    let date = format_imap_date(meta.time);
+    // Date: use the Date header if available, fall back to internal timestamp
+    let date = extract_header(header, "Date")
+        .unwrap_or_else(|| format_imap_date(meta.time));
     let subject = imap_quote(&meta.subject);
     let from = format_address_list(std::slice::from_ref(&meta.sender));
+
+    // Sender: extract from header; RFC 3501 says NIL means same as From
+    let sender = extract_header(header, "Sender")
+        .and_then(|v| parse_header_address(&v))
+        .map(|a| format_address_list(std::slice::from_ref(&a)))
+        .unwrap_or_else(|| from.clone());
+
+    // Reply-To: extract from header; RFC 2822 says defaults to From if absent
+    let reply_to = if !meta.reply_tos.is_empty() {
+        format_address_list(&meta.reply_tos)
+    } else {
+        extract_header(header, "Reply-To")
+            .and_then(|v| parse_header_address(&v))
+            .map(|a| format_address_list(std::slice::from_ref(&a)))
+            .unwrap_or_else(|| from.clone())
+    };
+
     let to = format_address_list(&meta.to_list);
     let cc = format_address_list(&meta.cc_list);
     let bcc = format_address_list(&meta.bcc_list);
@@ -474,6 +493,7 @@ pub fn build_envelope(meta: &MessageEnvelope, header: &str) -> String {
         .unwrap_or_else(|| "NIL".to_string());
     let message_id = extract_header(header, "Message-Id")
         .or_else(|| extract_header(header, "Message-ID"))
+        .or_else(|| meta.external_id.clone())
         .map(|v| imap_quote(&v))
         .unwrap_or_else(|| "NIL".to_string());
 
@@ -482,14 +502,40 @@ pub fn build_envelope(meta: &MessageEnvelope, header: &str) -> String {
         imap_quote(&date),
         subject,
         from,
-        from, // sender = from per convention
-        from, // reply-to = from per convention
+        sender,
+        reply_to,
         to,
         cc,
         bcc,
         in_reply_to,
         message_id,
     )
+}
+
+/// Parse a simple address from a header value like "Name <user@domain>" or "user@domain".
+fn parse_header_address(value: &str) -> Option<EmailAddress> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(lt) = value.find('<') {
+        let name = value[..lt].trim().trim_matches('"').to_string();
+        let addr = value[lt + 1..]
+            .trim_end_matches('>')
+            .trim()
+            .to_string();
+        Some(EmailAddress {
+            name,
+            address: addr,
+        })
+    } else if value.contains('@') {
+        Some(EmailAddress {
+            name: String::new(),
+            address: value.to_string(),
+        })
+    } else {
+        None
+    }
 }
 
 fn format_address_list(addrs: &[EmailAddress]) -> String {

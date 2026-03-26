@@ -503,6 +503,10 @@ async fn prepare_runtime_context(
         "resolved gluon store bootstrap context"
     );
 
+    // Ensure gluon directories exist before opening any stores (including
+    // read-only ones that would otherwise fail with MissingCacheRoot).
+    ensure_gluon_dirs_and_sync_state(&gluon_bootstrap, gluon_paths.root(), settings_dir);
+
     let mailbox_catalog =
         imap::mailbox_catalog::RuntimeMailboxCatalog::new(runtime_accounts.clone());
     let mailbox_view = build_mailbox_view(&gluon_bootstrap, gluon_paths.root())
@@ -564,6 +568,7 @@ async fn prepare_runtime_context(
         mailbox_catalog,
         mailbox_mutation,
         mailbox_view,
+        recent_tracker: imap::session::RecentTracker::new(),
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {
@@ -646,6 +651,74 @@ fn build_gluon_connector(
     Ok(imap::gluon_connector::GluonMailConnector::new(Arc::new(
         store,
     )))
+}
+
+/// Ensures gluon directories exist and resets sync state for any account
+/// whose SQLite database is missing. This handles two scenarios:
+///
+/// - The entire `gluon/` directory was deleted: directories are recreated so
+///   read-only store opens don't fail with `MissingCacheRoot`.
+/// - Only `gluon/backend` was deleted: the DB files are gone but sync state
+///   (stored outside gluon/ in settings_dir and vault) still reports "synced".
+///   Clearing the sync state file forces a full re-sync on next event loop run.
+fn ensure_gluon_dirs_and_sync_state(
+    gluon_bootstrap: &vault::GluonStoreBootstrap,
+    gluon_root: &std::path::Path,
+    settings_dir: &std::path::Path,
+) {
+    let layout = gluon_rs_mail::CacheLayout::new(gluon_root);
+    if let Err(err) = layout.ensure_base_dirs() {
+        tracing::error!(
+            gluon_dir = %gluon_root.display(),
+            error = %err,
+            "failed to create gluon base directories"
+        );
+        return;
+    }
+
+    for account in &gluon_bootstrap.accounts {
+        let account_paths = match layout.account_paths(&account.storage_user_id) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    account_id = %account.account_id,
+                    error = %err,
+                    "failed to resolve gluon account paths"
+                );
+                continue;
+            }
+        };
+
+        // Create per-account blob store directory.
+        if let Err(err) = std::fs::create_dir_all(account_paths.store_dir()) {
+            tracing::warn!(
+                account_id = %account.account_id,
+                error = %err,
+                "failed to create account store directory"
+            );
+        }
+
+        // If the SQLite DB is missing, the sync state is stale -- clear it
+        // so the event worker performs a full re-sync.
+        if !account_paths.primary_db_path().exists() {
+            let user_id = vault::get_user_id_by_account_id(settings_dir, &account.account_id);
+            if let Ok(uid) = user_id {
+                if let Err(err) = super::sync_state::clear_sync_state(settings_dir, &uid) {
+                    tracing::warn!(
+                        account_id = %account.account_id,
+                        error = %err,
+                        "failed to clear stale sync state"
+                    );
+                } else {
+                    tracing::info!(
+                        account_id = %account.account_id,
+                        db_path = %account_paths.primary_db_path().display(),
+                        "gluon database missing, cleared sync state to trigger full re-sync"
+                    );
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn build_gluon_mail_compatible_store(

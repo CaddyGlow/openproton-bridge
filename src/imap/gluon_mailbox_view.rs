@@ -92,6 +92,15 @@ impl GluonMailMailboxView {
 
         parsed.unwrap_or_else(|| fallback_metadata(mailbox, message))
     }
+
+    fn resolve_mailbox_parts(&self, mailbox: &ScopedMailboxId) -> Result<Option<(String, u64)>> {
+        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
+        let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
+        let Some(mb) = self.mailbox_by_name(&storage_user_id, mailbox_name)? else {
+            return Ok(None);
+        };
+        Ok(Some((storage_user_id, mb.internal_id)))
+    }
 }
 
 #[async_trait]
@@ -101,15 +110,18 @@ impl GluonMailboxView for GluonMailMailboxView {
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
     ) -> Result<Option<MessageEnvelope>> {
-        let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
+        else {
             return Ok(None);
         };
-
-        Ok(snapshot
-            .messages
-            .iter()
-            .find(|message| message.summary.uid == uid.value())
-            .map(|message| self.metadata_for_message(mailbox, message)))
+        let Some(message) = self
+            .store
+            .message_by_uid(&storage_user_id, mailbox_internal_id, uid.value())
+            .map_err(map_mail_error)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(self.metadata_for_message(mailbox, &message)))
     }
 
     async fn get_proton_id(
@@ -117,15 +129,13 @@ impl GluonMailboxView for GluonMailMailboxView {
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
     ) -> Result<Option<String>> {
-        let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
+        else {
             return Ok(None);
         };
-
-        Ok(snapshot
-            .messages
-            .iter()
-            .find(|message| message.summary.uid == uid.value())
-            .map(|message| message.summary.remote_id.clone()))
+        self.store
+            .message_remote_id_by_uid(&storage_user_id, mailbox_internal_id, uid.value())
+            .map_err(map_mail_error)
     }
 
     async fn get_uid(
@@ -145,21 +155,20 @@ impl GluonMailboxView for GluonMailMailboxView {
     }
 
     async fn get_rfc822(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<Vec<u8>>> {
-        let (account_id, _) = Self::resolve_parts(mailbox);
-        let storage_user_id = self.storage_user_id_for_account(account_id);
-        let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
+        else {
             return Ok(None);
         };
-        let Some(message) = snapshot
-            .messages
-            .iter()
-            .find(|message| message.summary.uid == uid.value())
+        let Some(internal_id) = self
+            .store
+            .message_internal_id_by_uid(&storage_user_id, mailbox_internal_id, uid.value())
+            .map_err(map_mail_error)?
         else {
             return Ok(None);
         };
 
         self.store
-            .read_message_blob(storage_user_id, &message.summary.internal_id)
+            .read_message_blob(&storage_user_id, &internal_id)
             .map(Some)
             .map_err(map_mail_error)
     }
@@ -215,16 +224,20 @@ impl GluonMailboxView for GluonMailMailboxView {
     }
 
     async fn get_flags(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Vec<String>> {
-        let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
+        else {
             return Ok(Vec::new());
         };
-
-        Ok(snapshot
-            .messages
-            .iter()
-            .find(|message| message.summary.uid == uid.value())
-            .map(|message| message.summary.flags.clone())
-            .unwrap_or_default())
+        let Some(internal_id) = self
+            .store
+            .message_internal_id_by_uid(&storage_user_id, mailbox_internal_id, uid.value())
+            .map_err(map_mail_error)?
+        else {
+            return Ok(Vec::new());
+        };
+        self.store
+            .message_flags_by_internal_id(&storage_user_id, &internal_id)
+            .map_err(map_mail_error)
     }
 
     async fn seq_to_uid(&self, mailbox: &ScopedMailboxId, seq: u32) -> Result<Option<ImapUid>> {
@@ -258,7 +271,9 @@ impl GluonMailboxView for GluonMailMailboxView {
         &self,
         mailbox: &ScopedMailboxId,
     ) -> Result<super::store::SelectMailboxData> {
-        let Some(snapshot) = self.upstream_snapshot(mailbox)? else {
+        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
+        let storage_user_id = self.storage_user_id_for_account(account_id);
+        let Some(mb) = self.mailbox_by_name(storage_user_id, mailbox_name)? else {
             return Ok(super::store::SelectMailboxData {
                 status: MailboxStatus {
                     uid_validity: 1,
@@ -276,42 +291,51 @@ impl GluonMailboxView for GluonMailMailboxView {
             });
         };
 
-        let unseen = snapshot
-            .messages
-            .iter()
-            .filter(|m| !has_seen_flag(&m.summary.flags))
-            .count() as u32;
+        let select = self
+            .store
+            .mailbox_select_data(storage_user_id, mb.internal_id)
+            .map_err(map_mail_error)?;
 
-        let status = MailboxStatus {
-            uid_validity: snapshot.mailbox.uid_validity,
-            next_uid: snapshot.next_uid,
-            exists: snapshot.message_count as u32,
-            unseen,
-        };
-
-        let mod_seq = computed_mod_seq(&snapshot);
-        let mb_snapshot = super::store::MailboxSnapshot {
-            exists: snapshot.message_count as u32,
-            mod_seq,
-        };
-
-        let mut uids = Vec::with_capacity(snapshot.messages.len());
-        let mut flags = std::collections::HashMap::with_capacity(snapshot.messages.len());
+        let count = select.entries.len() as u32;
+        let mut unseen = 0u32;
         let mut first_unseen_seq = None;
+        let mut uids = Vec::with_capacity(select.entries.len());
+        let mut flags = std::collections::HashMap::with_capacity(select.entries.len());
+        let mut mod_seq_hash = select.next_uid as u64;
 
-        for (index, message) in snapshot.messages.iter().enumerate() {
-            let uid = ImapUid::from(message.summary.uid);
-            uids.push(uid);
-            let msg_flags = message.summary.flags.clone();
-            if first_unseen_seq.is_none() && !has_seen_flag(&msg_flags) {
-                first_unseen_seq = Some(index as u32 + 1);
+        for (index, entry) in select.entries.iter().enumerate() {
+            let uid = ImapUid::from(entry.uid);
+            let seen = has_seen_flag(&entry.flags);
+            if !seen {
+                unseen += 1;
+                if first_unseen_seq.is_none() {
+                    first_unseen_seq = Some(index as u32 + 1);
+                }
             }
-            flags.insert(uid, msg_flags);
+            mod_seq_hash = mod_seq_hash.wrapping_mul(1_099_511_628_211);
+            mod_seq_hash ^= entry.uid as u64;
+            mod_seq_hash ^= entry.flags.len() as u64;
+            for flag in &entry.flags {
+                for byte in flag.as_bytes() {
+                    mod_seq_hash = mod_seq_hash.wrapping_mul(1_099_511_628_211);
+                    mod_seq_hash ^= u64::from(*byte);
+                }
+            }
+            uids.push(uid);
+            flags.insert(uid, entry.flags.clone());
         }
 
         Ok(super::store::SelectMailboxData {
-            status,
-            snapshot: mb_snapshot,
+            status: MailboxStatus {
+                uid_validity: select.uid_validity,
+                next_uid: select.next_uid,
+                exists: count,
+                unseen,
+            },
+            snapshot: super::store::MailboxSnapshot {
+                exists: count,
+                mod_seq: mod_seq_hash,
+            },
             uids,
             flags,
             first_unseen_seq,

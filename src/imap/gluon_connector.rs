@@ -168,6 +168,7 @@ pub trait GluonImapConnector: Send + Sync {
         metadata: MessageEnvelope,
     ) -> Result<ImapUid>;
     async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>>;
+    fn mailbox_exists(&self, mailbox: &ScopedMailboxId) -> bool;
     fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()>;
     async fn rename_mailbox(
         &self,
@@ -278,6 +279,24 @@ impl GluonMailConnector {
         }
     }
 
+    fn mailbox_by_name_rw(
+        &self,
+        storage_user_id: &str,
+        mailbox_name: &str,
+    ) -> Result<Option<UpstreamMailbox>> {
+        match self.store.list_upstream_mailboxes_rw(storage_user_id) {
+            Ok(mailboxes) => Ok(mailboxes
+                .into_iter()
+                .find(|mailbox| mailbox.name.eq_ignore_ascii_case(mailbox_name))),
+            Err(gluon_rs_mail::GluonError::IncompatibleSchema { family })
+                if family == "Missing" =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(map_mail_error(err)),
+        }
+    }
+
     fn ensure_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<(String, UpstreamMailbox)> {
         let account_id = mailbox.account_id();
         let mailbox_name = mailbox.mailbox_name();
@@ -299,27 +318,35 @@ impl GluonMailConnector {
             return Ok((storage_user_id, mailbox_state));
         }
 
-        let created = self
-            .store
-            .create_mailbox(
-                &storage_user_id,
-                &NewMailbox {
-                    remote_id: mailbox_name.to_string(),
-                    name: mailbox_name.to_string(),
-                    uid_validity: current_uid_validity(),
-                    subscribed: true,
-                    attributes: Vec::new(),
-                    flags: Vec::new(),
-                    permanent_flags: vec![
-                        "\\Seen".to_string(),
-                        "\\Flagged".to_string(),
-                        "\\Answered".to_string(),
-                        "\\Draft".to_string(),
-                        "\\Deleted".to_string(),
-                    ],
-                },
-            )
-            .map_err(map_mail_error)?;
+        let created = match self.store.create_mailbox(
+            &storage_user_id,
+            &NewMailbox {
+                remote_id: mailbox_name.to_string(),
+                name: mailbox_name.to_string(),
+                uid_validity: current_uid_validity(),
+                subscribed: true,
+                attributes: Vec::new(),
+                flags: Vec::new(),
+                permanent_flags: vec![
+                    "\\Seen".to_string(),
+                    "\\Flagged".to_string(),
+                    "\\Answered".to_string(),
+                    "\\Draft".to_string(),
+                    "\\Deleted".to_string(),
+                ],
+            },
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                // UNIQUE constraint: mailbox was created concurrently, retry lookup via RW conn
+                if let Some(mb) = self.mailbox_by_name_rw(&storage_user_id, mailbox_name)? {
+                    return Ok((storage_user_id, mb));
+                }
+                return Err(ImapError::Protocol(format!(
+                    "gluon-rs-mail connector failure: mailbox creation failed for {mailbox_name}"
+                )));
+            }
+        };
         debug!(
             service = "imap",
             pkg = "gluon/user",
@@ -375,6 +402,14 @@ impl GluonImapConnector for GluonMailConnector {
 
     async fn list_uids(&self, mailbox: &ScopedMailboxId) -> Result<Vec<ImapUid>> {
         self.view.list_uids(mailbox).await
+    }
+
+    fn mailbox_exists(&self, mailbox: &ScopedMailboxId) -> bool {
+        let storage_user_id = self.storage_user_id_for_account(mailbox.account_id());
+        self.mailbox_by_name(storage_user_id, mailbox.mailbox_name())
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     fn create_mailbox(&self, mailbox: &ScopedMailboxId) -> Result<()> {

@@ -72,17 +72,18 @@
       in
       {
         devShells.default = pkgs.mkShell {
-          nativeBuildInputs = [
-            bunPkg
-            caldavtesterPkg
-            pkgs.cargo
-            pkgs.clippy
-            pkgs.litmus
-            pkgs.pkg-config
-            pkgs.protobuf
-            pkgs.rustc
-            pkgs.rustfmt
-          ];
+          nativeBuildInputs =
+            [
+              bunPkg
+              caldavtesterPkg
+              pkgs.cargo
+              pkgs.clippy
+              pkgs.pkg-config
+              pkgs.protobuf
+              pkgs.rustc
+              pkgs.rustfmt
+            ]
+            ++ lib.optionals pkgs.stdenv.isLinux [ pkgs.litmus ];
 
           buildInputs =
             [
@@ -101,7 +102,11 @@
             echo " - Rust toolchain: rustc/cargo/clippy/rustfmt"
             echo " - Frontend tooling: bun"
             echo " - Proto tooling: protoc"
-            echo " - DAV compliance: litmus, caldavtester"
+            if [ "$(${pkgs.coreutils}/bin/uname -s)" = "Linux" ]; then
+              echo " - DAV compliance: litmus, caldavtester"
+            else
+              echo " - DAV compliance: caldavtester"
+            fi
             echo " - Linux UI libs: gtk3/webkitgtk/libsoup/cairo/pango"
           '';
         };

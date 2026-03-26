@@ -2067,6 +2067,7 @@ dependencies = [
 name = "gluon-rs-mail"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "gluon-rs-core",
  "rusqlite",
  "tempfile",

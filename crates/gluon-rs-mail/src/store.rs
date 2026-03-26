@@ -1,9 +1,44 @@
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, Mutex};
 
 use gluon_rs_core::{
     decode_blob, encode_blob, AccountBootstrap, AccountPaths, DeferredDeleteManager, GluonCoreError,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+
+/// A connection that returns itself to the pool on drop.
+pub struct PooledConnection {
+    conn: Option<Connection>,
+    pool: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
+    key: String,
+}
+
+impl Deref for PooledConnection {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for PooledConnection {
+    fn deref_mut(&mut self) -> &mut Connection {
+        self.conn.as_mut().unwrap()
+    }
+}
+
+impl Drop for PooledConnection {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            if let Ok(mut pool) = self.pool.lock() {
+                let conns = pool.entry(self.key.clone()).or_default();
+                if conns.len() < 4 {
+                    conns.push(conn);
+                }
+            }
+        }
+    }
+}
 
 use crate::{
     db::SchemaProbe,
@@ -15,6 +50,12 @@ use crate::{
 pub struct CompatibleStore {
     bootstrap: StoreBootstrap,
     accounts_by_storage_user_id: HashMap<String, AccountBootstrap>,
+    /// Cached read-write connections per storage_user_id.
+    rw_pool: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
+    /// Cached read-only connections per storage_user_id (unused, kept for compatibility).
+    ro_pool: Arc<Mutex<HashMap<String, Vec<Connection>>>>,
+    /// Cached schema probe results per storage_user_id (avoids re-inspecting on pool miss).
+    schema_cache: Arc<Mutex<HashMap<String, crate::db::SchemaFamily>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +126,19 @@ pub struct UpstreamMailboxSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectSnapshotEntry {
+    pub uid: u32,
+    pub flags: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectSnapshot {
+    pub uid_validity: u32,
+    pub next_uid: u32,
+    pub entries: Vec<SelectSnapshotEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeletedSubscription {
     pub name: String,
     pub remote_id: String,
@@ -126,6 +180,9 @@ impl CompatibleStore {
         Ok(Self {
             bootstrap,
             accounts_by_storage_user_id,
+            rw_pool: Arc::new(Mutex::new(HashMap::new())),
+            ro_pool: Arc::new(Mutex::new(HashMap::new())),
+            schema_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -607,7 +664,14 @@ impl CompatibleStore {
     }
 
     pub fn list_upstream_mailboxes(&self, storage_user_id: &str) -> Result<Vec<UpstreamMailbox>> {
-        let conn = self.open_upstream_db(storage_user_id)?;
+        self.list_upstream_mailboxes_on(self.open_upstream_db(storage_user_id)?)
+    }
+
+    pub fn list_upstream_mailboxes_rw(&self, storage_user_id: &str) -> Result<Vec<UpstreamMailbox>> {
+        self.list_upstream_mailboxes_on(self.open_upstream_db_rw(storage_user_id)?)
+    }
+
+    fn list_upstream_mailboxes_on(&self, conn: PooledConnection) -> Result<Vec<UpstreamMailbox>> {
         let mut stmt = conn.prepare(
             "SELECT id, remote_id, name, uid_validity, subscribed
              FROM mailboxes_v2
@@ -658,29 +722,32 @@ impl CompatibleStore {
         let conn = self.open_upstream_db(storage_user_id)?;
         let table_name = format!("mailbox_message_{mailbox_internal_id}");
         let mut stmt = conn.prepare(&format!(
-            "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted, m.size, m.deleted
+            "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
+                    m.size, m.deleted,
+                    GROUP_CONCAT(mf.value) AS flags_csv
              FROM {table_name} AS mm
              JOIN messages_v2 AS m ON m.id = mm.message_id
+             LEFT JOIN message_flags_v2 AS mf ON mf.message_id = mm.message_id
+             GROUP BY mm.message_id
              ORDER BY mm.uid"
         ))?;
         let mut rows = stmt.query([])?;
         let mut messages = Vec::new();
 
         while let Some(row) = rows.next()? {
-            let internal_id = row.get::<_, String>(0)?;
+            let flags_csv: Option<String> = row.get(7)?;
+            let flags = flags_csv
+                .map(|csv| csv.split(',').map(String::from).collect())
+                .unwrap_or_default();
             messages.push(UpstreamMessageSummary {
-                internal_id: internal_id.clone(),
+                internal_id: row.get::<_, String>(0)?,
                 remote_id: row.get::<_, String>(1)?,
                 uid: row.get::<_, u32>(2)?,
                 recent: row.get::<_, bool>(3)?,
                 mailbox_deleted: row.get::<_, bool>(4)?,
                 size: row.get::<_, i64>(5)?,
                 message_deleted: row.get::<_, bool>(6)?,
-                flags: query_string_vec(
-                    &conn,
-                    "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
-                    (&internal_id,),
-                )?,
+                flags,
             });
         }
 
@@ -760,11 +827,172 @@ impl CompatibleStore {
         })
     }
 
-    pub fn open_connection(&self, storage_user_id: &str) -> Result<Connection> {
+    pub fn mailbox_select_data(
+        &self,
+        storage_user_id: &str,
+        mailbox_internal_id: u64,
+    ) -> Result<SelectSnapshot> {
+        let conn = self.open_upstream_db(storage_user_id)?;
+        let mailbox = self.get_upstream_mailbox(&conn, mailbox_internal_id)?;
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        let next_uid = next_uid_for_mailbox(&conn, &table_name)?;
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT mm.uid, GROUP_CONCAT(f.value, char(0)) AS flags
+             FROM {table_name} AS mm
+             LEFT JOIN message_flags_v2 AS f ON f.message_id = mm.message_id
+             GROUP BY mm.message_id
+             ORDER BY mm.uid"
+        ))?;
+        let mut rows = stmt.query([])?;
+        let mut entries = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let uid = row.get::<_, u32>(0)?;
+            let flags_concat: Option<String> = row.get(1)?;
+            let flags = flags_concat
+                .map(|s| s.split('\0').map(String::from).collect())
+                .unwrap_or_default();
+            entries.push(SelectSnapshotEntry { uid, flags });
+        }
+
+        Ok(SelectSnapshot {
+            uid_validity: mailbox.uid_validity,
+            next_uid,
+            entries,
+        })
+    }
+
+    pub fn message_by_uid(
+        &self,
+        storage_user_id: &str,
+        mailbox_internal_id: u64,
+        uid: u32,
+    ) -> Result<Option<UpstreamMailboxMessage>> {
+        let account_paths = self.account_paths(storage_user_id)?;
+        let conn = self.open_upstream_db(storage_user_id)?;
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT mm.message_id, mm.message_remote_id, mm.uid, mm.recent, mm.deleted,
+                    m.size, m.deleted, m.body, m.body_structure, m.envelope
+             FROM {table_name} AS mm
+             JOIN messages_v2 AS m ON m.id = mm.message_id
+             WHERE mm.uid = ?1"
+        ))?;
+
+        let result = stmt
+            .query_row([uid], |row| {
+                let internal_id: String = row.get(0)?;
+                Ok((
+                    internal_id,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, bool>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            })
+            .optional()?;
+
+        let Some((
+            internal_id,
+            remote_id,
+            uid_val,
+            recent,
+            mailbox_deleted,
+            size,
+            message_deleted,
+            body,
+            body_structure,
+            envelope,
+        )) = result
+        else {
+            return Ok(None);
+        };
+
+        let flags = query_string_vec(
+            &conn,
+            "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
+            (&internal_id,),
+        )?;
+        let blob_path = account_paths.blob_path(&internal_id)?;
+
+        Ok(Some(UpstreamMailboxMessage {
+            summary: UpstreamMessageSummary {
+                internal_id,
+                remote_id,
+                uid: uid_val,
+                recent,
+                mailbox_deleted,
+                message_deleted,
+                size,
+                flags,
+            },
+            body,
+            body_structure,
+            envelope,
+            blob_exists: blob_path.exists(),
+            blob_path,
+        }))
+    }
+
+    pub fn message_internal_id_by_uid(
+        &self,
+        storage_user_id: &str,
+        mailbox_internal_id: u64,
+        uid: u32,
+    ) -> Result<Option<String>> {
+        let conn = self.open_upstream_db(storage_user_id)?;
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        conn.query_row(
+            &format!("SELECT message_id FROM {table_name} WHERE uid = ?1"),
+            [uid],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn message_flags_by_internal_id(
+        &self,
+        storage_user_id: &str,
+        internal_id: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self.open_upstream_db(storage_user_id)?;
+        query_string_vec(
+            &conn,
+            "SELECT value FROM message_flags_v2 WHERE message_id = ? ORDER BY value",
+            (internal_id,),
+        )
+    }
+
+    pub fn message_remote_id_by_uid(
+        &self,
+        storage_user_id: &str,
+        mailbox_internal_id: u64,
+        uid: u32,
+    ) -> Result<Option<String>> {
+        let conn = self.open_upstream_db(storage_user_id)?;
+        let table_name = format!("mailbox_message_{mailbox_internal_id}");
+        conn.query_row(
+            &format!("SELECT message_remote_id FROM {table_name} WHERE uid = ?1"),
+            [uid],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn open_connection(&self, storage_user_id: &str) -> Result<PooledConnection> {
         self.open_upstream_db(storage_user_id)
     }
 
-    pub fn open_connection_rw(&self, storage_user_id: &str) -> Result<Connection> {
+    pub fn open_connection_rw(&self, storage_user_id: &str) -> Result<PooledConnection> {
         self.open_upstream_db_rw(storage_user_id)
     }
 
@@ -962,38 +1190,103 @@ impl CompatibleStore {
             .collect())
     }
 
-    fn open_upstream_db(&self, storage_user_id: &str) -> Result<Connection> {
-        let account_paths = self.account_paths(storage_user_id)?;
-        let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
-        if !probe.is_upstream_compatible() {
+    fn cached_schema_family(&self, storage_user_id: &str) -> Option<crate::db::SchemaFamily> {
+        self.schema_cache
+            .lock()
+            .ok()
+            .and_then(|c| c.get(storage_user_id).copied())
+    }
+
+    fn cache_schema_family(&self, storage_user_id: &str, family: crate::db::SchemaFamily) {
+        // Only cache stable families; Missing/Empty will change once the DB is created.
+        if matches!(
+            family,
+            crate::db::SchemaFamily::UpstreamCore
+                | crate::db::SchemaFamily::OpenProtonCustom
+                | crate::db::SchemaFamily::Mixed
+                | crate::db::SchemaFamily::Unknown
+        ) {
+            if let Ok(mut c) = self.schema_cache.lock() {
+                c.insert(storage_user_id.to_string(), family);
+            }
+        }
+    }
+
+    fn open_upstream_db(&self, storage_user_id: &str) -> Result<PooledConnection> {
+        // Use cached schema family to skip SchemaProbe::inspect.
+        let family = if let Some(f) = self.cached_schema_family(storage_user_id) {
+            f
+        } else {
+            let account_paths = self.account_paths(storage_user_id)?;
+            let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
+            self.cache_schema_family(storage_user_id, probe.family);
+            probe.family
+        };
+
+        if !matches!(family, crate::SchemaFamily::UpstreamCore) {
             return Err(GluonError::IncompatibleSchema {
-                family: format!("{:?}", probe.family),
+                family: format!("{family:?}"),
             });
         }
 
-        Ok(Connection::open_with_flags(
+        // Open a fresh RO connection each time (no pooling) to always see latest WAL state.
+        // Schema probe caching makes this cheap.
+        let account_paths = self.account_paths(storage_user_id)?;
+        let conn = Connection::open_with_flags(
             account_paths.primary_db_path(),
             OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?)
+        )?;
+        configure_readonly_connection(&conn)?;
+        Ok(PooledConnection {
+            conn: Some(conn),
+            pool: self.ro_pool.clone(),
+            key: storage_user_id.to_string(),
+        })
     }
 
-    fn open_upstream_db_rw(&self, storage_user_id: &str) -> Result<Connection> {
-        let account_paths = self.account_paths(storage_user_id)?;
-        let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
+    fn open_upstream_db_rw(&self, storage_user_id: &str) -> Result<PooledConnection> {
+        // Try to reuse a cached read-write connection.
+        if let Ok(mut pool) = self.rw_pool.lock() {
+            if let Some(conns) = pool.get_mut(storage_user_id) {
+                if let Some(conn) = conns.pop() {
+                    return Ok(PooledConnection {
+                        conn: Some(conn),
+                        pool: self.rw_pool.clone(),
+                        key: storage_user_id.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Use cached schema family to skip SchemaProbe::inspect.
+        let family = if let Some(f) = self.cached_schema_family(storage_user_id) {
+            f
+        } else {
+            let account_paths = self.account_paths(storage_user_id)?;
+            let probe = SchemaProbe::inspect(&account_paths.primary_db_path())?;
+            self.cache_schema_family(storage_user_id, probe.family);
+            probe.family
+        };
+
         if !matches!(
-            probe.family,
+            family,
             crate::SchemaFamily::UpstreamCore
                 | crate::SchemaFamily::Missing
                 | crate::SchemaFamily::Empty
         ) {
             return Err(GluonError::IncompatibleSchema {
-                family: format!("{:?}", probe.family),
+                family: format!("{family:?}"),
             });
         }
 
+        let account_paths = self.account_paths(storage_user_id)?;
         let conn = Connection::open(account_paths.primary_db_path())?;
         configure_upstream_db_connection(&conn)?;
-        Ok(conn)
+        Ok(PooledConnection {
+            conn: Some(conn),
+            pool: self.rw_pool.clone(),
+            key: storage_user_id.to_string(),
+        })
     }
 
     fn get_upstream_mailbox(
@@ -1060,7 +1353,22 @@ fn query_count(conn: &Connection, sql: &str) -> Result<u32> {
 }
 
 fn configure_upstream_db_connection(conn: &Connection) -> Result<()> {
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON; \
+         PRAGMA journal_mode = WAL; \
+         PRAGMA synchronous = NORMAL; \
+         PRAGMA busy_timeout = 5000; \
+         PRAGMA cache_size = -8000; \
+         PRAGMA mmap_size = 67108864;",
+    )?;
+    Ok(())
+}
+
+fn configure_readonly_connection(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "PRAGMA cache_size = -8000; \
+         PRAGMA mmap_size = 67108864;",
+    )?;
     Ok(())
 }
 

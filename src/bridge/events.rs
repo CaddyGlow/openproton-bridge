@@ -1412,31 +1412,56 @@ async fn bounded_resync_account_inner(
     // Go bridge: if syncStatus.IsComplete() { sync labels only; return }
     // When force_message_sync is set (cursor reset / refresh flag), skip this
     // short-circuit so we reconcile messages against the API.
+    //
+    // Even when sync is "complete", compare the local count against the API
+    // total. Messages that arrived between the last sync and the event cursor
+    // bootstrap would otherwise be lost in a gap.
     if sync_status.has_labels && sync_status.has_messages && !force_message_sync {
-        info!(
-            service = "imap",
-            user = %config.account_id.0,
-            account_id = %config.account_id.0,
-            account_email = %config.account_email,
-            "Sync already complete, updating labels"
-        );
-        fetch_and_update_user_labels(config, client, expected_generation).await?;
-        let duration = resync_started_at.elapsed();
-        info!(
-            service = "imap",
-            user = %config.account_id.0,
-            user_id = %config.account_id.0,
-            account_id = %config.account_id.0,
-            account_email = %config.account_email,
-            start = sync_start,
-            start_unix = sync_start,
-            duration = ?duration,
-            duration_ms = duration.as_millis() as u64,
-            msg = "Finished user sync",
-            "Finished user sync"
-        );
-        progress_guard.finish();
-        return Ok(());
+        let api_total = match messages::get_grouped_message_count(client).await {
+            Ok(counts) => counts
+                .iter()
+                .find(|gc| gc.label_id == crate::api::types::ALL_MAIL_LABEL)
+                .map(|gc| gc.total)
+                .unwrap_or(0),
+            Err(_) => 0,
+        };
+        let local_total = sync_status.total_message_count;
+        if api_total > 0 && api_total > local_total {
+            info!(
+                service = "imap",
+                user = %config.account_id.0,
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                local_count = local_total,
+                api_count = api_total,
+                "Sync was complete but API has more messages; forcing resync"
+            );
+        } else {
+            info!(
+                service = "imap",
+                user = %config.account_id.0,
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                "Sync already complete, updating labels"
+            );
+            fetch_and_update_user_labels(config, client, expected_generation).await?;
+            let duration = resync_started_at.elapsed();
+            info!(
+                service = "imap",
+                user = %config.account_id.0,
+                user_id = %config.account_id.0,
+                account_id = %config.account_id.0,
+                account_email = %config.account_email,
+                start = sync_start,
+                start_unix = sync_start,
+                duration = ?duration,
+                duration_ms = duration.as_millis() as u64,
+                msg = "Finished user sync",
+                "Finished user sync"
+            );
+            progress_guard.finish();
+            return Ok(());
+        }
     }
     if force_message_sync && sync_status.has_labels && sync_status.has_messages {
         info!(
@@ -2584,19 +2609,17 @@ async fn run_event_worker_with_shutdown(
                                     }
                                 }
                             } else {
+                                // Event ID exists and we have cached messages.
+                                // Always run the startup resync so it can check
+                                // for a count gap between local store and API.
                                 info!(
                                     service = "imap",
                                     user = %config.account_id.0,
-                                    user_id = %config.account_id.0,
                                     account_id = %config.account_id.0,
                                     account_email = %config.account_email,
                                     count = cached_count,
-                                    msg = "Messages are already synced, skipping",
-                                    "Messages are already synced, skipping"
+                                    "Running startup resync to check for message gap"
                                 );
-                                startup_resync_pending = false;
-                                next_delay = Duration::ZERO;
-                                continue;
                             }
                         }
                         Ok(_) => {}

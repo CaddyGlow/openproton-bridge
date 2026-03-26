@@ -12,8 +12,19 @@ use tracing::{error, info, warn};
 use super::session::{ImapSession, SessionAction, SessionConfig};
 use super::Result;
 
-const MAX_CONNECTIONS_PER_IP: usize = 10;
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 10;
 const RATE_WINDOW_SECS: u64 = 60;
+
+fn max_connections_per_ip() -> usize {
+    std::env::var("IMAP_MAX_CONNECTIONS_PER_IP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_MAX_CONNECTIONS_PER_IP)
+}
+
+fn rate_limit_disabled() -> bool {
+    std::env::var("IMAP_DISABLE_RATE_LIMIT").is_ok()
+}
 static RUNTIME_TLS_CONFIG: OnceLock<RwLock<Option<Arc<rustls::ServerConfig>>>> = OnceLock::new();
 
 fn runtime_tls_config_store() -> &'static RwLock<Option<Arc<rustls::ServerConfig>>> {
@@ -108,7 +119,7 @@ impl RateLimiter {
         let timestamps = self.connections.entry(ip).or_default();
         timestamps.retain(|t| now.duration_since(*t) < window);
 
-        if timestamps.len() >= MAX_CONNECTIONS_PER_IP {
+        if timestamps.len() >= max_connections_per_ip() {
             return false;
         }
 
@@ -182,7 +193,7 @@ async fn run_server_from_listener(
         let (stream, peer) = listener.accept().await?;
 
         // Rate limit by IP
-        {
+        if !rate_limit_disabled() {
             let mut limiter = rate_limiter.lock().await;
             if !limiter.check(peer.ip()) {
                 warn!(peer = %peer, "rate limited, dropping connection");

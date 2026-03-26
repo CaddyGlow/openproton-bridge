@@ -135,6 +135,8 @@ pub enum FetchItem {
     Uid,
     Envelope,
     Rfc822Size,
+    Rfc822Header,
+    Rfc822Text,
     InternalDate,
     BodyStructure,
     Body,

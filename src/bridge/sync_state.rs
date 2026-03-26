@@ -39,6 +39,14 @@ fn sync_state_path(settings_dir: &Path, user_id: &str) -> std::path::PathBuf {
         .join(format!("sync-{user_id}"))
 }
 
+pub fn clear_sync_state(settings_dir: &Path, user_id: &str) -> Result<(), SyncStateError> {
+    let path = sync_state_path(settings_dir, user_id);
+    if path.exists() {
+        fs::remove_file(&path).map_err(SyncStateError::Io)?;
+    }
+    Ok(())
+}
+
 pub fn load_sync_state(
     settings_dir: &Path,
     user_id: &str,

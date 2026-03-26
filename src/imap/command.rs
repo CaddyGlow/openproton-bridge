@@ -40,6 +40,10 @@ pub enum Command {
         tag: String,
         mailbox: String,
     },
+    Delete {
+        tag: String,
+        mailbox: String,
+    },
     Subscribe {
         tag: String,
         mailbox: String,
@@ -135,6 +139,8 @@ pub enum FetchItem {
     Uid,
     Envelope,
     Rfc822Size,
+    Rfc822Header,
+    Rfc822Text,
     InternalDate,
     BodyStructure,
     Body,
@@ -293,6 +299,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "LSUB" => parse_lsub(&tag, args),
         "SELECT" => parse_select(&tag, args),
         "CREATE" => parse_create(&tag, args),
+        "DELETE" => parse_delete(&tag, args),
         "SUBSCRIBE" => parse_subscribe(&tag, args),
         "UNSUBSCRIBE" => parse_unsubscribe(&tag, args),
         "STATUS" => parse_status(&tag, args),
@@ -436,6 +443,14 @@ fn parse_lsub(tag: &str, args: &str) -> Result<Command> {
 fn parse_create(tag: &str, args: &str) -> Result<Command> {
     let (mailbox, _) = parse_astring(args.trim_start())?;
     Ok(Command::Create {
+        tag: tag.to_string(),
+        mailbox,
+    })
+}
+
+fn parse_delete(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, _) = parse_astring(args.trim_start())?;
+    Ok(Command::Delete {
         tag: tag.to_string(),
         mailbox,
     })
@@ -669,6 +684,12 @@ fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
         } else if starts_fetch_item_keyword(&upper_rem, "ENVELOPE") {
             items.push(FetchItem::Envelope);
             remaining = remaining[8..].trim_start();
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822.HEADER") {
+            items.push(FetchItem::Rfc822Header);
+            remaining = remaining[13..].trim_start();
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822.TEXT") {
+            items.push(FetchItem::Rfc822Text);
+            remaining = remaining[10..].trim_start();
         } else if starts_fetch_item_keyword(&upper_rem, "RFC822.SIZE") {
             items.push(FetchItem::Rfc822Size);
             remaining = remaining[11..].trim_start();

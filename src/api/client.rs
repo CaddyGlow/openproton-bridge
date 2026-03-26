@@ -134,6 +134,7 @@ impl ProtonClient {
         let client = Client::builder()
             .default_headers(headers)
             .cookie_store(true)
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(ApiError::Http)?;
 

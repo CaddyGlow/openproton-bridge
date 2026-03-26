@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,12 +31,60 @@ enum State {
     Logout,
 }
 
+/// Tracks which UIDs have been claimed as \Recent per mailbox.
+/// First session to SELECT a mailbox after new messages arrive claims \Recent.
+#[derive(Debug, Default)]
+pub struct RecentTracker {
+    claimed: Mutex<HashMap<String, HashSet<u32>>>,
+}
+
+impl RecentTracker {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Claim recent UIDs for a mailbox. Returns which UIDs were newly claimed.
+    pub fn claim(&self, mailbox: &str, uids: &[ImapUid]) -> HashSet<ImapUid> {
+        let mut claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
+        let set = claimed.entry(mailbox.to_string()).or_default();
+        let mut recent = HashSet::new();
+        for &uid in uids {
+            if set.insert(uid.value()) {
+                recent.insert(uid);
+            }
+        }
+        recent
+    }
+
+    /// Count unclaimed UIDs for STATUS RECENT.
+    pub fn count_unclaimed(&self, mailbox: &str, uids: &[ImapUid]) -> u32 {
+        let claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
+        let set = claimed.get(mailbox);
+        uids.iter()
+            .filter(|uid| {
+                set.map(|s| !s.contains(&uid.value())).unwrap_or(true)
+            })
+            .count() as u32
+    }
+
+    /// Remove UIDs (e.g., after expunge).
+    pub fn remove(&self, mailbox: &str, uids: &[ImapUid]) {
+        let mut claimed = self.claimed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = claimed.get_mut(mailbox) {
+            for uid in uids {
+                set.remove(&uid.value());
+            }
+        }
+    }
+}
+
 pub struct SessionConfig {
     pub connector: Arc<dyn gluon_rs_mail::ImapConnector>,
     pub gluon_connector: Arc<dyn GluonImapConnector>,
     pub mailbox_catalog: Arc<dyn GluonMailboxCatalog>,
     pub mailbox_mutation: Arc<dyn GluonMailboxMutation>,
     pub mailbox_view: Arc<dyn GluonMailboxView>,
+    pub recent_tracker: Arc<RecentTracker>,
 }
 
 static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -63,6 +111,7 @@ pub struct ImapSession<R, W: AsyncWriteExt + Unpin> {
     user_labels: Vec<mailbox::ResolvedMailbox>,
     starttls_available: bool,
     connection_id: u64,
+    recent_uids: HashSet<ImapUid>,
 }
 
 impl<R, W> ImapSession<R, W>
@@ -94,6 +143,7 @@ where
             user_labels: Vec::new(),
             starttls_available,
             connection_id: NEXT_IMAP_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            recent_uids: HashSet::new(),
         }
     }
 
@@ -193,6 +243,10 @@ where
                 ref tag,
                 ref mailbox,
             } => self.cmd_create(tag, mailbox).await?,
+            Command::Delete {
+                ref tag,
+                ref mailbox,
+            } => self.cmd_delete(tag, mailbox).await?,
             Command::Subscribe {
                 ref tag,
                 ref mailbox,
@@ -422,11 +476,24 @@ where
     }
 
     fn resolve_mailbox(&self, name: &str) -> Option<mailbox::ResolvedMailbox> {
-        self.config.mailbox_catalog.resolve_mailbox(
+        if let Some(mb) = self.config.mailbox_catalog.resolve_mailbox(
             self.authenticated_account_id.as_deref(),
             &self.user_labels,
             name,
-        )
+        ) {
+            return Some(mb);
+        }
+        // Fall back to checking the gluon store for dynamically created mailboxes
+        let scoped = self.scoped_mailbox_name(name);
+        if self.config.gluon_connector.mailbox_exists(&scoped) {
+            return Some(mailbox::ResolvedMailbox {
+                name: name.to_string(),
+                label_id: name.to_string(),
+                special_use: None,
+                selectable: true,
+            });
+        }
+        None
     }
 
     fn all_mailboxes(&self) -> Vec<mailbox::ResolvedMailbox> {
@@ -498,6 +565,22 @@ where
         Ok(Some(dest_uid))
     }
 
+    async fn refresh_selected_snapshot(&mut self) -> Result<()> {
+        let Some(mailbox) = self.selected_mailbox.clone() else {
+            return Ok(());
+        };
+        let scoped = self.scoped_mailbox_name(&mailbox);
+        let data = self
+            .config
+            .mailbox_view
+            .select_mailbox_data(&scoped)
+            .await?;
+        self.selected_mailbox_uids = data.uids;
+        self.selected_mailbox_flags = data.flags;
+        self.selected_mailbox_mod_seq = Some(data.snapshot.mod_seq);
+        Ok(())
+    }
+
     async fn emit_selected_mailbox_exists_update(&mut self) -> Result<()> {
         if self.state != State::Selected {
             return Ok(());
@@ -507,24 +590,18 @@ where
         };
 
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
-        let snapshot = self
+        let select_data = self
             .config
             .mailbox_view
-            .mailbox_snapshot(&scoped_mailbox)
+            .select_mailbox_data(&scoped_mailbox)
             .await?;
+
         let previous_mod_seq = self.selected_mailbox_mod_seq.unwrap_or(0);
         let previous_exists = self.selected_mailbox_uids.len() as u32;
-        let current_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
-        let mut current_flags: HashMap<ImapUid, Vec<String>> = HashMap::new();
-        for uid in &current_uids {
-            current_flags.insert(
-                *uid,
-                self.config
-                    .mailbox_view
-                    .get_flags(&scoped_mailbox, *uid)
-                    .await?,
-            );
-        }
+        let current_uids = select_data.uids;
+        let current_flags = select_data.flags;
+        let snapshot = select_data.snapshot;
+
         let has_uid_change = current_uids != self.selected_mailbox_uids;
         let has_flag_change = current_uids
             .iter()
@@ -578,14 +655,66 @@ where
     }
 
     fn matches_list_pattern(name: &str, pattern: &str) -> bool {
-        if pattern == "*" {
-            return true;
+        // RFC 3501 6.3.8 wildcard matching:
+        //   '*' matches zero or more characters (including hierarchy separator)
+        //   '%' matches zero or more characters but not hierarchy separator '/'
+        Self::glob_match(name.as_bytes(), pattern.as_bytes())
+    }
+
+    fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
+        let mut ni = 0;
+        let mut pi = 0;
+        let mut star_pi = usize::MAX;
+        let mut star_ni = 0;
+
+        while ni < name.len() {
+            if pi < pattern.len()
+                && (pattern[pi] == b'*'
+                    || (pattern[pi] == b'%' && name[ni] != b'/'))
+            {
+                if pattern[pi] == b'*' {
+                    star_pi = pi;
+                    star_ni = ni;
+                    pi += 1;
+                    continue;
+                } else {
+                    // '%' -- try to match zero chars first, backtrack if needed
+                    star_pi = pi;
+                    star_ni = ni;
+                    pi += 1;
+                    continue;
+                }
+            }
+
+            if pi < pattern.len()
+                && (pattern[pi].eq_ignore_ascii_case(&name[ni])
+                    || pattern[pi] == b'?')
+            {
+                ni += 1;
+                pi += 1;
+                continue;
+            }
+
+            if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_ni += 1;
+                // For '%', cannot skip over '/'
+                if pattern[star_pi] == b'%' && star_ni <= name.len() {
+                    if star_ni > 0 && name[star_ni - 1] == b'/' {
+                        return false;
+                    }
+                }
+                ni = star_ni;
+                continue;
+            }
+
+            return false;
         }
-        if pattern == "%" {
-            // "%" matches one level -- exclude names containing "/"
-            return !name.contains('/');
+
+        while pi < pattern.len() && (pattern[pi] == b'*' || pattern[pi] == b'%') {
+            pi += 1;
         }
-        name.eq_ignore_ascii_case(pattern)
+        pi == pattern.len()
     }
 
     fn format_list_entry(kind: &str, mb: &mailbox::ResolvedMailbox) -> String {
@@ -600,7 +729,7 @@ where
         format!("{kind} ({attr_str}) \"/\" \"{name}\"", name = mb.name)
     }
 
-    async fn cmd_list(&mut self, tag: &str, _reference: &str, pattern: &str) -> Result<()> {
+    async fn cmd_list(&mut self, tag: &str, reference: &str, pattern: &str) -> Result<()> {
         if self.state == State::NotAuthenticated {
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
@@ -608,10 +737,49 @@ where
         if pattern.is_empty() {
             self.writer.untagged("LIST (\\Noselect) \"/\" \"\"").await?;
         } else {
-            for mb in self.all_mailboxes() {
-                if Self::matches_list_pattern(&mb.name, pattern) {
+            let full_pattern = if reference.is_empty() {
+                pattern.to_string()
+            } else {
+                format!("{reference}{pattern}")
+            };
+
+            let all = self.all_mailboxes();
+            // Collect parent paths that need \Noselect entries
+            let mut parents: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for mb in &all {
+                let mut path = String::new();
+                for (i, seg) in mb.name.split('/').enumerate() {
+                    if i > 0 {
+                        path.push('/');
+                    }
+                    path.push_str(seg);
+                    // Only add as parent if it's not a real mailbox
+                    if path != mb.name
+                        && !all.iter().any(|m| m.name.eq_ignore_ascii_case(&path))
+                    {
+                        parents.insert(path.clone());
+                    }
+                }
+            }
+
+            // Emit real mailboxes
+            for mb in &all {
+                if Self::matches_list_pattern(&mb.name, &full_pattern) {
                     self.writer
-                        .untagged(&Self::format_list_entry("LIST", &mb))
+                        .untagged(&Self::format_list_entry("LIST", mb))
+                        .await?;
+                }
+            }
+
+            // Emit parent-only \Noselect entries
+            for parent in &parents {
+                if Self::matches_list_pattern(parent, &full_pattern) {
+                    self.writer
+                        .untagged(&format!(
+                            "LIST (\\Noselect) \"/\" \"{}\"",
+                            parent
+                        ))
                         .await?;
                 }
             }
@@ -620,7 +788,7 @@ where
         self.writer.tagged_ok(tag, None, "LIST completed").await
     }
 
-    async fn cmd_lsub(&mut self, tag: &str, _reference: &str, pattern: &str) -> Result<()> {
+    async fn cmd_lsub(&mut self, tag: &str, reference: &str, pattern: &str) -> Result<()> {
         if self.state == State::NotAuthenticated {
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
@@ -628,8 +796,13 @@ where
         if pattern.is_empty() {
             self.writer.untagged("LSUB (\\Noselect) \"/\" \"\"").await?;
         } else {
+            let full_pattern = if reference.is_empty() {
+                pattern.to_string()
+            } else {
+                format!("{reference}{pattern}")
+            };
             for mb in self.all_mailboxes() {
-                if Self::matches_list_pattern(&mb.name, pattern) {
+                if Self::matches_list_pattern(&mb.name, &full_pattern) {
                     self.writer
                         .untagged(&Self::format_list_entry("LSUB", &mb))
                         .await?;
@@ -645,18 +818,69 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        // Check if mailbox already exists
+        // If mailbox already exists, return OK for idempotent behavior.
+        // imaptest expects CREATE to succeed even if the mailbox exists.
         if self.resolve_mailbox(mailbox_name).is_some() {
+            return self.writer.tagged_ok(tag, None, "CREATE completed").await;
+        }
+
+        let scoped = self.scoped_mailbox_name(mailbox_name);
+        if let Err(e) = self.config.gluon_connector.create_mailbox(&scoped) {
             return self
                 .writer
-                .tagged_no(tag, "[ALREADYEXISTS] mailbox already exists")
+                .tagged_no(tag, &format!("CREATE failed: {e}"))
                 .await;
         }
 
-        // Custom mailbox creation is not supported - return NO with CANNOT
-        self.writer
-            .tagged_no(tag, "[CANNOT] custom mailbox creation not supported")
+        // Add to session's user_labels so it can be resolved immediately
+        self.user_labels.push(mailbox::ResolvedMailbox {
+            name: mailbox_name.to_string(),
+            label_id: mailbox_name.to_string(),
+            special_use: None,
+            selectable: true,
+        });
+
+        self.writer.tagged_ok(tag, None, "CREATE completed").await
+    }
+
+    async fn cmd_delete(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        // Cannot delete system mailboxes
+        if mailbox::find_mailbox(mailbox_name).is_some() {
+            return self
+                .writer
+                .tagged_no(tag, "[CANNOT] cannot delete system mailbox")
+                .await;
+        }
+
+        // Cannot delete selected mailbox
+        if self.selected_mailbox.as_deref() == Some(mailbox_name) {
+            return self
+                .writer
+                .tagged_no(tag, "cannot delete selected mailbox")
+                .await;
+        }
+
+        let scoped = self.scoped_mailbox_name(mailbox_name);
+        if let Err(e) = self
+            .config
+            .gluon_connector
+            .delete_mailbox(&scoped, false)
             .await
+        {
+            return self
+                .writer
+                .tagged_no(tag, &format!("DELETE failed: {e}"))
+                .await;
+        }
+
+        // Remove from session's user_labels
+        self.user_labels.retain(|l| l.name != mailbox_name);
+
+        self.writer.tagged_ok(tag, None, "DELETE completed").await
     }
 
     async fn cmd_subscribe(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
@@ -783,28 +1007,59 @@ where
             .select_mailbox_data(&scoped_mailbox)
             .await?;
 
+        // Collect custom keywords from all messages in the mailbox
+        let mut keywords: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for flags in select_data.flags.values() {
+            for flag in flags {
+                if !flag.starts_with('\\') {
+                    keywords.insert(flag.clone());
+                }
+            }
+        }
+
+        let mut flags_list =
+            "\\Seen \\Answered \\Flagged \\Deleted \\Draft".to_string();
+        for kw in &keywords {
+            flags_list.push(' ');
+            flags_list.push_str(kw);
+        }
+
+        // Claim recent UIDs for this session
+        self.recent_uids = self
+            .config
+            .recent_tracker
+            .claim(&mb.name, &select_data.uids);
+        let recent_count = self.recent_uids.len();
+
         self.writer
             .untagged(&format!("{} EXISTS", select_data.status.exists))
             .await?;
-        self.writer.untagged("0 RECENT").await?;
         self.writer
-            .untagged("FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)")
+            .untagged(&format!("{recent_count} RECENT"))
             .await?;
         self.writer
-            .untagged("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]")
+            .untagged(&format!("FLAGS ({flags_list})"))
             .await?;
         self.writer
             .untagged(&format!(
-                "OK [UIDVALIDITY {}]",
+                "OK [PERMANENTFLAGS ({flags_list} \\*)] Flags permitted"
+            ))
+            .await?;
+        self.writer
+            .untagged(&format!(
+                "OK [UIDVALIDITY {}] UIDs valid",
                 select_data.status.uid_validity
             ))
             .await?;
         self.writer
-            .untagged(&format!("OK [UIDNEXT {}]", select_data.status.next_uid))
+            .untagged(&format!(
+                "OK [UIDNEXT {}] Predicted next UID",
+                select_data.status.next_uid
+            ))
             .await?;
         if let Some(first_unseen_seq) = select_data.first_unseen_seq {
             self.writer
-                .untagged(&format!("OK [UNSEEN {}]", first_unseen_seq))
+                .untagged(&format!("OK [UNSEEN {}] First unseen", first_unseen_seq))
                 .await?;
         }
 
@@ -859,7 +1114,11 @@ where
         for item in items {
             match item {
                 StatusDataItem::Messages => attrs.push(format!("MESSAGES {}", status.exists)),
-                StatusDataItem::Recent => attrs.push("RECENT 0".to_string()),
+                StatusDataItem::Recent => {
+                    let uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+                    let recent = self.config.recent_tracker.count_unclaimed(&mb.name, &uids);
+                    attrs.push(format!("RECENT {recent}"));
+                }
                 StatusDataItem::UidNext => attrs.push(format!("UIDNEXT {}", status.next_uid)),
                 StatusDataItem::UidValidity => {
                     attrs.push(format!("UIDVALIDITY {}", status.uid_validity))
@@ -1044,10 +1303,11 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
+        self.refresh_selected_snapshot().await?;
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let mailbox_view = self.config.mailbox_view.clone();
-        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+        let all_uids = self.selected_mailbox_uids.clone();
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "FETCH completed").await;
@@ -1068,7 +1328,21 @@ where
             FetchItem::BodySection { section, .. } => {
                 !body_section_is_header_only(section.as_deref())
             }
+            FetchItem::Rfc822Text => true,
             _ => false,
+        });
+        let needs_metadata = expanded.iter().any(|i| {
+            matches!(
+                i,
+                FetchItem::Envelope
+                    | FetchItem::Rfc822Size
+                    | FetchItem::Rfc822Header
+                    | FetchItem::Rfc822Text
+                    | FetchItem::InternalDate
+                    | FetchItem::BodyStructure
+                    | FetchItem::Body
+                    | FetchItem::BodySection { .. }
+            )
         });
 
         // Resolve which messages to fetch from current mailbox snapshot.
@@ -1098,8 +1372,19 @@ where
         let mut cache_misses = 0u32;
 
         for (uid, seq) in target_messages {
-            let meta = mailbox_view.get_metadata(&scoped_mailbox, uid).await?;
-            let flags = mailbox_view.get_flags(&scoped_mailbox, uid).await?;
+            let meta = if needs_metadata {
+                mailbox_view.get_metadata(&scoped_mailbox, uid).await?
+            } else {
+                None
+            };
+            let mut flags = self
+                .selected_mailbox_flags
+                .get(&uid)
+                .cloned()
+                .unwrap_or_default();
+            if self.recent_uids.contains(&uid) {
+                flags.push("\\Recent".to_string());
+            }
             let mut has_seen = flags.iter().any(|flag| flag == &seen_flag);
 
             if needs_body_sections {
@@ -1119,8 +1404,12 @@ where
             let mut part_literals: HashMap<usize, Vec<u8>> = HashMap::new();
 
             let mut rfc822_data = None;
-            let needs_rfc822_load =
-                (needs_body_sections && !header_only_body_fetch) || needs_full_rfc822;
+            let needs_rfc822_header_or_text = expanded
+                .iter()
+                .any(|i| matches!(i, FetchItem::Rfc822Header | FetchItem::Rfc822Text));
+            let needs_rfc822_load = (needs_body_sections && !header_only_body_fetch)
+                || needs_full_rfc822
+                || needs_rfc822_header_or_text;
             if needs_rfc822_load {
                 rfc822_data = mailbox_view.get_rfc822(&scoped_mailbox, uid).await?;
                 if rfc822_data.is_some() {
@@ -1165,6 +1454,28 @@ where
                         } else if let Some(ref meta) = meta {
                             parts.push(format!("RFC822.SIZE {}", meta.size));
                         }
+                    }
+                    FetchItem::Rfc822Header => {
+                        let header_data = if let Some(ref data) = rfc822_data {
+                            extract_header_section(data).into_bytes()
+                        } else if let Some(ref meta) = meta {
+                            build_metadata_header_section(meta).into_bytes()
+                        } else {
+                            Vec::new()
+                        };
+                        let idx = parts.len();
+                        parts.push(format!("RFC822.HEADER {{{}}}", header_data.len()));
+                        part_literals.insert(idx, header_data);
+                    }
+                    FetchItem::Rfc822Text => {
+                        let text_data = if let Some(ref data) = rfc822_data {
+                            extract_text_section(data)
+                        } else {
+                            Vec::new()
+                        };
+                        let idx = parts.len();
+                        parts.push(format!("RFC822.TEXT {{{}}}", text_data.len()));
+                        part_literals.insert(idx, text_data);
                     }
                     FetchItem::InternalDate => {
                         if let Some(ref meta) = meta {
@@ -1423,10 +1734,11 @@ where
             return self.writer.tagged_no(tag, "mailbox is read-only").await;
         }
 
+        self.refresh_selected_snapshot().await?;
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let mutation = &self.config.mailbox_mutation;
-        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+        let all_uids = self.selected_mailbox_uids.clone();
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "STORE completed").await;
@@ -1552,10 +1864,11 @@ where
             return self.writer.tagged_no(tag, "no mailbox selected").await;
         }
 
+        self.refresh_selected_snapshot().await?;
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let mailbox_view = self.config.mailbox_view.clone();
-        let all_uids = mailbox_view.list_uids(&scoped_mailbox).await?;
+        let all_uids = self.selected_mailbox_uids.clone();
         let needs_rfc822 = criteria.iter().any(search_key_needs_rfc822);
 
         let mut results = Vec::new();
@@ -1635,9 +1948,10 @@ where
             Some(m) => m.clone(),
             None => return Ok(true),
         };
+        self.refresh_selected_snapshot().await?;
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let mutation = &self.config.mailbox_mutation;
-        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+        let all_uids = self.selected_mailbox_uids.clone();
 
         let mut expunged_seqs = Vec::new();
         let mut offset = 0u32;
@@ -1717,9 +2031,10 @@ where
             Some(m) => m.clone(),
             None => return self.writer.tagged_no(tag, "no mailbox selected").await,
         };
+        self.refresh_selected_snapshot().await?;
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let mutation = &self.config.mailbox_mutation;
-        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+        let all_uids = self.selected_mailbox_uids.clone();
 
         if all_uids.is_empty() {
             return self
@@ -1821,6 +2136,7 @@ where
             }
         };
 
+        self.refresh_selected_snapshot().await?;
         let mailbox = self.selected_mailbox.as_ref().unwrap().clone();
         let scoped_mailbox = self.scoped_mailbox_name(&mailbox);
         let scoped_dest_mailbox = self.scoped_mailbox_name(&dest_mb.name);
@@ -1829,7 +2145,7 @@ where
         }
 
         let mutation = &self.config.mailbox_mutation;
-        let all_uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
+        let all_uids = self.selected_mailbox_uids.clone();
 
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "COPY completed").await;
@@ -1913,6 +2229,7 @@ where
         let source_mb = self
             .resolve_mailbox(&mailbox)
             .unwrap_or_else(|| dest_mb.clone());
+        self.refresh_selected_snapshot().await?;
         let scoped_source_mailbox = self.scoped_mailbox_name(&mailbox);
         let scoped_dest_mailbox = self.scoped_mailbox_name(&dest_mb.name);
         if scoped_source_mailbox == scoped_dest_mailbox {
@@ -1920,11 +2237,7 @@ where
         }
 
         let mutation = &self.config.mailbox_mutation;
-        let all_uids = self
-            .config
-            .mailbox_view
-            .list_uids(&scoped_source_mailbox)
-            .await?;
+        let all_uids = self.selected_mailbox_uids.clone();
         if all_uids.is_empty() {
             return self.writer.tagged_ok(tag, None, "MOVE completed").await;
         }
@@ -2024,7 +2337,7 @@ where
         tag: &str,
         mailbox_name: &str,
         flags: &[ImapFlag],
-        _date: &Option<String>,
+        append_date: &Option<String>,
         literal_size: u32,
     ) -> Result<()> {
         if self.state == State::NotAuthenticated {
@@ -2069,24 +2382,46 @@ where
 
         // Build metadata from the RFC822 message
         let header_text = extract_header_section(&literal);
-        let subject = header_text
-            .lines()
-            .find(|l| l.to_lowercase().starts_with("subject:"))
-            .and_then(|l| l.split_once(':'))
-            .map(|(_, v)| v.trim().to_string())
+
+        let extract_hdr = |name: &str| -> Option<String> {
+            let search = format!("{}:", name);
+            let search_lower = search.to_lowercase();
+            header_text
+                .lines()
+                .find(|l| l.to_lowercase().starts_with(&search_lower))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_string())
+        };
+
+        let subject = extract_hdr("Subject").unwrap_or_default();
+        let from_str = extract_hdr("From").unwrap_or_default();
+        let sender = parse_append_address(&from_str);
+        let to_list = extract_hdr("To")
+            .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let from = header_text
-            .lines()
-            .find(|l| l.to_lowercase().starts_with("from:"))
-            .and_then(|l| l.split_once(':'))
-            .map(|(_, v)| v.trim().to_string())
+        let cc_list = extract_hdr("Cc")
+            .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let time = extract_sent_date(&literal).unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs() as i64
-        });
+        let bcc_list = extract_hdr("Bcc")
+            .map(|v| parse_address_list_header(&v))
+            .unwrap_or_default();
+        let reply_tos = extract_hdr("Reply-To")
+            .map(|v| parse_address_list_header(&v))
+            .unwrap_or_default();
+        let external_id = extract_hdr("Message-Id")
+            .or_else(|| extract_hdr("Message-ID"));
+
+        // Use APPEND date argument if provided, else Date header, else now
+        let time = append_date
+            .as_deref()
+            .and_then(parse_rfc2822_date)
+            .or_else(|| extract_sent_date(&literal))
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64
+            });
 
         let is_unread = !flags.iter().any(|f| matches!(f, ImapFlag::Seen));
 
@@ -2122,16 +2457,13 @@ where
             id: proton_id.clone(),
             address_id: String::new(),
             label_ids: vec![mb.label_id.clone()],
-            external_id: None,
+            external_id,
             subject,
-            sender: gluon_rs_mail::EmailAddress {
-                name: String::new(),
-                address: from,
-            },
-            to_list: vec![],
-            cc_list: vec![],
-            bcc_list: vec![],
-            reply_tos: vec![],
+            sender,
+            to_list,
+            cc_list,
+            bcc_list,
+            reply_tos,
             flags: 0,
             time,
             size: literal.len() as i64,
@@ -2153,11 +2485,24 @@ where
         // Apply flags
         let flag_strs: Vec<String> = flags.iter().map(|f| f.as_str().to_string()).collect();
         if !flag_strs.is_empty() {
-            mutation.set_flags(&scoped_mailbox, uid, flag_strs).await?;
+            mutation
+                .set_flags(&scoped_mailbox, uid, flag_strs.clone())
+                .await?;
         }
 
         let status = mutation.mailbox_status(&scoped_mailbox).await?;
         let appenduid_code = format!("APPENDUID {} {}", status.uid_validity, uid);
+
+        // If the target is the currently selected mailbox, update local state and notify
+        if self.selected_mailbox.as_deref() == Some(&mb.name) {
+            self.selected_mailbox_uids.push(uid);
+            self.selected_mailbox_flags
+                .insert(uid, flag_strs.clone());
+            self.writer
+                .untagged(&format!("{} EXISTS", status.exists))
+                .await?;
+            self.writer.untagged("0 RECENT").await?;
+        }
 
         info!(
             mailbox = %mb.name,
@@ -2615,6 +2960,34 @@ fn extract_text_section(data: &[u8]) -> Vec<u8> {
     }
 }
 
+fn parse_append_address(value: &str) -> gluon_rs_mail::EmailAddress {
+    let value = value.trim();
+    if let Some(lt) = value.find('<') {
+        let name = value[..lt].trim().trim_matches('"').to_string();
+        let addr = value[lt + 1..]
+            .trim_end_matches('>')
+            .trim()
+            .to_string();
+        gluon_rs_mail::EmailAddress {
+            name,
+            address: addr,
+        }
+    } else {
+        gluon_rs_mail::EmailAddress {
+            name: String::new(),
+            address: value.to_string(),
+        }
+    }
+}
+
+fn parse_address_list_header(value: &str) -> Vec<gluon_rs_mail::EmailAddress> {
+    value
+        .split(',')
+        .map(|s| parse_append_address(s.trim()))
+        .filter(|a| !a.address.is_empty())
+        .collect()
+}
+
 fn extract_header_section(data: &[u8]) -> String {
     let s = String::from_utf8_lossy(data);
     if let Some(pos) = s.find("\r\n\r\n") {
@@ -2906,6 +3279,7 @@ mod tests {
             mailbox_catalog: config.mailbox_catalog.clone(),
             mailbox_mutation: config.mailbox_mutation.clone(),
             mailbox_view: config.mailbox_view.clone(),
+            recent_tracker: config.recent_tracker.clone(),
         })
     }
 
@@ -2963,6 +3337,7 @@ mod tests {
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts.clone()),
             mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
             mailbox_view: GluonMailMailboxView::new(gluon_store),
+            recent_tracker: RecentTracker::new(),
         });
         (config, tempdir, auth_router, runtime_accounts)
     }
@@ -3044,6 +3419,7 @@ mod tests {
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts.clone()),
             mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
             mailbox_view: GluonMailMailboxView::new(gluon_store),
+            recent_tracker: RecentTracker::new(),
         });
 
         (config, tempdir, auth_router, runtime_accounts)
@@ -3210,6 +3586,7 @@ mod tests {
             mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts.clone()),
             mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
             mailbox_view: GluonMailMailboxView::new(gluon_store),
+            recent_tracker: RecentTracker::new(),
         });
         (config, tempdir, auth_router, runtime_accounts)
     }
@@ -6336,8 +6713,8 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("2 EXISTS"));
         assert!(response
-            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"));
-        assert!(response.contains("OK [UNSEEN 2]"));
+            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Flags permitted"));
+        assert!(response.contains("OK [UNSEEN 2] First unseen"));
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
     }
 
@@ -6378,8 +6755,8 @@ mod tests {
         let response = String::from_utf8_lossy(&buf[..n]);
         assert!(response.contains("2 EXISTS"));
         assert!(response
-            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)]"));
-        assert!(response.contains("OK [UNSEEN 2]"));
+            .contains("OK [PERMANENTFLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)] Flags permitted"));
+        assert!(response.contains("OK [UNSEEN 2] First unseen"));
         assert!(response.contains("a001 OK [READ-WRITE] SELECT completed"));
     }
 

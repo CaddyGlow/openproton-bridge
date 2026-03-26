@@ -1057,6 +1057,34 @@ fn parse_search_criterion(s: &str) -> Result<(SearchKey, &str)> {
         let remaining = remaining[3..].trim_start();
         let (inner, rest) = parse_search_criterion(remaining)?;
         Ok((SearchKey::Not(Box::new(inner)), rest))
+    } else if starts_search_keyword(&upper, "UNANSWERED") {
+        Ok((
+            SearchKey::Not(Box::new(SearchKey::Answered)),
+            remaining[10..].trim_start(),
+        ))
+    } else if starts_search_keyword(&upper, "UNDELETED") {
+        Ok((
+            SearchKey::Not(Box::new(SearchKey::Deleted)),
+            remaining[9..].trim_start(),
+        ))
+    } else if starts_search_keyword(&upper, "UNDRAFT") {
+        Ok((
+            SearchKey::Not(Box::new(SearchKey::Draft)),
+            remaining[7..].trim_start(),
+        ))
+    } else if starts_search_keyword(&upper, "UNFLAGGED") {
+        Ok((
+            SearchKey::Not(Box::new(SearchKey::Flagged)),
+            remaining[9..].trim_start(),
+        ))
+    } else if remaining
+        .as_bytes()
+        .first()
+        .is_some_and(|b| b.is_ascii_digit() || *b == b'*')
+    {
+        let (seq_str, rest) = split_first_word(remaining)?;
+        let seq = parse_sequence_set(&seq_str)?;
+        Ok((SearchKey::Sequence(seq), rest.trim_start()))
     } else {
         let token = remaining
             .split_whitespace()

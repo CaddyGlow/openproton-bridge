@@ -110,6 +110,15 @@ pub enum Command {
     Unselect {
         tag: String,
     },
+    Delete {
+        tag: String,
+        mailbox: String,
+    },
+    Rename {
+        tag: String,
+        source: String,
+        dest: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -297,6 +306,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "LSUB" => parse_lsub(&tag, args),
         "SELECT" => parse_select(&tag, args),
         "CREATE" => parse_create(&tag, args),
+        "DELETE" => parse_delete(&tag, args),
         "SUBSCRIBE" => parse_subscribe(&tag, args),
         "UNSUBSCRIBE" => parse_unsubscribe(&tag, args),
         "STATUS" => parse_status(&tag, args),
@@ -311,6 +321,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "EXAMINE" => parse_examine(&tag, args),
         "APPEND" => parse_append(&tag, args),
         "UNSELECT" => Ok(Command::Unselect { tag }),
+        "RENAME" => parse_rename(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
             cmd_word
@@ -442,6 +453,24 @@ fn parse_create(tag: &str, args: &str) -> Result<Command> {
     Ok(Command::Create {
         tag: tag.to_string(),
         mailbox,
+    })
+}
+
+fn parse_delete(tag: &str, args: &str) -> Result<Command> {
+    let (mailbox, _) = parse_astring(args.trim_start())?;
+    Ok(Command::Delete {
+        tag: tag.to_string(),
+        mailbox,
+    })
+}
+
+fn parse_rename(tag: &str, args: &str) -> Result<Command> {
+    let (source, rest) = parse_astring(args.trim_start())?;
+    let (dest, _) = parse_astring(rest.trim_start())?;
+    Ok(Command::Rename {
+        tag: tag.to_string(),
+        source,
+        dest,
     })
 }
 
@@ -673,9 +702,18 @@ fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
         } else if starts_fetch_item_keyword(&upper_rem, "ENVELOPE") {
             items.push(FetchItem::Envelope);
             remaining = remaining[8..].trim_start();
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822.HEADER") {
+            items.push(FetchItem::Rfc822Header);
+            remaining = remaining[13..].trim_start();
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822.TEXT") {
+            items.push(FetchItem::Rfc822Text);
+            remaining = remaining[10..].trim_start();
         } else if starts_fetch_item_keyword(&upper_rem, "RFC822.SIZE") {
             items.push(FetchItem::Rfc822Size);
             remaining = remaining[11..].trim_start();
+        } else if starts_fetch_item_keyword(&upper_rem, "RFC822") {
+            items.push(FetchItem::Rfc822);
+            remaining = remaining[6..].trim_start();
         } else if starts_fetch_item_keyword(&upper_rem, "INTERNALDATE") {
             items.push(FetchItem::InternalDate);
             remaining = remaining[12..].trim_start();

@@ -1,4 +1,3 @@
-pub mod command;
 pub mod convert;
 pub mod gluon_codec;
 pub mod gluon_connector;

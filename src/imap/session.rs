@@ -6,10 +6,6 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
-use super::command::{
-    parse_command, Command, FetchItem, ImapFlag, SearchKey, SequenceSet, StatusDataItem,
-    StoreAction,
-};
 use super::gluon_connector::GluonImapConnector;
 use super::mailbox;
 use super::mailbox_catalog::GluonMailboxCatalog;
@@ -19,6 +15,10 @@ use super::response::ResponseWriter;
 use super::rfc822;
 use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use super::Result;
+use gluon_rs_mail::command::{
+    parse_command, Command, FetchItem, ImapFlag, SearchKey, SequenceSet, StatusDataItem,
+    StoreAction,
+};
 
 /// RFC 2177 recommends servers terminate IDLE after 30 minutes.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);

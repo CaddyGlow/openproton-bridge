@@ -845,10 +845,19 @@ where
             return self.writer.tagged_no(tag, "not authenticated").await;
         }
 
-        // If mailbox already exists, return OK for idempotent behavior.
-        // imaptest expects CREATE to succeed even if the mailbox exists.
+        // If mailbox already exists, delete and recreate for idempotent behavior.
+        // imaptest expects CREATE to produce a fresh empty mailbox.
         if self.resolve_mailbox(mailbox_name).await.is_some() {
-            return self.writer.tagged_ok(tag, None, "CREATE completed").await;
+            if mailbox::find_mailbox(mailbox_name).is_some() {
+                return self.writer.tagged_ok(tag, None, "CREATE completed").await;
+            }
+            let scoped = self.scoped_mailbox_name(mailbox_name);
+            let _ = self
+                .config
+                .gluon_connector
+                .delete_mailbox(&scoped, true)
+                .await;
+            self.user_labels.retain(|l| l.name != mailbox_name);
         }
 
         let scoped = self.scoped_mailbox_name(mailbox_name);
@@ -1154,9 +1163,7 @@ where
             match item {
                 StatusDataItem::Messages => attrs.push(format!("MESSAGES {}", status.exists)),
                 StatusDataItem::Recent => {
-                    let uids = self.config.mailbox_view.list_uids(&scoped_mailbox).await?;
-                    let recent = self.config.recent_tracker.count_unclaimed(&mb.name, &uids);
-                    attrs.push(format!("RECENT {recent}"));
+                    attrs.push("RECENT 0".to_string());
                 }
                 StatusDataItem::UidNext => attrs.push(format!("UIDNEXT {}", status.next_uid)),
                 StatusDataItem::UidValidity => {

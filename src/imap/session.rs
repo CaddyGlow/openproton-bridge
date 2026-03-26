@@ -306,6 +306,11 @@ where
                 ref sequence,
             } => self.cmd_uid_expunge(tag, sequence).await?,
             Command::Unselect { ref tag } => self.cmd_unselect(tag).await?,
+            Command::Rename {
+                ref tag,
+                ref source,
+                ref dest,
+            } => self.cmd_rename(tag, source, dest).await?,
             Command::Append {
                 ref tag,
                 ref mailbox,
@@ -919,6 +924,62 @@ where
         self.writer.tagged_ok(tag, None, "DELETE completed").await
     }
 
+    async fn cmd_rename(&mut self, tag: &str, source: &str, dest: &str) -> Result<()> {
+        if self.state == State::NotAuthenticated {
+            return self.writer.tagged_no(tag, "not authenticated").await;
+        }
+
+        // Cannot rename system mailboxes (INBOX, etc.)
+        if mailbox::find_mailbox(source).is_some() {
+            return self
+                .writer
+                .tagged_no(tag, "[CANNOT] cannot rename system mailbox")
+                .await;
+        }
+
+        // Verify source exists
+        if self.resolve_mailbox(source).await.is_none() {
+            return self
+                .writer
+                .tagged_no(tag, "source mailbox does not exist")
+                .await;
+        }
+
+        // Verify dest doesn't already exist
+        if self.resolve_mailbox(dest).await.is_some() {
+            return self
+                .writer
+                .tagged_no(tag, "destination mailbox already exists")
+                .await;
+        }
+
+        let scoped_source = self.scoped_mailbox_name(source);
+        let scoped_dest = self.scoped_mailbox_name(dest);
+
+        if let Err(e) = self
+            .config
+            .gluon_connector
+            .rename_mailbox(&scoped_source, &scoped_dest)
+            .await
+        {
+            return self
+                .writer
+                .tagged_no(tag, &format!("RENAME failed: {e}"))
+                .await;
+        }
+
+        // Update session's user_labels: remove old, add new
+        self.user_labels.retain(|l| l.name != source);
+        self.user_labels.push(mailbox::ResolvedMailbox {
+            name: dest.to_string(),
+            label_id: dest.to_string(),
+            special_use: None,
+            selectable: true,
+        });
+
+        self.writer.tagged_ok(tag, None, "RENAME completed").await
+    }
+
     async fn cmd_subscribe(&mut self, tag: &str, mailbox_name: &str) -> Result<()> {
         if self.state == State::NotAuthenticated {
             return self.writer.tagged_no(tag, "not authenticated").await;
@@ -1380,7 +1441,10 @@ where
             FetchItem::BodySection { section, .. } => {
                 !body_section_is_header_only(section.as_deref())
             }
-            FetchItem::Rfc822Text | FetchItem::BodyStructure | FetchItem::Body => true,
+            FetchItem::Rfc822Text
+            | FetchItem::BodyStructure
+            | FetchItem::Body
+            | FetchItem::Envelope => true,
             _ => false,
         });
         let needs_metadata = expanded.iter().any(|i| {
@@ -2888,40 +2952,80 @@ fn evaluate_search_key(
             .as_ref()
             .map(|m| m.subject.to_lowercase().contains(&s.to_lowercase()))
             .unwrap_or(false),
-        SearchKey::From(s) => meta
-            .as_ref()
-            .map(|m| {
-                m.sender.address.to_lowercase().contains(&s.to_lowercase())
-                    || m.sender.name.to_lowercase().contains(&s.to_lowercase())
-            })
-            .unwrap_or(false),
-        SearchKey::To(s) => meta
-            .as_ref()
-            .map(|m| {
-                m.to_list.iter().any(|a| {
-                    a.address.to_lowercase().contains(&s.to_lowercase())
-                        || a.name.to_lowercase().contains(&s.to_lowercase())
+        SearchKey::From(s) => {
+            let s_lower = s.to_lowercase();
+            let meta_match = meta
+                .as_ref()
+                .map(|m| {
+                    m.sender.address.to_lowercase().contains(&s_lower)
+                        || m.sender.name.to_lowercase().contains(&s_lower)
                 })
-            })
-            .unwrap_or(false),
-        SearchKey::Cc(s) => meta
-            .as_ref()
-            .map(|m| {
-                m.cc_list.iter().any(|a| {
-                    a.address.to_lowercase().contains(&s.to_lowercase())
-                        || a.name.to_lowercase().contains(&s.to_lowercase())
+                .unwrap_or(false);
+            meta_match
+                || rfc822_data
+                    .map(|d| {
+                        let hdr = extract_header_section(d);
+                        search_raw_header(&hdr, "from", &s_lower)
+                    })
+                    .unwrap_or(false)
+        }
+        SearchKey::To(s) => {
+            let s_lower = s.to_lowercase();
+            let meta_match = meta
+                .as_ref()
+                .map(|m| {
+                    m.to_list.iter().any(|a| {
+                        a.address.to_lowercase().contains(&s_lower)
+                            || a.name.to_lowercase().contains(&s_lower)
+                    })
                 })
-            })
-            .unwrap_or(false),
-        SearchKey::Bcc(s) => meta
-            .as_ref()
-            .map(|m| {
-                m.bcc_list.iter().any(|a| {
-                    a.address.to_lowercase().contains(&s.to_lowercase())
-                        || a.name.to_lowercase().contains(&s.to_lowercase())
+                .unwrap_or(false);
+            meta_match
+                || rfc822_data
+                    .map(|d| {
+                        let hdr = extract_header_section(d);
+                        search_raw_header(&hdr, "to", &s_lower)
+                    })
+                    .unwrap_or(false)
+        }
+        SearchKey::Cc(s) => {
+            let s_lower = s.to_lowercase();
+            let meta_match = meta
+                .as_ref()
+                .map(|m| {
+                    m.cc_list.iter().any(|a| {
+                        a.address.to_lowercase().contains(&s_lower)
+                            || a.name.to_lowercase().contains(&s_lower)
+                    })
                 })
-            })
-            .unwrap_or(false),
+                .unwrap_or(false);
+            meta_match
+                || rfc822_data
+                    .map(|d| {
+                        let hdr = extract_header_section(d);
+                        search_raw_header(&hdr, "cc", &s_lower)
+                    })
+                    .unwrap_or(false)
+        }
+        SearchKey::Bcc(s) => {
+            let s_lower = s.to_lowercase();
+            let meta_match = meta
+                .as_ref()
+                .map(|m| {
+                    m.bcc_list.iter().any(|a| {
+                        a.address.to_lowercase().contains(&s_lower)
+                            || a.name.to_lowercase().contains(&s_lower)
+                    })
+                })
+                .unwrap_or(false);
+            meta_match
+                || rfc822_data
+                    .map(|d| {
+                        let hdr = extract_header_section(d);
+                        search_raw_header(&hdr, "bcc", &s_lower)
+                    })
+                    .unwrap_or(false)
+        }
         SearchKey::Header(field, value) => {
             if let Some(data) = rfc822_data {
                 let header_section = extract_header_section(data);
@@ -3006,6 +3110,10 @@ fn search_key_needs_rfc822(key: &SearchKey) -> bool {
         SearchKey::Header(_, _)
         | SearchKey::Body(_)
         | SearchKey::Text(_)
+        | SearchKey::From(_)
+        | SearchKey::To(_)
+        | SearchKey::Cc(_)
+        | SearchKey::Bcc(_)
         | SearchKey::SentBefore(_)
         | SearchKey::SentSince(_)
         | SearchKey::SentOn(_) => true,
@@ -3017,18 +3125,99 @@ fn search_key_needs_rfc822(key: &SearchKey) -> bool {
     }
 }
 
-/// Extract the Date header from RFC822 data and parse it to a unix timestamp.
+/// Search raw header for a field containing a substring (case-insensitive).
+/// Handles multi-line headers (continuation lines starting with whitespace).
+fn search_raw_header(header: &str, field_name: &str, value_lower: &str) -> bool {
+    let field_prefix = format!("{}:", field_name);
+    let mut in_target_field = false;
+    let mut full_value = String::new();
+
+    for line in header.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation line
+            if in_target_field {
+                full_value.push(' ');
+                full_value.push_str(line.trim());
+            }
+            continue;
+        }
+        // New header line: check if previous collected value matches
+        if in_target_field && full_value.to_lowercase().contains(value_lower) {
+            return true;
+        }
+        in_target_field = false;
+        full_value.clear();
+
+        if line.to_lowercase().starts_with(&field_prefix) {
+            in_target_field = true;
+            full_value = line[field_prefix.len()..].trim().to_string();
+        }
+    }
+    // Check last field
+    if in_target_field && full_value.to_lowercase().contains(value_lower) {
+        return true;
+    }
+    false
+}
+
+/// Extract the Date header from RFC822 data and parse it to a date-only
+/// unix timestamp (start of day, ignoring time and timezone per RFC 3501 6.4.4).
 ///
-/// Parses common RFC2822 date formats like:
-///   "Mon, 14 Nov 2023 22:13:20 +0000"
-///   "14 Nov 2023 22:13:20 +0000"
+/// For SENTBEFORE/SENTSINCE/SENTON, RFC 3501 says to disregard time and timezone
+/// and compare only the date portion.
 fn extract_sent_date(data: &[u8]) -> Option<i64> {
     let header = extract_header_section(data);
     let date_line = header
         .lines()
         .find(|l| l.to_lowercase().starts_with("date:"))?;
     let date_str = date_line.split_once(':')?.1.trim();
-    parse_rfc2822_date(date_str)
+    parse_rfc2822_date_only(date_str)
+}
+
+/// Parse an RFC2822 date string, returning the start-of-day timestamp (ignoring time and
+/// timezone). This is what RFC 3501 SENTBEFORE/SENTSINCE/SENTON require.
+fn parse_rfc2822_date_only(s: &str) -> Option<i64> {
+    let months = [
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    ];
+
+    // Strip optional day-of-week prefix (e.g., "Mon, ")
+    let s = if let Some(pos) = s.find(',') {
+        s[pos + 1..].trim()
+    } else {
+        s.trim()
+    };
+
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 3 {
+        return None;
+    }
+
+    let day: u32 = parts[0].parse().ok()?;
+    let month = months
+        .iter()
+        .position(|&m| m.eq_ignore_ascii_case(parts[1]))? as u32
+        + 1;
+    let year: i32 = parts[2].parse().ok()?;
+
+    // Return start of day (00:00:00 UTC) for the given date, ignoring time and timezone
+    let days_in_month = [31u32, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = |y: i32| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+
+    let mut total_days: i64 = 0;
+    for y in 1970..year {
+        total_days += if is_leap(y) { 366 } else { 365 };
+    }
+    for m in 1..month {
+        total_days += days_in_month[(m - 1) as usize] as i64;
+        if m == 2 && is_leap(year) {
+            total_days += 1;
+        }
+    }
+    total_days += (day as i64) - 1;
+
+    Some(total_days * 86400)
 }
 
 fn parse_rfc2822_date(s: &str) -> Option<i64> {
@@ -3043,20 +3232,40 @@ fn parse_rfc2822_date(s: &str) -> Option<i64> {
         s.trim()
     };
 
-    // Expected: "14 Nov 2023 22:13:20 +0000" or "14 Nov 2023 22:13:20 -0500"
+    // Expected formats:
+    //   "14 Nov 2023 22:13:20 +0000"   (RFC 2822)
+    //   "14-Nov-2023 22:13:20 +0000"   (IMAP internal date-time)
     let parts: Vec<&str> = s.split_whitespace().collect();
-    if parts.len() < 4 {
+
+    // Try to parse IMAP date-time format (DD-Mon-YYYY HH:MM:SS +ZZZZ)
+    let (day, month, year, time_idx) = if parts.len() >= 2 && parts[0].contains('-') {
+        let date_parts: Vec<&str> = parts[0].split('-').collect();
+        if date_parts.len() != 3 {
+            return None;
+        }
+        let d: u32 = date_parts[0].parse().ok()?;
+        let m = months
+            .iter()
+            .position(|&mo| mo.eq_ignore_ascii_case(date_parts[1]))? as u32
+            + 1;
+        let y: i32 = date_parts[2].parse().ok()?;
+        (d, m, y, 1usize)
+    } else if parts.len() >= 4 {
+        let d: u32 = parts[0].parse().ok()?;
+        let m = months
+            .iter()
+            .position(|&mo| mo.eq_ignore_ascii_case(parts[1]))? as u32
+            + 1;
+        let y: i32 = parts[2].parse().ok()?;
+        (d, m, y, 3usize)
+    } else {
+        return None;
+    };
+
+    if time_idx >= parts.len() {
         return None;
     }
-
-    let day: u32 = parts[0].parse().ok()?;
-    let month = months
-        .iter()
-        .position(|&m| m.eq_ignore_ascii_case(parts[1]))? as u32
-        + 1;
-    let year: i32 = parts[2].parse().ok()?;
-
-    let time_parts: Vec<&str> = parts[3].split(':').collect();
+    let time_parts: Vec<&str> = parts[time_idx].split(':').collect();
     if time_parts.len() < 2 {
         return None;
     }
@@ -3069,8 +3278,9 @@ fn parse_rfc2822_date(s: &str) -> Option<i64> {
     };
 
     // Parse timezone offset
-    let tz_offset_secs: i64 = if parts.len() > 4 {
-        let tz = parts[4];
+    let tz_idx = time_idx + 1;
+    let tz_offset_secs: i64 = if parts.len() > tz_idx {
+        let tz = parts[tz_idx];
         if tz.len() >= 4 {
             let sign = if tz.starts_with('-') { -1i64 } else { 1 };
             let tz_digits = tz.trim_start_matches(['+', '-']);
@@ -3125,7 +3335,9 @@ fn body_section_is_header_only(section: Option<&str>) -> bool {
         return false;
     };
     let upper = section.trim().to_uppercase();
-    upper == "HEADER" || upper.starts_with("HEADER.FIELDS")
+    // Only HEADER.FIELDS (specific fields) can be satisfied from metadata.
+    // Bare "HEADER" needs the full RFC822 data to return all original headers.
+    upper.starts_with("HEADER.FIELDS")
 }
 
 fn build_metadata_header_section(meta: &gluon_rs_mail::MessageEnvelope) -> String {

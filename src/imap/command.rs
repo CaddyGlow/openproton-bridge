@@ -114,6 +114,11 @@ pub enum Command {
     Unselect {
         tag: String,
     },
+    Rename {
+        tag: String,
+        source: String,
+        dest: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -314,6 +319,7 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "EXAMINE" => parse_examine(&tag, args),
         "APPEND" => parse_append(&tag, args),
         "UNSELECT" => Ok(Command::Unselect { tag }),
+        "RENAME" => parse_rename(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
             cmd_word
@@ -453,6 +459,16 @@ fn parse_delete(tag: &str, args: &str) -> Result<Command> {
     Ok(Command::Delete {
         tag: tag.to_string(),
         mailbox,
+    })
+}
+
+fn parse_rename(tag: &str, args: &str) -> Result<Command> {
+    let (source, rest) = parse_astring(args.trim_start())?;
+    let (dest, _) = parse_astring(rest.trim_start())?;
+    Ok(Command::Rename {
+        tag: tag.to_string(),
+        source,
+        dest,
     })
 }
 

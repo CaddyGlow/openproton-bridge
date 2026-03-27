@@ -15,6 +15,8 @@ pub mod mailbox;
 pub mod metadata_parse;
 pub mod response;
 pub mod rfc822;
+pub mod server;
+pub mod session;
 pub mod well_known;
 
 pub use db::{SchemaFamily, SchemaProbe};

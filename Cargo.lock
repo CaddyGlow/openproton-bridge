@@ -2070,10 +2070,14 @@ dependencies = [
  "async-trait",
  "gluon-rs-core",
  "mailparse",
+ "rcgen",
  "rusqlite",
+ "rustls",
+ "rustls-pemfile",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

@@ -9,7 +9,11 @@ gluon-rs-core = { path = "../gluon-rs-core" }
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "2"
 mailparse = "0.15"
-tokio = { version = "1", features = ["io-util", "sync"] }
+tokio = { version = "1", features = ["io-util", "sync", "time", "net", "rt", "macros"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rcgen = "0.13"
 tracing = "0.1"
 
 [dev-dependencies]

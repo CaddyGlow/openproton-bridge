@@ -127,3 +127,6 @@ members = [
     "crates/gluon-rs-calendar",
     "apps/bridge-ui/src-tauri",
 ]
+
+[profile.release]
+lto = "thin"

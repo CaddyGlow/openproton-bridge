@@ -228,6 +228,13 @@ pub fn parse_search_criterion(s: &str) -> Result<(SearchKey, &str)> {
             SearchKey::Not(Box::new(SearchKey::Flagged)),
             remaining[9..].trim_start(),
         ))
+    } else if remaining.starts_with('(') {
+        let close = remaining
+            .find(')')
+            .ok_or_else(|| ImapError::Protocol("unclosed paren in SEARCH".into()))?;
+        let inner = remaining[1..close].trim();
+        let (key, _) = parse_search_criterion(inner)?;
+        Ok((key, remaining[close + 1..].trim_start()))
     } else if remaining
         .as_bytes()
         .first()

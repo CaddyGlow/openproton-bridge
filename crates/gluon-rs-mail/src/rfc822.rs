@@ -27,17 +27,17 @@ pub fn build_body(data: &[u8]) -> String {
             charset,
         } => {
             let encoding = extract_content_transfer_encoding(&header_section);
-            let size = data.len();
-            let lines = text.lines().count();
+            let body_size = body_section.len();
+            let body_lines = body_section.lines().count();
 
             format!(
                 "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
                 type_main.to_uppercase(),
-                subtype.to_uppercase(),
+                subtype,
                 charset,
                 encoding.to_uppercase(),
-                size,
-                lines
+                body_size,
+                body_lines
             )
         }
     }
@@ -77,20 +77,20 @@ pub fn build_bodystructure(data: &[u8]) -> String {
             let encoding = extract_content_transfer_encoding(&header_section);
             let content_id = extract_content_id(&header_section);
             let disposition = extract_content_disposition(&header_section);
-            let size = data.len();
-            let lines = text.lines().count();
+            let body_size = body_section.len();
+            let body_lines = body_section.lines().count();
 
             // RFC 3501 Section 7.4.2 BODYSTRUCTURE field order for text:
             // type subtype params id desc enc octets lines md5 dsp lang loc
             format!(
                 "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
                 type_main.to_uppercase(),
-                subtype.to_uppercase(),
+                subtype,
                 charset,
                 content_id,
                 encoding.to_uppercase(),
-                size,
-                lines,
+                body_size,
+                body_lines,
                 disposition
             )
         }
@@ -237,7 +237,7 @@ fn extract_content_transfer_encoding(header: &str) -> String {
         })
         .and_then(|line| line.split_once(':'))
         .map(|(_, v)| v.trim().to_string())
-        .unwrap_or_else(|| "8BIT".to_string())
+        .unwrap_or_else(|| "7BIT".to_string())
 }
 
 fn split_header_body(text: &str) -> (String, String) {
@@ -283,17 +283,17 @@ fn build_part_structure(part: &str) -> String {
             let encoding = extract_content_transfer_encoding(&header);
             let content_id = extract_content_id(&header);
             let disposition = extract_content_disposition(&header);
-            let size = part.len();
+            let body_size = body.len();
             let lines = body.lines().count();
 
             format!(
                 "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
                 type_main.to_uppercase(),
-                subtype.to_uppercase(),
+                subtype,
                 charset,
                 content_id,
                 encoding.to_uppercase(),
-                size,
+                body_size,
                 lines,
                 disposition
             )
@@ -325,16 +325,16 @@ fn build_part_body(part: &str) -> String {
             charset,
         } => {
             let encoding = extract_content_transfer_encoding(&header);
-            let size = part.len();
+            let body_size = body.len();
             let lines = body.lines().count();
 
             format!(
                 "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
                 type_main.to_uppercase(),
-                subtype.to_uppercase(),
+                subtype,
                 charset,
                 encoding.to_uppercase(),
-                size,
+                body_size,
                 lines
             )
         }

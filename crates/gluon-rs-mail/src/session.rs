@@ -891,7 +891,22 @@ where
                 format!("{reference}{pattern}")
             };
 
-            let all = self.all_mailboxes();
+            let mut all = self.all_mailboxes();
+            // Merge store mailboxes (dynamically created via CREATE)
+            if let Some(ref mut ss) = self.store_session {
+                if let Ok(store_mbs) = ss.list_upstream_mailboxes() {
+                    for mb in store_mbs {
+                        if !all.iter().any(|m| m.name.eq_ignore_ascii_case(&mb.name)) {
+                            all.push(mailbox::ResolvedMailbox {
+                                name: mb.name.clone(),
+                                label_id: mb.name,
+                                special_use: None,
+                                selectable: true,
+                            });
+                        }
+                    }
+                }
+            }
             // Collect parent paths that need \Noselect entries
             let mut parents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for mb in &all {
@@ -960,7 +975,22 @@ where
             } else {
                 format!("{reference}{pattern}")
             };
-            for mb in self.all_mailboxes() {
+            let mut all = self.all_mailboxes();
+            if let Some(ref mut ss) = self.store_session {
+                if let Ok(store_mbs) = ss.list_upstream_mailboxes() {
+                    for mb in store_mbs {
+                        if !all.iter().any(|m| m.name.eq_ignore_ascii_case(&mb.name)) {
+                            all.push(mailbox::ResolvedMailbox {
+                                name: mb.name.clone(),
+                                label_id: mb.name,
+                                special_use: None,
+                                selectable: true,
+                            });
+                        }
+                    }
+                }
+            }
+            for mb in all {
                 if Self::matches_list_pattern(&mb.name, &full_pattern) {
                     self.writer
                         .untagged(&Self::format_list_entry("LSUB", &mb))
@@ -2329,10 +2359,10 @@ where
                 .get_metadata(&scoped_mailbox, uid)
                 .await?;
             let flags = self
-                .config
-                .mailbox_view
-                .get_flags(&scoped_mailbox, uid)
-                .await?;
+                .selected_mailbox_flags
+                .get(&uid)
+                .cloned()
+                .unwrap_or_default();
 
             let mut rfc822_data = if needs_rfc822 {
                 self.config

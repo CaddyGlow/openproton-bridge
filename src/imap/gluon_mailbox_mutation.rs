@@ -9,14 +9,14 @@ use uuid::Uuid;
 
 use gluon_rs_mail::{EmailAddress, MessageEnvelope};
 
+use gluon_rs_mail::imap_store::{
+    GluonMailboxMutation, GluonMailboxView, MailboxStatus, ProtonMessageId,
+};
+use gluon_rs_mail::{ImapError, ImapResult as Result, ImapUid, ScopedMailboxId};
+
 use super::gluon_mailbox_view::GluonMailMailboxView;
 use super::mailbox;
-use super::mailbox_mutation::GluonMailboxMutation;
-use super::mailbox_view::GluonMailboxView;
 use super::rfc822;
-use super::store::MailboxStatus;
-use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
-use super::{ImapError, Result};
 
 #[derive(Clone)]
 pub struct GluonMailMailboxMutation {

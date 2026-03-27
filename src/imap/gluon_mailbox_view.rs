@@ -4,15 +4,11 @@ use async_trait::async_trait;
 use gluon_rs_mail::{
     CompatibleStore, UpstreamMailbox, UpstreamMailboxMessage, UpstreamMailboxSnapshot,
 };
-use mailparse::{addrparse, dateparse, DispositionType, MailAddr, MailHeaderMap, ParsedMail};
 
-use gluon_rs_mail::{EmailAddress, MessageEnvelope};
-
-use super::mailbox;
-use super::mailbox_view::GluonMailboxView;
-use super::store::{MailboxSnapshot, MailboxStatus};
-use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
-use super::{ImapError, Result};
+use gluon_rs_mail::imap_store::{
+    GluonMailboxView, MailboxSnapshot, MailboxStatus, ProtonMessageId, SelectMailboxData,
+};
+use gluon_rs_mail::{ImapError, ImapResult as Result, ImapUid, MessageEnvelope, ScopedMailboxId};
 
 #[derive(Clone)]
 pub struct GluonMailMailboxView {
@@ -274,21 +270,18 @@ impl GluonMailboxView for GluonMailMailboxView {
             .map(|index| index as u32 + 1))
     }
 
-    async fn select_mailbox_data(
-        &self,
-        mailbox: &ScopedMailboxId,
-    ) -> Result<super::store::SelectMailboxData> {
+    async fn select_mailbox_data(&self, mailbox: &ScopedMailboxId) -> Result<SelectMailboxData> {
         let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id);
         let Some(mb) = self.mailbox_by_name(storage_user_id, mailbox_name).await? else {
-            return Ok(super::store::SelectMailboxData {
+            return Ok(SelectMailboxData {
                 status: MailboxStatus {
                     uid_validity: 1,
                     next_uid: 1,
                     exists: 0,
                     unseen: 0,
                 },
-                snapshot: super::store::MailboxSnapshot {
+                snapshot: MailboxSnapshot {
                     exists: 0,
                     mod_seq: 0,
                 },
@@ -332,14 +325,14 @@ impl GluonMailboxView for GluonMailMailboxView {
             flags.insert(uid, entry.flags.clone());
         }
 
-        Ok(super::store::SelectMailboxData {
+        Ok(SelectMailboxData {
             status: MailboxStatus {
                 uid_validity: select.uid_validity,
                 next_uid: select.next_uid,
                 exists: count,
                 unseen,
             },
-            snapshot: super::store::MailboxSnapshot {
+            snapshot: MailboxSnapshot {
                 exists: count,
                 mod_seq: mod_seq_hash,
             },
@@ -352,18 +345,18 @@ impl GluonMailboxView for GluonMailMailboxView {
     async fn select_mailbox_data_fast(
         &self,
         mailbox: &ScopedMailboxId,
-    ) -> Result<super::store::SelectMailboxData> {
+    ) -> Result<SelectMailboxData> {
         let Some((storage_user_id, mailbox_internal_id)) =
             self.resolve_mailbox_parts(mailbox).await?
         else {
-            return Ok(super::store::SelectMailboxData {
+            return Ok(SelectMailboxData {
                 status: MailboxStatus {
                     uid_validity: 1,
                     next_uid: 1,
                     exists: 0,
                     unseen: 0,
                 },
-                snapshot: super::store::MailboxSnapshot {
+                snapshot: MailboxSnapshot {
                     exists: 0,
                     mod_seq: 0,
                 },
@@ -410,14 +403,14 @@ impl GluonMailboxView for GluonMailMailboxView {
             flags.insert(uid, entry.flags.clone());
         }
 
-        Ok(super::store::SelectMailboxData {
+        Ok(SelectMailboxData {
             status: MailboxStatus {
                 uid_validity: select.uid_validity,
                 next_uid: select.next_uid,
                 exists: count,
                 unseen,
             },
-            snapshot: super::store::MailboxSnapshot {
+            snapshot: MailboxSnapshot {
                 exists: count,
                 mod_seq: mod_seq_hash,
             },
@@ -452,131 +445,7 @@ fn computed_mod_seq(snapshot: &UpstreamMailboxSnapshot) -> u64 {
     hash
 }
 
-pub(super) fn parse_metadata_from_rfc822(
-    mailbox: &ScopedMailboxId,
-    summary: &gluon_rs_mail::UpstreamMessageSummary,
-    data: &[u8],
-) -> Option<MessageEnvelope> {
-    let parsed = mailparse::parse_mail(data).ok()?;
-    let header = parsed.get_headers();
-    let label_id = mailbox_label_id(mailbox, &summary.remote_id);
-    let date_header = header.get_first_value("Date");
-    let time = date_header
-        .as_deref()
-        .and_then(|value| dateparse(value).ok())
-        .unwrap_or(0);
-
-    Some(MessageEnvelope {
-        id: summary.remote_id.clone(),
-        address_id: String::new(),
-        label_ids: vec![label_id],
-        external_id: header.get_first_value("Message-ID"),
-        subject: header.get_first_value("Subject").unwrap_or_default(),
-        sender: first_address(&parsed, "From"),
-        to_list: addresses(&parsed, "To"),
-        cc_list: addresses(&parsed, "Cc"),
-        bcc_list: addresses(&parsed, "Bcc"),
-        reply_tos: addresses(&parsed, "Reply-To"),
-        flags: 0,
-        time,
-        size: summary.size,
-        unread: if has_seen_flag(&summary.flags) { 0 } else { 1 },
-        is_replied: 0,
-        is_replied_all: 0,
-        is_forwarded: 0,
-        num_attachments: count_attachments(&parsed) as i32,
-    })
-}
-
-pub(super) fn fallback_metadata(
-    mailbox: &ScopedMailboxId,
-    message: &UpstreamMailboxMessage,
-) -> MessageEnvelope {
-    MessageEnvelope {
-        id: message.summary.remote_id.clone(),
-        address_id: String::new(),
-        label_ids: vec![mailbox_label_id(mailbox, &message.summary.remote_id)],
-        external_id: None,
-        subject: String::new(),
-        sender: EmailAddress {
-            name: String::new(),
-            address: String::new(),
-        },
-        to_list: Vec::new(),
-        cc_list: Vec::new(),
-        bcc_list: Vec::new(),
-        reply_tos: Vec::new(),
-        flags: 0,
-        time: 0,
-        size: message.summary.size,
-        unread: if has_seen_flag(&message.summary.flags) {
-            0
-        } else {
-            1
-        },
-        is_replied: 0,
-        is_replied_all: 0,
-        is_forwarded: 0,
-        num_attachments: 0,
-    }
-}
-
-fn mailbox_label_id(scoped: &ScopedMailboxId, fallback: &str) -> String {
-    mailbox::find_mailbox(scoped.mailbox_name())
-        .map(|mailbox| mailbox.label_id.to_string())
-        .unwrap_or_else(|| fallback.to_string())
-}
-
-fn first_address(parsed: &ParsedMail<'_>, header_name: &str) -> EmailAddress {
-    addresses(parsed, header_name)
-        .into_iter()
-        .next()
-        .unwrap_or(EmailAddress {
-            name: String::new(),
-            address: String::new(),
-        })
-}
-
-fn addresses(parsed: &ParsedMail<'_>, header_name: &str) -> Vec<EmailAddress> {
-    parsed
-        .headers
-        .iter()
-        .filter(|header| header.get_key_ref().eq_ignore_ascii_case(header_name))
-        .map(|header| header.get_value())
-        .filter_map(|value| addrparse(&value).ok())
-        .flat_map(|parsed| parsed.iter().cloned().collect::<Vec<_>>())
-        .flat_map(mail_addr_to_email_addresses)
-        .collect()
-}
-
-fn mail_addr_to_email_addresses(addr: MailAddr) -> Vec<EmailAddress> {
-    match addr {
-        MailAddr::Single(info) => vec![EmailAddress {
-            name: info.display_name.unwrap_or_default(),
-            address: info.addr,
-        }],
-        MailAddr::Group(group) => group
-            .addrs
-            .into_iter()
-            .map(|info| EmailAddress {
-                name: info.display_name.unwrap_or_default(),
-                address: info.addr,
-            })
-            .collect(),
-    }
-}
-
-fn count_attachments(parsed: &ParsedMail<'_>) -> usize {
-    let mut count = 0usize;
-    for subpart in &parsed.subparts {
-        let disposition = subpart.get_content_disposition();
-        if matches!(disposition.disposition, DispositionType::Attachment) {
-            count += 1;
-        }
-        count += count_attachments(subpart);
-    }
-    count
-}
+pub use gluon_rs_mail::metadata_parse::{fallback_metadata, parse_metadata_from_rfc822};
 
 #[cfg(test)]
 mod tests {

@@ -42,4 +42,21 @@ pub enum ImapError {
     GluonCorruption { path: PathBuf, reason: String },
 }
 
+impl From<gluon_rs_mail::ImapError> for ImapError {
+    fn from(e: gluon_rs_mail::ImapError) -> Self {
+        match e {
+            gluon_rs_mail::ImapError::Io(io) => ImapError::Io(io),
+            gluon_rs_mail::ImapError::Tls(msg) => ImapError::Tls(msg),
+            gluon_rs_mail::ImapError::Upstream(msg) => ImapError::Protocol(msg),
+            gluon_rs_mail::ImapError::Protocol(msg) => ImapError::Protocol(msg),
+            gluon_rs_mail::ImapError::AuthFailed => ImapError::AuthFailed,
+            gluon_rs_mail::ImapError::MailboxNotFound(name) => ImapError::MailboxNotFound(name),
+            gluon_rs_mail::ImapError::MessageNotFound(uid) => ImapError::MessageNotFound(uid),
+            gluon_rs_mail::ImapError::GluonCorruption { path, reason } => {
+                ImapError::GluonCorruption { path, reason }
+            }
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ImapError>;

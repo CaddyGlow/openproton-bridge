@@ -3,43 +3,8 @@ use std::sync::Arc;
 use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::types::AccountId;
 
-use super::mailbox::{self, ResolvedMailbox};
-
-pub trait GluonMailboxCatalog: Send + Sync {
-    fn user_labels(
-        &self,
-        account_id: Option<&str>,
-        fallback_labels: &[ResolvedMailbox],
-    ) -> Vec<ResolvedMailbox>;
-
-    fn resolve_mailbox(
-        &self,
-        account_id: Option<&str>,
-        fallback_labels: &[ResolvedMailbox],
-        name: &str,
-    ) -> Option<ResolvedMailbox> {
-        if let Some(mailbox) = mailbox::find_mailbox(name) {
-            return Some(mailbox.into());
-        }
-
-        self.user_labels(account_id, fallback_labels)
-            .into_iter()
-            .find(|mailbox| mailbox.name.eq_ignore_ascii_case(name))
-    }
-
-    fn all_mailboxes(
-        &self,
-        account_id: Option<&str>,
-        fallback_labels: &[ResolvedMailbox],
-    ) -> Vec<ResolvedMailbox> {
-        let mut all: Vec<ResolvedMailbox> = mailbox::system_mailboxes()
-            .iter()
-            .map(|mailbox| ResolvedMailbox::from(*mailbox))
-            .collect();
-        all.extend(self.user_labels(account_id, fallback_labels));
-        all
-    }
-}
+pub use gluon_rs_mail::GluonMailboxCatalog;
+use gluon_rs_mail::ResolvedMailbox;
 
 #[derive(Clone)]
 pub struct RuntimeMailboxCatalog {
@@ -74,7 +39,7 @@ mod tests {
     use super::{GluonMailboxCatalog, RuntimeMailboxCatalog};
     use crate::api::types::Session;
     use crate::bridge::accounts::RuntimeAccountRegistry;
-    use crate::imap::mailbox::ResolvedMailbox;
+    use gluon_rs_mail::ResolvedMailbox;
 
     fn test_session(uid: &str) -> Session {
         Session {

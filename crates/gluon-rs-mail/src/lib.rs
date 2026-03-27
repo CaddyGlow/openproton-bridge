@@ -6,10 +6,13 @@ pub mod types;
 
 // IMAP protocol modules.
 pub mod command;
+pub mod gluon_connector;
 pub mod imap_connector;
 pub mod imap_error;
 pub mod imap_store;
 pub mod imap_types;
+pub mod mailbox;
+pub mod metadata_parse;
 pub mod response;
 pub mod rfc822;
 pub mod well_known;
@@ -28,11 +31,20 @@ pub use store::{
 pub use target::CompatibilityTarget;
 pub use types::StoreBootstrap;
 
+pub use gluon_connector::{
+    GluonCreatedMessage, GluonImapConnector, GluonMailbox, GluonMessageRef, GluonUpdate,
+    GluonUpdateReceiver,
+};
 pub use imap_connector::{AuthResult, ImapConnector, MetadataPage};
 pub use imap_error::{ImapError, ImapResult};
 pub use imap_store::{
-    MailboxSnapshot, MailboxStatus, SelectMailboxData, StoreEvent, StoreEventKind,
+    GluonMailboxMutation, GluonMailboxView, MailboxSnapshot, MailboxStatus, ProtonMessageId,
+    SelectMailboxData, StoreEvent, StoreEventKind,
 };
 pub use imap_types::{
     EmailAddress, ImapUid, MailboxInfo, MessageEnvelope, MessageId, ScopedMailboxId,
+};
+pub use mailbox::{
+    find_mailbox, message_flags, system_mailboxes, GluonMailboxCatalog, ImapMailbox,
+    ResolvedMailbox,
 };

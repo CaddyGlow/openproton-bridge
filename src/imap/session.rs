@@ -6,19 +6,20 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, info, warn};
 
-use super::gluon_connector::GluonImapConnector;
-use super::mailbox;
-use super::mailbox_catalog::GluonMailboxCatalog;
-use super::mailbox_mutation::GluonMailboxMutation;
-use super::mailbox_view::GluonMailboxView;
-use super::response::ResponseWriter;
-use super::rfc822;
-use super::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
-use super::Result;
 use gluon_rs_mail::command::{
     parse_command, Command, FetchItem, ImapFlag, SearchKey, SequenceSet, StatusDataItem,
     StoreAction,
 };
+use gluon_rs_mail::gluon_connector::GluonImapConnector;
+use gluon_rs_mail::imap_store::{GluonMailboxMutation, GluonMailboxView};
+use gluon_rs_mail::mailbox::{self as mailbox, GluonMailboxCatalog};
+use gluon_rs_mail::rfc822;
+use gluon_rs_mail::{ImapUid, ScopedMailboxId};
+
+use super::response::ResponseWriter;
+use super::Result;
+
+type ProtonMessageId = gluon_rs_mail::imap_store::ProtonMessageId;
 
 /// RFC 2177 recommends servers terminate IDLE after 30 minutes.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -435,7 +436,7 @@ where
             .selected_mailbox
             .as_ref()
             .map(|mailbox| self.scoped_mailbox_name(mailbox))
-            .ok_or_else(|| super::ImapError::Protocol("no mailbox selected".to_string()))?;
+            .ok_or_else(|| crate::imap::ImapError::Protocol("no mailbox selected".to_string()))?;
         let mut update_rx = self.config.gluon_connector.subscribe_updates();
         self.writer.continuation("idling").await?;
         self.emit_selected_mailbox_exists_update().await?;
@@ -1527,14 +1528,14 @@ where
                                 None
                             };
                             let parsed = blob_data.as_deref().and_then(|data| {
-                                super::gluon_mailbox_view::parse_metadata_from_rfc822(
+                                gluon_rs_mail::metadata_parse::parse_metadata_from_rfc822(
                                     &scoped_mailbox,
                                     &message.summary,
                                     data,
                                 )
                             });
                             Some(parsed.unwrap_or_else(|| {
-                                super::gluon_mailbox_view::fallback_metadata(
+                                gluon_rs_mail::metadata_parse::fallback_metadata(
                                     &scoped_mailbox,
                                     &message,
                                 )
@@ -1951,7 +1952,7 @@ where
                 if let Ok(Some(internal_id)) = ss.message_internal_id_by_uid(mb_id, uid.value()) {
                     let previous_flags =
                         ss.message_flags_by_internal_id(&internal_id).map_err(|e| {
-                            super::ImapError::Protocol(format!("store session flags: {e}"))
+                            crate::imap::ImapError::Protocol(format!("store session flags: {e}"))
                         })?;
                     let had_seen = previous_flags.iter().any(|flag| flag == "\\Seen");
                     let had_flagged = previous_flags.iter().any(|flag| flag == "\\Flagged");
@@ -1960,7 +1961,7 @@ where
                         StoreAction::SetFlags | StoreAction::SetFlagsSilent => {
                             ss.set_message_flags(&internal_id, &flag_strings)
                                 .map_err(|e| {
-                                    super::ImapError::Protocol(format!(
+                                    crate::imap::ImapError::Protocol(format!(
                                         "store session set_flags: {e}"
                                     ))
                                 })?;
@@ -1968,7 +1969,7 @@ where
                         StoreAction::AddFlags | StoreAction::AddFlagsSilent => {
                             ss.add_message_flags(&internal_id, &flag_strings)
                                 .map_err(|e| {
-                                    super::ImapError::Protocol(format!(
+                                    crate::imap::ImapError::Protocol(format!(
                                         "store session add_flags: {e}"
                                     ))
                                 })?;
@@ -1976,7 +1977,7 @@ where
                         StoreAction::RemoveFlags | StoreAction::RemoveFlagsSilent => {
                             ss.remove_message_flags(&internal_id, &flag_strings)
                                 .map_err(|e| {
-                                    super::ImapError::Protocol(format!(
+                                    crate::imap::ImapError::Protocol(format!(
                                         "store session remove_flags: {e}"
                                     ))
                                 })?;
@@ -1988,7 +1989,9 @@ where
                         {
                             let current_flags =
                                 ss.message_flags_by_internal_id(&internal_id).map_err(|e| {
-                                    super::ImapError::Protocol(format!("store session flags: {e}"))
+                                    crate::imap::ImapError::Protocol(format!(
+                                        "store session flags: {e}"
+                                    ))
                                 })?;
                             let has_seen = current_flags.iter().any(|flag| flag == "\\Seen");
                             let has_flagged = current_flags.iter().any(|flag| flag == "\\Flagged");
@@ -2051,7 +2054,9 @@ where
                             .unwrap_or(0);
                         let current_flags =
                             ss.message_flags_by_internal_id(&internal_id).map_err(|e| {
-                                super::ImapError::Protocol(format!("store session flags: {e}"))
+                                crate::imap::ImapError::Protocol(format!(
+                                    "store session flags: {e}"
+                                ))
                             })?;
                         let flag_str = current_flags.join(" ");
                         let fetch_items = if uid_mode {
@@ -3557,12 +3562,12 @@ async fn resolve_mailbox_internal_id(
 async fn select_data_from_session(
     session: &mut gluon_rs_mail::StoreSession,
     mailbox_internal_id: u64,
-) -> Result<super::store::SelectMailboxData> {
-    use super::store::{MailboxSnapshot, MailboxStatus, SelectMailboxData};
+) -> Result<gluon_rs_mail::imap_store::SelectMailboxData> {
+    use gluon_rs_mail::imap_store::{MailboxSnapshot, MailboxStatus, SelectMailboxData};
 
     let select = session
         .mailbox_select_data(mailbox_internal_id)
-        .map_err(|e| super::ImapError::Protocol(format!("store session select: {e}")))?;
+        .map_err(|e| crate::imap::ImapError::Protocol(format!("store session select: {e}")))?;
 
     let count = select.entries.len() as u32;
     let mut unseen = 0u32;

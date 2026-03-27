@@ -2067,6 +2067,7 @@ dependencies = [
 name = "gluon-rs-mail"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "gluon-rs-core",
  "mailparse",
@@ -2079,6 +2080,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

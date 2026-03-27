@@ -30,24 +30,6 @@ impl GluonMailMailboxView {
             .unwrap_or(account_id)
     }
 
-    async fn mailbox_by_name(
-        &self,
-        storage_user_id: &str,
-        mailbox_name: &str,
-    ) -> Result<Option<UpstreamMailbox>> {
-        match self.store.list_upstream_mailboxes(storage_user_id) {
-            Ok(mailboxes) => Ok(mailboxes
-                .into_iter()
-                .find(|mailbox| mailbox.name.eq_ignore_ascii_case(mailbox_name))),
-            Err(gluon_rs_mail::GluonError::IncompatibleSchema { family })
-                if family == "Missing" =>
-            {
-                Ok(None)
-            }
-            Err(err) => Err(map_mail_error(err)),
-        }
-    }
-
     fn resolve_parts(mailbox: &ScopedMailboxId) -> (&str, &str) {
         let account_id = mailbox.account_id().unwrap_or("__default__");
         let name = mailbox.mailbox_name();
@@ -59,14 +41,11 @@ impl GluonMailMailboxView {
         &self,
         mailbox: &ScopedMailboxId,
     ) -> Result<Option<UpstreamMailboxSnapshot>> {
-        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
-        let storage_user_id = self.storage_user_id_for_account(account_id);
-        let Some(mailbox) = self.mailbox_by_name(storage_user_id, mailbox_name).await? else {
+        let Some((storage_user_id, mb_id)) = self.resolve_mailbox_parts(mailbox)? else {
             return Ok(None);
         };
-
         self.store
-            .mailbox_snapshot(storage_user_id, mailbox.internal_id)
+            .mailbox_snapshot(&storage_user_id, mb_id)
             .map(Some)
             .map_err(map_mail_error)
     }
@@ -89,16 +68,14 @@ impl GluonMailMailboxView {
         parsed.unwrap_or_else(|| fallback_metadata(mailbox, message))
     }
 
-    async fn resolve_mailbox_parts(
-        &self,
-        mailbox: &ScopedMailboxId,
-    ) -> Result<Option<(String, u64)>> {
+    fn resolve_mailbox_parts(&self, mailbox: &ScopedMailboxId) -> Result<Option<(String, u64)>> {
         let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
         let storage_user_id = self.storage_user_id_for_account(account_id).to_string();
-        let Some(mb) = self.mailbox_by_name(&storage_user_id, mailbox_name).await? else {
-            return Ok(None);
-        };
-        Ok(Some((storage_user_id, mb.internal_id)))
+        let mb_id = self
+            .store
+            .resolve_mailbox_id(&storage_user_id, mailbox_name)
+            .map_err(map_mail_error)?;
+        Ok(mb_id.map(|id| (storage_user_id, id)))
     }
 }
 
@@ -109,8 +86,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
     ) -> Result<Option<MessageEnvelope>> {
-        let Some((storage_user_id, mailbox_internal_id)) =
-            self.resolve_mailbox_parts(mailbox).await?
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
         else {
             return Ok(None);
         };
@@ -129,8 +105,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         mailbox: &ScopedMailboxId,
         uid: ImapUid,
     ) -> Result<Option<String>> {
-        let Some((storage_user_id, mailbox_internal_id)) =
-            self.resolve_mailbox_parts(mailbox).await?
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
         else {
             return Ok(None);
         };
@@ -156,8 +131,7 @@ impl GluonMailboxView for GluonMailMailboxView {
     }
 
     async fn get_rfc822(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Option<Vec<u8>>> {
-        let Some((storage_user_id, mailbox_internal_id)) =
-            self.resolve_mailbox_parts(mailbox).await?
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
         else {
             return Ok(None);
         };
@@ -226,8 +200,7 @@ impl GluonMailboxView for GluonMailMailboxView {
     }
 
     async fn get_flags(&self, mailbox: &ScopedMailboxId, uid: ImapUid) -> Result<Vec<String>> {
-        let Some((storage_user_id, mailbox_internal_id)) =
-            self.resolve_mailbox_parts(mailbox).await?
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
         else {
             return Ok(Vec::new());
         };
@@ -271,9 +244,7 @@ impl GluonMailboxView for GluonMailMailboxView {
     }
 
     async fn select_mailbox_data(&self, mailbox: &ScopedMailboxId) -> Result<SelectMailboxData> {
-        let (account_id, mailbox_name) = Self::resolve_parts(mailbox);
-        let storage_user_id = self.storage_user_id_for_account(account_id);
-        let Some(mb) = self.mailbox_by_name(storage_user_id, mailbox_name).await? else {
+        let Some((storage_user_id, mb_internal_id)) = self.resolve_mailbox_parts(mailbox)? else {
             return Ok(SelectMailboxData {
                 status: MailboxStatus {
                     uid_validity: 1,
@@ -293,7 +264,7 @@ impl GluonMailboxView for GluonMailMailboxView {
 
         let select = self
             .store
-            .mailbox_select_data(storage_user_id, mb.internal_id)
+            .mailbox_select_data(&storage_user_id, mb_internal_id)
             .map_err(map_mail_error)?;
 
         let count = select.entries.len() as u32;
@@ -346,8 +317,7 @@ impl GluonMailboxView for GluonMailMailboxView {
         &self,
         mailbox: &ScopedMailboxId,
     ) -> Result<SelectMailboxData> {
-        let Some((storage_user_id, mailbox_internal_id)) =
-            self.resolve_mailbox_parts(mailbox).await?
+        let Some((storage_user_id, mailbox_internal_id)) = self.resolve_mailbox_parts(mailbox)?
         else {
             return Ok(SelectMailboxData {
                 status: MailboxStatus {

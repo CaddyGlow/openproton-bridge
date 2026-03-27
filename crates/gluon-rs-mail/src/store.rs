@@ -107,6 +107,8 @@ pub struct CompatibleStore {
     bootstrap: StoreBootstrap,
     accounts_by_storage_user_id: HashMap<String, AccountBootstrap>,
     connections: Arc<Mutex<HashMap<String, ConnHandle>>>,
+    /// Cache: (storage_user_id, mailbox_name_lower) -> internal_id.
+    mailbox_id_cache: Arc<Mutex<HashMap<(String, String), u64>>>,
 }
 
 impl CompatibleStore {
@@ -146,6 +148,7 @@ impl CompatibleStore {
             bootstrap,
             accounts_by_storage_user_id,
             connections: Arc::new(Mutex::new(HashMap::new())),
+            mailbox_id_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -215,6 +218,44 @@ impl CompatibleStore {
         let mut conns = self.connections.lock().unwrap_or_else(|e| e.into_inner());
         conns.insert(storage_user_id.to_string(), handle.clone());
         Ok(handle)
+    }
+
+    /// Fast mailbox name -> internal_id resolution with caching.
+    /// Avoids scanning mailboxes_v2 on every operation.
+    pub fn resolve_mailbox_id(
+        &self,
+        storage_user_id: &str,
+        mailbox_name: &str,
+    ) -> Result<Option<u64>> {
+        let key = (
+            storage_user_id.to_string(),
+            mailbox_name.to_ascii_lowercase(),
+        );
+        if let Ok(cache) = self.mailbox_id_cache.lock() {
+            if let Some(&id) = cache.get(&key) {
+                return Ok(Some(id));
+            }
+        }
+        // Cache miss: scan DB
+        let mailboxes = self.list_upstream_mailboxes(storage_user_id)?;
+        let mut found = None;
+        if let Ok(mut cache) = self.mailbox_id_cache.lock() {
+            for mb in &mailboxes {
+                let k = (storage_user_id.to_string(), mb.name.to_ascii_lowercase());
+                cache.insert(k, mb.internal_id);
+                if mb.name.eq_ignore_ascii_case(mailbox_name) {
+                    found = Some(mb.internal_id);
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    /// Invalidate cached mailbox ids for an account (after create/delete/rename).
+    pub fn invalidate_mailbox_cache(&self, storage_user_id: &str) {
+        if let Ok(mut cache) = self.mailbox_id_cache.lock() {
+            cache.retain(|(uid, _), _| uid != storage_user_id);
+        }
     }
 
     pub fn schema_probe(&self, storage_user_id: &str) -> Result<SchemaProbe> {

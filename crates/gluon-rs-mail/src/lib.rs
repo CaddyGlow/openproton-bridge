@@ -1,3 +1,4 @@
+pub mod blob_store;
 pub mod db;
 pub mod error;
 pub mod store;
@@ -19,6 +20,7 @@ pub mod server;
 pub mod session;
 pub mod well_known;
 
+pub use blob_store::{BlobStore, FilesystemBlobStore};
 pub use db::{SchemaFamily, SchemaProbe};
 pub use error::{GluonError, Result};
 pub use gluon_rs_core::{
@@ -26,9 +28,9 @@ pub use gluon_rs_core::{
     GluonCoreError, GluonKey,
 };
 pub use store::{
-    CompatibleStore, ConnHandle, DeletedSubscription, NewMailbox, NewMessage, SelectSnapshot,
-    SelectSnapshotEntry, StoreSession, UpstreamMailbox, UpstreamMailboxMessage,
-    UpstreamMailboxSnapshot, UpstreamMessageSummary,
+    CompatibleStore, ConnHandle, ConnectionProvider, DefaultSqliteProvider, DeletedSubscription,
+    NewMailbox, NewMessage, SelectSnapshot, SelectSnapshotEntry, StoreSession, UpstreamMailbox,
+    UpstreamMailboxMessage, UpstreamMailboxSnapshot, UpstreamMessageSummary,
 };
 pub use target::CompatibilityTarget;
 pub use types::StoreBootstrap;
@@ -44,8 +46,8 @@ pub use imap_store::{
     SelectMailboxData, StoreEvent, StoreEventKind,
 };
 pub use imap_types::{
-    EmailAddress, ImapUid, MailboxInfo, MailboxVisibility, MessageEnvelope, MessageId,
-    ScopedMailboxId,
+    EmailAddress, ImapLimits, ImapUid, MailboxInfo, MailboxVisibility, MessageEnvelope, MessageId,
+    ScopedMailboxId, SessionEvent,
 };
 pub use mailbox::{
     find_mailbox, message_flags, system_mailboxes, GluonMailboxCatalog, ImapMailbox,

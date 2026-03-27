@@ -85,6 +85,11 @@ pub struct SessionConfig {
     pub mailbox_view: Arc<dyn GluonMailboxView>,
     pub recent_tracker: Arc<RecentTracker>,
     pub shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    pub event_tx: Option<tokio::sync::broadcast::Sender<crate::imap_types::SessionEvent>>,
+    pub delimiter: char,
+    pub login_jail_time: Duration,
+    pub idle_bulk_time: Duration,
+    pub limits: crate::imap_types::ImapLimits,
 }
 
 static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -159,6 +164,14 @@ where
             .await
     }
 
+    fn emit_close_event(&self) {
+        if let Some(tx) = &self.config.event_tx {
+            let _ = tx.send(crate::imap_types::SessionEvent::Close {
+                session_id: self.connection_id,
+            });
+        }
+    }
+
     pub async fn run(&mut self) -> Result<SessionAction> {
         self.run_inner(true).await
     }
@@ -181,12 +194,14 @@ where
                     biased;
                     _ = shutdown_rx.changed() => {
                         self.writer.untagged("BYE server shutting down").await?;
+                        self.emit_close_event();
                         return Ok(SessionAction::Close);
                     }
                     result = self.reader.read_line(&mut line) => {
                         let n = result?;
                         if n == 0 {
                             debug!(connection_id = self.connection_id, "client disconnected");
+                            self.emit_close_event();
                             return Ok(SessionAction::Close);
                         }
                     }
@@ -195,8 +210,17 @@ where
                 let n = self.reader.read_line(&mut line).await?;
                 if n == 0 {
                     debug!(connection_id = self.connection_id, "client disconnected");
+                    self.emit_close_event();
                     return Ok(SessionAction::Close);
                 }
+            }
+
+            if line.len() > self.config.limits.max_command_length {
+                let tag = line.split_whitespace().next().unwrap_or("*").to_string();
+                self.writer
+                    .tagged_bad(&tag, "command exceeds maximum length")
+                    .await?;
+                continue;
             }
 
             let line = line.trim_end().to_string();
@@ -215,7 +239,10 @@ where
             match self.handle_line(&line).await? {
                 SessionAction::Continue => {}
                 SessionAction::StartTls => return Ok(SessionAction::StartTls),
-                SessionAction::Close => return Ok(SessionAction::Close),
+                SessionAction::Close => {
+                    self.emit_close_event();
+                    return Ok(SessionAction::Close);
+                }
             }
         }
     }
@@ -386,6 +413,9 @@ where
         let auth_result = match self.config.connector.authorize(username, password).await {
             Ok(r) => r,
             Err(crate::imap_error::ImapError::AuthFailed) => {
+                if self.config.login_jail_time > Duration::ZERO {
+                    tokio::time::sleep(self.config.login_jail_time).await;
+                }
                 return self
                     .writer
                     .tagged_no(tag, "[AUTHENTICATIONFAILED] invalid credentials")
@@ -393,6 +423,9 @@ where
             }
             Err(e) => {
                 warn!(error = %e, "connector authorize failed");
+                if self.config.login_jail_time > Duration::ZERO {
+                    tokio::time::sleep(self.config.login_jail_time).await;
+                }
                 return self
                     .writer
                     .tagged_no(tag, &format!("login failed: {e}"))
@@ -431,6 +464,14 @@ where
             Err(e) => {
                 warn!(error = %e, "failed to acquire pinned store session, falling back to pool");
             }
+        }
+
+        if let Some(tx) = &self.config.event_tx {
+            let _ = tx.send(crate::imap_types::SessionEvent::Login {
+                session_id: self.connection_id,
+                account_id: auth_result.account_id.clone(),
+                email: auth_result.primary_email.clone(),
+            });
         }
 
         info!(
@@ -516,6 +557,11 @@ where
     }
 
     async fn cmd_logout(&mut self, tag: &str) -> Result<()> {
+        if let Some(tx) = &self.config.event_tx {
+            let _ = tx.send(crate::imap_types::SessionEvent::Logout {
+                session_id: self.connection_id,
+            });
+        }
         self.writer.untagged("BYE server logging out").await?;
         self.state = State::Logout;
         self.authenticated_account_id = None;
@@ -550,20 +596,24 @@ where
         self.writer.continuation("idling").await?;
         self.emit_selected_mailbox_exists_update().await?;
 
-        let idle_deadline = tokio::time::Instant::now() + IDLE_TIMEOUT;
+        let idle_deadline = tokio::time::Instant::now() + self.config.limits.idle_timeout;
         let idle_timeout = tokio::time::sleep_until(idle_deadline);
         tokio::pin!(idle_timeout);
+        let bulk_time = self.config.idle_bulk_time;
 
         loop {
             let mut line = String::new();
             tokio::select! {
                 _ = &mut idle_timeout => {
-                    debug!("IDLE timeout after 30 minutes");
+                    debug!("IDLE timeout");
                     break;
                 }
                 update = update_rx.recv() => {
                     match update {
                         Ok(update) if update.affects_scoped_mailbox(&scoped_mailbox) => {
+                            if bulk_time > Duration::ZERO {
+                                tokio::time::sleep(bulk_time).await;
+                            }
                             self.emit_selected_mailbox_exists_update().await?;
                         }
                         Ok(_) => {}
@@ -804,14 +854,18 @@ where
         Ok(())
     }
 
-    fn matches_list_pattern(name: &str, pattern: &str) -> bool {
+    fn matches_list_pattern(&self, name: &str, pattern: &str) -> bool {
         // RFC 3501 6.3.8 wildcard matching:
         //   '*' matches zero or more characters (including hierarchy separator)
-        //   '%' matches zero or more characters but not hierarchy separator '/'
-        Self::glob_match(name.as_bytes(), pattern.as_bytes())
+        //   '%' matches zero or more characters but not hierarchy separator
+        Self::glob_match(
+            name.as_bytes(),
+            pattern.as_bytes(),
+            self.config.delimiter as u8,
+        )
     }
 
-    fn glob_match(name: &[u8], pattern: &[u8]) -> bool {
+    fn glob_match(name: &[u8], pattern: &[u8], delimiter: u8) -> bool {
         let mut ni = 0;
         let mut pi = 0;
         let mut star_pi = usize::MAX;
@@ -819,7 +873,7 @@ where
 
         while ni < name.len() {
             if pi < pattern.len()
-                && (pattern[pi] == b'*' || (pattern[pi] == b'%' && name[ni] != b'/'))
+                && (pattern[pi] == b'*' || (pattern[pi] == b'%' && name[ni] != delimiter))
             {
                 if pattern[pi] == b'*' {
                     star_pi = pi;
@@ -846,9 +900,9 @@ where
             if star_pi != usize::MAX {
                 pi = star_pi + 1;
                 star_ni += 1;
-                // For '%', cannot skip over '/'
+                // For '%', cannot skip over delimiter
                 if pattern[star_pi] == b'%' && star_ni <= name.len() {
-                    if star_ni > 0 && name[star_ni - 1] == b'/' {
+                    if star_ni > 0 && name[star_ni - 1] == delimiter {
                         return false;
                     }
                 }
@@ -865,7 +919,7 @@ where
         pi == pattern.len()
     }
 
-    fn format_list_entry(kind: &str, mb: &mailbox::ResolvedMailbox) -> String {
+    fn format_list_entry(&self, kind: &str, mb: &mailbox::ResolvedMailbox) -> String {
         let mut attrs = Vec::new();
         if !mb.selectable {
             attrs.push("\\Noselect".to_string());
@@ -874,7 +928,8 @@ where
             attrs.push(su.clone());
         }
         let attr_str = attrs.join(" ");
-        format!("{kind} ({attr_str}) \"/\" \"{name}\"", name = mb.name)
+        let delim = self.config.delimiter;
+        format!("{kind} ({attr_str}) \"{delim}\" \"{name}\"", name = mb.name)
     }
 
     async fn cmd_list(&mut self, tag: &str, reference: &str, pattern: &str) -> Result<()> {
@@ -926,7 +981,7 @@ where
             // Emit real mailboxes, filtering by visibility
             let account_id = self.authenticated_account_id.clone().unwrap_or_default();
             for mb in &all {
-                if Self::matches_list_pattern(&mb.name, &full_pattern) {
+                if self.matches_list_pattern(&mb.name, &full_pattern) {
                     let vis = self
                         .config
                         .connector
@@ -944,16 +999,19 @@ where
                         crate::imap_types::MailboxVisibility::Visible => {}
                     }
                     self.writer
-                        .untagged(&Self::format_list_entry("LIST", mb))
+                        .untagged(&self.format_list_entry("LIST", mb))
                         .await?;
                 }
             }
 
             // Emit parent-only \Noselect entries
             for parent in &parents {
-                if Self::matches_list_pattern(parent, &full_pattern) {
+                if self.matches_list_pattern(parent, &full_pattern) {
                     self.writer
-                        .untagged(&format!("LIST (\\Noselect) \"/\" \"{}\"", parent))
+                        .untagged(&format!(
+                            "LIST (\\Noselect) \"{}\" \"{}\"",
+                            self.config.delimiter, parent
+                        ))
                         .await?;
                 }
             }
@@ -991,9 +1049,9 @@ where
                 }
             }
             for mb in all {
-                if Self::matches_list_pattern(&mb.name, &full_pattern) {
+                if self.matches_list_pattern(&mb.name, &full_pattern) {
                     self.writer
-                        .untagged(&Self::format_list_entry("LSUB", &mb))
+                        .untagged(&self.format_list_entry("LSUB", &mb))
                         .await?;
                 }
             }
@@ -1344,6 +1402,13 @@ where
         self.selected_mailbox_flags = select_data.flags;
         self.selected_read_only = false;
         self.state = State::Selected;
+
+        if let Some(tx) = &self.config.event_tx {
+            let _ = tx.send(crate::imap_types::SessionEvent::Select {
+                session_id: self.connection_id,
+                mailbox: mb.name.to_string(),
+            });
+        }
 
         info!(
             service = "imap",
@@ -2909,6 +2974,18 @@ where
                     .await;
             }
         };
+
+        if literal_size as usize > self.config.limits.max_message_size {
+            self.writer.continuation("Ready").await?;
+            let mut discard = vec![0u8; literal_size as usize];
+            tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut discard).await?;
+            let mut crlf = [0u8; 2];
+            let _ = tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut crlf).await;
+            return self
+                .writer
+                .tagged_no(tag, "message exceeds maximum allowed size")
+                .await;
+        }
 
         if !mb.selectable {
             self.writer.continuation("Ready").await?;

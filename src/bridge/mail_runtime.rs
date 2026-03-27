@@ -570,6 +570,11 @@ async fn prepare_runtime_context(
         mailbox_view,
         recent_tracker: imap::session::RecentTracker::new(),
         shutdown_rx: None,
+        event_tx: None,
+        delimiter: '/',
+        login_jail_time: std::time::Duration::ZERO,
+        idle_bulk_time: std::time::Duration::ZERO,
+        limits: gluon_rs_mail::ImapLimits::default(),
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {

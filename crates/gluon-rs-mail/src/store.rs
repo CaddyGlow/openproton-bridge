@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use gluon_rs_core::{
@@ -7,10 +8,39 @@ use gluon_rs_core::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 use crate::{
+    blob_store::{BlobStore, FilesystemBlobStore},
     db::SchemaProbe,
     error::{GluonError, Result},
     types::StoreBootstrap,
 };
+
+pub trait ConnectionProvider: Send + Sync {
+    fn open_connection(&self, db_path: &Path) -> Result<Connection>;
+    fn configure(&self, conn: &Connection) -> Result<()>;
+}
+
+pub struct DefaultSqliteProvider;
+
+impl ConnectionProvider for DefaultSqliteProvider {
+    fn open_connection(&self, db_path: &Path) -> Result<Connection> {
+        Ok(Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?)
+    }
+
+    fn configure(&self, conn: &Connection) -> Result<()> {
+        conn.pragma_update(None, "journal_mode", "wal")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.pragma_update(None, "cache_size", -8000)?;
+        conn.pragma_update(None, "mmap_size", 67_108_864)?;
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamMailbox {
@@ -102,13 +132,27 @@ pub struct DeletedSubscription {
 /// Callers that previously accepted `&SqlitePool` now accept `&ConnHandle`.
 pub type ConnHandle = Arc<Mutex<Connection>>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompatibleStore {
     bootstrap: StoreBootstrap,
     accounts_by_storage_user_id: HashMap<String, AccountBootstrap>,
     connections: Arc<Mutex<HashMap<String, ConnHandle>>>,
     /// Cache: (storage_user_id, mailbox_name_lower) -> internal_id.
     mailbox_id_cache: Arc<Mutex<HashMap<(String, String), u64>>>,
+    provider: Arc<dyn ConnectionProvider>,
+    blob_stores: Arc<Mutex<HashMap<String, Arc<dyn BlobStore>>>>,
+}
+
+impl std::fmt::Debug for CompatibleStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompatibleStore")
+            .field("bootstrap", &self.bootstrap)
+            .field(
+                "accounts_by_storage_user_id",
+                &self.accounts_by_storage_user_id,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompatibleStore {
@@ -121,6 +165,14 @@ impl CompatibleStore {
     }
 
     fn open_with_mode(bootstrap: StoreBootstrap, create_dirs: bool) -> Result<Self> {
+        Self::open_with_mode_and_provider(bootstrap, create_dirs, Arc::new(DefaultSqliteProvider))
+    }
+
+    fn open_with_mode_and_provider(
+        bootstrap: StoreBootstrap,
+        create_dirs: bool,
+        provider: Arc<dyn ConnectionProvider>,
+    ) -> Result<Self> {
         bootstrap.validate()?;
         if create_dirs {
             bootstrap.layout.ensure_base_dirs()?;
@@ -133,6 +185,7 @@ impl CompatibleStore {
         }
 
         let mut accounts_by_storage_user_id = HashMap::new();
+        let mut blob_stores_map: HashMap<String, Arc<dyn BlobStore>> = HashMap::new();
         for account in &bootstrap.accounts {
             let account_paths = bootstrap
                 .layout
@@ -140,6 +193,14 @@ impl CompatibleStore {
             if create_dirs {
                 std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
             }
+
+            blob_stores_map.insert(
+                account.storage_user_id.clone(),
+                Arc::new(FilesystemBlobStore::new(
+                    account_paths.store_dir().to_path_buf(),
+                    account.key.clone(),
+                )),
+            );
 
             accounts_by_storage_user_id.insert(account.storage_user_id.clone(), account.clone());
         }
@@ -149,7 +210,44 @@ impl CompatibleStore {
             accounts_by_storage_user_id,
             connections: Arc::new(Mutex::new(HashMap::new())),
             mailbox_id_cache: Arc::new(Mutex::new(HashMap::new())),
+            provider,
+            blob_stores: Arc::new(Mutex::new(blob_stores_map)),
         })
+    }
+
+    pub fn open_with_provider(
+        bootstrap: StoreBootstrap,
+        provider: Arc<dyn ConnectionProvider>,
+    ) -> Result<Self> {
+        Self::open_with_mode_and_provider(bootstrap, true, provider)
+    }
+
+    pub fn blob_store_for(&self, storage_user_id: &str) -> Arc<dyn BlobStore> {
+        let stores = self.blob_stores.lock().unwrap_or_else(|e| e.into_inner());
+        stores.get(storage_user_id).cloned().unwrap_or_else(|| {
+            // Fallback: create a filesystem blob store on the fly
+            let account_paths = self
+                .bootstrap
+                .layout
+                .account_paths(storage_user_id)
+                .expect("account paths");
+            let account = self
+                .accounts_by_storage_user_id
+                .get(storage_user_id)
+                .expect("account");
+            Arc::new(FilesystemBlobStore::new(
+                account_paths.store_dir().to_path_buf(),
+                account.key.clone(),
+            ))
+        })
+    }
+
+    pub fn with_blob_store(self, storage_user_id: &str, store: Arc<dyn BlobStore>) -> Self {
+        {
+            let mut stores = self.blob_stores.lock().unwrap_or_else(|e| e.into_inner());
+            stores.insert(storage_user_id.to_string(), store);
+        }
+        self
     }
 
     pub fn bootstrap(&self) -> &StoreBootstrap {
@@ -187,19 +285,8 @@ impl CompatibleStore {
         let account_paths = self.account_paths(storage_user_id)?;
         let db_path = account_paths.primary_db_path();
 
-        let conn = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-
-        conn.pragma_update(None, "journal_mode", "wal")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "busy_timeout", 5000)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "cache_size", -8000)?;
-        conn.pragma_update(None, "mmap_size", 67_108_864)?;
+        let conn = self.provider.open_connection(&db_path)?;
+        self.provider.configure(&conn)?;
 
         // Initialize schema.
         for stmt in UPSTREAM_SCHEMA_STATEMENTS {
@@ -339,11 +426,8 @@ impl CompatibleStore {
         message: &NewMessage,
     ) -> Result<UpstreamMessageSummary> {
         self.initialize_upstream_schema(storage_user_id)?;
-        let account_paths = self.account_paths(storage_user_id)?;
-        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
-        let blob_path = account_paths.blob_path(&message.internal_id)?;
-        let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
-        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+        self.blob_store_for(storage_user_id)
+            .set(&message.internal_id, &message.blob)?;
 
         let handle = self.conn_for(storage_user_id)?;
         let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -399,11 +483,8 @@ impl CompatibleStore {
         size: i64,
     ) -> Result<()> {
         self.initialize_upstream_schema(storage_user_id)?;
-        let account_paths = self.account_paths(storage_user_id)?;
-        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
-        let blob_path = account_paths.blob_path(internal_message_id)?;
-        let encoded = encode_blob(&self.account(storage_user_id)?.key, blob)?;
-        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+        self.blob_store_for(storage_user_id)
+            .set(internal_message_id, blob)?;
 
         let handle = self.conn_for(storage_user_id)?;
         let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -581,11 +662,8 @@ impl CompatibleStore {
         internal_message_id: &str,
         message: &NewMessage,
     ) -> Result<()> {
-        let account_paths = self.account_paths(storage_user_id)?;
-        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
-        let blob_path = account_paths.blob_path(internal_message_id)?;
-        let encoded = encode_blob(&self.account(storage_user_id)?.key, &message.blob)?;
-        std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+        self.blob_store_for(storage_user_id)
+            .set(internal_message_id, &message.blob)?;
 
         let handle = self.conn_for(storage_user_id)?;
         let conn = handle.lock().unwrap_or_else(|e| e.into_inner());
@@ -790,10 +868,8 @@ impl CompatibleStore {
         storage_user_id: &str,
         internal_message_id: &str,
     ) -> Result<Vec<u8>> {
-        let account_paths = self.account_paths(storage_user_id)?;
-        let encoded = std::fs::read(account_paths.blob_path(internal_message_id)?)
-            .map_err(GluonCoreError::from)?;
-        Ok(decode_blob(&self.account(storage_user_id)?.key, &encoded)?)
+        self.blob_store_for(storage_user_id)
+            .get(internal_message_id)
     }
 
     pub fn mailbox_snapshot(
@@ -1216,14 +1292,10 @@ impl CompatibleStore {
             return Ok(Vec::new());
         }
 
-        let account_paths = self.account_paths(storage_user_id)?;
-        let account = self.account(storage_user_id)?;
-        std::fs::create_dir_all(account_paths.store_dir()).map_err(GluonCoreError::from)?;
+        let blob_store = self.blob_store_for(storage_user_id);
 
         for message in messages {
-            let blob_path = account_paths.blob_path(&message.internal_id)?;
-            let encoded = encode_blob(&account.key, &message.blob)?;
-            std::fs::write(&blob_path, encoded).map_err(GluonCoreError::from)?;
+            blob_store.set(&message.internal_id, &message.blob)?;
         }
 
         {

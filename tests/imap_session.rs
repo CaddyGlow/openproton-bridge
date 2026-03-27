@@ -282,6 +282,11 @@ fn with_failing_connector(
         mailbox_view: config.mailbox_view.clone(),
         recent_tracker: config.recent_tracker.clone(),
         shutdown_rx: None,
+        event_tx: None,
+        delimiter: '/',
+        login_jail_time: Duration::ZERO,
+        idle_bulk_time: Duration::ZERO,
+        limits: gluon_rs_mail::imap_types::ImapLimits::default(),
     })
 }
 
@@ -341,6 +346,11 @@ fn test_gluon_config() -> (
         mailbox_view: GluonMailMailboxView::new(gluon_store),
         recent_tracker: RecentTracker::new(),
         shutdown_rx: None,
+        event_tx: None,
+        delimiter: '/',
+        login_jail_time: Duration::ZERO,
+        idle_bulk_time: Duration::ZERO,
+        limits: gluon_rs_mail::imap_types::ImapLimits::default(),
     });
     (config, tempdir, auth_router, runtime_accounts)
 }
@@ -424,6 +434,11 @@ async fn test_gluon_mail_config() -> (
         mailbox_view: GluonMailMailboxView::new(gluon_store),
         recent_tracker: RecentTracker::new(),
         shutdown_rx: None,
+        event_tx: None,
+        delimiter: '/',
+        login_jail_time: Duration::ZERO,
+        idle_bulk_time: Duration::ZERO,
+        limits: gluon_rs_mail::imap_types::ImapLimits::default(),
     });
 
     (config, tempdir, auth_router, runtime_accounts)
@@ -590,6 +605,11 @@ fn multi_account_compat_config(
         mailbox_view: GluonMailMailboxView::new(gluon_store),
         recent_tracker: RecentTracker::new(),
         shutdown_rx: None,
+        event_tx: None,
+        delimiter: '/',
+        login_jail_time: Duration::ZERO,
+        idle_bulk_time: Duration::ZERO,
+        limits: gluon_rs_mail::imap_types::ImapLimits::default(),
     });
     (config, tempdir, auth_router, runtime_accounts)
 }

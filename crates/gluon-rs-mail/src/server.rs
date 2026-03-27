@@ -1,13 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
+
+use crate::imap_types::SessionEvent;
 
 use crate::imap_error::ImapResult as Result;
 use crate::session::{ImapSession, SessionAction, SessionConfig};
@@ -355,16 +358,25 @@ pub struct GluonServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    event_tx: tokio::sync::broadcast::Sender<SessionEvent>,
+    connections_total: Arc<AtomicU64>,
+    connection_times: Arc<Mutex<VecDeque<Instant>>>,
+    panic_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 impl GluonServer {
     pub fn new(config: Arc<SessionConfig>) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let (event_tx, _) = tokio::sync::broadcast::channel(256);
         Self {
             default_config: config,
             tls_config: None,
             shutdown_tx,
             shutdown_rx,
+            event_tx,
+            connections_total: Arc::new(AtomicU64::new(0)),
+            connection_times: Arc::new(Mutex::new(VecDeque::new())),
+            panic_handler: None,
         }
     }
 
@@ -372,6 +384,30 @@ impl GluonServer {
         let server = ImapServer::new().with_tls(cert_dir)?;
         self.tls_config = server.tls_config();
         Ok(self)
+    }
+
+    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
+        self.event_tx.subscribe()
+    }
+
+    pub fn get_total_connections(&self) -> u64 {
+        self.connections_total.load(Ordering::Relaxed)
+    }
+
+    pub fn get_rolling_connection_count(&self, window: Duration) -> usize {
+        let times = self.connection_times.try_lock();
+        match times {
+            Ok(times) => {
+                let cutoff = Instant::now() - window;
+                times.iter().filter(|t| **t >= cutoff).count()
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub fn with_panic_handler(mut self, handler: impl Fn(String) + Send + Sync + 'static) -> Self {
+        self.panic_handler = Some(Arc::new(handler));
+        self
     }
 
     /// Returns a config with the shutdown receiver injected.
@@ -384,6 +420,11 @@ impl GluonServer {
             mailbox_view: self.default_config.mailbox_view.clone(),
             recent_tracker: self.default_config.recent_tracker.clone(),
             shutdown_rx: Some(self.shutdown_rx.clone()),
+            event_tx: Some(self.event_tx.clone()),
+            delimiter: self.default_config.delimiter,
+            login_jail_time: self.default_config.login_jail_time,
+            idle_bulk_time: self.default_config.idle_bulk_time,
+            limits: self.default_config.limits.clone(),
         })
     }
 
@@ -434,16 +475,61 @@ impl GluonServer {
                         "new GluonServer connection"
                     );
 
+                    self.connections_total.fetch_add(1, Ordering::Relaxed);
+                    {
+                        let mut times = self.connection_times.lock().await;
+                        times.push_back(Instant::now());
+                        // Trim old entries beyond 1 hour
+                        let cutoff = Instant::now() - Duration::from_secs(3600);
+                        while times.front().map(|t| *t < cutoff).unwrap_or(false) {
+                            times.pop_front();
+                        }
+                    }
+
                     let config = config.clone();
                     let tls_config = tls_config.clone();
+                    let panic_handler = self.panic_handler.clone();
+                    let inner_handle = tokio::spawn(async move {
+                        handle_connection(stream, config, tls_config).await
+                    });
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, config, tls_config).await {
-                            error!(
-                                pkg = "imap/server",
-                                peer = %peer,
-                                error = %e,
-                                "connection error"
-                            );
+                        match inner_handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                error!(
+                                    pkg = "imap/server",
+                                    peer = %peer,
+                                    error = %e,
+                                    "connection error"
+                                );
+                            }
+                            Err(join_err) if join_err.is_panic() => {
+                                let panic_val = join_err.into_panic();
+                                let msg = if let Some(s) = panic_val.downcast_ref::<String>() {
+                                    s.clone()
+                                } else if let Some(s) = panic_val.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else {
+                                    "unknown panic".to_string()
+                                };
+                                error!(
+                                    pkg = "imap/server",
+                                    peer = %peer,
+                                    panic = %msg,
+                                    "session panicked"
+                                );
+                                if let Some(handler) = &panic_handler {
+                                    handler(msg);
+                                }
+                            }
+                            Err(join_err) => {
+                                error!(
+                                    pkg = "imap/server",
+                                    peer = %peer,
+                                    error = %join_err,
+                                    "session task cancelled"
+                                );
+                            }
                         }
                     });
                 }

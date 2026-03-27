@@ -112,6 +112,11 @@ fn build_session_config(data_dir: &std::path::Path) -> Arc<SessionConfig> {
         mailbox_view: GluonMailMailboxView::new(gluon_store),
         recent_tracker: openproton_bridge::imap::session::RecentTracker::new(),
         shutdown_rx: None,
+        event_tx: None,
+        delimiter: '/',
+        login_jail_time: std::time::Duration::ZERO,
+        idle_bulk_time: std::time::Duration::ZERO,
+        limits: gluon_rs_mail::imap_types::ImapLimits::default(),
     })
 }
 

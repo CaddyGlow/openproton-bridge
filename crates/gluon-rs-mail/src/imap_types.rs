@@ -135,6 +135,42 @@ pub struct MessageEnvelope {
     pub num_attachments: i32,
 }
 
+#[derive(Debug, Clone)]
+pub enum SessionEvent {
+    Login {
+        session_id: u64,
+        account_id: String,
+        email: String,
+    },
+    Logout {
+        session_id: u64,
+    },
+    Select {
+        session_id: u64,
+        mailbox: String,
+    },
+    Close {
+        session_id: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ImapLimits {
+    pub max_message_size: usize,
+    pub max_command_length: usize,
+    pub idle_timeout: std::time::Duration,
+}
+
+impl Default for ImapLimits {
+    fn default() -> Self {
+        Self {
+            max_message_size: 25 * 1024 * 1024,
+            max_command_length: 65536,
+            idle_timeout: std::time::Duration::from_secs(30 * 60),
+        }
+    }
+}
+
 /// Controls whether a mailbox appears in LIST responses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailboxVisibility {

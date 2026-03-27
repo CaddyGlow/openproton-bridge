@@ -1,99 +1,112 @@
+use mailparse::{MailHeaderMap, ParsedMail};
+
 use crate::imap_types::{EmailAddress, MessageEnvelope};
+
+/// Build an IMAP BODY response from RFC822 data.
+///
+/// Format per RFC 3501 section 7.4.2:
+/// Non-multipart: (type subtype (params) id desc encoding size [lines])
+/// Multipart: ((part1)(part2)... "subtype")
+pub fn build_body(data: &[u8]) -> String {
+    match mailparse::parse_mail(data) {
+        Ok(parsed) => build_body_from_parsed(&parsed),
+        Err(_) => simple_text_body(data.len()),
+    }
+}
+
+fn build_body_from_parsed(parsed: &ParsedMail) -> String {
+    let mime = &parsed.ctype.mimetype;
+
+    if mime.starts_with("multipart/") {
+        let subtype = mime.split('/').nth(1).unwrap_or("mixed").to_uppercase();
+        if parsed.subparts.is_empty() {
+            return simple_text_body(parsed.raw_bytes.len());
+        }
+        let parts: Vec<String> = parsed
+            .subparts
+            .iter()
+            .map(|p| build_body_from_parsed(p))
+            .collect();
+        format!("({} \"{}\")", parts.join(""), subtype)
+    } else if mime.starts_with("message/rfc822") {
+        let (type_main, subtype) = split_mime_type(mime);
+        let encoding = parsed_encoding(parsed);
+        let body_raw = body_bytes_of(parsed);
+        let body_size = body_raw.len();
+        let body_lines = count_lines(&body_raw);
+        // message/rfc822: type subtype params id desc enc octets lines
+        // then the envelope, body, and line count of the encapsulated message
+        // For simplicity, use the basic form matching existing behavior.
+        format!(
+            "(\"{}\" \"{}\" (\"CHARSET\" \"UTF-8\") NIL NIL \"{}\" {} {})",
+            type_main, subtype, encoding, body_size, body_lines
+        )
+    } else {
+        let (type_main, subtype) = split_mime_type(mime);
+        let charset = parsed_charset(parsed);
+        let encoding = parsed_encoding(parsed);
+        let body_raw = body_bytes_of(parsed);
+        let body_size = body_raw.len();
+        let body_lines = count_lines(&body_raw);
+        format!(
+            "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
+            type_main, subtype, charset, encoding, body_size, body_lines
+        )
+    }
+}
 
 /// Build an IMAP BODYSTRUCTURE response from RFC822 data.
 ///
 /// Format per RFC 3501 section 7.4.2:
-/// Non-multipart: (type subtype (params) id desc encoding size [lines] [md5] [disposition] [language] [location])
-/// Multipart: ((part1)(part2)... "subtype" (params) [disposition] [language] [location])
-pub fn build_body(data: &[u8]) -> String {
-    let text = String::from_utf8_lossy(data);
-    let (header_section, body_section) = split_header_body(&text);
-    let content_type = extract_content_type(&header_section);
-
-    match &content_type {
-        ContentType::Multipart { subtype, boundary } => {
-            let parts = parse_multipart_parts(&body_section, boundary);
-            let part_bodies: Vec<String> = parts.iter().map(|p| build_part_body(p)).collect();
-
-            if part_bodies.is_empty() {
-                simple_text_body(data.len())
-            } else {
-                format!("({} \"{}\")", part_bodies.join(""), subtype.to_uppercase())
-            }
-        }
-        ContentType::Simple {
-            type_main,
-            subtype,
-            charset,
-        } => {
-            let encoding = extract_content_transfer_encoding(&header_section);
-            let body_size = body_section.len();
-            let body_lines = body_section.lines().count();
-
-            format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
-                type_main.to_uppercase(),
-                subtype,
-                charset,
-                encoding.to_uppercase(),
-                body_size,
-                body_lines
-            )
-        }
+/// Non-multipart: (type subtype (params) id desc encoding size lines md5 dsp lang loc)
+/// Multipart: ((part1)(part2)... "subtype" (params) dsp lang loc)
+pub fn build_bodystructure(data: &[u8]) -> String {
+    match mailparse::parse_mail(data) {
+        Ok(parsed) => build_bodystructure_from_parsed(&parsed),
+        Err(_) => simple_text_structure(data.len()),
     }
 }
 
-pub fn build_bodystructure(data: &[u8]) -> String {
-    let text = String::from_utf8_lossy(data);
-    let (header_section, body_section) = split_header_body(&text);
+fn build_bodystructure_from_parsed(parsed: &ParsedMail) -> String {
+    let mime = &parsed.ctype.mimetype;
 
-    // Parse Content-Type header
-    let content_type = extract_content_type(&header_section);
+    if mime.starts_with("multipart/") {
+        let subtype = mime.split('/').nth(1).unwrap_or("mixed").to_uppercase();
+        let boundary = parsed
+            .ctype
+            .params
+            .get("boundary")
+            .cloned()
+            .unwrap_or_default();
 
-    match &content_type {
-        ContentType::Multipart { subtype, boundary } => {
-            // Parse multipart parts
-            let parts = parse_multipart_parts(&body_section, boundary);
-            let part_structures: Vec<String> =
-                parts.iter().map(|p| build_part_structure(p)).collect();
-
-            if part_structures.is_empty() {
-                // Fallback to simple text if no parts found
-                simple_text_structure(data.len())
-            } else {
-                format!(
-                    "({} \"{}\" (\"BOUNDARY\" \"{}\") NIL NIL)",
-                    part_structures.join(""),
-                    subtype.to_uppercase(),
-                    boundary
-                )
-            }
+        if parsed.subparts.is_empty() {
+            return simple_text_structure(parsed.raw_bytes.len());
         }
-        ContentType::Simple {
-            type_main,
+        let parts: Vec<String> = parsed
+            .subparts
+            .iter()
+            .map(|p| build_bodystructure_from_parsed(p))
+            .collect();
+        format!(
+            "({} \"{}\" (\"BOUNDARY\" \"{}\") NIL NIL)",
+            parts.join(""),
             subtype,
-            charset,
-        } => {
-            let encoding = extract_content_transfer_encoding(&header_section);
-            let content_id = extract_content_id(&header_section);
-            let disposition = extract_content_disposition(&header_section);
-            let body_size = body_section.len();
-            let body_lines = body_section.lines().count();
+            boundary
+        )
+    } else {
+        let (type_main, subtype) = split_mime_type(mime);
+        let charset = parsed_charset(parsed);
+        let encoding = parsed_encoding(parsed);
+        let content_id = parsed_content_id(parsed);
+        let disposition = parsed_content_disposition(parsed);
+        let body_raw = body_bytes_of(parsed);
+        let body_size = body_raw.len();
+        let body_lines = count_lines(&body_raw);
 
-            // RFC 3501 Section 7.4.2 BODYSTRUCTURE field order for text:
-            // type subtype params id desc enc octets lines md5 dsp lang loc
-            format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
-                type_main.to_uppercase(),
-                subtype,
-                charset,
-                content_id,
-                encoding.to_uppercase(),
-                body_size,
-                body_lines,
-                disposition
-            )
-        }
+        format!(
+            "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
+            type_main, subtype, charset, content_id, encoding, body_size, body_lines, disposition
+        )
     }
 }
 
@@ -112,90 +125,48 @@ pub fn simple_text_structure(size: usize) -> String {
     )
 }
 
-#[derive(Debug)]
-enum ContentType {
-    Simple {
-        type_main: String,
-        subtype: String,
-        charset: String,
-    },
-    Multipart {
-        subtype: String,
-        boundary: String,
-    },
+// -- mailparse-based helpers for BODYSTRUCTURE/BODY building --
+
+fn split_mime_type(mime: &str) -> (String, String) {
+    let (t, s) = mime.split_once('/').unwrap_or(("text", "plain"));
+    (t.to_uppercase(), s.to_string())
 }
 
-fn extract_content_type(header: &str) -> ContentType {
-    let ct_line = header
-        .lines()
-        .find(|line| line.to_lowercase().starts_with("content-type:"))
-        .unwrap_or("Content-Type: text/plain; charset=UTF-8");
-
-    let value = ct_line
-        .split_once(':')
-        .map(|(_, v)| v.trim())
-        .unwrap_or("text/plain");
-
-    // Handle multipart
-    if value.to_lowercase().starts_with("multipart/") {
-        let subtype = value
-            .split('/')
-            .nth(1)
-            .and_then(|s| s.split(';').next())
-            .unwrap_or("mixed")
-            .trim()
-            .to_string();
-
-        let boundary = extract_param(value, "boundary").unwrap_or_default();
-
-        return ContentType::Multipart { subtype, boundary };
-    }
-
-    // Parse type/subtype
-    let (type_main, subtype) = value
-        .split(';')
-        .next()
-        .and_then(|s| s.split_once('/'))
-        .map(|(t, s)| (t.trim().to_string(), s.trim().to_string()))
-        .unwrap_or_else(|| ("text".to_string(), "plain".to_string()));
-
-    let charset = extract_param(value, "charset").unwrap_or_else(|| "UTF-8".to_string());
-
-    ContentType::Simple {
-        type_main,
-        subtype,
-        charset,
-    }
+fn parsed_charset(parsed: &ParsedMail) -> String {
+    parsed
+        .ctype
+        .params
+        .get("charset")
+        .cloned()
+        .unwrap_or_else(|| "UTF-8".to_string())
 }
 
-fn extract_param(value: &str, param_name: &str) -> Option<String> {
-    let search = format!("{}=", param_name.to_lowercase());
-    for part in value.split(';') {
-        let part = part.trim();
-        if part.to_lowercase().starts_with(&search) {
-            let val = &part[search.len()..];
-            // Remove surrounding quotes
-            let val = val.trim_matches('"').trim_matches('\'');
-            return Some(val.to_string());
-        }
-    }
-    None
+fn parsed_encoding(parsed: &ParsedMail) -> String {
+    parsed
+        .get_headers()
+        .get_first_value("Content-Transfer-Encoding")
+        .map(|v| v.trim().to_uppercase())
+        .unwrap_or_else(|| "7BIT".to_string())
 }
 
-fn extract_content_id(header: &str) -> String {
-    extract_header(header, "Content-ID")
-        .or_else(|| extract_header(header, "Content-Id"))
-        .map(|v| imap_quote(&v))
+fn parsed_content_id(parsed: &ParsedMail) -> String {
+    parsed
+        .get_headers()
+        .get_first_value("Content-ID")
+        .or_else(|| parsed.get_headers().get_first_value("Content-Id"))
+        .map(|v| imap_quote(v.trim()))
         .unwrap_or_else(|| "NIL".to_string())
 }
 
-fn extract_content_disposition(header: &str) -> String {
-    let raw = extract_header(header, "Content-Disposition");
-    let raw = match raw {
-        Some(v) => v,
-        None => return "NIL".to_string(),
-    };
+fn parsed_content_disposition(parsed: &ParsedMail) -> String {
+    parsed
+        .get_headers()
+        .get_first_value("Content-Disposition")
+        .map(|raw| format_content_disposition_raw(&raw))
+        .unwrap_or_else(|| "NIL".to_string())
+}
 
+fn format_content_disposition_raw(raw: &str) -> String {
     let mut parts = raw.splitn(2, ';');
     let disp_type = parts.next().unwrap_or("").trim().to_lowercase();
     if disp_type.is_empty() {
@@ -228,241 +199,243 @@ fn extract_content_disposition(header: &str) -> String {
     }
 }
 
-fn extract_content_transfer_encoding(header: &str) -> String {
-    header
-        .lines()
-        .find(|line| {
-            line.to_lowercase()
-                .starts_with("content-transfer-encoding:")
-        })
-        .and_then(|line| line.split_once(':'))
-        .map(|(_, v)| v.trim().to_string())
-        .unwrap_or_else(|| "7BIT".to_string())
-}
-
-fn split_header_body(text: &str) -> (String, String) {
-    if let Some(pos) = text.find("\r\n\r\n") {
-        (text[..pos].to_string(), text[pos + 4..].to_string())
-    } else if let Some(pos) = text.find("\n\n") {
-        (text[..pos].to_string(), text[pos + 2..].to_string())
+/// Return the body bytes (after headers) of a ParsedMail node.
+fn body_bytes_of(parsed: &ParsedMail) -> Vec<u8> {
+    let raw = parsed.raw_bytes;
+    if let Some(pos) = find_header_end(raw) {
+        raw[pos..].to_vec()
     } else {
-        (text.to_string(), String::new())
+        Vec::new()
     }
 }
 
-fn parse_multipart_parts(body: &str, boundary: &str) -> Vec<String> {
-    let delimiter = format!("--{}", boundary);
-    let mut parts = Vec::new();
+/// Strip the trailing CRLF (or LF) that RFC 2046 5.1.1 attaches to the boundary
+/// delimiter rather than the body content.
+fn strip_trailing_crlf(mut data: Vec<u8>) -> Vec<u8> {
+    if data.ends_with(b"\r\n") {
+        data.truncate(data.len() - 2);
+    } else if data.ends_with(b"\n") {
+        data.truncate(data.len() - 1);
+    }
+    data
+}
 
-    for section in body.split(&delimiter) {
-        // Strip the leading CRLF/LF that follows the boundary line.
-        let section = section
-            .strip_prefix("\r\n")
-            .unwrap_or(section.strip_prefix('\n').unwrap_or(section));
-        if section.is_empty() {
-            continue;
-        }
-        // End delimiter: after splitting by `--boundary`, the closing `--boundary--`
-        // produces a section starting with "--". This is the epilogue marker; stop here.
-        if section.starts_with("--") {
+fn count_lines(data: &[u8]) -> usize {
+    let text = String::from_utf8_lossy(data);
+    text.lines().count()
+}
+
+/// Find the offset where the body starts (after the blank line separating headers from body).
+fn find_header_end(raw: &[u8]) -> Option<usize> {
+    // Look for \r\n\r\n first, then \n\n
+    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        return Some(pos + 4);
+    }
+    if let Some(pos) = raw.windows(2).position(|w| w == b"\n\n") {
+        return Some(pos + 2);
+    }
+    None
+}
+
+/// Extract the raw header bytes (including trailing blank line separator) from a ParsedMail node.
+fn headers_bytes_of(parsed: &ParsedMail) -> Vec<u8> {
+    let raw = parsed.raw_bytes;
+    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        raw[..pos + 4].to_vec()
+    } else if let Some(pos) = raw.windows(2).position(|w| w == b"\n\n") {
+        raw[..pos + 2].to_vec()
+    } else {
+        raw.to_vec()
+    }
+}
+
+/// Extract just the header block (without trailing blank line) from a ParsedMail node.
+fn header_block_of(parsed: &ParsedMail) -> Vec<u8> {
+    let raw = parsed.raw_bytes;
+    if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+        // Include the trailing \r\n of the last header line
+        raw[..pos + 2].to_vec()
+    } else if let Some(pos) = raw.windows(2).position(|w| w == b"\n\n") {
+        raw[..pos + 1].to_vec()
+    } else {
+        raw.to_vec()
+    }
+}
+
+// -- Section spec parsing --
+
+enum PartQualifier<'a> {
+    Body,
+    Mime,
+    Header,
+    Text,
+    HeaderFields(&'a str),
+}
+
+fn parse_section_spec(section: &str) -> (Vec<usize>, PartQualifier<'_>) {
+    let mut indices = Vec::new();
+    let mut rest = section;
+
+    loop {
+        let num_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if num_end == 0 {
             break;
         }
-        // Per RFC 2046 section 5.1.1, the CRLF immediately preceding a boundary
-        // delimiter belongs to the boundary, not the preceding body part.
-        let section = section
-            .strip_suffix("\r\n")
-            .unwrap_or(section.strip_suffix('\n').unwrap_or(section));
-        parts.push(section.to_string());
-    }
-
-    parts
-}
-
-fn build_part_structure(part: &str) -> String {
-    let (header, body) = split_header_body(part);
-    let content_type = extract_content_type(&header);
-
-    match content_type {
-        ContentType::Simple {
-            type_main,
-            subtype,
-            charset,
-        } => {
-            let encoding = extract_content_transfer_encoding(&header);
-            let content_id = extract_content_id(&header);
-            let disposition = extract_content_disposition(&header);
-            let body_size = body.len();
-            let lines = body.lines().count();
-
-            format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") {} NIL \"{}\" {} {} NIL {} NIL NIL)",
-                type_main.to_uppercase(),
-                subtype,
-                charset,
-                content_id,
-                encoding.to_uppercase(),
-                body_size,
-                lines,
-                disposition
-            )
-        }
-        ContentType::Multipart { subtype, boundary } => {
-            // Nested multipart
-            let parts = parse_multipart_parts(&body, &boundary);
-            let part_structures: Vec<String> =
-                parts.iter().map(|p| build_part_structure(p)).collect();
-
-            format!(
-                "({} \"{}\" (\"BOUNDARY\" \"{}\") NIL NIL)",
-                part_structures.join(""),
-                subtype.to_uppercase(),
-                boundary
-            )
+        if let Ok(n) = rest[..num_end].parse::<usize>() {
+            indices.push(n);
+            rest = &rest[num_end..];
+            if rest.starts_with('.') {
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        } else {
+            break;
         }
     }
-}
 
-fn build_part_body(part: &str) -> String {
-    let (header, body) = split_header_body(part);
-    let content_type = extract_content_type(&header);
-
-    match content_type {
-        ContentType::Simple {
-            type_main,
-            subtype,
-            charset,
-        } => {
-            let encoding = extract_content_transfer_encoding(&header);
-            let body_size = body.len();
-            let lines = body.lines().count();
-
-            format!(
-                "(\"{}\" \"{}\" (\"CHARSET\" \"{}\") NIL NIL \"{}\" {} {})",
-                type_main.to_uppercase(),
-                subtype,
-                charset,
-                encoding.to_uppercase(),
-                body_size,
-                lines
-            )
+    let terminal = if rest.is_empty() {
+        PartQualifier::Body
+    } else {
+        let upper = rest.to_uppercase();
+        if upper == "MIME" {
+            PartQualifier::Mime
+        } else if upper == "HEADER" {
+            PartQualifier::Header
+        } else if upper == "TEXT" {
+            PartQualifier::Text
+        } else if upper.starts_with("HEADER.FIELDS") {
+            PartQualifier::HeaderFields(rest)
+        } else {
+            PartQualifier::Body
         }
-        ContentType::Multipart { subtype, boundary } => {
-            let parts = parse_multipart_parts(&body, &boundary);
-            let part_bodies: Vec<String> = parts.iter().map(|p| build_part_body(p)).collect();
-            format!("({} \"{}\")", part_bodies.join(""), subtype.to_uppercase())
-        }
-    }
+    };
+
+    (indices, terminal)
 }
 
 /// Extract a specific MIME part from RFC822 data by part number.
 ///
 /// Part specs: "1" = first part, "2" = second part, "2.1" = first sub-part of second part.
+/// Qualifiers: "1.MIME" = MIME headers, "1.HEADER" = headers, "1.TEXT" = body text.
 /// Returns None if the part doesn't exist.
 pub fn extract_mime_part(data: &[u8], part_spec: &str) -> Option<Vec<u8>> {
-    let text = String::from_utf8_lossy(data);
-
-    // Parse the part spec suffix for MIME/HEADER/TEXT qualifiers
-    let (numbers, qualifier) = parse_part_spec(part_spec);
-    if numbers.is_empty() {
+    let (indices, qualifier) = parse_section_spec(part_spec);
+    if indices.is_empty() {
         return None;
     }
 
-    let part_text = navigate_to_part(&text, &numbers)?;
+    // Navigate to the target part using owned data (supports re-parsing for message/rfc822)
+    let target_raw = navigate_to_raw_part(data, &indices)?;
+
+    let target = mailparse::parse_mail(&target_raw).ok()?;
 
     match qualifier {
         PartQualifier::Body => {
-            let (_, body) = split_header_body(&part_text);
-            Some(body.into_bytes())
+            if target.ctype.mimetype.starts_with("message/") {
+                Some(body_bytes_of(&target))
+            } else {
+                target.get_body_raw().ok().map(strip_trailing_crlf)
+            }
         }
-        PartQualifier::Mime => {
-            let (header, _) = split_header_body(&part_text);
-            Some(format!("{}\r\n", header).into_bytes())
-        }
-        PartQualifier::Header => {
-            let (header, _) = split_header_body(&part_text);
-            Some(format!("{}\r\n", header).into_bytes())
-        }
-        PartQualifier::Text => {
-            let (_, body) = split_header_body(&part_text);
-            Some(body.into_bytes())
+        PartQualifier::Mime => Some(header_block_of(&target)),
+        PartQualifier::Header => Some(header_block_of(&target)),
+        PartQualifier::Text => Some(body_bytes_of(&target)),
+        PartQualifier::HeaderFields(spec) => {
+            let fields = parse_header_field_names(spec);
+            let hdrs = headers_bytes_of(&target);
+            let hdr_text = String::from_utf8_lossy(&hdrs);
+            let header_section = hdr_text
+                .split("\r\n\r\n")
+                .next()
+                .or_else(|| hdr_text.split("\n\n").next())
+                .unwrap_or(&hdr_text);
+            Some(filter_headers_by_field_names(header_section, &fields).into_bytes())
         }
     }
 }
 
-enum PartQualifier {
-    Body,
-    Mime,
-    Header,
-    Text,
-}
+/// Navigate the MIME tree to find the raw bytes of the target part.
+///
+/// Returns the raw bytes of the MIME part (including its headers) so the
+/// caller can re-parse it. This owned approach naturally handles message/rfc822
+/// by re-parsing the embedded message body at each step.
+fn navigate_to_raw_part(data: &[u8], indices: &[usize]) -> Option<Vec<u8>> {
+    let mut current = data.to_vec();
 
-fn parse_part_spec(spec: &str) -> (Vec<usize>, PartQualifier) {
-    let upper = spec.to_uppercase();
-
-    // Check for trailing qualifiers like "1.MIME", "1.2.HEADER", "1.TEXT"
-    if let Some(pos) = upper.rfind(".MIME") {
-        if pos > 0 && upper[pos..] == *".MIME" {
-            let nums = parse_part_numbers(&spec[..pos]);
-            return (nums, PartQualifier::Mime);
-        }
-    }
-    if let Some(pos) = upper.rfind(".HEADER") {
-        if pos > 0 && upper[pos..] == *".HEADER" {
-            let nums = parse_part_numbers(&spec[..pos]);
-            return (nums, PartQualifier::Header);
-        }
-    }
-    if let Some(pos) = upper.rfind(".TEXT") {
-        if pos > 0 && upper[pos..] == *".TEXT" {
-            let nums = parse_part_numbers(&spec[..pos]);
-            return (nums, PartQualifier::Text);
-        }
-    }
-
-    let nums = parse_part_numbers(spec);
-    (nums, PartQualifier::Body)
-}
-
-fn parse_part_numbers(s: &str) -> Vec<usize> {
-    s.split('.')
-        .filter_map(|p| p.parse::<usize>().ok())
-        .collect()
-}
-
-fn navigate_to_part(text: &str, numbers: &[usize]) -> Option<String> {
-    if numbers.is_empty() {
-        return None;
-    }
-
-    let mut current = text.to_string();
-
-    for &num in numbers {
-        if num == 0 {
+    for &idx in indices {
+        if idx == 0 {
             return None;
         }
 
-        let (header, body) = split_header_body(&current);
-        let content_type = extract_content_type(&header);
+        let parsed = mailparse::parse_mail(&current).ok()?;
 
-        match content_type {
-            ContentType::Multipart { boundary, .. } => {
-                let parts = parse_multipart_parts(&body, &boundary);
-                if num > parts.len() {
+        if parsed.ctype.mimetype.starts_with("message/") {
+            // message/rfc822: get the body (the embedded message), then parse it
+            // and index into its parts
+            let embedded_raw = body_bytes_of(&parsed);
+            let embedded = mailparse::parse_mail(&embedded_raw).ok()?;
+
+            if embedded.subparts.is_empty() {
+                // Single-part embedded message: part 1 = the message itself
+                if idx != 1 {
                     return None;
                 }
-                current = parts[num - 1].clone();
-            }
-            ContentType::Simple { .. } => {
-                // For non-multipart, only part 1 is valid (the message itself)
-                if num != 1 {
+                current = embedded.raw_bytes.to_vec();
+            } else {
+                // Multipart embedded message
+                if idx > embedded.subparts.len() {
                     return None;
                 }
-                // current stays as-is
+                current = embedded.subparts[idx - 1].raw_bytes.to_vec();
             }
+        } else if !parsed.subparts.is_empty() {
+            // Multipart: index into subparts
+            if idx > parsed.subparts.len() {
+                return None;
+            }
+            current = parsed.subparts[idx - 1].raw_bytes.to_vec();
+        } else {
+            // Non-multipart: only part 1 is valid (the message itself)
+            if idx != 1 {
+                return None;
+            }
+            // current stays as-is
         }
     }
 
     Some(current)
+}
+
+fn parse_header_field_names(spec: &str) -> Vec<String> {
+    // spec looks like "HEADER.FIELDS (From To Subject)" or "HEADER.FIELDS.NOT (Bcc)"
+    if let Some(start) = spec.find('(') {
+        if let Some(end) = spec.find(')') {
+            return spec[start + 1..end]
+                .split_whitespace()
+                .map(|s| s.to_lowercase())
+                .collect();
+        }
+    }
+    Vec::new()
+}
+
+fn filter_headers_by_field_names(header_section: &str, fields: &[String]) -> String {
+    let mut result = String::new();
+    for line in header_section.split('\n') {
+        let line = line.trim_end_matches('\r');
+        if let Some(colon_pos) = line.find(':') {
+            let name = line[..colon_pos].trim().to_lowercase();
+            if fields.iter().any(|f| f == &name) {
+                result.push_str(line);
+                result.push_str("\r\n");
+            }
+        }
+    }
+    result.push_str("\r\n");
+    result
 }
 
 /// Build an IMAP ENVELOPE response string from metadata and parsed headers.
@@ -833,37 +806,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_content_type_simple() {
-        let header = "Content-Type: text/html; charset=iso-8859-1";
-        let ct = extract_content_type(header);
-        match ct {
-            ContentType::Simple {
-                type_main,
-                subtype,
-                charset,
-            } => {
-                assert_eq!(type_main, "text");
-                assert_eq!(subtype, "html");
-                assert_eq!(charset, "iso-8859-1");
-            }
-            _ => panic!("expected Simple"),
-        }
-    }
-
-    #[test]
-    fn test_extract_content_type_multipart() {
-        let header = "Content-Type: multipart/alternative; boundary=\"boundary123\"";
-        let ct = extract_content_type(header);
-        match ct {
-            ContentType::Multipart { subtype, boundary } => {
-                assert_eq!(subtype, "alternative");
-                assert_eq!(boundary, "boundary123");
-            }
-            _ => panic!("expected Multipart"),
-        }
-    }
-
-    #[test]
     fn test_extract_mime_part_simple_multipart() {
         let msg = b"Content-Type: multipart/mixed; boundary=\"sep\"\r\n\r\n--sep\r\nContent-Type: text/plain\r\n\r\nHello world\r\n--sep\r\nContent-Type: text/html\r\n\r\n<p>Hello</p>\r\n--sep--\r\n";
 
@@ -899,37 +841,93 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_content_id() {
-        let header = "Content-ID: <abc123@proton.me>";
-        assert_eq!(extract_content_id(header), "\"<abc123@proton.me>\"");
+    fn test_parsed_content_id() {
+        let msg = b"Content-Type: text/plain\r\nContent-ID: <abc123@proton.me>\r\n\r\nbody";
+        let parsed = mailparse::parse_mail(msg).unwrap();
+        assert_eq!(parsed_content_id(&parsed), "\"<abc123@proton.me>\"");
     }
 
     #[test]
-    fn test_extract_content_id_missing() {
-        let header = "Content-Type: text/plain";
-        assert_eq!(extract_content_id(header), "NIL");
+    fn test_parsed_content_id_missing() {
+        let msg = b"Content-Type: text/plain\r\n\r\nbody";
+        let parsed = mailparse::parse_mail(msg).unwrap();
+        assert_eq!(parsed_content_id(&parsed), "NIL");
     }
 
     #[test]
-    fn test_extract_content_disposition_attachment() {
-        let header = "Content-Disposition: attachment; filename=\"test.pdf\"";
-        let disp = extract_content_disposition(header);
+    fn test_parsed_content_disposition_attachment() {
+        let msg = b"Content-Type: text/plain\r\nContent-Disposition: attachment; filename=\"test.pdf\"\r\n\r\nbody";
+        let parsed = mailparse::parse_mail(msg).unwrap();
+        let disp = parsed_content_disposition(&parsed);
         assert!(disp.contains("\"ATTACHMENT\""), "disp={disp}");
         assert!(disp.contains("\"FILENAME\""), "disp={disp}");
         assert!(disp.contains("\"test.pdf\""), "disp={disp}");
     }
 
     #[test]
-    fn test_extract_content_disposition_inline() {
-        let header = "Content-Disposition: inline";
-        let disp = extract_content_disposition(header);
+    fn test_parsed_content_disposition_inline() {
+        let msg = b"Content-Type: text/plain\r\nContent-Disposition: inline\r\n\r\nbody";
+        let parsed = mailparse::parse_mail(msg).unwrap();
+        let disp = parsed_content_disposition(&parsed);
         assert!(disp.contains("\"INLINE\""), "disp={disp}");
     }
 
     #[test]
-    fn test_extract_content_disposition_missing() {
-        let header = "Content-Type: text/plain";
-        assert_eq!(extract_content_disposition(header), "NIL");
+    fn test_parsed_content_disposition_missing() {
+        let msg = b"Content-Type: text/plain\r\n\r\nbody";
+        let parsed = mailparse::parse_mail(msg).unwrap();
+        assert_eq!(parsed_content_disposition(&parsed), "NIL");
+    }
+
+    #[test]
+    fn test_extract_mime_part_message_rfc822() {
+        let inner = "From: inner@example.com\r\nSubject: Inner\r\nContent-Type: text/plain\r\n\r\nInner body";
+        let msg = format!(
+            "Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n\
+             --outer\r\n\
+             Content-Type: message/rfc822\r\n\r\n\
+             {}\r\n\
+             --outer--\r\n",
+            inner
+        );
+
+        // BODY[1] of a message/rfc822 part should return the embedded message body
+        let part1 = extract_mime_part(msg.as_bytes(), "1").unwrap();
+        let part1_str = String::from_utf8_lossy(&part1);
+        assert!(
+            part1_str.contains("From: inner@example.com"),
+            "got: {part1_str}"
+        );
+
+        // BODY[1.1] should navigate into the embedded message's first part
+        let part1_1 = extract_mime_part(msg.as_bytes(), "1.1").unwrap();
+        let part1_1_str = String::from_utf8_lossy(&part1_1);
+        assert_eq!(part1_1_str, "Inner body");
+    }
+
+    #[test]
+    fn test_extract_mime_part_nested_multipart_in_rfc822() {
+        let msg = "Content-Type: multipart/mixed; boundary=\"outer\"\r\n\r\n\
+            --outer\r\n\
+            Content-Type: message/rfc822\r\n\r\n\
+            From: nested@example.com\r\n\
+            Content-Type: multipart/alternative; boundary=\"inner\"\r\n\r\n\
+            --inner\r\n\
+            Content-Type: text/plain\r\n\r\n\
+            Plain text\r\n\
+            --inner\r\n\
+            Content-Type: text/html\r\n\r\n\
+            <p>HTML</p>\r\n\
+            --inner--\r\n\
+            --outer--\r\n";
+
+        // 1.1 = first part of the embedded message's multipart/alternative
+        let p = extract_mime_part(msg.as_bytes(), "1.1").unwrap();
+        assert_eq!(String::from_utf8_lossy(&p), "Plain text");
+
+        // 1.2 = second part
+        let p = extract_mime_part(msg.as_bytes(), "1.2").unwrap();
+        assert_eq!(String::from_utf8_lossy(&p), "<p>HTML</p>");
     }
 
     #[test]

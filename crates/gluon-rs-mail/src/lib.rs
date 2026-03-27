@@ -44,7 +44,8 @@ pub use imap_store::{
     SelectMailboxData, StoreEvent, StoreEventKind,
 };
 pub use imap_types::{
-    EmailAddress, ImapUid, MailboxInfo, MessageEnvelope, MessageId, ScopedMailboxId,
+    EmailAddress, ImapUid, MailboxInfo, MailboxVisibility, MessageEnvelope, MessageId,
+    ScopedMailboxId,
 };
 pub use mailbox::{
     find_mailbox, message_flags, system_mailboxes, GluonMailboxCatalog, ImapMailbox,

@@ -134,6 +134,15 @@ pub enum Command {
         source: String,
         dest: String,
     },
+    Id {
+        tag: String,
+        params: Option<Vec<(String, String)>>,
+    },
+    Authenticate {
+        tag: String,
+        mechanism: String,
+        initial_response: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -303,6 +312,8 @@ pub fn parse_command(line: &str) -> Result<Command> {
         "APPEND" => parse_append(&tag, args),
         "UNSELECT" => Ok(Command::Unselect { tag }),
         "RENAME" => parse_rename(&tag, args),
+        "ID" => parse_id(&tag, args),
+        "AUTHENTICATE" => parse_authenticate(&tag, args),
         _ => Err(ImapError::Protocol(format!(
             "unknown command: {}",
             cmd_word
@@ -547,6 +558,63 @@ fn parse_move(tag: &str, args: &str, uid: bool) -> Result<Command> {
         sequence,
         mailbox,
         uid,
+    })
+}
+
+fn parse_id(tag: &str, args: &str) -> Result<Command> {
+    let trimmed = args.trim();
+    if trimmed.eq_ignore_ascii_case("NIL") || trimmed.is_empty() {
+        return Ok(Command::Id {
+            tag: tag.to_string(),
+            params: None,
+        });
+    }
+
+    // Parse parenthesized list of key-value string pairs
+    let content = trimmed
+        .strip_prefix('(')
+        .and_then(|s| s.strip_suffix(')'))
+        .ok_or_else(|| ImapError::Protocol("ID params must be NIL or parenthesized list".into()))?;
+
+    let mut pairs = Vec::new();
+    let mut rest = content.trim();
+    while !rest.is_empty() {
+        let (key, r) = parse_astring(rest)?;
+        rest = r.trim_start();
+        let (value, r) = parse_astring(rest)?;
+        rest = r.trim_start();
+        pairs.push((key, value));
+    }
+
+    Ok(Command::Id {
+        tag: tag.to_string(),
+        params: Some(pairs),
+    })
+}
+
+fn parse_authenticate(tag: &str, args: &str) -> Result<Command> {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return Err(ImapError::Protocol(
+            "AUTHENTICATE requires mechanism name".into(),
+        ));
+    }
+
+    let (mechanism, rest) = match split_first_word(trimmed) {
+        Ok((m, r)) => (m, r),
+        Err(_) => (trimmed.to_string(), ""),
+    };
+
+    let initial_response = if rest.trim().is_empty() {
+        None
+    } else {
+        Some(rest.trim().to_string())
+    };
+
+    Ok(Command::Authenticate {
+        tag: tag.to_string(),
+        mechanism,
+        initial_response,
     })
 }
 

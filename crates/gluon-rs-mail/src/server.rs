@@ -349,6 +349,114 @@ async fn handle_connection_implicit_tls(
     Ok(())
 }
 
+/// High-level IMAP server with graceful shutdown support.
+pub struct GluonServer {
+    default_config: Arc<SessionConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl GluonServer {
+    pub fn new(config: Arc<SessionConfig>) -> Self {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        Self {
+            default_config: config,
+            tls_config: None,
+            shutdown_tx,
+            shutdown_rx,
+        }
+    }
+
+    pub fn with_tls(mut self, cert_dir: &Path) -> Result<Self> {
+        let server = ImapServer::new().with_tls(cert_dir)?;
+        self.tls_config = server.tls_config();
+        Ok(self)
+    }
+
+    /// Returns a config with the shutdown receiver injected.
+    fn session_config(&self) -> Arc<SessionConfig> {
+        Arc::new(SessionConfig {
+            connector: self.default_config.connector.clone(),
+            gluon_connector: self.default_config.gluon_connector.clone(),
+            mailbox_catalog: self.default_config.mailbox_catalog.clone(),
+            mailbox_mutation: self.default_config.mailbox_mutation.clone(),
+            mailbox_view: self.default_config.mailbox_view.clone(),
+            recent_tracker: self.default_config.recent_tracker.clone(),
+            shutdown_rx: Some(self.shutdown_rx.clone()),
+        })
+    }
+
+    pub async fn serve(&self, addr: &str) -> Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        self.serve_listener(listener).await
+    }
+
+    pub async fn serve_listener(&self, listener: TcpListener) -> Result<()> {
+        let config = self.session_config();
+        let tls_config = self.tls_config.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+        let rate_limiter = Arc::new(Mutex::new(RateLimiter::new()));
+
+        let listener_addr = listener
+            .local_addr()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        info!(
+            pkg = "imap/server",
+            msg = "GluonServer listening",
+            addr = %listener_addr,
+            "GluonServer listening"
+        );
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    info!(pkg = "imap/server", "GluonServer shutting down");
+                    return Ok(());
+                }
+                result = listener.accept() => {
+                    let (stream, peer) = result?;
+
+                    if !rate_limit_disabled() {
+                        let mut limiter = rate_limiter.lock().await;
+                        if !limiter.check(peer.ip()) {
+                            warn!(peer = %peer, "rate limited, dropping connection");
+                            drop(stream);
+                            continue;
+                        }
+                    }
+
+                    info!(
+                        pkg = "imap/server",
+                        peer = %peer,
+                        "new GluonServer connection"
+                    );
+
+                    let config = config.clone();
+                    let tls_config = tls_config.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, config, tls_config).await {
+                            error!(
+                                pkg = "imap/server",
+                                peer = %peer,
+                                error = %e,
+                                "connection error"
+                            );
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    /// Signal all sessions and the accept loop to shut down.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+    }
+}
+
 fn generate_self_signed_cert(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| crate::imap_error::ImapError::Tls(e.to_string()))?;
 

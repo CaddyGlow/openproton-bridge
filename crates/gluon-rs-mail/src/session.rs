@@ -84,6 +84,7 @@ pub struct SessionConfig {
     pub mailbox_mutation: Arc<dyn GluonMailboxMutation>,
     pub mailbox_view: Arc<dyn GluonMailboxView>,
     pub recent_tracker: Arc<RecentTracker>,
+    pub shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -173,10 +174,29 @@ where
 
         loop {
             let mut line = String::new();
-            let n = self.reader.read_line(&mut line).await?;
-            if n == 0 {
-                debug!(connection_id = self.connection_id, "client disconnected");
-                return Ok(SessionAction::Close);
+
+            // Check for shutdown signal alongside reading the next command
+            if let Some(ref mut shutdown_rx) = self.config.shutdown_rx.clone() {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        self.writer.untagged("BYE server shutting down").await?;
+                        return Ok(SessionAction::Close);
+                    }
+                    result = self.reader.read_line(&mut line) => {
+                        let n = result?;
+                        if n == 0 {
+                            debug!(connection_id = self.connection_id, "client disconnected");
+                            return Ok(SessionAction::Close);
+                        }
+                    }
+                }
+            } else {
+                let n = self.reader.read_line(&mut line).await?;
+                if n == 0 {
+                    debug!(connection_id = self.connection_id, "client disconnected");
+                    return Ok(SessionAction::Close);
+                }
             }
 
             let line = line.trim_end().to_string();
@@ -322,6 +342,18 @@ where
                 self.cmd_append(tag, mailbox, flags, date, literal_size)
                     .await?
             }
+            Command::Id {
+                ref tag,
+                ref params,
+            } => self.cmd_id(tag, params).await?,
+            Command::Authenticate {
+                ref tag,
+                ref mechanism,
+                ref initial_response,
+            } => {
+                self.cmd_authenticate(tag, mechanism, initial_response.as_deref())
+                    .await?
+            }
         }
 
         Ok(SessionAction::Continue)
@@ -330,12 +362,12 @@ where
     async fn cmd_capability(&mut self, tag: &str) -> Result<()> {
         let caps = if self.state == State::NotAuthenticated {
             if self.starttls_available {
-                "CAPABILITY IMAP4rev1 STARTTLS IDLE UIDPLUS MOVE UNSELECT"
+                "CAPABILITY IMAP4rev1 STARTTLS IDLE UIDPLUS MOVE UNSELECT ID AUTH=PLAIN"
             } else {
-                "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE UNSELECT"
+                "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE UNSELECT ID AUTH=PLAIN"
             }
         } else {
-            "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE UNSELECT"
+            "CAPABILITY IMAP4rev1 IDLE UIDPLUS MOVE UNSELECT ID"
         };
         self.writer.untagged(caps).await?;
         self.writer
@@ -347,7 +379,10 @@ where
         if self.state != State::NotAuthenticated {
             return self.writer.tagged_bad(tag, "already authenticated").await;
         }
+        self.do_login(tag, username, password).await
+    }
 
+    async fn do_login(&mut self, tag: &str, username: &str, password: &str) -> Result<()> {
         let auth_result = match self.config.connector.authorize(username, password).await {
             Ok(r) => r,
             Err(crate::imap_error::ImapError::AuthFailed) => {
@@ -406,6 +441,78 @@ where
             "IMAP login successful"
         );
         self.writer.tagged_ok(tag, None, "LOGIN completed").await
+    }
+
+    async fn cmd_id(&mut self, tag: &str, params: &Option<Vec<(String, String)>>) -> Result<()> {
+        if let Some(params) = params {
+            for (key, value) in params {
+                debug!(key = %key, value = %value, "IMAP client ID");
+            }
+        }
+        self.writer
+            .untagged("ID (\"name\" \"gluon-rs-mail\" \"version\" \"0.1.0\")")
+            .await?;
+        self.writer.tagged_ok(tag, None, "ID completed").await
+    }
+
+    async fn cmd_authenticate(
+        &mut self,
+        tag: &str,
+        mechanism: &str,
+        initial_response: Option<&str>,
+    ) -> Result<()> {
+        if self.state != State::NotAuthenticated {
+            return self.writer.tagged_bad(tag, "already authenticated").await;
+        }
+
+        match mechanism.to_uppercase().as_str() {
+            "PLAIN" => self.authenticate_plain(tag, initial_response).await,
+            _ => {
+                self.writer
+                    .tagged_no(tag, "unsupported authentication mechanism")
+                    .await
+            }
+        }
+    }
+
+    async fn authenticate_plain(
+        &mut self,
+        tag: &str,
+        initial_response: Option<&str>,
+    ) -> Result<()> {
+        let encoded = if let Some(resp) = initial_response {
+            resp.to_string()
+        } else {
+            self.writer.continuation("").await?;
+            let mut line = String::new();
+            self.reader.read_line(&mut line).await?;
+            line.trim().to_string()
+        };
+
+        use base64::Engine;
+        let decoded = match base64::engine::general_purpose::STANDARD.decode(&encoded) {
+            Ok(d) => d,
+            Err(_) => {
+                return self
+                    .writer
+                    .tagged_no(tag, "[AUTHENTICATIONFAILED] invalid base64")
+                    .await;
+            }
+        };
+
+        // PLAIN format: authzid\0authcid\0password
+        let parts: Vec<&[u8]> = decoded.splitn(3, |b| *b == 0).collect();
+        if parts.len() != 3 {
+            return self
+                .writer
+                .tagged_no(tag, "[AUTHENTICATIONFAILED] invalid PLAIN data")
+                .await;
+        }
+
+        let username = String::from_utf8_lossy(parts[1]);
+        let password = String::from_utf8_lossy(parts[2]);
+
+        self.do_login(tag, &username, &password).await
     }
 
     async fn cmd_logout(&mut self, tag: &str) -> Result<()> {
@@ -801,9 +908,26 @@ where
                 }
             }
 
-            // Emit real mailboxes
+            // Emit real mailboxes, filtering by visibility
+            let account_id = self.authenticated_account_id.clone().unwrap_or_default();
             for mb in &all {
                 if Self::matches_list_pattern(&mb.name, &full_pattern) {
+                    let vis = self
+                        .config
+                        .connector
+                        .get_mailbox_visibility(&account_id, &mb.label_id)
+                        .await?;
+                    match vis {
+                        crate::imap_types::MailboxVisibility::Hidden => continue,
+                        crate::imap_types::MailboxVisibility::HiddenIfEmpty => {
+                            let scoped = self.scoped_mailbox_name(&mb.name);
+                            let status = self.config.mailbox_view.mailbox_status(&scoped).await;
+                            if status.map(|s| s.exists).unwrap_or(0) == 0 {
+                                continue;
+                            }
+                        }
+                        crate::imap_types::MailboxVisibility::Visible => {}
+                    }
                     self.writer
                         .untagged(&Self::format_list_entry("LIST", mb))
                         .await?;

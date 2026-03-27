@@ -135,6 +135,14 @@ pub struct MessageEnvelope {
     pub num_attachments: i32,
 }
 
+/// Controls whether a mailbox appears in LIST responses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxVisibility {
+    Visible,
+    Hidden,
+    HiddenIfEmpty,
+}
+
 /// Mailbox descriptor. Replaces the protocol-coupled ResolvedMailbox/ImapMailbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MailboxInfo {

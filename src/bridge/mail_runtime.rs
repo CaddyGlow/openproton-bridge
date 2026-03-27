@@ -569,6 +569,7 @@ async fn prepare_runtime_context(
         mailbox_mutation,
         mailbox_view,
         recent_tracker: imap::session::RecentTracker::new(),
+        shutdown_rx: None,
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {

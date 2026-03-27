@@ -912,6 +912,7 @@ fn build_session_config(data_dir: &std::path::Path) -> Arc<SessionConfig> {
         }),
         mailbox_view: Arc::new(StoreMailboxView { store: gluon_store }),
         recent_tracker: RecentTracker::new(),
+        shutdown_rx: None,
     })
 }
 

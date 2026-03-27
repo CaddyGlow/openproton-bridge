@@ -120,6 +120,7 @@ fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
         mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
         mailbox_view: GluonMailMailboxView::new(gluon_store),
         recent_tracker: openproton_bridge::imap::session::RecentTracker::new(),
+        shutdown_rx: None,
     });
     (config, tempdir)
 }

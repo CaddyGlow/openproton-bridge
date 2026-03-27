@@ -87,6 +87,42 @@ pub trait ImapConnector: Send + Sync {
 
     /// Fetch user labels from upstream.
     async fn fetch_user_labels(&self, account_id: &str) -> Result<Vec<MailboxInfo>>;
+
+    /// Mark messages as forwarded/not-forwarded upstream.
+    async fn mark_messages_forwarded(
+        &self,
+        account_id: &str,
+        message_ids: &[&str],
+        forwarded: bool,
+    ) -> Result<()> {
+        let _ = (account_id, message_ids, forwarded);
+        Ok(())
+    }
+
+    /// Move messages between mailboxes (label dest, unlabel source).
+    /// Returns true if messages should be removed from the source view.
+    async fn move_messages(
+        &self,
+        account_id: &str,
+        message_ids: &[&str],
+        from_label: &str,
+        to_label: &str,
+    ) -> Result<bool> {
+        self.label_messages(account_id, message_ids, to_label)
+            .await?;
+        self.unlabel_messages(account_id, message_ids, from_label)
+            .await?;
+        Ok(true)
+    }
+
+    /// Check mailbox visibility for LIST filtering.
+    async fn get_mailbox_visibility(
+        &self,
+        _account_id: &str,
+        _mailbox_id: &str,
+    ) -> Result<crate::imap_types::MailboxVisibility> {
+        Ok(crate::imap_types::MailboxVisibility::Visible)
+    }
 }
 
 /// A page of message metadata from the upstream provider.

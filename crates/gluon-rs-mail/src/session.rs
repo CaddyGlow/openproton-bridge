@@ -1048,10 +1048,37 @@ where
                     }
                 }
             }
-            for mb in all {
+            // Collect parent paths that need \Noselect entries
+            let mut parents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for mb in &all {
+                let mut path = String::new();
+                for (i, seg) in mb.name.split('/').enumerate() {
+                    if i > 0 {
+                        path.push('/');
+                    }
+                    path.push_str(seg);
+                    if path != mb.name && !all.iter().any(|m| m.name.eq_ignore_ascii_case(&path)) {
+                        parents.insert(path.clone());
+                    }
+                }
+            }
+
+            for mb in &all {
                 if self.matches_list_pattern(&mb.name, &full_pattern) {
                     self.writer
-                        .untagged(&self.format_list_entry("LSUB", &mb))
+                        .untagged(&self.format_list_entry("LSUB", mb))
+                        .await?;
+                }
+            }
+
+            // Emit parent-only \Noselect entries
+            for parent in &parents {
+                if self.matches_list_pattern(parent, &full_pattern) {
+                    self.writer
+                        .untagged(&format!(
+                            "LSUB (\\Noselect) \"{}\" \"{}\"",
+                            self.config.delimiter, parent
+                        ))
                         .await?;
                 }
             }
@@ -2608,6 +2635,14 @@ where
 
         self.store_session = session;
 
+        // Update the session's UID and flag snapshots so subsequent commands
+        // (e.g. FETCH by sequence number) use the post-expunge view.
+        self.selected_mailbox_uids
+            .retain(|uid| !successfully_expunged_uids.contains(uid));
+        for uid in &successfully_expunged_uids {
+            self.selected_mailbox_flags.remove(uid);
+        }
+
         if !silent {
             for seq in &expunged_seqs {
                 self.writer.untagged(&format!("{} EXPUNGE", seq)).await?;
@@ -2713,6 +2748,14 @@ where
         mutation
             .batch_remove_messages(&scoped_mailbox, &successfully_expunged_uids)
             .await?;
+
+        // Update the session's UID and flag snapshots so subsequent commands
+        // use the post-expunge view.
+        self.selected_mailbox_uids
+            .retain(|uid| !successfully_expunged_uids.contains(uid));
+        for uid in &successfully_expunged_uids {
+            self.selected_mailbox_flags.remove(uid);
+        }
 
         for seq in &expunged_seqs {
             self.writer.untagged(&format!("{} EXPUNGE", seq)).await?;

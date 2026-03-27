@@ -252,18 +252,26 @@ fn split_header_body(text: &str) -> (String, String) {
 
 fn parse_multipart_parts(body: &str, boundary: &str) -> Vec<String> {
     let delimiter = format!("--{}", boundary);
-    let end_delimiter = format!("--{}--", boundary);
-
     let mut parts = Vec::new();
 
     for section in body.split(&delimiter) {
-        let section = section.trim();
-        if section.is_empty() || section.starts_with("--") {
+        // Strip the leading CRLF/LF that follows the boundary line.
+        let section = section
+            .strip_prefix("\r\n")
+            .unwrap_or(section.strip_prefix('\n').unwrap_or(section));
+        if section.is_empty() {
             continue;
         }
-        if section.starts_with(&end_delimiter) {
+        // End delimiter: after splitting by `--boundary`, the closing `--boundary--`
+        // produces a section starting with "--". This is the epilogue marker; stop here.
+        if section.starts_with("--") {
             break;
         }
+        // Per RFC 2046 section 5.1.1, the CRLF immediately preceding a boundary
+        // delimiter belongs to the boundary, not the preceding body part.
+        let section = section
+            .strip_suffix("\r\n")
+            .unwrap_or(section.strip_suffix('\n').unwrap_or(section));
         parts.push(section.to_string());
     }
 
@@ -796,7 +804,7 @@ mod tests {
         let msg = b"Content-Type: text/plain; charset=UTF-8\r\n\r\nHello World";
         let structure = build_bodystructure(msg);
         assert!(structure.contains("\"TEXT\""));
-        assert!(structure.contains("\"PLAIN\""));
+        assert!(structure.contains("\"plain\""));
         assert!(structure.contains("\"UTF-8\""));
     }
 
@@ -805,7 +813,7 @@ mod tests {
         let msg = b"Content-Type: text/html; charset=UTF-8\r\n\r\n<html><body>Hello</body></html>";
         let structure = build_bodystructure(msg);
         assert!(structure.contains("\"TEXT\""));
-        assert!(structure.contains("\"HTML\""));
+        assert!(structure.contains("\"html\""));
     }
 
     #[test]

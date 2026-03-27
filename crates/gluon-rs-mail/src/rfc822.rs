@@ -498,13 +498,17 @@ fn parse_header_address(value: &str) -> Option<EmailAddress> {
     if value.is_empty() {
         return None;
     }
-    if let Some(lt) = value.find('<') {
-        let name = value[..lt].trim().trim_matches('"').to_string();
-        let addr = value[lt + 1..].trim_end_matches('>').trim().to_string();
-        Some(EmailAddress {
-            name,
-            address: addr,
-        })
+    if let Ok(addrs) = mailparse::addrparse(value) {
+        match addrs.first()? {
+            mailparse::MailAddr::Single(info) => Some(EmailAddress {
+                name: info.display_name.clone().unwrap_or_default(),
+                address: info.addr.clone(),
+            }),
+            mailparse::MailAddr::Group(info) => info.addrs.first().map(|a| EmailAddress {
+                name: a.display_name.clone().unwrap_or_default(),
+                address: a.addr.clone(),
+            }),
+        }
     } else if value.contains('@') {
         Some(EmailAddress {
             name: String::new(),
@@ -620,16 +624,16 @@ pub fn format_internal_date(timestamp: i64) -> String {
 }
 
 fn extract_header(header: &str, name: &str) -> Option<String> {
-    let search = format!("{}:", name);
-    let search_lower = search.to_lowercase();
-
-    for line in header.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if line.to_lowercase().starts_with(&search_lower) {
-            return Some(line[search.len()..].trim().to_string());
-        }
-    }
-    None
+    // Use mailparse for proper folded-header handling (continuation lines).
+    let header_bytes = if let Some(pos) = header.find("\r\n\r\n") {
+        &header[..pos]
+    } else if let Some(pos) = header.find("\n\n") {
+        &header[..pos]
+    } else {
+        header
+    };
+    let headers = mailparse::parse_headers(header_bytes.as_bytes()).ok()?.0;
+    headers.get_first_value(name)
 }
 
 #[cfg(test)]

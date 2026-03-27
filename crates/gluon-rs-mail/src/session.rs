@@ -3047,35 +3047,31 @@ where
         let mut crlf = [0u8; 2];
         let _ = tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut crlf).await;
 
-        // Build metadata from the RFC822 message
-        let header_text = extract_header_section(&literal);
-
-        let extract_hdr = |name: &str| -> Option<String> {
-            let search = format!("{}:", name);
-            let search_lower = search.to_lowercase();
-            header_text
-                .lines()
-                .find(|l| l.to_lowercase().starts_with(&search_lower))
-                .and_then(|l| l.split_once(':'))
-                .map(|(_, v)| v.trim().to_string())
+        // Build metadata from the RFC822 message using mailparse
+        let parsed_mail = mailparse::parse_mail(&literal).ok();
+        let get_hdr = |name: &str| -> Option<String> {
+            parsed_mail.as_ref().and_then(|p| {
+                use mailparse::MailHeaderMap;
+                p.get_headers().get_first_value(name)
+            })
         };
 
-        let subject = extract_hdr("Subject").unwrap_or_default();
-        let from_str = extract_hdr("From").unwrap_or_default();
+        let subject = get_hdr("Subject").unwrap_or_default();
+        let from_str = get_hdr("From").unwrap_or_default();
         let sender = parse_append_address(&from_str);
-        let to_list = extract_hdr("To")
+        let to_list = get_hdr("To")
             .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let cc_list = extract_hdr("Cc")
+        let cc_list = get_hdr("Cc")
             .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let bcc_list = extract_hdr("Bcc")
+        let bcc_list = get_hdr("Bcc")
             .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let reply_tos = extract_hdr("Reply-To")
+        let reply_tos = get_hdr("Reply-To")
             .map(|v| parse_address_list_header(&v))
             .unwrap_or_default();
-        let external_id = extract_hdr("Message-Id").or_else(|| extract_hdr("Message-ID"));
+        let external_id = get_hdr("Message-Id").or_else(|| get_hdr("Message-ID"));
 
         // Use APPEND date argument if provided, else Date header, else now
         let time = append_date
@@ -3439,37 +3435,13 @@ pub fn search_key_needs_rfc822(key: &SearchKey) -> bool {
 }
 
 /// Search raw header for a field containing a substring (case-insensitive).
-/// Handles multi-line headers (continuation lines starting with whitespace).
+/// Uses mailparse for proper folded-header handling.
 pub fn search_raw_header(header: &str, field_name: &str, value_lower: &str) -> bool {
-    let field_prefix = format!("{}:", field_name);
-    let mut in_target_field = false;
-    let mut full_value = String::new();
-
-    for line in header.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if line.starts_with(' ') || line.starts_with('\t') {
-            // Continuation line
-            if in_target_field {
-                full_value.push(' ');
-                full_value.push_str(line.trim());
-            }
-            continue;
+    if let Ok((headers, _)) = mailparse::parse_headers(header.as_bytes()) {
+        use mailparse::MailHeaderMap;
+        if let Some(val) = headers.get_first_value(field_name) {
+            return val.to_lowercase().contains(value_lower);
         }
-        // New header line: check if previous collected value matches
-        if in_target_field && full_value.to_lowercase().contains(value_lower) {
-            return true;
-        }
-        in_target_field = false;
-        full_value.clear();
-
-        if line.to_lowercase().starts_with(&field_prefix) {
-            in_target_field = true;
-            full_value = line[field_prefix.len()..].trim().to_string();
-        }
-    }
-    // Check last field
-    if in_target_field && full_value.to_lowercase().contains(value_lower) {
-        return true;
     }
     false
 }
@@ -3480,12 +3452,10 @@ pub fn search_raw_header(header: &str, field_name: &str, value_lower: &str) -> b
 /// For SENTBEFORE/SENTSINCE/SENTON, RFC 3501 says to disregard time and timezone
 /// and compare only the date portion.
 pub fn extract_sent_date(data: &[u8]) -> Option<i64> {
-    let header = extract_header_section(data);
-    let date_line = header
-        .lines()
-        .find(|l| l.to_lowercase().starts_with("date:"))?;
-    let date_str = date_line.split_once(':')?.1.trim();
-    parse_rfc2822_date_only(date_str)
+    let (headers, _) = mailparse::parse_headers(data).ok()?;
+    use mailparse::MailHeaderMap;
+    let date_str = headers.get_first_value("Date")?;
+    parse_rfc2822_date_only(date_str.trim())
 }
 
 /// Parse an RFC2822 date string, returning the start-of-day timestamp (ignoring time and
@@ -3785,28 +3755,58 @@ pub fn format_mailbox_name(name: &str) -> String {
 }
 
 pub fn parse_append_address(value: &str) -> crate::imap_types::EmailAddress {
-    let value = value.trim();
-    if let Some(lt) = value.find('<') {
-        let name = value[..lt].trim().trim_matches('"').to_string();
-        let addr = value[lt + 1..].trim_end_matches('>').trim().to_string();
-        crate::imap_types::EmailAddress {
-            name,
-            address: addr,
+    if let Ok(addrs) = mailparse::addrparse(value) {
+        if let Some(addr) = addrs.first() {
+            match addr {
+                mailparse::MailAddr::Single(info) => {
+                    return crate::imap_types::EmailAddress {
+                        name: info.display_name.clone().unwrap_or_default(),
+                        address: info.addr.clone(),
+                    };
+                }
+                mailparse::MailAddr::Group(info) => {
+                    if let Some(first) = info.addrs.first() {
+                        return crate::imap_types::EmailAddress {
+                            name: first.display_name.clone().unwrap_or_default(),
+                            address: first.addr.clone(),
+                        };
+                    }
+                }
+            }
         }
-    } else {
-        crate::imap_types::EmailAddress {
-            name: String::new(),
-            address: value.to_string(),
-        }
+    }
+    // Fallback for unparseable
+    crate::imap_types::EmailAddress {
+        name: String::new(),
+        address: value.trim().to_string(),
     }
 }
 
 pub fn parse_address_list_header(value: &str) -> Vec<crate::imap_types::EmailAddress> {
-    value
-        .split(',')
-        .map(|s| parse_append_address(s.trim()))
-        .filter(|a| !a.address.is_empty())
-        .collect()
+    match mailparse::addrparse(value) {
+        Ok(addrs) => addrs
+            .iter()
+            .flat_map(|addr| match addr {
+                mailparse::MailAddr::Single(info) => vec![crate::imap_types::EmailAddress {
+                    name: info.display_name.clone().unwrap_or_default(),
+                    address: info.addr.clone(),
+                }],
+                mailparse::MailAddr::Group(info) => info
+                    .addrs
+                    .iter()
+                    .map(|a| crate::imap_types::EmailAddress {
+                        name: a.display_name.clone().unwrap_or_default(),
+                        address: a.addr.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        Err(_) => value
+            .split(',')
+            .map(|s| parse_append_address(s.trim()))
+            .filter(|a| !a.address.is_empty())
+            .collect(),
+    }
 }
 
 pub fn extract_header_section(data: &[u8]) -> String {

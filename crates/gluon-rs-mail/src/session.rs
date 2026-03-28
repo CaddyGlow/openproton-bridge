@@ -1063,21 +1063,30 @@ where
                 }
             }
 
-            for mb in &all {
+            // Merge real and parent entries, sort by name, emit in order
+            let mut entries: Vec<(String, Option<usize>)> = Vec::new();
+            for (i, mb) in all.iter().enumerate() {
                 if self.matches_list_pattern(&mb.name, &full_pattern) {
-                    self.writer
-                        .untagged(&self.format_list_entry("LSUB", mb))
-                        .await?;
+                    entries.push((mb.name.clone(), Some(i)));
                 }
             }
-
-            // Emit parent-only \Noselect entries
             for parent in &parents {
                 if self.matches_list_pattern(parent, &full_pattern) {
+                    entries.push((parent.clone(), None));
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+            for (name, mb_index) in &entries {
+                if let Some(idx) = mb_index {
+                    self.writer
+                        .untagged(&self.format_list_entry("LSUB", &all[*idx]))
+                        .await?;
+                } else {
                     self.writer
                         .untagged(&format!(
                             "LSUB (\\Noselect) \"{}\" \"{}\"",
-                            self.config.delimiter, parent
+                            self.config.delimiter, name
                         ))
                         .await?;
                 }
@@ -2835,16 +2844,32 @@ where
                 }
             }
 
-            if let Some(dest_uid) = self
+            match self
                 .copy_message_local(&scoped_mailbox, &scoped_dest_mailbox, uid)
-                .await?
+                .await
             {
-                src_uids.push(uid);
-                dst_uids.push(dest_uid);
+                Ok(Some(dest_uid)) => {
+                    src_uids.push(uid);
+                    dst_uids.push(dest_uid);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, uid = uid.value(), "copy_message_local failed");
+                    return self
+                        .writer
+                        .tagged_no(tag, &format!("[TRYCREATE] COPY failed: {err}"))
+                        .await;
+                }
             }
         }
 
-        let dest_status = mutation.mailbox_status(&scoped_dest_mailbox).await?;
+        let dest_status = match mutation.mailbox_status(&scoped_dest_mailbox).await {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(error = %err, "failed to get dest mailbox status for COPYUID");
+                return self.writer.tagged_ok(tag, None, "COPY completed").await;
+            }
+        };
         let copyuid_code = format_copyuid(dest_status.uid_validity, &src_uids, &dst_uids);
         self.writer
             .tagged_ok(tag, Some(&copyuid_code), "COPY completed")
@@ -2963,19 +2988,39 @@ where
                 }
             }
 
-            if let Some(dest_uid) = self
+            match self
                 .copy_message_local(&scoped_source_mailbox, &scoped_dest_mailbox, uid)
-                .await?
+                .await
             {
-                src_uids.push(uid);
-                dst_uids.push(dest_uid);
-                mutation.remove_message(&scoped_source_mailbox, uid).await?;
-                expunged_seqs.push(seq);
-                offset += 1;
+                Ok(Some(dest_uid)) => {
+                    src_uids.push(uid);
+                    dst_uids.push(dest_uid);
+                    mutation.remove_message(&scoped_source_mailbox, uid).await?;
+                    expunged_seqs.push(seq);
+                    offset += 1;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    warn!(error = %err, uid = uid.value(), "move copy_message_local failed");
+                    return self
+                        .writer
+                        .tagged_no(tag, &format!("[TRYCREATE] MOVE failed: {err}"))
+                        .await;
+                }
             }
         }
 
-        let dest_status = mutation.mailbox_status(&scoped_dest_mailbox).await?;
+        let dest_status = match mutation.mailbox_status(&scoped_dest_mailbox).await {
+            Ok(s) => s,
+            Err(err) => {
+                warn!(error = %err, "failed to get dest mailbox status for COPYUID");
+                // Emit expunges even if status fails
+                for seq in expunged_seqs {
+                    self.writer.untagged(&format!("{seq} EXPUNGE")).await?;
+                }
+                return self.writer.tagged_ok(tag, None, "MOVE completed").await;
+            }
+        };
         let copyuid_code = format_copyuid(dest_status.uid_validity, &src_uids, &dst_uids);
 
         for seq in expunged_seqs {
@@ -3747,7 +3792,14 @@ pub fn extract_text_section(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn format_mailbox_name(name: &str) -> String {
-    if name.contains(' ') || name.contains('"') || name.contains('\\') || name.is_empty() {
+    if name.is_empty()
+        || name.contains(' ')
+        || name.contains('"')
+        || name.contains('\\')
+        || name.contains('(')
+        || name.contains(')')
+        || name.contains('{')
+    {
         format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\""))
     } else {
         name.to_string()

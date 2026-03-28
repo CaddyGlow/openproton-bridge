@@ -66,7 +66,7 @@ pub fn parse_fetch_items(s: &str) -> Result<Vec<FetchItem>> {
             remaining = remaining[13..].trim_start();
         } else if starts_fetch_item_keyword(&upper_rem, "RFC822.TEXT") {
             items.push(FetchItem::Rfc822Text);
-            remaining = remaining[10..].trim_start();
+            remaining = remaining[11..].trim_start();
         } else if starts_fetch_item_keyword(&upper_rem, "RFC822.SIZE") {
             items.push(FetchItem::Rfc822Size);
             remaining = remaining[11..].trim_start();

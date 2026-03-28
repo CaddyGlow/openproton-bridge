@@ -728,6 +728,22 @@ where
         source_uid: ImapUid,
     ) -> Result<Option<ImapUid>> {
         let mutation = self.config.mailbox_mutation.clone();
+
+        // Try the efficient path: link existing message to dest mailbox
+        if let Ok(Some(dest_uid)) = self
+            .config
+            .gluon_connector
+            .copy_message(source_mailbox, dest_mailbox, source_uid)
+            .await
+        {
+            // Copy flags
+            if let Ok(flags) = mutation.get_flags(source_mailbox, source_uid).await {
+                let _ = mutation.set_flags(dest_mailbox, dest_uid, flags).await;
+            }
+            return Ok(Some(dest_uid));
+        }
+
+        // Fallback: create new message in dest
         let Some(proton_id) = mutation.get_proton_id(source_mailbox, source_uid).await? else {
             return Ok(None);
         };
@@ -735,10 +751,12 @@ where
             return Ok(None);
         };
 
+        // Generate unique id for the copy to avoid UNIQUE constraint on remote_id
+        let copy_id = format!("{}-copy-{}", proton_id, source_uid.value());
         let dest_uid = mutation
             .store_metadata(
                 dest_mailbox,
-                &ProtonMessageId::from(proton_id.as_str()),
+                &ProtonMessageId::from(copy_id.as_str()),
                 metadata,
             )
             .await?;

@@ -256,3 +256,42 @@ pub fn parse_search_criterion(s: &str) -> Result<(SearchKey, &str)> {
         )))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_parenthesized_search() {
+        let (criterion, rest) = parse_search_criterion("(UNSEEN)").unwrap();
+        assert!(matches!(criterion, SearchKey::Unseen));
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_parse_sequence_search() {
+        let (criterion, _) = parse_search_criterion("3").unwrap();
+        assert!(matches!(criterion, SearchKey::Sequence(_)));
+    }
+
+    #[test]
+    fn test_parse_combined_criteria() {
+        let criteria = parse_search_criteria("UNSEEN FLAGGED").unwrap();
+        assert_eq!(criteria.len(), 2);
+        assert!(matches!(criteria[0], SearchKey::Unseen));
+        assert!(matches!(criteria[1], SearchKey::Flagged));
+    }
+
+    #[test]
+    fn test_parse_empty_returns_all() {
+        let criteria = parse_search_criteria("").unwrap();
+        assert_eq!(criteria.len(), 1);
+        assert!(matches!(criteria[0], SearchKey::All));
+    }
+
+    #[test]
+    fn test_parse_not_flagged() {
+        let (criterion, _) = parse_search_criterion("NOT FLAGGED").unwrap();
+        assert!(matches!(criterion, SearchKey::Not(_)));
+    }
+}

@@ -8,12 +8,14 @@ use crate::imap_error::ImapResult as Result;
 use crate::imap_store::{ProtonMessageId, StoreEvent, StoreEventKind};
 use crate::imap_types::{ImapUid, MessageEnvelope, ScopedMailboxId};
 
+/// A mailbox reference with its mod-sequence for ordering updates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GluonMailbox {
     pub mailbox: ScopedMailboxId,
     pub mod_seq: u64,
 }
 
+/// A message reference within a mailbox (UID + optional Proton ID).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GluonMessageRef {
     pub mailbox: ScopedMailboxId,
@@ -22,6 +24,7 @@ pub struct GluonMessageRef {
     pub mod_seq: u64,
 }
 
+/// A newly created message with its target mailbox names and flags.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GluonCreatedMessage {
     pub message: GluonMessageRef,
@@ -29,6 +32,7 @@ pub struct GluonCreatedMessage {
     pub flags: Option<Vec<String>>,
 }
 
+/// Store-level update events consumed by the IMAP session during IDLE.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GluonUpdate {
     Noop,
@@ -84,6 +88,7 @@ pub enum GluonUpdate {
     },
 }
 
+/// Merges store-level events with authored updates, deduplicating echoes.
 #[derive(Debug)]
 pub struct GluonUpdateReceiver {
     store_events: broadcast::Receiver<StoreEvent>,
@@ -156,6 +161,8 @@ impl GluonUpdateReceiver {
     }
 }
 
+/// Store connector for the IMAP session: message CRUD, mailbox lifecycle,
+/// update subscriptions, and blob I/O.
 #[async_trait]
 pub trait GluonImapConnector: Send + Sync {
     fn subscribe_updates(&self) -> GluonUpdateReceiver;

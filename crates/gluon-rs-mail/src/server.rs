@@ -52,6 +52,7 @@ fn runtime_tls_config() -> Option<Arc<rustls::ServerConfig>> {
         .clone()
 }
 
+/// Low-level IMAP server builder for TLS configuration.
 pub struct ImapServer {
     tls_config: Option<Arc<rustls::ServerConfig>>,
 }
@@ -134,6 +135,7 @@ impl RateLimiter {
     }
 }
 
+/// Start an IMAP server on `addr` using the global TLS config.
 pub async fn run_server(addr: &str, config: Arc<SessionConfig>) -> Result<()> {
     run_server_with_tls_config(addr, config, runtime_tls_config()).await
 }
@@ -169,6 +171,7 @@ pub async fn run_server_with_listener_and_tls_config_implicit_tls(
     run_server_from_listener_implicit_tls(listener, config, tls_config).await
 }
 
+/// Start an IMAP server on `addr` with an explicit TLS config.
 pub async fn run_server_with_tls_config(
     addr: &str,
     config: Arc<SessionConfig>,
@@ -352,7 +355,8 @@ async fn handle_connection_implicit_tls(
     Ok(())
 }
 
-/// High-level IMAP server with graceful shutdown support.
+/// High-level IMAP server with graceful shutdown, event streaming,
+/// connection metrics, and panic recovery.
 pub struct GluonServer {
     default_config: Arc<SessionConfig>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -365,6 +369,7 @@ pub struct GluonServer {
 }
 
 impl GluonServer {
+    /// Create a new server with the given session config.
     pub fn new(config: Arc<SessionConfig>) -> Self {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
@@ -380,20 +385,24 @@ impl GluonServer {
         }
     }
 
+    /// Enable TLS using certs from `cert_dir` (generates self-signed if absent).
     pub fn with_tls(mut self, cert_dir: &Path) -> Result<Self> {
         let server = ImapServer::new().with_tls(cert_dir)?;
         self.tls_config = server.tls_config();
         Ok(self)
     }
 
+    /// Subscribe to session lifecycle events (login, logout, select, close).
     pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<SessionEvent> {
         self.event_tx.subscribe()
     }
 
+    /// Total number of connections accepted since server start.
     pub fn get_total_connections(&self) -> u64 {
         self.connections_total.load(Ordering::Relaxed)
     }
 
+    /// Number of connections accepted within the given time window.
     pub fn get_rolling_connection_count(&self, window: Duration) -> usize {
         let times = self.connection_times.try_lock();
         match times {
@@ -405,6 +414,7 @@ impl GluonServer {
         }
     }
 
+    /// Register a callback invoked when a session task panics.
     pub fn with_panic_handler(mut self, handler: impl Fn(String) + Send + Sync + 'static) -> Self {
         self.panic_handler = Some(Arc::new(handler));
         self
@@ -428,11 +438,13 @@ impl GluonServer {
         })
     }
 
+    /// Bind to `addr` and start accepting IMAP connections.
     pub async fn serve(&self, addr: &str) -> Result<()> {
         let listener = TcpListener::bind(addr).await?;
         self.serve_listener(listener).await
     }
 
+    /// Accept IMAP connections from an already-bound listener.
     pub async fn serve_listener(&self, listener: TcpListener) -> Result<()> {
         let config = self.session_config();
         let tls_config = self.tls_config.clone();
@@ -543,6 +555,7 @@ impl GluonServer {
     }
 }
 
+/// Generate a self-signed TLS certificate and key, writing them to `dir`.
 fn generate_self_signed_cert(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| crate::imap_error::ImapError::Tls(e.to_string()))?;
 

@@ -8,6 +8,7 @@ use crate::imap_types::{ImapUid, MessageEnvelope, MessageId, ScopedMailboxId};
 /// Backwards-compatible alias for code that still uses ProtonMessageId.
 pub type ProtonMessageId = MessageId;
 
+/// STATUS response data for a mailbox.
 pub struct MailboxStatus {
     pub uid_validity: u32,
     pub next_uid: u32,
@@ -15,12 +16,14 @@ pub struct MailboxStatus {
     pub unseen: u32,
 }
 
+/// Lightweight mailbox snapshot for change detection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MailboxSnapshot {
     pub exists: u32,
     pub mod_seq: u64,
 }
 
+/// Full SELECT response data for a mailbox.
 pub struct SelectMailboxData {
     pub status: MailboxStatus,
     pub snapshot: MailboxSnapshot,
@@ -29,6 +32,7 @@ pub struct SelectMailboxData {
     pub first_unseen_seq: Option<u32>,
 }
 
+/// Kind of store-level event for the update watcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreEventKind {
     MailboxCreated,
@@ -39,6 +43,7 @@ pub enum StoreEventKind {
     MessageRemoved,
 }
 
+/// A store-level event emitted when mailbox/message state changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreEvent {
     pub mailbox: String,
@@ -48,6 +53,7 @@ pub struct StoreEvent {
     pub mod_seq: u64,
 }
 
+/// Read-side mailbox operations: metadata, UIDs, flags, SELECT data.
 #[async_trait]
 pub trait GluonMailboxView: Send + Sync {
     async fn get_metadata(
@@ -84,6 +90,7 @@ pub trait GluonMailboxView: Send + Sync {
     }
 }
 
+/// Write-side mailbox operations: store metadata, update flags, expunge.
 #[async_trait]
 pub trait GluonMailboxMutation: Send + Sync {
     async fn get_metadata(

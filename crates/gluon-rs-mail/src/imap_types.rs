@@ -135,29 +135,31 @@ pub struct MessageEnvelope {
     pub num_attachments: i32,
 }
 
+/// Lifecycle events emitted by IMAP sessions for observability.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
+    /// A session successfully authenticated.
     Login {
         session_id: u64,
         account_id: String,
         email: String,
     },
-    Logout {
-        session_id: u64,
-    },
-    Select {
-        session_id: u64,
-        mailbox: String,
-    },
-    Close {
-        session_id: u64,
-    },
+    /// A session logged out.
+    Logout { session_id: u64 },
+    /// A session selected a mailbox.
+    Select { session_id: u64, mailbox: String },
+    /// A session connection closed.
+    Close { session_id: u64 },
 }
 
+/// Per-server IMAP resource limits.
 #[derive(Debug, Clone)]
 pub struct ImapLimits {
+    /// Maximum accepted message size in bytes (APPEND).
     pub max_message_size: usize,
+    /// Maximum IMAP command line length in bytes.
     pub max_command_length: usize,
+    /// Duration before an IDLE session is terminated.
     pub idle_timeout: std::time::Duration,
 }
 
@@ -186,4 +188,44 @@ pub struct MailboxInfo {
     pub id: String,
     pub special_use: Option<String>,
     pub selectable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_imap_limits_defaults() {
+        let limits = ImapLimits::default();
+        assert_eq!(limits.max_message_size, 25 * 1024 * 1024);
+        assert_eq!(limits.max_command_length, 65536);
+        assert_eq!(limits.idle_timeout, std::time::Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn test_scoped_mailbox_id_roundtrip() {
+        let scoped = ScopedMailboxId::from_parts(Some("acct1"), "INBOX");
+        assert_eq!(scoped.account_id(), Some("acct1"));
+        assert_eq!(scoped.mailbox_name(), "INBOX");
+    }
+
+    #[test]
+    fn test_scoped_mailbox_id_no_account() {
+        let scoped = ScopedMailboxId::from_parts(None, "Sent");
+        assert_eq!(scoped.account_id(), None);
+        assert_eq!(scoped.mailbox_name(), "Sent");
+    }
+
+    #[test]
+    fn test_imap_uid_display() {
+        let uid = ImapUid::from(42u32);
+        assert_eq!(uid.value(), 42);
+        assert_eq!(uid.to_string(), "42");
+    }
+
+    #[test]
+    fn test_message_id_from_str() {
+        let id = MessageId::from("abc123");
+        assert_eq!(id.as_str(), "abc123");
+    }
 }

@@ -14,11 +14,15 @@ use crate::{
     types::StoreBootstrap,
 };
 
+/// Strategy for opening and configuring SQLite connections.
 pub trait ConnectionProvider: Send + Sync {
+    /// Open a connection to the database at `db_path`.
     fn open_connection(&self, db_path: &Path) -> Result<Connection>;
+    /// Apply pragmas and settings to a freshly opened connection.
     fn configure(&self, conn: &Connection) -> Result<()>;
 }
 
+/// Default SQLite provider with WAL mode and sensible pragmas.
 pub struct DefaultSqliteProvider;
 
 impl ConnectionProvider for DefaultSqliteProvider {
@@ -129,9 +133,9 @@ pub struct DeletedSubscription {
 }
 
 /// A shared handle to a single rusqlite `Connection` for one account.
-/// Callers that previously accepted `&SqlitePool` now accept `&ConnHandle`.
 pub type ConnHandle = Arc<Mutex<Connection>>;
 
+/// Multi-account message store backed by per-account SQLite databases.
 #[derive(Clone)]
 pub struct CompatibleStore {
     bootstrap: StoreBootstrap,
@@ -1346,7 +1350,7 @@ impl CompatibleStore {
     }
 }
 
-/// A pre-connected session for batching multiple queries with a single connection.
+/// A pinned connection for batching multiple queries without pool overhead.
 pub struct StoreSession {
     conn: ConnHandle,
 }

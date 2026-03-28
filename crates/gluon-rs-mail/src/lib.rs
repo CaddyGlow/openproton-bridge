@@ -1,3 +1,5 @@
+//! gluon-rs-mail: A complete, self-contained IMAP4rev1 server library.
+
 pub mod blob_store;
 pub mod db;
 pub mod error;

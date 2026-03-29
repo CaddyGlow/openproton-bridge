@@ -7,6 +7,8 @@ pub mod store;
 pub mod target;
 pub mod types;
 
+pub mod backend;
+
 // IMAP protocol modules.
 pub mod command;
 pub mod gluon_connector;
@@ -54,4 +56,9 @@ pub use imap_types::{
 pub use mailbox::{
     find_mailbox, message_flags, system_mailboxes, GluonMailboxCatalog, ImapMailbox,
     ResolvedMailbox,
+};
+
+pub use backend::{
+    BackendConfig, GluonBackend, GluonUser, SessionPhase, SessionSnapshot, SessionState,
+    StateUpdate,
 };

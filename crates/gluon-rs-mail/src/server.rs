@@ -435,6 +435,7 @@ impl GluonServer {
             login_jail_time: self.default_config.login_jail_time,
             idle_bulk_time: self.default_config.idle_bulk_time,
             limits: self.default_config.limits.clone(),
+            backend: self.default_config.backend.clone(),
         })
     }
 

@@ -575,6 +575,7 @@ async fn prepare_runtime_context(
         login_jail_time: std::time::Duration::ZERO,
         idle_bulk_time: std::time::Duration::ZERO,
         limits: gluon_rs_mail::ImapLimits::default(),
+        backend: None,
     });
 
     let smtp_config = Arc::new(smtp::session::SmtpSessionConfig {

@@ -126,6 +126,7 @@ fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
         login_jail_time: std::time::Duration::ZERO,
         idle_bulk_time: std::time::Duration::ZERO,
         limits: gluon_rs_mail::imap_types::ImapLimits::default(),
+        backend: None,
     });
     (config, tempdir)
 }

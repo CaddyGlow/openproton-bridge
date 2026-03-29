@@ -132,6 +132,8 @@ pub struct SessionConfig {
     pub idle_bulk_time: Duration,
     /// Resource limits (message size, command length, idle timeout).
     pub limits: crate::imap_types::ImapLimits,
+    /// Optional backend for multi-user session management.
+    pub backend: Option<Arc<crate::backend::GluonBackend>>,
 }
 
 static NEXT_IMAP_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);

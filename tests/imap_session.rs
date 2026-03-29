@@ -287,6 +287,7 @@ fn with_failing_connector(
         login_jail_time: Duration::ZERO,
         idle_bulk_time: Duration::ZERO,
         limits: gluon_rs_mail::imap_types::ImapLimits::default(),
+        backend: None,
     })
 }
 
@@ -351,6 +352,7 @@ fn test_gluon_config() -> (
         login_jail_time: Duration::ZERO,
         idle_bulk_time: Duration::ZERO,
         limits: gluon_rs_mail::imap_types::ImapLimits::default(),
+        backend: None,
     });
     (config, tempdir, auth_router, runtime_accounts)
 }
@@ -439,6 +441,7 @@ async fn test_gluon_mail_config() -> (
         login_jail_time: Duration::ZERO,
         idle_bulk_time: Duration::ZERO,
         limits: gluon_rs_mail::imap_types::ImapLimits::default(),
+        backend: None,
     });
 
     (config, tempdir, auth_router, runtime_accounts)
@@ -610,6 +613,7 @@ fn multi_account_compat_config(
         login_jail_time: Duration::ZERO,
         idle_bulk_time: Duration::ZERO,
         limits: gluon_rs_mail::imap_types::ImapLimits::default(),
+        backend: None,
     });
     (config, tempdir, auth_router, runtime_accounts)
 }

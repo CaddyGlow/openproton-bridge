@@ -71,14 +71,14 @@ start_rust_harness() {
 
     if [ "$profile" = "release" ]; then
         echo "Building IMAP harness (release)..."
-        OPENPROTON_CREDENTIAL_STORE=file cargo build --release --bin imap_harness 2>&1 | grep -v warning || true
+        OPENPROTON_CREDENTIAL_STORE=file cargo build --release -p gluon-rs-mail --features harness --bin imap-harness 2>&1 | grep -v warning || true
         IMAP_PORT="$PORT" IMAP_DATA_DIR="$DATA_DIR" IMAP_DISABLE_RATE_LIMIT=1 RUST_LOG=warn \
-            ./target/release/imap_harness >"$DATA_DIR/harness.log" 2>&1 &
+            ./target/release/imap-harness >"$DATA_DIR/harness.log" 2>&1 &
     else
         echo "Building IMAP harness (debug)..."
-        OPENPROTON_CREDENTIAL_STORE=file cargo build --bin imap_harness 2>&1 | grep -v warning || true
+        OPENPROTON_CREDENTIAL_STORE=file cargo build -p gluon-rs-mail --features harness --bin imap-harness 2>&1 | grep -v warning || true
         IMAP_PORT="$PORT" IMAP_DATA_DIR="$DATA_DIR" IMAP_DISABLE_RATE_LIMIT=1 RUST_LOG=warn \
-            cargo run --bin imap_harness >"$DATA_DIR/harness.log" 2>&1 &
+            cargo run -p gluon-rs-mail --features harness --bin imap-harness >"$DATA_DIR/harness.log" 2>&1 &
     fi
     HARNESS_PID=$!
 

@@ -549,6 +549,7 @@ struct IcsParseIssue {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IcsParseMode {
+    #[allow(dead_code)]
     Strict,
     Lenient,
 }

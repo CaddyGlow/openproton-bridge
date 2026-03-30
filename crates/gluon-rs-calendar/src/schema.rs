@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 
 use crate::error::Result;
 
 pub const SCHEMA_COMPONENT: &str = "calendar_cache";
+#[cfg(test)]
 pub const SCHEMA_VERSION: u32 = 1;
 
 struct Migration {
@@ -152,7 +153,9 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub fn current_version(conn: &Connection) -> Result<u32> {
+    use rusqlite::OptionalExtension;
     let version = conn
         .query_row(
             "SELECT MAX(version) FROM schema_migrations WHERE component = ?1",

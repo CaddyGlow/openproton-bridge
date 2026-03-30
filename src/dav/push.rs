@@ -9,7 +9,7 @@ use super::error::{DavError, Result};
 use super::http::DavResponse;
 
 const DEFAULT_SUBSCRIPTION_TTL_SECS: i64 = 7 * 86400; // 7 days
-const MIN_SUBSCRIPTION_TTL_SECS: i64 = 3 * 86400; // 3 days
+const _MIN_SUBSCRIPTION_TTL_SECS: i64 = 3 * 86400; // 3 days
 
 #[derive(Debug, Clone)]
 pub struct PushSubscription {

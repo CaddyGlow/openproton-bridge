@@ -10,16 +10,27 @@ mod misc;
 mod search;
 mod store;
 
+#[allow(unused_imports)]
 pub use append::*;
+#[allow(unused_imports)]
 pub use auth::*;
+#[allow(unused_imports)]
 pub use copy_move::*;
+#[allow(unused_imports)]
 pub use expunge::*;
+#[allow(unused_imports)]
 pub use fetch::*;
+#[allow(unused_imports)]
 pub use helpers::*;
+#[allow(unused_imports)]
 pub use idle::*;
+#[allow(unused_imports)]
 pub use mailbox_cmds::*;
+#[allow(unused_imports)]
 pub use misc::*;
+#[allow(unused_imports)]
 pub use search::*;
+#[allow(unused_imports)]
 pub use store::*;
 
 use std::collections::{HashMap, HashSet};

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use gluon_rs_mail::session::{extract_header_section, extract_text_section};
 use gluon_rs_mail::{CompatibleStore, NewMailbox, NewMessage, UpstreamMailboxMessage};
 use uuid::Uuid;
 
@@ -192,7 +193,7 @@ impl GluonMailboxMutation for GluonMailMailboxMutation {
             .view
             .get_metadata(mailbox, uid)
             .await?
-            .unwrap_or_else(|| fallback_metadata(&message.summary.remote_id));
+            .unwrap_or_else(|| gluon_rs_mail::metadata_parse::fallback_metadata(mailbox, &message));
         let updated = NewMessage {
             internal_id: message.summary.internal_id.clone(),
             remote_id: message.summary.remote_id.clone(),
@@ -490,54 +491,6 @@ fn format_header_address(address: &EmailAddress) -> String {
         return address.address.clone();
     }
     format!("{} <{}>", address.name, address.address)
-}
-
-fn extract_header_section(data: &[u8]) -> String {
-    let s = String::from_utf8_lossy(data);
-    if let Some(pos) = s.find("\r\n\r\n") {
-        s[..pos].to_string()
-    } else if let Some(pos) = s.find("\n\n") {
-        s[..pos].to_string()
-    } else {
-        s.to_string()
-    }
-}
-
-fn extract_text_section(data: &[u8]) -> Vec<u8> {
-    let s = String::from_utf8_lossy(data);
-    if let Some(pos) = s.find("\r\n\r\n") {
-        data[pos + 4..].to_vec()
-    } else if let Some(pos) = s.find("\n\n") {
-        data[pos + 2..].to_vec()
-    } else {
-        Vec::new()
-    }
-}
-
-fn fallback_metadata(proton_id: &str) -> MessageEnvelope {
-    MessageEnvelope {
-        id: proton_id.to_string(),
-        address_id: "addr-1".to_string(),
-        label_ids: vec!["0".to_string()],
-        external_id: Some(format!("{proton_id}@example.test")),
-        subject: proton_id.to_string(),
-        sender: EmailAddress {
-            name: String::new(),
-            address: "unknown@example.test".to_string(),
-        },
-        to_list: Vec::new(),
-        cc_list: Vec::new(),
-        bcc_list: Vec::new(),
-        reply_tos: Vec::new(),
-        flags: 0,
-        time: 0,
-        size: 0,
-        unread: 1,
-        is_replied: 0,
-        is_replied_all: 0,
-        is_forwarded: 0,
-        num_attachments: 0,
-    }
 }
 
 #[cfg(test)]

@@ -65,7 +65,7 @@ impl GluonMailConnector {
             {
                 Ok(None)
             }
-            Err(err) => Err(map_mail_error(err)),
+            Err(err) => Err(super::store_helpers::map_err(err)),
         }
     }
 
@@ -83,7 +83,7 @@ impl GluonMailConnector {
             {
                 Ok(None)
             }
-            Err(err) => Err(map_mail_error(err)),
+            Err(err) => Err(super::store_helpers::map_err(err)),
         }
     }
 
@@ -242,7 +242,7 @@ impl GluonImapConnector for GluonMailConnector {
                     source_mailbox_state.internal_id,
                     dest_mailbox.mailbox_name(),
                 )
-                .map_err(map_mail_error)?;
+                .map_err(super::store_helpers::map_err)?;
         } else {
             let _ = self.ensure_mailbox(dest_mailbox).await?;
         }
@@ -270,7 +270,7 @@ impl GluonImapConnector for GluonMailConnector {
         {
             self.store
                 .delete_mailbox(&storage_user_id, mailbox_state.internal_id)
-                .map_err(map_mail_error)?;
+                .map_err(super::store_helpers::map_err)?;
         }
 
         self.publish_authored(if silent {
@@ -550,10 +550,6 @@ fn current_uid_validity() -> u32 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as u32
-}
-
-fn map_mail_error(err: gluon_rs_mail::GluonError) -> gluon_rs_mail::ImapError {
-    gluon_rs_mail::ImapError::Protocol(format!("gluon-rs-mail connector failure: {err}"))
 }
 
 fn log_gluon_update(source: &str, update: &GluonUpdate) {

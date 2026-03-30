@@ -1,12 +1,13 @@
 //! Per-user state and session factory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use tokio::sync::broadcast;
 
 use crate::gluon_connector::GluonImapConnector;
 use crate::imap_connector::ImapConnector;
+use crate::imap_types::ImapUid;
 use crate::store::CompatibleStore;
 
 use super::state::SessionState;
@@ -19,6 +20,9 @@ pub struct GluonUser {
     pub store: Arc<CompatibleStore>,
     sessions: RwLock<HashMap<u64, ()>>,
     update_tx: broadcast::Sender<StateUpdate>,
+    /// Track which messages each session has in its snapshot.
+    /// Used during expunge to prevent deleting messages still visible to other sessions.
+    message_refs: RwLock<HashMap<u64, HashSet<(String, ImapUid)>>>,
 }
 
 impl GluonUser {
@@ -36,6 +40,7 @@ impl GluonUser {
             store,
             sessions: RwLock::new(HashMap::new()),
             update_tx,
+            message_refs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -53,6 +58,7 @@ impl GluonUser {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&session_id);
+        self.unregister_snapshot(session_id);
     }
 
     pub fn broadcast_update(&self, update: StateUpdate) {
@@ -64,5 +70,47 @@ impl GluonUser {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-session expunge coordination
+    // -----------------------------------------------------------------------
+
+    /// Register the set of UIDs visible to a session after SELECT.
+    /// Called when a session selects a mailbox.
+    pub fn register_snapshot(&self, session_id: u64, mailbox: &str, uids: &[ImapUid]) {
+        let entries: HashSet<(String, ImapUid)> = uids
+            .iter()
+            .map(|&uid| (mailbox.to_ascii_lowercase(), uid))
+            .collect();
+        self.message_refs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session_id, entries);
+    }
+
+    /// Remove snapshot tracking for a session (CLOSE / LOGOUT).
+    pub fn unregister_snapshot(&self, session_id: u64) {
+        self.message_refs
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&session_id);
+    }
+
+    /// Check whether a message can be expunged by the given session.
+    ///
+    /// Returns `true` if no *other* session references this (mailbox, uid) pair.
+    pub fn can_expunge(&self, session_id: u64, mailbox: &str, uid: ImapUid) -> bool {
+        let key = (mailbox.to_ascii_lowercase(), uid);
+        let refs = self.message_refs.read().unwrap_or_else(|e| e.into_inner());
+        for (&sid, entries) in refs.iter() {
+            if sid == session_id {
+                continue;
+            }
+            if entries.contains(&key) {
+                return false;
+            }
+        }
+        true
     }
 }

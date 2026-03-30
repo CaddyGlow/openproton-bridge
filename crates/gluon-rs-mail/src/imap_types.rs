@@ -105,7 +105,7 @@ impl From<String> for MessageId {
 }
 
 /// Email address (name + address pair).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmailAddress {
     pub name: String,
     pub address: String,
@@ -113,7 +113,7 @@ pub struct EmailAddress {
 
 /// Message metadata envelope. Crate-local equivalent of the upstream API's
 /// message metadata, without serde annotations or API-specific naming.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MessageEnvelope {
     pub id: String,
     pub address_id: String,

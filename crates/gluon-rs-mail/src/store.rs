@@ -305,6 +305,9 @@ impl CompatibleStore {
             [],
         )?;
 
+        // Run schema migrations.
+        crate::db_migrations::migrate(&conn)?;
+
         let handle = Arc::new(Mutex::new(conn));
         let mut conns = self.connections.lock().unwrap_or_else(|e| e.into_inner());
         conns.insert(storage_user_id.to_string(), handle.clone());

@@ -2,6 +2,7 @@
 
 pub mod blob_store;
 pub mod db;
+pub mod db_migrations;
 pub mod error;
 pub mod store;
 pub mod target;
@@ -59,6 +60,6 @@ pub use mailbox::{
 };
 
 pub use backend::{
-    BackendConfig, GluonBackend, GluonUser, SessionPhase, SessionSnapshot, SessionState,
-    StateUpdate,
+    actions::FlagAction, BackendConfig, GluonBackend, GluonUser, SessionPhase, SessionSnapshot,
+    SessionState, StateUpdate,
 };

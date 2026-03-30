@@ -9,6 +9,7 @@ use tracing::{debug, info};
 
 use super::gluon_mailbox_mutation::GluonMailMailboxMutation;
 use super::gluon_mailbox_view::GluonMailMailboxView;
+use super::store_helpers::storage_user_id_for_account;
 
 pub use gluon_rs_mail::gluon_connector::{
     GluonCreatedMessage, GluonImapConnector, GluonMailbox, GluonMessageRef, GluonUpdate,
@@ -47,14 +48,7 @@ impl GluonMailConnector {
     }
 
     fn storage_user_id_for_account<'a>(&'a self, account_id: Option<&'a str>) -> &'a str {
-        let account_id = account_id.unwrap_or("__default__");
-        self.store
-            .bootstrap()
-            .accounts
-            .iter()
-            .find(|account| account.account_id == account_id)
-            .map(|account| account.storage_user_id.as_str())
-            .unwrap_or(account_id)
+        storage_user_id_for_account(&self.store, account_id.unwrap_or("__default__"))
     }
 
     async fn mailbox_by_name(

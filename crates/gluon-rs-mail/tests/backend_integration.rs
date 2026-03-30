@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use gluon_rs_mail::backend::actions::FlagAction;
-use gluon_rs_mail::backend::snapshot::SessionSnapshot;
-use gluon_rs_mail::backend::state::SessionPhase;
-use gluon_rs_mail::backend::updates::StateUpdate;
+use gluon_rs_mail::backend::state::actions::FlagAction;
+use gluon_rs_mail::backend::state::session::SessionPhase;
+use gluon_rs_mail::backend::state::snapshot::SessionSnapshot;
+use gluon_rs_mail::backend::state::updates::StateUpdate;
 use gluon_rs_mail::backend::user::GluonUser;
 use gluon_rs_mail::backend::{BackendConfig, GluonBackend};
 use gluon_rs_mail::gluon_connector::GluonImapConnector;

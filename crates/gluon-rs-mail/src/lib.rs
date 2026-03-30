@@ -60,6 +60,6 @@ pub use mailbox::{
 };
 
 pub use backend::{
-    actions::FlagAction, BackendConfig, GluonBackend, GluonUser, SessionPhase, SessionSnapshot,
+    BackendConfig, FlagAction, GluonBackend, GluonUser, SessionPhase, SessionSnapshot,
     SessionState, StateUpdate,
 };

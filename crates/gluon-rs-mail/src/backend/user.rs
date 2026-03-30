@@ -10,8 +10,7 @@ use crate::imap_connector::ImapConnector;
 use crate::imap_types::ImapUid;
 use crate::store::CompatibleStore;
 
-use super::state::SessionState;
-use super::updates::StateUpdate;
+use super::state::{SessionState, StateUpdate};
 
 pub struct GluonUser {
     pub user_id: String,

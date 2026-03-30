@@ -7,9 +7,9 @@ use tracing::warn;
 use crate::imap_error::{ImapError, ImapResult};
 use crate::imap_types::{ImapUid, ScopedMailboxId};
 
-use super::state::SessionState;
+use super::session::SessionState;
 use super::updates::StateUpdate;
-use super::user::GluonUser;
+use crate::backend::user::GluonUser;
 
 /// How to mutate flags on a message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

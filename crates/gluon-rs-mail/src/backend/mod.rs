@@ -1,9 +1,6 @@
 //! Backend layer: multi-user management, authentication, session state.
 
-pub mod actions;
-pub mod snapshot;
 pub mod state;
-pub mod updates;
 pub mod user;
 
 use std::collections::HashMap;
@@ -11,9 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use crate::imap_error::{ImapError, ImapResult};
 
-pub use snapshot::SessionSnapshot;
-pub use state::{SessionPhase, SessionState};
-pub use updates::StateUpdate;
+pub use state::{FlagAction, SessionPhase, SessionSnapshot, SessionState, StateUpdate};
 pub use user::GluonUser;
 
 pub struct BackendConfig {

@@ -27,13 +27,13 @@ use crate::crypto::keys::{self, Keyring};
 use crate::imap::convert::to_envelope;
 use crate::imap::gluon_connector::GluonImapConnector;
 use crate::imap::mailbox;
-use crate::imap::mailbox_view::GluonMailboxView;
 use crate::imap::rfc822;
-use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
 use crate::pim::incremental as pim_incremental;
 use crate::pim::store::PimStore;
 use crate::vault;
+use gluon_rs_mail::GluonMailboxView;
 use gluon_rs_mail::MessageEnvelope;
+use gluon_rs_mail::{ImapUid, ProtonMessageId, ScopedMailboxId};
 
 use super::accounts::{
     AccountHealth, AccountRuntimeError, RuntimeAccountInfo, RuntimeAccountRegistry,

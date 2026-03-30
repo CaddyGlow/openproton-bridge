@@ -2942,7 +2942,7 @@ fn cli_tls_paths(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathB
 
 fn ensure_cli_tls_certificate(dir: &std::path::Path) -> anyhow::Result<()> {
     let cert_dir = dir.join("tls");
-    let _imap = imap::server::ImapServer::new().with_tls(&cert_dir)?;
+    let _imap = gluon_rs_mail::server::ImapServer::new().with_tls(&cert_dir)?;
     let _smtp = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
     Ok(())
 }

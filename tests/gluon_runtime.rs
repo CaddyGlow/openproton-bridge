@@ -5,6 +5,7 @@ use gluon_rs_mail::{
     AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, NewMailbox,
     NewMessage, StoreBootstrap,
 };
+use gluon_rs_mail::{ImapUid, ScopedMailboxId};
 use openproton_bridge::api::types::{Address, AddressKey, ApiMode, Session, UserKey};
 use openproton_bridge::bridge::accounts::RuntimeAuthMaterial;
 use openproton_bridge::bridge::events::VaultCheckpointStore;
@@ -15,7 +16,6 @@ use openproton_bridge::bridge::session_manager::SessionManager;
 use openproton_bridge::bridge::types::{
     AccountId, CheckpointSyncState, EventCheckpoint, EventCheckpointStore,
 };
-use openproton_bridge::imap::types::{ImapUid, ScopedMailboxId};
 use openproton_bridge::paths::RuntimePaths;
 use openproton_bridge::vault;
 use sequoia_openpgp as openpgp;

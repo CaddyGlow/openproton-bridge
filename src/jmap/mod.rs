@@ -136,11 +136,11 @@ mod tests {
     use crate::imap::gluon_connector::{
         GluonImapConnector, GluonMailConnector, GluonMailbox, GluonMessageRef, GluonUpdate,
     };
-    use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
     use gluon_rs_mail::{
         AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey,
         StoreBootstrap,
     };
+    use gluon_rs_mail::{ImapUid, ProtonMessageId, ScopedMailboxId};
     use tempfile::TempDir;
 
     #[test]

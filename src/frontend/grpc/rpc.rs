@@ -510,8 +510,8 @@ fn resolve_optimize_cache_concurrency(raw_concurrency: u32) -> usize {
     requested.clamp(1, OPTIMIZE_CACHE_CONCURRENCY_MAX)
 }
 
-fn scoped_cache_mailbox(account_id: &str, mailbox: &str) -> crate::imap::types::ScopedMailboxId {
-    crate::imap::types::ScopedMailboxId::from_parts(Some(account_id), mailbox)
+fn scoped_cache_mailbox(account_id: &str, mailbox: &str) -> gluon_rs_mail::ScopedMailboxId {
+    gluon_rs_mail::ScopedMailboxId::from_parts(Some(account_id), mailbox)
 }
 
 #[allow(clippy::result_large_err)]
@@ -623,15 +623,15 @@ async fn load_cache_auth_material(
 
 #[allow(clippy::result_large_err)]
 async fn optimize_cache_message(
-    mailbox: crate::imap::types::ScopedMailboxId,
-    uid: crate::imap::types::ImapUid,
+    mailbox: gluon_rs_mail::ScopedMailboxId,
+    uid: gluon_rs_mail::ImapUid,
     proton_id: String,
     mut client: ProtonClient,
     access_token: String,
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
     account_id: crate::bridge::types::AccountId,
     addr_keyrings: Arc<HashMap<String, Arc<crate::crypto::keys::Keyring>>>,
-    mutation: Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation>,
+    mutation: Arc<dyn gluon_rs_mail::GluonMailboxMutation>,
 ) -> bool {
     let msg_resp = match crate::api::messages::get_message(&client, &proton_id).await {
         Ok(msg) => msg,
@@ -733,8 +733,8 @@ async fn optimize_cache_message(
 #[allow(clippy::result_large_err)]
 async fn run_cache_optimization_for_account(
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
-    view: Arc<dyn crate::imap::mailbox_view::GluonMailboxView>,
-    mutation: Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation>,
+    view: Arc<dyn gluon_rs_mail::GluonMailboxView>,
+    mutation: Arc<dyn gluon_rs_mail::GluonMailboxMutation>,
     account: Session,
     mailboxes: Vec<String>,
     semaphore: Arc<Semaphore>,
@@ -976,8 +976,8 @@ async fn run_cache_optimization_for_account(
 #[allow(clippy::result_large_err)]
 async fn run_cache_optimization(
     runtime_accounts: Arc<bridge::accounts::RuntimeAccountRegistry>,
-    view: Arc<dyn crate::imap::mailbox_view::GluonMailboxView>,
-    mutation: Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation>,
+    view: Arc<dyn gluon_rs_mail::GluonMailboxView>,
+    mutation: Arc<dyn gluon_rs_mail::GluonMailboxMutation>,
     accounts: Vec<Session>,
     mailboxes: Vec<String>,
     concurrency: usize,
@@ -1170,9 +1170,9 @@ impl pb::bridge_server::Bridge for BridgeService {
                 Status::internal(format!("failed to open compatible store: {err}"))
             })?,
         );
-        let view: std::sync::Arc<dyn crate::imap::mailbox_view::GluonMailboxView> =
+        let view: std::sync::Arc<dyn gluon_rs_mail::GluonMailboxView> =
             crate::imap::gluon_mailbox_view::GluonMailMailboxView::new(compatible_store.clone());
-        let mutation: std::sync::Arc<dyn crate::imap::mailbox_mutation::GluonMailboxMutation> =
+        let mutation: std::sync::Arc<dyn gluon_rs_mail::GluonMailboxMutation> =
             crate::imap::gluon_mailbox_mutation::GluonMailMailboxMutation::new(
                 compatible_store,
             );

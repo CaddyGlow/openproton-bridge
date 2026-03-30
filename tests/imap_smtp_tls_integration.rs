@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use gluon_rs_mail::server::{run_server_with_tls_config as run_imap_server, ImapServer};
+use gluon_rs_mail::session::SessionConfig;
 use gluon_rs_mail::{
     AccountBootstrap, CacheLayout, CompatibilityTarget, CompatibleStore, GluonKey, StoreBootstrap,
 };
@@ -11,8 +13,6 @@ use openproton_bridge::imap::gluon_connector::GluonMailConnector;
 use openproton_bridge::imap::gluon_mailbox_mutation::GluonMailMailboxMutation;
 use openproton_bridge::imap::gluon_mailbox_view::GluonMailMailboxView;
 use openproton_bridge::imap::mailbox_catalog::RuntimeMailboxCatalog;
-use openproton_bridge::imap::server::{run_server_with_tls_config as run_imap_server, ImapServer};
-use openproton_bridge::imap::session::SessionConfig;
 use openproton_bridge::smtp::server::{run_server_with_tls_config as run_smtp_server, SmtpServer};
 use openproton_bridge::smtp::session::SmtpSessionConfig;
 use tempfile::TempDir;
@@ -119,7 +119,7 @@ fn test_imap_config() -> (Arc<SessionConfig>, TempDir) {
         mailbox_catalog: RuntimeMailboxCatalog::new(runtime_accounts),
         mailbox_mutation: GluonMailMailboxMutation::new(gluon_store.clone()),
         mailbox_view: GluonMailMailboxView::new(gluon_store),
-        recent_tracker: openproton_bridge::imap::session::RecentTracker::new(),
+        recent_tracker: gluon_rs_mail::session::RecentTracker::new(),
         shutdown_rx: None,
         event_tx: None,
         delimiter: '/',

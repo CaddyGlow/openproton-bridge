@@ -7,14 +7,7 @@ pub mod gluon_mailbox_view;
 pub mod gluon_txn;
 pub mod mailbox;
 pub mod mailbox_catalog;
-pub mod mailbox_mutation;
-pub mod mailbox_view;
-pub mod response;
 pub mod rfc822;
-pub mod server;
-pub mod session;
-pub mod store;
-pub mod types;
 
 use std::path::PathBuf;
 

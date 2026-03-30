@@ -575,9 +575,8 @@ mod tests {
     use tempfile::{tempdir, TempDir};
 
     use super::GluonMailMailboxMutation;
-    use crate::imap::mailbox_mutation::GluonMailboxMutation;
-    use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
     use gluon_rs_mail::{EmailAddress, MessageEnvelope};
+    use gluon_rs_mail::{GluonMailboxMutation, ImapUid, ProtonMessageId, ScopedMailboxId};
 
     struct TestFixture {
         _tempdir: TempDir,

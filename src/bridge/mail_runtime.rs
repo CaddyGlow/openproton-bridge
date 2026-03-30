@@ -327,13 +327,13 @@ pub async fn start(
 
 struct PreparedMailRuntime {
     active_sessions: Vec<Session>,
-    imap_config: Arc<imap::session::SessionConfig>,
+    imap_config: Arc<gluon_rs_mail::session::SessionConfig>,
     smtp_config: Arc<smtp::session::SmtpSessionConfig>,
     runtime_accounts: Arc<super::accounts::RuntimeAccountRegistry>,
     runtime_snapshot: Vec<super::accounts::RuntimeAccountInfo>,
     api_base_url: String,
     auth_router: super::auth_router::AuthRouter,
-    event_mailbox_view: Arc<dyn imap::mailbox_view::GluonMailboxView>,
+    event_mailbox_view: Arc<dyn gluon_rs_mail::GluonMailboxView>,
     pim_stores: HashMap<String, Arc<PimStore>>,
     checkpoint_store: super::events::SharedCheckpointStore,
     poll_interval: Duration,
@@ -562,13 +562,13 @@ async fn prepare_runtime_context(
         auth_router.clone(),
         runtime_accounts.clone(),
     );
-    let imap_config = Arc::new(imap::session::SessionConfig {
+    let imap_config = Arc::new(gluon_rs_mail::session::SessionConfig {
         connector,
         gluon_connector,
         mailbox_catalog,
         mailbox_mutation,
         mailbox_view,
-        recent_tracker: imap::session::RecentTracker::new(),
+        recent_tracker: gluon_rs_mail::session::RecentTracker::new(),
         shutdown_rx: None,
         event_tx: None,
         delimiter: '/',
@@ -586,14 +586,14 @@ async fn prepare_runtime_context(
 
     if !config.disable_tls {
         let cert_dir = settings_dir.join("tls");
-        let _imap_server = imap::server::ImapServer::new().with_tls(&cert_dir)?;
+        let _imap_server = gluon_rs_mail::server::ImapServer::new().with_tls(&cert_dir)?;
         let _smtp_server = smtp::server::SmtpServer::new().with_tls(&cert_dir)?;
         match config.dav_tls_mode {
             DavTlsMode::None => dav::server::clear_runtime_tls_config(),
             DavTlsMode::StartTls => dav::server::install_runtime_tls_config_from_dir(&cert_dir)?,
         }
     } else {
-        imap::server::clear_runtime_tls_config();
+        gluon_rs_mail::server::clear_runtime_tls_config();
         smtp::server::clear_runtime_tls_config();
         dav::server::clear_runtime_tls_config();
     }
@@ -623,7 +623,7 @@ async fn prepare_runtime_context(
 fn build_mailbox_view(
     gluon_bootstrap: &vault::GluonStoreBootstrap,
     gluon_root: &std::path::Path,
-) -> anyhow::Result<Arc<dyn imap::mailbox_view::GluonMailboxView>> {
+) -> anyhow::Result<Arc<dyn gluon_rs_mail::GluonMailboxView>> {
     let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, true)?;
     Ok(imap::gluon_mailbox_view::GluonMailMailboxView::new(
         Arc::new(store),
@@ -633,7 +633,7 @@ fn build_mailbox_view(
 fn build_mailbox_mutation(
     gluon_bootstrap: &vault::GluonStoreBootstrap,
     gluon_root: &std::path::Path,
-) -> anyhow::Result<Arc<dyn imap::mailbox_mutation::GluonMailboxMutation>> {
+) -> anyhow::Result<Arc<dyn gluon_rs_mail::GluonMailboxMutation>> {
     let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, false)?;
     Ok(imap::gluon_mailbox_mutation::GluonMailMailboxMutation::new(
         Arc::new(store),
@@ -643,7 +643,7 @@ fn build_mailbox_mutation(
 fn build_event_mailbox_view(
     gluon_bootstrap: &vault::GluonStoreBootstrap,
     gluon_root: &std::path::Path,
-) -> anyhow::Result<Arc<dyn imap::mailbox_view::GluonMailboxView>> {
+) -> anyhow::Result<Arc<dyn gluon_rs_mail::GluonMailboxView>> {
     let store = build_gluon_mail_compatible_store(gluon_bootstrap, gluon_root, true)?;
     Ok(imap::gluon_mailbox_view::GluonMailMailboxView::new(
         Arc::new(store),
@@ -888,7 +888,8 @@ async fn run_runtime(
     let imap_config_for_starttls = imap_config.clone();
     let smtp_config_for_starttls = smtp_config.clone();
     let mut imap_task = tokio::spawn(async move {
-        imap::server::run_server_with_listener(imap_listener, imap_config_for_starttls).await
+        gluon_rs_mail::server::run_server_with_listener(imap_listener, imap_config_for_starttls)
+            .await
     });
     let mut smtp_task = tokio::spawn(async move {
         smtp::server::run_server_with_listener(smtp_listener, smtp_config_for_starttls).await
@@ -896,7 +897,8 @@ async fn run_runtime(
     let mut imap_implicit_tls_task = imap_implicit_tls_listener.map(|listener| {
         let imap_config = imap_config.clone();
         tokio::spawn(async move {
-            imap::server::run_server_with_listener_implicit_tls(listener, imap_config).await
+            gluon_rs_mail::server::run_server_with_listener_implicit_tls(listener, imap_config)
+                .await
         })
     });
     let mut smtp_implicit_tls_task = smtp_implicit_tls_listener.map(|listener| {

@@ -428,10 +428,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::GluonMailMailboxView;
-    use crate::imap::mailbox_view::GluonMailboxView;
     use crate::imap::rfc822;
-    use crate::imap::types::{ImapUid, ProtonMessageId, ScopedMailboxId};
     use gluon_rs_mail::{EmailAddress, MessageEnvelope};
+    use gluon_rs_mail::{GluonMailboxView, ImapUid, ProtonMessageId, ScopedMailboxId};
 
     async fn open_store() -> Arc<CompatibleStore> {
         let temp = tempdir().expect("tempdir");

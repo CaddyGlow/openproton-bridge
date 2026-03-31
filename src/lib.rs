@@ -5,7 +5,7 @@ pub mod cli_human_verification;
 pub mod client_config;
 pub mod crypto;
 pub mod dav;
-pub mod frontend;
+pub mod grpc;
 pub mod imap;
 pub mod jmap;
 pub mod observability;

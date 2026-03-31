@@ -6,14 +6,13 @@ use crate::api::calendar::{self, CalendarEvent, SyncEventOperation, SyncMultiple
 use crate::api::calendar::{Calendar, CalendarEventPart};
 use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRoute;
-use crate::pim::dav::{CalDavRepository, DeleteMode, StoreBackedDavAdapter};
-use crate::pim::query::{CalendarEventRange, QueryPage};
 use crate::pim::store::PimStore;
+use crate::pim::{CalendarEventRange, QueryPage};
 
 use super::calendar_crypto;
-use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
+use super::{DavError, Result};
 
 pub async fn handle_request(
     method: &str,
@@ -26,12 +25,10 @@ pub async fn handle_request(
 ) -> Result<Option<DavResponse>> {
     let path = normalize_path(raw_path);
     let calendars_root = format!("/dav/{}/calendars/", auth.account_id.0);
-    let adapter = StoreBackedDavAdapter::new(store.clone());
-
     if let Some(calendar_id) = parse_calendar_collection_id(&calendars_root, &path) {
         return match method {
             "GET" | "HEAD" => {
-                let count = adapter
+                let count = store
                     .list_calendar_events(
                         &calendar_id,
                         false,
@@ -51,7 +48,7 @@ pub async fn handle_request(
                 Ok(Some(response))
             }
             "MKCALENDAR" => {
-                let exists = adapter
+                let exists = store
                     .get_calendar(&calendar_id, false)
                     .map_err(|err| DavError::Backend(err.to_string()))?
                     .is_some();
@@ -62,7 +59,7 @@ pub async fn handle_request(
                         body: b"calendar already exists\n".to_vec(),
                     }));
                 }
-                adapter
+                store
                     .upsert_calendar(&Calendar {
                         id: calendar_id,
                         name: "Calendar".to_string(),
@@ -80,7 +77,7 @@ pub async fn handle_request(
                 }))
             }
             "PROPPATCH" => {
-                let existing = adapter
+                let existing = store
                     .get_calendar(&calendar_id, true)
                     .map_err(|err| DavError::Backend(err.to_string()))?;
                 let Some(existing) = existing else {
@@ -104,7 +101,7 @@ pub async fn handle_request(
                     .or_else(|| extract_prop_text(body, "calendar_color"))
                     .unwrap_or_else(|| existing.color.clone());
 
-                adapter
+                store
                     .upsert_calendar(&Calendar {
                         id: existing.id,
                         name: display_name,
@@ -119,15 +116,15 @@ pub async fn handle_request(
                 Ok(Some(prop_patch_ok_response(raw_path, &accepted_props)))
             }
             "DELETE" => {
-                let exists = adapter
+                let exists = store
                     .get_calendar(&calendar_id, false)
                     .map_err(|err| DavError::Backend(err.to_string()))?
                     .is_some();
                 if !exists {
                     return Ok(Some(not_found_response()));
                 }
-                adapter
-                    .delete_calendar(&calendar_id, DeleteMode::Soft)
+                store
+                    .soft_delete_calendar(&calendar_id)
                     .map_err(|err| DavError::Backend(err.to_string()))?;
                 Ok(Some(DavResponse {
                     status: "204 No Content",
@@ -145,7 +142,7 @@ pub async fn handle_request(
 
     match method {
         "GET" | "HEAD" => {
-            let stored = adapter
+            let stored = store
                 .get_calendar_event(&event_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             let Some(stored) = stored else {
@@ -192,7 +189,7 @@ pub async fn handle_request(
             Ok(Some(response))
         }
         "PUT" => {
-            let existing = adapter
+            let existing = store
                 .get_calendar_event(&event_id, true)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             let current_etag = existing
@@ -214,7 +211,7 @@ pub async fn handle_request(
             }
             let normalized_ics = normalized_ics.unwrap();
 
-            ensure_calendar_exists(&adapter, &calendar_id)?;
+            ensure_calendar_exists(store, &calendar_id)?;
             let now = epoch_seconds();
             let create_time = store
                 .get_calendar_event_payload(&event_id, true)
@@ -224,7 +221,7 @@ pub async fn handle_request(
                 .unwrap_or(now);
             let event = parse_ics(&event_id, &calendar_id, payload, create_time, now);
             let event_uid = event.uid.clone();
-            adapter
+            store
                 .upsert_calendar_event(&event)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
 
@@ -286,8 +283,7 @@ pub async fn handle_request(
                                         if result.response.code == 1000 {
                                             if let Some(ref upstream_event) = result.response.event
                                             {
-                                                let _ =
-                                                    adapter.upsert_calendar_event(upstream_event);
+                                                let _ = store.upsert_calendar_event(upstream_event);
                                                 tracing::info!(
                                                     event_id = %upstream_event.id,
                                                     calendar_id = %calendar_id,
@@ -326,7 +322,7 @@ pub async fn handle_request(
                 }
             }
 
-            let stored = adapter
+            let stored = store
                 .get_calendar_event(&event_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?
                 .ok_or_else(|| DavError::Backend("event missing after upsert".to_string()))?;
@@ -345,7 +341,7 @@ pub async fn handle_request(
             }))
         }
         "DELETE" => {
-            let existing = adapter
+            let existing = store
                 .get_calendar_event(&event_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             let Some(existing) = existing else {
@@ -417,8 +413,8 @@ pub async fn handle_request(
                 }
             }
 
-            adapter
-                .delete_calendar_event(&event_id, DeleteMode::Soft)
+            store
+                .soft_delete_calendar_event(&event_id)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             Ok(Some(DavResponse {
                 status: "204 No Content",
@@ -430,13 +426,13 @@ pub async fn handle_request(
     }
 }
 
-fn ensure_calendar_exists(adapter: &StoreBackedDavAdapter, calendar_id: &str) -> Result<()> {
-    let exists = adapter
+fn ensure_calendar_exists(store: &PimStore, calendar_id: &str) -> Result<()> {
+    let exists = store
         .get_calendar(calendar_id, true)
         .map_err(|err| DavError::Backend(err.to_string()))?
         .is_some();
     if !exists {
-        adapter
+        store
             .upsert_calendar(&Calendar {
                 id: calendar_id.to_string(),
                 name: "Calendar".to_string(),

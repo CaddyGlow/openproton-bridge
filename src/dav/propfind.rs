@@ -5,19 +5,18 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::bridge::auth_router::AuthRoute;
-use crate::pim::dav::CalDavRepository;
-use crate::pim::query::QueryPage;
 use crate::pim::store::PimStore;
-use crate::pim::types::StoredCalendar;
+use crate::pim::QueryPage;
+use crate::pim::StoredCalendar;
 
 use super::discovery;
-use super::error::{DavError, Result};
 use super::http::DavResponse;
-use super::push_crypto::VapidKeyPair;
+use super::push::VapidKeyPair;
 use super::xml::{
     multistatus_xml_for_propfind, DavPropResource, DavPropfindMode, DavResourceKind,
     WebDavPushConfig,
 };
+use super::{DavError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavDepth {
@@ -94,10 +93,8 @@ pub fn handle_propfind_with_store(
         AccountResource::AddressbookDefault => vec![default_addressbook_resource(auth)],
         AccountResource::CalendarsHome => calendar_home_resources(auth, depth, store, vapid_keys),
         AccountResource::CalendarCollection(calendar_id) => {
-            let calendar = store.and_then(|store| {
-                let adapter = crate::pim::dav::StoreBackedDavAdapter::new(store.clone());
-                adapter.get_calendar(&calendar_id, false).ok().flatten()
-            });
+            let calendar =
+                store.and_then(|store| store.get_calendar(&calendar_id, false).ok().flatten());
             vec![calendar_collection_resource(
                 auth,
                 &calendar_id,
@@ -137,8 +134,7 @@ fn calendar_home_resources(
     if depth != DavDepth::Zero {
         let mut calendar_ids = HashSet::new();
         if let Some(store) = store {
-            let adapter = crate::pim::dav::StoreBackedDavAdapter::new(store.clone());
-            if let Ok(calendars) = adapter.list_calendars(
+            if let Ok(calendars) = store.list_calendars(
                 false,
                 QueryPage {
                     limit: 500,
@@ -623,7 +619,6 @@ mod tests {
     use crate::api::calendar::{Calendar, CalendarEvent, CalendarEventPart};
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
-    use crate::pim::dav::CalDavRepository;
     use crate::pim::store::PimStore;
 
     use super::{handle_propfind, handle_propfind_with_store, parse_depth, DavDepth};

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::error::{DavError, Result};
+use super::{DavError, Result};
 
 const MAX_REQUEST_SIZE: usize = 16 * 1024;
 

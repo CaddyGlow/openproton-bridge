@@ -7,5 +7,4 @@ pub mod mail_runtime;
 pub mod runtime_supervisor;
 pub mod session_manager;
 pub mod sync_state;
-pub mod token_refresh;
 pub mod types;

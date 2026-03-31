@@ -2,11 +2,22 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL;
 use base64::Engine;
+use hkdf::Hkdf;
+use p256::ecdh::EphemeralSecret;
+use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::PublicKey;
+use sha2::Sha256;
+use tokio::sync::broadcast;
 
-use super::error::{DavError, Result};
+use crate::bridge::calendar_notify::CalendarChangeEvent;
+
 use super::http::DavResponse;
+use super::{DavError, Result};
 
 const DEFAULT_SUBSCRIPTION_TTL_SECS: i64 = 7 * 86400; // 7 days
 const _MIN_SUBSCRIPTION_TTL_SECS: i64 = 3 * 86400; // 3 days
@@ -262,6 +273,256 @@ fn days_to_date(days_since_epoch: i64) -> (i64, i64, i64, i64) {
     (y, m, d, weekday)
 }
 
+// -- VAPID / Web Push crypto --
+
+pub struct VapidKeyPair {
+    signing_key: SigningKey,
+    pub public_key_bytes: Vec<u8>,
+    pub public_key_base64url: String,
+}
+
+impl VapidKeyPair {
+    pub fn generate() -> Self {
+        let signing_key = SigningKey::random(&mut rand::thread_rng());
+        let verifying_key = VerifyingKey::from(&signing_key);
+        let point = verifying_key.to_encoded_point(false);
+        let public_key_bytes = point.as_bytes().to_vec();
+        let public_key_base64url = BASE64URL.encode(&public_key_bytes);
+        Self {
+            signing_key,
+            public_key_bytes,
+            public_key_base64url,
+        }
+    }
+
+    pub fn sign_vapid_jwt(&self, audience: &str) -> std::result::Result<String, DavError> {
+        use p256::ecdsa::signature::Signer;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let header = BASE64URL.encode(br#"{"typ":"JWT","alg":"ES256"}"#);
+        let payload = format!(
+            r#"{{"aud":"{}","exp":{},"sub":"mailto:bridge@localhost"}}"#,
+            audience,
+            now + 86400,
+        );
+        let payload_b64 = BASE64URL.encode(payload.as_bytes());
+        let signing_input = format!("{header}.{payload_b64}");
+
+        let signature: p256::ecdsa::Signature = self.signing_key.sign(signing_input.as_bytes());
+        let sig_b64 = BASE64URL.encode(signature.to_bytes());
+
+        Ok(format!(
+            "vapid t={signing_input}.{sig_b64}, k={}",
+            self.public_key_base64url
+        ))
+    }
+}
+
+/// Encrypt a push message payload per RFC 8291 (aes128gcm content encoding).
+pub fn encrypt_push_payload(
+    plaintext: &[u8],
+    client_public_key: &[u8],
+    auth_secret: &[u8],
+) -> std::result::Result<(Vec<u8>, Vec<u8>), DavError> {
+    let client_pk = PublicKey::from_sec1_bytes(client_public_key)
+        .map_err(|e| DavError::Backend(format!("invalid client public key: {e}")))?;
+
+    let server_secret = EphemeralSecret::random(&mut rand::thread_rng());
+    let server_pk = p256::PublicKey::from(&server_secret);
+    let server_point = server_pk.to_encoded_point(false);
+    let server_pub_bytes = server_point.as_bytes().to_vec();
+
+    let shared_secret = server_secret.diffie_hellman(&client_pk);
+
+    let hkdf_auth = Hkdf::<Sha256>::new(Some(auth_secret), shared_secret.raw_secret_bytes());
+
+    let mut ikm_info = Vec::with_capacity(128);
+    ikm_info.extend_from_slice(b"WebPush: info\0");
+    ikm_info.extend_from_slice(client_public_key);
+    ikm_info.extend_from_slice(&server_pub_bytes);
+
+    let mut ikm = [0u8; 32];
+    hkdf_auth
+        .expand(&ikm_info, &mut ikm)
+        .map_err(|e| DavError::Backend(format!("HKDF expand for IKM failed: {e}")))?;
+
+    let mut salt = [0u8; 16];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut salt);
+
+    let hkdf_cek = Hkdf::<Sha256>::new(Some(&salt), &ikm);
+
+    let mut cek = [0u8; 16];
+    hkdf_cek
+        .expand(b"Content-Encoding: aes128gcm\0", &mut cek)
+        .map_err(|e| DavError::Backend(format!("HKDF expand for CEK failed: {e}")))?;
+
+    let mut nonce_bytes = [0u8; 12];
+    hkdf_cek
+        .expand(b"Content-Encoding: nonce\0", &mut nonce_bytes)
+        .map_err(|e| DavError::Backend(format!("HKDF expand for nonce failed: {e}")))?;
+
+    let mut padded = Vec::with_capacity(plaintext.len() + 1);
+    padded.extend_from_slice(plaintext);
+    padded.push(0x02);
+
+    let cipher = Aes128Gcm::new_from_slice(&cek)
+        .map_err(|e| DavError::Backend(format!("AES-GCM key init failed: {e}")))?;
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = cipher
+        .encrypt(nonce, padded.as_ref())
+        .map_err(|e| DavError::Backend(format!("AES-GCM encrypt failed: {e}")))?;
+
+    let rs: u32 = 4096;
+    let keyid_len = server_pub_bytes.len() as u8;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&salt);
+    body.extend_from_slice(&rs.to_be_bytes());
+    body.push(keyid_len);
+    body.extend_from_slice(&server_pub_bytes);
+    body.extend_from_slice(&ciphertext);
+
+    Ok((body, server_pub_bytes))
+}
+
+// -- Push sender --
+
+pub async fn run_push_sender(
+    mut change_rx: broadcast::Receiver<CalendarChangeEvent>,
+    subscription_store: PushSubscriptionStore,
+    vapid_keys: Arc<VapidKeyPair>,
+    http_client: reqwest::Client,
+) {
+    loop {
+        match change_rx.recv().await {
+            Ok(event) => {
+                send_notifications_for_event(
+                    &event,
+                    &subscription_store,
+                    &vapid_keys,
+                    &http_client,
+                )
+                .await;
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::debug!(lagged = n, "push sender broadcast lagged");
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+    tracing::info!("push sender task stopped");
+}
+
+async fn send_notifications_for_event(
+    event: &CalendarChangeEvent,
+    store: &PushSubscriptionStore,
+    vapid_keys: &VapidKeyPair,
+    http_client: &reqwest::Client,
+) {
+    let subscriptions = store.get_for_account(&event.account_id);
+    if subscriptions.is_empty() {
+        return;
+    }
+
+    let topic = format!("{}/{}", event.account_id, event.calendar_id);
+
+    for sub in &subscriptions {
+        if event.calendar_id != "*" && !sub.resource_path.contains(&event.calendar_id) {
+            continue;
+        }
+
+        let push_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><push-message xmlns="https://bitfire.at/webdav-push"><topic>{topic}</topic><content-update/></push-message>"#,
+        );
+
+        let encrypted = match encrypt_push_payload(
+            push_xml.as_bytes(),
+            &sub.client_public_key,
+            &sub.auth_secret,
+        ) {
+            Ok((body, _)) => body,
+            Err(err) => {
+                tracing::warn!(
+                    subscription_id = %sub.id,
+                    error = %err,
+                    "failed to encrypt push payload"
+                );
+                continue;
+            }
+        };
+
+        let audience = extract_origin(&sub.push_resource).unwrap_or_default();
+        let auth_header = match vapid_keys.sign_vapid_jwt(&audience) {
+            Ok(h) => h,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to sign VAPID JWT");
+                continue;
+            }
+        };
+
+        let result = http_client
+            .post(&sub.push_resource)
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Encoding", "aes128gcm")
+            .header("Authorization", &auth_header)
+            .header("Topic", &topic)
+            .header("Urgency", "normal")
+            .header("TTL", "86400")
+            .body(encrypted)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                if status == 404 || status == 410 {
+                    tracing::info!(
+                        subscription_id = %sub.id,
+                        status,
+                        "push endpoint gone, removing subscription"
+                    );
+                    store.remove_by_push_resource(&sub.push_resource);
+                } else if status >= 400 {
+                    tracing::warn!(
+                        subscription_id = %sub.id,
+                        status,
+                        "push delivery failed"
+                    );
+                } else {
+                    tracing::debug!(
+                        subscription_id = %sub.id,
+                        status,
+                        "push notification delivered"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    subscription_id = %sub.id,
+                    error = %err,
+                    "push delivery request failed"
+                );
+            }
+        }
+    }
+}
+
+fn extract_origin(url: &str) -> Option<String> {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or(url.strip_prefix("http://"))?;
+    let host = after_scheme.split('/').next()?;
+    if url.starts_with("https://") {
+        Some(format!("https://{host}"))
+    } else {
+        Some(format!("http://{host}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,5 +666,87 @@ mod tests {
         assert!(date.contains("2024"), "got: {date}");
         assert!(date.contains("Jan"), "got: {date}");
         assert!(date.contains("GMT"), "got: {date}");
+    }
+
+    #[test]
+    fn vapid_key_pair_generates_valid_keys() {
+        let kp = VapidKeyPair::generate();
+        assert_eq!(kp.public_key_bytes.len(), 65);
+        assert_eq!(kp.public_key_bytes[0], 0x04);
+        assert!(!kp.public_key_base64url.is_empty());
+    }
+
+    #[test]
+    fn vapid_jwt_has_expected_structure() {
+        let kp = VapidKeyPair::generate();
+        let auth = kp.sign_vapid_jwt("https://push.example.com").unwrap();
+        assert!(auth.starts_with("vapid t="));
+        assert!(auth.contains(", k="));
+    }
+
+    #[test]
+    fn encrypt_decrypt_round_trip() {
+        let client_secret = EphemeralSecret::random(&mut rand::thread_rng());
+        let client_pk = p256::PublicKey::from(&client_secret);
+        let client_point = client_pk.to_encoded_point(false);
+        let client_pub_bytes = client_point.as_bytes();
+
+        let mut auth_secret = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut auth_secret);
+
+        let plaintext = b"<push-message>test</push-message>";
+        let (body, _server_pub) =
+            encrypt_push_payload(plaintext, client_pub_bytes, &auth_secret).unwrap();
+
+        assert!(body.len() > 86);
+        let salt = &body[0..16];
+        let rs = u32::from_be_bytes(body[16..20].try_into().unwrap());
+        assert_eq!(rs, 4096);
+        let idlen = body[20] as usize;
+        assert_eq!(idlen, 65);
+        let server_pub = &body[21..21 + idlen];
+        let ciphertext = &body[21 + idlen..];
+
+        let server_pk = PublicKey::from_sec1_bytes(server_pub).unwrap();
+        let shared = client_secret.diffie_hellman(&server_pk);
+
+        let hkdf_auth = Hkdf::<Sha256>::new(Some(&auth_secret), shared.raw_secret_bytes());
+        let mut ikm_info = Vec::new();
+        ikm_info.extend_from_slice(b"WebPush: info\0");
+        ikm_info.extend_from_slice(client_pub_bytes);
+        ikm_info.extend_from_slice(server_pub);
+        let mut ikm = [0u8; 32];
+        hkdf_auth.expand(&ikm_info, &mut ikm).unwrap();
+
+        let hkdf_cek = Hkdf::<Sha256>::new(Some(salt), &ikm);
+        let mut cek = [0u8; 16];
+        hkdf_cek
+            .expand(b"Content-Encoding: aes128gcm\0", &mut cek)
+            .unwrap();
+        let mut nonce = [0u8; 12];
+        hkdf_cek
+            .expand(b"Content-Encoding: nonce\0", &mut nonce)
+            .unwrap();
+
+        let cipher = Aes128Gcm::new_from_slice(&cek).unwrap();
+        let decrypted = cipher
+            .decrypt(Nonce::from_slice(&nonce), ciphertext)
+            .unwrap();
+
+        assert_eq!(decrypted.last(), Some(&0x02));
+        let recovered = &decrypted[..decrypted.len() - 1];
+        assert_eq!(recovered, plaintext);
+    }
+
+    #[test]
+    fn extract_origin_works() {
+        assert_eq!(
+            extract_origin("https://push.example.com/v1/abc"),
+            Some("https://push.example.com".to_string())
+        );
+        assert_eq!(
+            extract_origin("http://localhost:8080/push"),
+            Some("http://localhost:8080".to_string())
+        );
     }
 }

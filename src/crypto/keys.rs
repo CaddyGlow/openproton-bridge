@@ -19,7 +19,7 @@ use super::{CryptoError, Result};
 /// An unlocked PGP key: the cert plus the password needed to access secret key material.
 pub struct UnlockedKey {
     pub cert: Cert,
-    pub(crate) password: Password,
+    pub password: Password,
 }
 
 impl UnlockedKey {
@@ -33,7 +33,7 @@ impl UnlockedKey {
 
 /// A collection of unlocked keys that can decrypt messages.
 pub struct Keyring {
-    pub(crate) keys: Vec<UnlockedKey>,
+    pub keys: Vec<UnlockedKey>,
 }
 
 impl Keyring {

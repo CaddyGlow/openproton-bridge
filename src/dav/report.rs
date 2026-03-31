@@ -9,18 +9,15 @@ use crate::api::{calendar, client::ProtonClient};
 use crate::bridge::accounts::RuntimeAccountRegistry;
 use crate::bridge::auth_router::AuthRoute;
 use crate::bridge::types::AccountId;
-use crate::pim::dav::{
-    CalDavRepository, CardDavRepository, DavSyncStateRepository, StoreBackedDavAdapter,
-};
-use crate::pim::query::{CalendarEventRange, QueryPage};
 use crate::pim::store::PimStore;
 use crate::pim::sync_calendar;
+use crate::pim::{CalendarEventRange, QueryPage};
 
 use super::calendar_crypto::{self, CalendarDecryptContext};
 use super::discovery;
-use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
+use super::{DavError, Result};
 
 const CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN: Duration = Duration::from_secs(300);
 
@@ -41,7 +38,6 @@ pub async fn handle_report(
     let path = normalize_path(raw_path);
     let body_text = std::str::from_utf8(body)
         .map_err(|_| DavError::InvalidRequest("REPORT body is not utf-8"))?;
-    let adapter = StoreBackedDavAdapter::new(store.clone());
     if body_text.trim().is_empty() {
         return Ok(Some(invalid_report_payload_response(
             "REPORT body is missing or empty",
@@ -61,11 +57,11 @@ pub async fn handle_report(
                     body_text,
                 )));
             }
-            return Ok(Some(addressbook_query(&adapter, &auth.account_id.0)?));
+            return Ok(Some(addressbook_query(store, &auth.account_id.0)?));
         }
         if body_text.contains("sync-collection") {
             return Ok(Some(carddav_sync_collection(
-                &adapter,
+                store,
                 &auth.account_id.0,
                 body_text,
             )?));
@@ -95,7 +91,6 @@ pub async fn handle_report(
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_query(
-                &adapter,
                 store,
                 &auth.account_id.0,
                 &calendar_id,
@@ -117,7 +112,6 @@ pub async fn handle_report(
             let decrypt_context =
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(calendar_multiget(
-                &adapter,
                 store,
                 &auth.account_id.0,
                 &calendar_id,
@@ -140,7 +134,6 @@ pub async fn handle_report(
                 build_decrypt_context(runtime_accounts, &auth.account_id.0, &calendar_id).await;
             return Ok(Some(
                 caldav_sync_collection(
-                    &adapter,
                     store,
                     runtime_accounts,
                     &auth.account_id.0,
@@ -164,8 +157,8 @@ pub async fn handle_report(
     Ok(None)
 }
 
-fn addressbook_query(adapter: &StoreBackedDavAdapter, account_id: &str) -> Result<DavResponse> {
-    let contacts = adapter
+fn addressbook_query(store: &PimStore, account_id: &str) -> Result<DavResponse> {
+    let contacts = store
         .list_contacts(
             false,
             QueryPage {
@@ -194,7 +187,6 @@ fn addressbook_query(adapter: &StoreBackedDavAdapter, account_id: &str) -> Resul
 }
 
 fn calendar_query(
-    adapter: &StoreBackedDavAdapter,
     store: &Arc<PimStore>,
     account_id: &str,
     calendar_id: &str,
@@ -202,7 +194,7 @@ fn calendar_query(
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
     let range = query.range.clone();
-    let events = adapter
+    let events = store
         .list_calendar_events(
             calendar_id,
             false,
@@ -242,7 +234,6 @@ fn calendar_query(
 }
 
 fn calendar_multiget(
-    adapter: &StoreBackedDavAdapter,
     store: &Arc<PimStore>,
     account_id: &str,
     calendar_id: &str,
@@ -258,7 +249,7 @@ fn calendar_multiget(
         if !seen_event_ids.insert(event_id.clone()) {
             continue;
         }
-        let event = adapter
+        let event = store
             .get_calendar_event(&event_id, false)
             .map_err(|err| DavError::Backend(err.to_string()))?;
         let Some(event) = event else {
@@ -298,12 +289,8 @@ fn calendar_multiget(
     Ok(multistatus_response(&items, None))
 }
 
-fn carddav_sync_collection(
-    adapter: &StoreBackedDavAdapter,
-    account_id: &str,
-    body: &str,
-) -> Result<DavResponse> {
-    let contacts = adapter
+fn carddav_sync_collection(store: &PimStore, account_id: &str, body: &str) -> Result<DavResponse> {
+    let contacts = store
         .list_contacts(
             true,
             QueryPage {
@@ -318,7 +305,7 @@ fn carddav_sync_collection(
         .map(|item| item.updated_at_ms)
         .max()
         .unwrap_or_else(epoch_millis);
-    adapter
+    store
         .set_sync_state_int(&sync_scope("carddav", account_id), current_token)
         .map_err(|err| DavError::Backend(err.to_string()))?;
     let items = contacts
@@ -347,7 +334,6 @@ fn carddav_sync_collection(
 }
 
 async fn caldav_sync_collection(
-    adapter: &StoreBackedDavAdapter,
     store: &Arc<PimStore>,
     runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
     account_id: &str,
@@ -355,9 +341,8 @@ async fn caldav_sync_collection(
     request_sync_token: i64,
     decrypt_context: Option<&CalendarDecryptContext>,
 ) -> Result<DavResponse> {
-    maybe_backfill_empty_caldav_sync(adapter, store, runtime_accounts, account_id, calendar_id)
-        .await?;
-    let events = adapter
+    maybe_backfill_empty_caldav_sync(store, runtime_accounts, account_id, calendar_id).await?;
+    let events = store
         .list_calendar_events(
             calendar_id,
             true,
@@ -368,7 +353,7 @@ async fn caldav_sync_collection(
             },
         )
         .map_err(|err| DavError::Backend(err.to_string()))?;
-    let prior_sync_token = adapter
+    let prior_sync_token = store
         .get_sync_state_int(&caldav_sync_scope(account_id, calendar_id))
         .map_err(|err| DavError::Backend(err.to_string()))?;
     let since = if prior_sync_token.is_some() {
@@ -376,8 +361,8 @@ async fn caldav_sync_collection(
     } else {
         None
     };
-    let current_token = calendar_collection_sync_version(adapter, calendar_id, Some(&events))?;
-    adapter
+    let current_token = calendar_collection_sync_version(store, calendar_id, Some(&events))?;
+    store
         .set_sync_state_int(&caldav_sync_scope(account_id, calendar_id), current_token)
         .map_err(|err| DavError::Backend(err.to_string()))?;
     let items = events
@@ -429,13 +414,12 @@ async fn caldav_sync_collection(
 }
 
 async fn maybe_backfill_empty_caldav_sync(
-    adapter: &StoreBackedDavAdapter,
     store: &Arc<PimStore>,
     runtime_accounts: Option<&Arc<RuntimeAccountRegistry>>,
     account_id: &str,
     calendar_id: &str,
 ) -> Result<()> {
-    let cached_events = adapter
+    let cached_events = store
         .list_calendar_events(
             calendar_id,
             false,
@@ -450,7 +434,7 @@ async fn maybe_backfill_empty_caldav_sync(
         return Ok(());
     }
 
-    if !backfill_cooldown_elapsed(adapter, account_id, calendar_id)? {
+    if !backfill_cooldown_elapsed(store, account_id, calendar_id)? {
         tracing::debug!(
             account_id,
             calendar_id,
@@ -487,7 +471,7 @@ async fn maybe_backfill_empty_caldav_sync(
     )
     .await
     .map_err(|err| DavError::Backend(err.to_string()))?;
-    adapter
+    store
         .set_sync_state_int(
             &caldav_backfill_scope(account_id, calendar_id),
             epoch_millis(),
@@ -497,11 +481,11 @@ async fn maybe_backfill_empty_caldav_sync(
 }
 
 fn backfill_cooldown_elapsed(
-    adapter: &StoreBackedDavAdapter,
+    store: &PimStore,
     account_id: &str,
     calendar_id: &str,
 ) -> Result<bool> {
-    let Some(last_backfill_ms) = adapter
+    let Some(last_backfill_ms) = store
         .get_sync_state_int(&caldav_backfill_scope(account_id, calendar_id))
         .map_err(|err| DavError::Backend(err.to_string()))?
     else {
@@ -516,11 +500,11 @@ fn caldav_backfill_scope(account_id: &str, calendar_id: &str) -> String {
 }
 
 pub(crate) fn calendar_collection_sync_version(
-    adapter: &StoreBackedDavAdapter,
+    store: &PimStore,
     calendar_id: &str,
-    cached_events: Option<&[crate::pim::types::StoredCalendarEvent]>,
+    cached_events: Option<&[crate::pim::StoredCalendarEvent]>,
 ) -> Result<i64> {
-    let calendar_version = adapter
+    let calendar_version = store
         .get_calendar(calendar_id, true)
         .map_err(|err| DavError::Backend(err.to_string()))?
         .map(|calendar| calendar.updated_at_ms)
@@ -528,7 +512,7 @@ pub(crate) fn calendar_collection_sync_version(
     let event_version = if let Some(events) = cached_events {
         events.iter().map(|event| event.updated_at_ms).max()
     } else {
-        adapter
+        store
             .list_calendar_events(
                 calendar_id,
                 true,
@@ -1466,7 +1450,6 @@ mod tests {
     use crate::api::calendar::{CalendarEvent, CalendarEventPart};
     use crate::bridge::auth_router::AuthRoute;
     use crate::bridge::types::AccountId;
-    use crate::pim::dav::{DavSyncStateRepository, StoreBackedDavAdapter};
     use crate::pim::store::PimStore;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1492,14 +1475,6 @@ mod tests {
     const FIXTURE_CAL_SYNC_TOKEN_MALFORMED: &str = include_str!(
         "../../tests/fixtures/rfc-6352-4791/must_fail/calendar-sync-token-malformed.xml"
     );
-
-    fn test_adapter() -> StoreBackedDavAdapter {
-        let tmp = tempdir().unwrap();
-        let contacts_db = tmp.path().join("contacts.db");
-        let calendar_db = tmp.path().join("calendar.db");
-        Box::leak(Box::new(tmp));
-        StoreBackedDavAdapter::new(Arc::new(PimStore::new(contacts_db, calendar_db).unwrap()))
-    }
 
     fn store() -> Arc<PimStore> {
         let tmp = tempdir().unwrap();
@@ -1596,17 +1571,17 @@ mod tests {
 
     #[test]
     fn backfill_cooldown_blocks_immediate_repeat_attempts() {
-        let adapter = test_adapter();
-        assert!(backfill_cooldown_elapsed(&adapter, "uid-1", "work").unwrap());
+        let store = store();
+        assert!(backfill_cooldown_elapsed(&store, "uid-1", "work").unwrap());
 
-        adapter
+        store
             .set_sync_state_int(
                 &caldav_backfill_scope("uid-1", "work"),
                 super::epoch_millis(),
             )
             .unwrap();
-        assert!(!backfill_cooldown_elapsed(&adapter, "uid-1", "work").unwrap());
-        assert!(backfill_cooldown_elapsed(&adapter, "uid-1", "other").unwrap());
+        assert!(!backfill_cooldown_elapsed(&store, "uid-1", "work").unwrap());
+        assert!(backfill_cooldown_elapsed(&store, "uid-1", "other").unwrap());
     }
 
     #[test]

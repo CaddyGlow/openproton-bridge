@@ -1,11 +1,11 @@
 pub mod convert;
-pub mod dav;
 pub mod incremental;
-pub mod query;
 pub mod store;
 pub mod sync_calendar;
 pub mod sync_contacts;
-pub mod types;
+
+pub use gluon_rs_calendar::{CalendarEventRange, StoredCalendar, StoredCalendarEvent};
+pub use gluon_rs_contacts::{QueryPage, StoredContact};
 
 use std::future::Future;
 use std::time::Duration;

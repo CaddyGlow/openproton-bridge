@@ -7,9 +7,16 @@ use serde_json::Value;
 use crate::api::{calendar, contacts};
 
 use super::convert;
-use super::query::{to_calendar_page, CalendarEventRange, QueryPage};
-use super::types::{StoredCalendar, StoredCalendarEvent, StoredContact};
-use super::Result;
+use super::{
+    CalendarEventRange, QueryPage, Result, StoredCalendar, StoredCalendarEvent, StoredContact,
+};
+
+fn to_calendar_page(page: QueryPage) -> gluon_rs_calendar::QueryPage {
+    gluon_rs_calendar::QueryPage {
+        limit: page.limit,
+        offset: page.offset,
+    }
+}
 
 pub struct PimStore {
     contacts: ContactsStore,
@@ -268,4 +275,178 @@ impl PimStore {
 
 fn is_calendar_scope(scope: &str) -> bool {
     scope.starts_with("calendar.") || scope.starts_with("dav.cal.")
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::api::calendar::{Calendar, CalendarEvent};
+    use crate::api::contacts::{Contact, ContactCard, ContactEmail, ContactMetadata};
+    use crate::pim::{CalendarEventRange, QueryPage};
+
+    fn test_store() -> PimStore {
+        let tmp = tempdir().unwrap();
+        let contacts_db = tmp.path().join("contacts.db");
+        let calendar_db = tmp.path().join("calendar.db");
+        Box::leak(Box::new(tmp));
+        PimStore::new(contacts_db, calendar_db).unwrap()
+    }
+
+    fn contact(id: &str, email: &str) -> Contact {
+        Contact {
+            metadata: ContactMetadata {
+                id: id.to_string(),
+                name: format!("Name {id}"),
+                uid: format!("uid-{id}"),
+                size: 1,
+                create_time: 1,
+                modify_time: 2,
+                contact_emails: vec![ContactEmail {
+                    id: format!("email-{id}"),
+                    email: email.to_string(),
+                    name: "Name".to_string(),
+                    kind: vec![],
+                    defaults: None,
+                    order: None,
+                    contact_id: id.to_string(),
+                    label_ids: vec![],
+                    last_used_time: None,
+                }],
+                label_ids: vec![],
+            },
+            cards: vec![ContactCard {
+                card_type: 0,
+                data: "BEGIN:VCARD".to_string(),
+                signature: None,
+            }],
+        }
+    }
+
+    fn calendar(id: &str, name: &str) -> Calendar {
+        Calendar {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: "".to_string(),
+            color: "#00AAFF".to_string(),
+            display: 1,
+            calendar_type: 0,
+            flags: 0,
+        }
+    }
+
+    fn calendar_event(id: &str, calendar_id: &str, start_time: i64) -> CalendarEvent {
+        CalendarEvent {
+            id: id.to_string(),
+            uid: format!("uid-{id}"),
+            calendar_id: calendar_id.to_string(),
+            shared_event_id: format!("shared-{id}"),
+            create_time: start_time - 5,
+            last_edit_time: start_time - 1,
+            start_time,
+            end_time: start_time + 3600,
+            ..CalendarEvent::default()
+        }
+    }
+
+    #[test]
+    fn store_supports_contact_read_write_delete() {
+        let store = test_store();
+        store
+            .upsert_contact(&contact("c1", "alice@proton.me"))
+            .unwrap();
+
+        let got = store.get_contact("c1", false).unwrap().unwrap();
+        assert_eq!(got.id, "c1");
+
+        let by_email = store
+            .search_contacts_by_email(
+                "alice@",
+                QueryPage {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(by_email.len(), 1);
+        assert_eq!(by_email[0].id, "c1");
+
+        store.soft_delete_contact("c1").unwrap();
+        assert!(store.get_contact("c1", false).unwrap().is_none());
+        assert!(store.get_contact("c1", true).unwrap().is_some());
+    }
+
+    #[test]
+    fn store_supports_calendar_and_event_read_write_delete() {
+        let store = test_store();
+        store
+            .upsert_calendar(&calendar("cal-1", "Primary"))
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar_event("evt-1", "cal-1", 100))
+            .unwrap();
+        store
+            .upsert_calendar_event(&calendar_event("evt-2", "cal-1", 200))
+            .unwrap();
+
+        let cals = store
+            .list_calendars(
+                false,
+                QueryPage {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(cals.len(), 1);
+        assert_eq!(cals[0].id, "cal-1");
+
+        let events = store
+            .list_calendar_events(
+                "cal-1",
+                false,
+                CalendarEventRange {
+                    start_time_from: Some(50),
+                    start_time_to: Some(150),
+                },
+                QueryPage {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "evt-1");
+
+        store.soft_delete_calendar_event("evt-1").unwrap();
+        assert!(store.get_calendar_event("evt-1", false).unwrap().is_none());
+        assert!(store.get_calendar_event("evt-1", true).unwrap().is_some());
+
+        store.hard_delete_calendar("cal-1").unwrap();
+        assert!(store.get_calendar("cal-1", true).unwrap().is_none());
+    }
+
+    #[test]
+    fn store_exposes_sync_state_scopes() {
+        let store = test_store();
+        store
+            .set_sync_state_text("dav.card.token", "ctag-1")
+            .unwrap();
+        store
+            .set_sync_state_int("dav.cal.last_sync_ms", 1700000000000)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_sync_state_text("dav.card.token")
+                .unwrap()
+                .as_deref(),
+            Some("ctag-1")
+        );
+        assert_eq!(
+            store.get_sync_state_int("dav.cal.last_sync_ms").unwrap(),
+            Some(1700000000000)
+        );
+    }
 }

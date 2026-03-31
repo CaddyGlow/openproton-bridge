@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use tokio::sync::{watch, RwLock};
+use tokio::sync::{watch, Mutex as AsyncMutex, RwLock};
 use tracing::{debug, warn};
 
 use crate::api::auth;
@@ -11,7 +11,7 @@ use crate::api::error::{is_auth_error, is_invalid_refresh_token_error, ApiError}
 use crate::api::types::{Address, Session, UserKey};
 use crate::imap::mailbox::ResolvedMailbox;
 
-use super::types::{AccountId, AccountResolver};
+use super::types::AccountId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountHealth {
@@ -218,10 +218,17 @@ impl AccountRegistry {
     }
 }
 
-impl AccountResolver for AccountRegistry {
-    fn resolve_account_id(&self, email: &str) -> Option<AccountId> {
-        self.email_index.get(&normalize_email(email)).cloned()
-    }
+static REFRESH_LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+
+fn token_refresh_lock(account_id: &str) -> Arc<AsyncMutex<()>> {
+    let mut locks = REFRESH_LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("token refresh lock map poisoned");
+    locks
+        .entry(account_id.to_string())
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
 }
 
 fn normalize_email(email: &str) -> String {
@@ -641,7 +648,7 @@ impl RuntimeAccountRegistry {
         account_id: &AccountId,
         stale_access_token: Option<&str>,
     ) -> Result<Session, AccountRuntimeError> {
-        let lock = super::token_refresh::lock_for_account(&account_id.0);
+        let lock = token_refresh_lock(&account_id.0);
         let _guard = lock.lock().await;
 
         let existing = self

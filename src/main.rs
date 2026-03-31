@@ -14,22 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncBufReadExt;
 
-mod api;
-mod bridge;
-mod certs;
-mod cli_human_verification;
-mod client_config;
-mod crypto;
-mod dav;
-mod frontend;
-mod imap;
-mod jmap;
-mod observability;
-mod paths;
-mod pim;
-mod single_instance;
-mod smtp;
-mod vault;
+use openproton_bridge::*;
 
 #[derive(Parser)]
 #[command(
@@ -522,7 +507,7 @@ async fn execute_non_interactive_command_grpc(
     command: Command,
     runtime_paths: &paths::RuntimePaths,
 ) -> anyhow::Result<()> {
-    let mut client = frontend::grpc::client::CliGrpcClient::connect(runtime_paths)
+    let mut client = grpc::client::CliGrpcClient::connect(runtime_paths)
         .await
         .with_context(|| {
             format!(
@@ -1363,7 +1348,7 @@ async fn cmd_cli(
                                     cmd_account_info(selector, dir, runtime_paths).await
                                 }
                                 ExecutionMode::Grpc => {
-                                    let mut client = match frontend::grpc::client::CliGrpcClient::connect(
+                                    let mut client = match grpc::client::CliGrpcClient::connect(
                                         runtime_paths,
                                     )
                                     .await
@@ -1911,13 +1896,13 @@ async fn cmd_cli(
                         };
 
                         let grpc_options = if let Some(runtime) = runtime_state.as_ref() {
-                            frontend::grpc::GrpcServerOptions {
+                            grpc::GrpcServerOptions {
                                 runtime_supervisor: Some(runtime.supervisor.clone()),
                                 start_mail_runtime_on_startup: false,
                                 stop_mail_runtime_on_shutdown: false,
                             }
                         } else {
-                            frontend::grpc::GrpcServerOptions::default()
+                            grpc::GrpcServerOptions::default()
                         };
 
                         match start_interactive_grpc(bind.clone(), runtime_paths, grpc_options).await {
@@ -4141,7 +4126,7 @@ async fn cmd_account_info(
 }
 
 async fn cmd_account_info_grpc(
-    client: &mut frontend::grpc::client::CliGrpcClient,
+    client: &mut grpc::client::CliGrpcClient,
     selector: &str,
 ) -> anyhow::Result<()> {
     let users = client.get_user_list().await?;
@@ -4207,9 +4192,9 @@ async fn cmd_account_info_grpc(
 }
 
 fn resolve_grpc_account_selector_user(
-    users: &[frontend::grpc::pb::User],
+    users: &[grpc::pb::User],
     selector: &str,
-) -> anyhow::Result<frontend::grpc::pb::User> {
+) -> anyhow::Result<grpc::pb::User> {
     if users.is_empty() {
         anyhow::bail!("no accounts are configured");
     }
@@ -4326,7 +4311,7 @@ async fn cmd_mutt_config(
     Ok(())
 }
 
-async fn cmd_status_grpc(client: &mut frontend::grpc::client::CliGrpcClient) -> anyhow::Result<()> {
+async fn cmd_status_grpc(client: &mut grpc::client::CliGrpcClient) -> anyhow::Result<()> {
     let mut users = client.get_user_list().await?;
     users.sort_by_cached_key(|user| user.username.to_ascii_lowercase());
     if users.is_empty() {
@@ -4359,9 +4344,7 @@ async fn cmd_status_grpc(client: &mut frontend::grpc::client::CliGrpcClient) -> 
     Ok(())
 }
 
-async fn cmd_accounts_list_grpc(
-    client: &mut frontend::grpc::client::CliGrpcClient,
-) -> anyhow::Result<()> {
+async fn cmd_accounts_list_grpc(client: &mut grpc::client::CliGrpcClient) -> anyhow::Result<()> {
     let mut users = client.get_user_list().await?;
     users.sort_by_cached_key(|user| user.username.to_ascii_lowercase());
     if users.is_empty() {
@@ -4388,7 +4371,7 @@ async fn cmd_accounts_list_grpc(
 }
 
 async fn cmd_logout_grpc(
-    client: &mut frontend::grpc::client::CliGrpcClient,
+    client: &mut grpc::client::CliGrpcClient,
     email: Option<&str>,
     all: bool,
 ) -> anyhow::Result<()> {
@@ -4418,16 +4401,16 @@ async fn cmd_logout_grpc(
 }
 
 fn grpc_user_state_label(state: i32) -> &'static str {
-    match frontend::grpc::pb::UserState::try_from(state) {
-        Ok(frontend::grpc::pb::UserState::Connected) => "connected",
-        Ok(frontend::grpc::pb::UserState::Locked) => "locked",
-        Ok(frontend::grpc::pb::UserState::SignedOut) => "signed-out",
+    match grpc::pb::UserState::try_from(state) {
+        Ok(grpc::pb::UserState::Connected) => "connected",
+        Ok(grpc::pb::UserState::Locked) => "locked",
+        Ok(grpc::pb::UserState::SignedOut) => "signed-out",
         Err(_) => "unknown",
     }
 }
 
 async fn cmd_mutt_config_grpc(
-    client: &mut frontend::grpc::client::CliGrpcClient,
+    client: &mut grpc::client::CliGrpcClient,
     account_selector: Option<&str>,
     address_override: Option<&str>,
     output: Option<&std::path::Path>,
@@ -4461,7 +4444,7 @@ async fn cmd_mutt_config_grpc(
 }
 
 async fn cmd_optimize_cache_grpc(
-    client: &mut frontend::grpc::client::CliGrpcClient,
+    client: &mut grpc::client::CliGrpcClient,
     account_selector: Option<&str>,
     mailboxes: Vec<String>,
     concurrency: u32,
@@ -4768,10 +4751,10 @@ async fn cmd_serve(
         &snapshot.active_sessions,
         &snapshot.runtime_snapshot,
     );
-    frontend::grpc::run_server_with_options(
+    grpc::run_server_with_options(
         runtime_paths.clone(),
         bind.to_string(),
-        frontend::grpc::GrpcServerOptions {
+        grpc::GrpcServerOptions {
             runtime_supervisor: Some(supervisor),
             start_mail_runtime_on_startup: false,
             stop_mail_runtime_on_shutdown: true,
@@ -4925,12 +4908,12 @@ async fn maybe_collect_runtime_completion(
 async fn start_interactive_grpc(
     bind: String,
     runtime_paths: &paths::RuntimePaths,
-    options: frontend::grpc::GrpcServerOptions,
+    options: grpc::GrpcServerOptions,
 ) -> anyhow::Result<InteractiveGrpcRuntime> {
     let runtime_paths = runtime_paths.clone();
     let bind_for_task = bind.clone();
     let join_handle = tokio::spawn(async move {
-        frontend::grpc::run_server_with_options(runtime_paths, bind_for_task, options).await
+        grpc::run_server_with_options(runtime_paths, bind_for_task, options).await
     });
     Ok(InteractiveGrpcRuntime { join_handle, bind })
 }
@@ -4966,7 +4949,7 @@ async fn maybe_collect_grpc_completion(
 }
 
 async fn cmd_grpc(bind: &str, runtime_paths: &paths::RuntimePaths) -> anyhow::Result<()> {
-    frontend::grpc::run_server(runtime_paths.clone(), bind.to_string()).await
+    grpc::run_server(runtime_paths.clone(), bind.to_string()).await
 }
 
 fn generate_bridge_password() -> String {

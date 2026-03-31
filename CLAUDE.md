@@ -28,10 +28,10 @@ The project uses `build.rs` to compile `proto/bridge.proto` via `tonic-build` wi
 ### Module Dependency Flow
 
 ```
-frontend (gRPC/Tauri) -> bridge -> imap, smtp, dav, api, crypto
-                                   bridge -> pim (calendar/contacts sync)
-                                   api and crypto are standalone
-                                   imap, smtp, and dav must never cross-depend
+grpc (gRPC/Tauri) -> bridge -> imap, smtp, dav, api, crypto
+                                bridge -> pim (calendar/contacts sync)
+                                api and crypto are standalone
+                                imap, smtp, and dav must never cross-depend
 ```
 
 ### Core Modules
@@ -40,18 +40,18 @@ frontend (gRPC/Tauri) -> bridge -> imap, smtp, dav, api, crypto
 - **`crypto/`** -- PGP operations via `sequoia-openpgp`. `keys` (key parsing/unlocking), `encrypt`, `decrypt`. Standalone; no IMAP/SMTP/bridge imports.
 - **`imap/`** -- Custom IMAP4rev1 server built directly on tokio TCP + tokio-rustls (no IMAP library). `server` (connection accept loop), `session` (per-connection state machine), `command` (IMAP command parsing), `response` (IMAP response formatting), `mailbox` (label-to-mailbox mapping), `store` (MessageStore trait + GluonStore SQLite impl + InMemoryStore for tests), `gluon_*` (Go-bridge-compatible on-disk message store: codec, locking, transactions).
 - **`smtp/`** -- Custom SMTP server on tokio TCP + tokio-rustls. `server`, `session` (SMTP state machine), `send` (message submission to Proton API).
-- **`bridge/`** -- Orchestration layer. `accounts` (AccountRegistry, RuntimeAccountRegistry with health tracking and token refresh), `auth_router` (maps IMAP/SMTP/DAV login credentials to Proton sessions via bridge passwords), `events` (event loop syncing Proton server events to local store), `session_manager` (centralized session lifecycle), `runtime_supervisor` (multi-account runtime with health tracking), `mail_runtime` (orchestrates IMAP/SMTP/DAV servers with event workers), `types` (AccountId newtype, SessionProvider/AccountResolver/EventCheckpointStore traits).
+- **`bridge/`** -- Orchestration layer. `accounts` (AccountRegistry, RuntimeAccountRegistry with health tracking and token refresh), `auth_router` (maps IMAP/SMTP/DAV login credentials to Proton sessions via bridge passwords), `events` (event loop syncing Proton server events to local store), `session_manager` (centralized session lifecycle), `runtime_supervisor` (multi-account runtime with health tracking), `mail_runtime` (orchestrates IMAP/SMTP/DAV servers with event workers), `types` (AccountId newtype, EventCheckpointStore trait).
 - **`vault`** -- Go-bridge-compatible encrypted vault (AES-256-GCM + MessagePack). Reads/writes `vault.enc` with keys from OS keychain (`keyring`), `pass`, or file-based credential stores. Stores per-account sessions, settings, gluon encryption keys.
-- **`frontend/grpc/`** -- gRPC control service (`proto/bridge.proto`) exposing login, account management, settings, and event streaming to GUI clients (Tauri app in `apps/bridge-ui/`).
+- **`grpc/`** -- gRPC control service (`proto/bridge.proto`) exposing login, account management, settings, and event streaming to GUI clients (Tauri app in `apps/bridge-ui/`).
 - **`paths`** -- RuntimePaths: resolves config/data/cache directories matching Go bridge layout (XDG on Linux, Library on macOS, AppData on Windows).
-- **`dav/`** -- CardDAV/CalDAV server on tokio TCP + tokio-rustls. `server`, `auth`, `discovery` (well-known/principal routing), `propfind`/`report` (WebDAV XML request handling), `carddav`/`caldav` (resource-specific handlers), `calendar_crypto` (encrypted calendar event handling).
-- **`pim/`** -- Personal Information Management sync engine. `sync_contacts`/`sync_calendar` (incremental sync from Proton events), `store` (local PIM persistence), `query` (vCard/iCal query interface), `schema` (data models). Drives DAV server content.
+- **`dav/`** -- CardDAV/CalDAV server on tokio TCP + tokio-rustls. `server`, `auth`, `discovery` (well-known/principal routing), `propfind`/`report` (WebDAV XML request handling), `carddav`/`caldav` (resource-specific handlers), `calendar_crypto` (encrypted calendar event handling), `push` (WebDAV-Push subscriptions, VAPID/RFC 8291 encryption, notification sender).
+- **`pim/`** -- Personal Information Management sync engine. `sync_contacts`/`sync_calendar` (incremental sync from Proton events), `store` (local PIM persistence with SQLite via gluon_rs_contacts/gluon_rs_calendar). Re-exports `QueryPage`, `CalendarEventRange`, `StoredContact`, `StoredCalendar`, `StoredCalendarEvent` from its root. Drives DAV server content.
 - **`observability`** -- Tracing setup with rotating session logs, crash reports, and support bundles.
 
 ### Key Trait Boundaries
 
 - `MessageStore` (`imap::store`) -- abstracts message persistence. `GluonStore` (SQLite + on-disk) for production, `InMemoryStore` for tests.
-- `SessionProvider`, `AccountResolver`, `EventCheckpointStore` (`bridge::types`) -- abstractions for session/account/event state.
+- `EventCheckpointStore` (`bridge::types`) -- abstraction for event checkpoint persistence (3 impls: InMemory, File, Vault).
 - No `ProtonApi` trait yet; `ProtonClient` is used directly (via free functions in `api::auth`, `api::messages`, etc.).
 
 ### Data Flow: Email Client -> Proton

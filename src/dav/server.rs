@@ -19,12 +19,12 @@ use super::auth::{resolve_basic_auth, DavAuthError};
 use super::caldav;
 use super::carddav;
 use super::discovery;
-use super::error::{DavError, Result};
 use super::http::{
     not_implemented_response, parse_request_head, split_head_from_buffer, DavRequest, DavResponse,
 };
 use super::propfind;
 use super::report;
+use super::{DavError, Result};
 
 const MAX_DAV_BODY_BYTES: usize = 1_048_576;
 const DAV_CAPABILITIES_HEADER: &str =
@@ -197,7 +197,7 @@ pub struct DavServerConfig {
     pub pim_stores: HashMap<String, Arc<PimStore>>,
     pub runtime_accounts: Option<Arc<RuntimeAccountRegistry>>,
     pub push_subscriptions: Option<super::push::PushSubscriptionStore>,
-    pub vapid_keys: Option<Arc<super::push_crypto::VapidKeyPair>>,
+    pub vapid_keys: Option<Arc<super::push::VapidKeyPair>>,
 }
 
 pub struct DavServer {

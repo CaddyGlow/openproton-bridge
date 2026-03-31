@@ -74,8 +74,8 @@ fn handle_stream_recv_error(
     }
 }
 
-fn to_pim_page(page: Option<pb::PimPage>) -> crate::pim::query::QueryPage {
-    let defaults = crate::pim::query::QueryPage::default();
+fn to_pim_page(page: Option<pb::PimPage>) -> crate::pim::QueryPage {
+    let defaults = crate::pim::QueryPage::default();
     match page {
         Some(page) => {
             let limit = if page.limit == 0 {
@@ -83,7 +83,7 @@ fn to_pim_page(page: Option<pb::PimPage>) -> crate::pim::query::QueryPage {
             } else {
                 page.limit as usize
             };
-            crate::pim::query::QueryPage {
+            crate::pim::QueryPage {
                 limit,
                 offset: page.offset as usize,
             }
@@ -92,7 +92,7 @@ fn to_pim_page(page: Option<pb::PimPage>) -> crate::pim::query::QueryPage {
     }
 }
 
-fn to_pb_pim_contact(contact: crate::pim::types::StoredContact) -> pb::PimContact {
+fn to_pb_pim_contact(contact: crate::pim::StoredContact) -> pb::PimContact {
     pb::PimContact {
         id: contact.id,
         uid: contact.uid,
@@ -105,7 +105,7 @@ fn to_pb_pim_contact(contact: crate::pim::types::StoredContact) -> pb::PimContac
     }
 }
 
-fn to_pb_pim_calendar(calendar: crate::pim::types::StoredCalendar) -> pb::PimCalendar {
+fn to_pb_pim_calendar(calendar: crate::pim::StoredCalendar) -> pb::PimCalendar {
     pb::PimCalendar {
         id: calendar.id,
         name: calendar.name,
@@ -119,7 +119,7 @@ fn to_pb_pim_calendar(calendar: crate::pim::types::StoredCalendar) -> pb::PimCal
     }
 }
 
-fn to_pb_pim_calendar_event(event: crate::pim::types::StoredCalendarEvent) -> pb::PimCalendarEvent {
+fn to_pb_pim_calendar_event(event: crate::pim::StoredCalendarEvent) -> pb::PimCalendarEvent {
     pb::PimCalendarEvent {
         id: event.id,
         calendar_id: event.calendar_id,
@@ -2538,7 +2538,7 @@ impl pb::bridge_server::Bridge for BridgeService {
             .list_calendar_events(
                 req.calendar_id.as_str(),
                 req.include_deleted,
-                crate::pim::query::CalendarEventRange {
+                crate::pim::CalendarEventRange {
                     start_time_from: req.start_time_from,
                     start_time_to: req.start_time_to,
                 },

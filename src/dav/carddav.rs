@@ -4,14 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::api::contacts::{Contact, ContactCard, ContactEmail, ContactMetadata};
 use crate::bridge::auth_router::AuthRoute;
-use crate::pim::dav::{CardDavRepository, DeleteMode, StoreBackedDavAdapter};
-use crate::pim::query::QueryPage;
 use crate::pim::store::PimStore;
+use crate::pim::QueryPage;
 
 use super::discovery;
-use super::error::{DavError, Result};
 use super::etag;
 use super::http::DavResponse;
+use super::{DavError, Result};
 
 pub fn handle_request(
     method: &str,
@@ -23,12 +22,10 @@ pub fn handle_request(
 ) -> Result<Option<DavResponse>> {
     let path = normalize_path(raw_path);
     let collection = discovery::default_addressbook_path(&auth.account_id.0);
-    let adapter = StoreBackedDavAdapter::new(store.clone());
-
     if path == collection {
         return match method {
             "GET" | "HEAD" => {
-                let count = adapter
+                let count = store
                     .list_contacts(false, QueryPage::default())
                     .map_err(|err| DavError::Backend(err.to_string()))?
                     .len();
@@ -52,7 +49,7 @@ pub fn handle_request(
 
     match method {
         "GET" | "HEAD" => {
-            let stored = adapter
+            let stored = store
                 .get_contact(&contact_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             let Some(stored) = stored else {
@@ -80,7 +77,7 @@ pub fn handle_request(
             Ok(Some(response))
         }
         "PUT" => {
-            let existing = adapter
+            let existing = store
                 .get_contact(&contact_id, true)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             let current_etag = existing
@@ -102,10 +99,10 @@ pub fn handle_request(
                 .map(|value| value.create_time)
                 .unwrap_or(now);
             let contact = parse_vcard(&contact_id, payload, create_time, now);
-            adapter
+            store
                 .upsert_contact(&contact)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
-            let stored = adapter
+            let stored = store
                 .get_contact(&contact_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?
                 .ok_or_else(|| DavError::Backend("contact missing after upsert".to_string()))?;
@@ -124,7 +121,7 @@ pub fn handle_request(
             }))
         }
         "DELETE" => {
-            let existing = adapter
+            let existing = store
                 .get_contact(&contact_id, false)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             let Some(existing) = existing else {
@@ -134,8 +131,8 @@ pub fn handle_request(
             if !etag::if_match_satisfied(headers.get("if-match"), Some(current_etag.as_str())) {
                 return Ok(Some(precondition_failed_response()));
             }
-            adapter
-                .delete_contact(&contact_id, DeleteMode::Soft)
+            store
+                .soft_delete_contact(&contact_id)
                 .map_err(|err| DavError::Backend(err.to_string()))?;
             Ok(Some(DavResponse {
                 status: "204 No Content",

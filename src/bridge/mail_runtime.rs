@@ -908,7 +908,7 @@ async fn run_runtime(
         })
     });
     let push_subscription_store = dav::push::PushSubscriptionStore::new();
-    let vapid_keys = Arc::new(dav::push_crypto::VapidKeyPair::generate());
+    let vapid_keys = Arc::new(dav::push::VapidKeyPair::generate());
 
     let mut dav_task = dav_listener.map(|listener| {
         let config = dav::server::DavServerConfig {
@@ -932,7 +932,7 @@ async fn run_runtime(
             .danger_accept_invalid_certs(true)
             .build()
             .unwrap_or_default();
-        Some(tokio::spawn(dav::push_send::run_push_sender(
+        Some(tokio::spawn(dav::push::run_push_sender(
             push_rx, push_store, push_vapid, push_http,
         )))
     } else {

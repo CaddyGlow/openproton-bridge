@@ -2034,19 +2034,25 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 name = "gluon-rs-calendar"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "gluon-rs-dav",
  "rusqlite",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
 name = "gluon-rs-contacts"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "gluon-rs-dav",
  "rusqlite",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -2061,6 +2067,23 @@ dependencies = [
  "thiserror 2.0.18",
  "uuid",
  "zeroize",
+]
+
+[[package]]
+name = "gluon-rs-dav"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "rcgen",
+ "regex",
+ "rustls",
+ "rustls-pemfile",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
 ]
 
 [[package]]
@@ -3516,6 +3539,7 @@ dependencies = [
  "fs2",
  "gluon-rs-calendar",
  "gluon-rs-contacts",
+ "gluon-rs-dav",
  "gluon-rs-mail",
  "hkdf",
  "hmac",

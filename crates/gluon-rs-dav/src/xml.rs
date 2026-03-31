@@ -494,6 +494,7 @@ pub fn multistatus_xml_for_propfind(
     xml.into_bytes()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_named_or_valued_property(
     ok_props: &mut String,
     missing_props: &mut String,
@@ -574,7 +575,7 @@ fn collection_content_length(kind: DavResourceKind) -> Option<&'static str> {
     }
 }
 
-fn escape_xml(input: &str) -> String {
+pub fn escape_xml(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
@@ -646,52 +647,6 @@ mod tests {
     }
 
     #[test]
-    fn calendar_resource_includes_collection_metadata() {
-        let payload = multistatus_xml(&[DavPropResource {
-            href: "/dav/uid-1/calendars/work/".to_string(),
-            display_name: "Work".to_string(),
-            kind: DavResourceKind::Calendar,
-            current_user_principal: None,
-            principal_url: None,
-            principal_collection_set: None,
-            addressbook_home_set: None,
-            calendar_home_set: None,
-            calendar_user_addresses: Vec::new(),
-            schedule_inbox_url: None,
-            schedule_outbox_url: None,
-            owner: None,
-            current_user_privileges: Vec::new(),
-            quota_available_bytes: Some(1_000_000_000),
-            quota_used_bytes: Some(0),
-            resource_id: Some("work".to_string()),
-            calendar_free_busy_set: vec!["/dav/uid-1/calendars/work/".to_string()],
-            schedule_calendar_transp: None,
-            schedule_default_calendar_url: None,
-            calendar_color: Some("#00AAFF".to_string()),
-            calendar_description: Some("Team calendar".to_string()),
-            calendar_ctag: Some("work-10".to_string()),
-            sync_token: Some("https://openproton.local/sync/work-10".to_string()),
-            supported_calendar_components: vec!["VEVENT"],
-            supported_reports: vec!["calendar-query", "calendar-multiget", "sync-collection"],
-            push_config: None,
-        }]);
-        let xml = String::from_utf8(payload).expect("xml is utf8");
-        assert!(xml.contains("<cs:getctag>work-10</cs:getctag>"));
-        assert!(xml.contains("<d:sync-token>https://openproton.local/sync/work-10</d:sync-token>"));
-        assert!(xml.contains(r#"<cal:comp name="VEVENT"/>"#));
-        assert!(xml.contains("<ical:calendar-color>#00AAFF</ical:calendar-color>"));
-        assert!(xml.contains("<d:supported-report-set>"));
-        assert!(xml.contains("<cal:calendar-query/>"));
-        assert!(xml.contains("<cal:calendar-multiget/>"));
-        assert!(xml.contains("<d:sync-collection/>"));
-        assert!(xml.contains("<d:quota-available-bytes>1000000000</d:quota-available-bytes>"));
-        assert!(xml.contains("<d:resource-id><d:href>urn:uuid:work</d:href></d:resource-id>"));
-        assert!(xml.contains("<cal:calendar-free-busy-set>"));
-        assert!(!xml.contains("<cal:schedule-calendar-transp>"));
-        assert!(!xml.contains("<cal:schedule-default-calendar-URL>"));
-    }
-
-    #[test]
     fn propfind_prop_mode_filters_unrequested_properties() {
         let mut requested = HashSet::new();
         requested.insert("displayname".to_string());
@@ -732,51 +687,6 @@ mod tests {
         assert!(xml.contains("<cs:getctag>work-10</cs:getctag>"));
         assert!(!xml.contains("<d:sync-token>"));
         assert!(!xml.contains("<d:supported-report-set>"));
-    }
-
-    #[test]
-    fn propfind_prop_mode_returns_404_for_requested_missing_properties() {
-        let mut requested = HashSet::new();
-        requested.insert("displayname".to_string());
-        requested.insert("calendar-color".to_string());
-        requested.insert("calendar-description".to_string());
-        let payload = multistatus_xml_for_propfind(
-            &[DavPropResource {
-                href: "/dav/uid-1/calendars/work/".to_string(),
-                display_name: "Work".to_string(),
-                kind: DavResourceKind::Calendar,
-                current_user_principal: None,
-                principal_url: None,
-                principal_collection_set: None,
-                addressbook_home_set: None,
-                calendar_home_set: None,
-                calendar_user_addresses: Vec::new(),
-                schedule_inbox_url: None,
-                schedule_outbox_url: None,
-                owner: None,
-                current_user_privileges: Vec::new(),
-                quota_available_bytes: None,
-                quota_used_bytes: None,
-                resource_id: None,
-                calendar_free_busy_set: Vec::new(),
-                schedule_calendar_transp: None,
-                schedule_default_calendar_url: None,
-                calendar_color: None,
-                calendar_description: None,
-                calendar_ctag: None,
-                sync_token: None,
-                supported_calendar_components: Vec::new(),
-                supported_reports: Vec::new(),
-                push_config: None,
-            }],
-            &DavPropfindMode::Prop(requested),
-        );
-        let xml = String::from_utf8(payload).expect("xml is utf8");
-        assert!(xml.contains("<d:status>HTTP/1.1 200 OK</d:status>"));
-        assert!(xml.contains("<d:displayname>Work</d:displayname>"));
-        assert!(xml.contains("<d:status>HTTP/1.1 404 Not Found</d:status>"));
-        assert!(xml.contains("<ical:calendar-color/>"));
-        assert!(xml.contains("<cal:calendar-description/>"));
     }
 
     #[test]

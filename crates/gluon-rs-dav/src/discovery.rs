@@ -1,4 +1,4 @@
-use super::http::DavResponse;
+use crate::http::DavResponse;
 
 pub const DAV_ROOT_PATH: &str = "/";
 pub const WELL_KNOWN_CARDDAV: &str = "/.well-known/carddav";

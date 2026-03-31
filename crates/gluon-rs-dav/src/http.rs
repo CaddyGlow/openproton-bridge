@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::{DavError, Result};
+use crate::error::{DavError, Result};
 
 const MAX_REQUEST_SIZE: usize = 16 * 1024;
 
@@ -117,6 +117,79 @@ pub fn not_implemented_response() -> DavResponse {
             ),
         ],
         body: b"DAV support is not implemented yet\n".to_vec(),
+    }
+}
+
+pub fn options_response() -> DavResponse {
+    DavResponse {
+        status: "200 OK",
+        headers: vec![
+            (
+                "DAV",
+                "1, 2, calendar-access, addressbook, sync-collection, webdav-push".to_string(),
+            ),
+            (
+                "Allow",
+                "OPTIONS, PROPFIND, PROPPATCH, REPORT, MKCALENDAR, GET, HEAD, PUT, DELETE, POST"
+                    .to_string(),
+            ),
+            ("Content-Type", "text/plain; charset=utf-8".to_string()),
+        ],
+        body: b"OpenProton DAV\n".to_vec(),
+    }
+}
+
+pub fn unauthorized_response() -> DavResponse {
+    DavResponse {
+        status: "401 Unauthorized",
+        headers: vec![
+            (
+                "WWW-Authenticate",
+                "Basic realm=\"openproton-bridge\"".to_string(),
+            ),
+            ("Content-Type", "text/plain; charset=utf-8".to_string()),
+        ],
+        body: b"authentication required\n".to_vec(),
+    }
+}
+
+pub fn not_found_response() -> DavResponse {
+    DavResponse {
+        status: "404 Not Found",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"not found\n".to_vec(),
+    }
+}
+
+pub fn forbidden_response() -> DavResponse {
+    DavResponse {
+        status: "403 Forbidden",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"forbidden\n".to_vec(),
+    }
+}
+
+pub fn service_unavailable_response() -> DavResponse {
+    DavResponse {
+        status: "503 Service Unavailable",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"account store unavailable\n".to_vec(),
+    }
+}
+
+pub fn payload_too_large_response() -> DavResponse {
+    DavResponse {
+        status: "413 Payload Too Large",
+        headers: vec![("Content-Type", "text/plain; charset=utf-8".to_string())],
+        body: b"request body too large\n".to_vec(),
+    }
+}
+
+pub fn finite_depth_required_response() -> DavResponse {
+    DavResponse {
+        status: "403 Forbidden",
+        headers: vec![("Content-Type", "application/xml; charset=utf-8".to_string())],
+        body: br#"<?xml version="1.0" encoding="utf-8"?><d:error xmlns:d="DAV:"><d:propfind-finite-depth/></d:error>"#.to_vec(),
     }
 }
 

@@ -6,7 +6,7 @@ use openproton_bridge::api::calendar::Calendar;
 use openproton_bridge::api::types::{ApiMode, Session};
 use openproton_bridge::bridge::accounts::AccountRegistry;
 use openproton_bridge::bridge::auth_router::AuthRouter;
-use openproton_bridge::dav::server::{run_server_with_listener_and_config, DavServerConfig};
+use openproton_bridge::dav::server::{run_server_with_listener_and_config, DavSetup};
 use openproton_bridge::pim::store::PimStore;
 use tokio::net::TcpListener;
 
@@ -49,13 +49,14 @@ async fn main() -> anyhow::Result<()> {
 
     let mut pim_stores = HashMap::new();
     pim_stores.insert("uid-1".to_string(), store);
-    let config = DavServerConfig {
+    let setup = DavSetup {
         auth_router: AuthRouter::new(AccountRegistry::from_single_session(session)),
         pim_stores,
         runtime_accounts: None,
         push_subscriptions: None,
         vapid_keys: None,
     };
+    let config = setup.into_server_config();
 
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     eprintln!("DAV harness listening on http://127.0.0.1:{port}");

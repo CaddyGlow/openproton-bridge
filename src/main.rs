@@ -3160,7 +3160,7 @@ fn dav_calendar_home_url(
         dav_url_scheme(dav_tls_mode),
         bind,
         dav_port,
-        dav::discovery::calendar_home_path(account_id)
+        gluon_rs_dav::discovery::calendar_home_path(account_id)
     )
 }
 

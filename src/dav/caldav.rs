@@ -9,10 +9,11 @@ use crate::bridge::auth_router::AuthRoute;
 use crate::pim::store::PimStore;
 use crate::pim::{CalendarEventRange, QueryPage};
 
+use gluon_rs_dav::etag;
+use gluon_rs_dav::http::DavResponse;
+use gluon_rs_dav::{DavError, Result};
+
 use super::calendar_crypto;
-use super::etag;
-use super::http::DavResponse;
-use super::{DavError, Result};
 
 pub async fn handle_request(
     method: &str,

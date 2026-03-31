@@ -68,6 +68,36 @@ impl ContactsStore {
         Ok(raw_json)
     }
 
+    pub fn get_contact_card_data(
+        &self,
+        contact_id: &str,
+        include_deleted: bool,
+    ) -> Result<Option<String>> {
+        if contact_id.trim().is_empty() {
+            return Ok(None);
+        }
+        let conn = open_read_connection(self)?;
+        // Only return cards for non-deleted contacts (or all if include_deleted)
+        let exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM contacts WHERE id = ?1 AND (?2 = 1 OR deleted = 0)",
+                rusqlite::params![contact_id, bool_to_sql(include_deleted)],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            return Ok(None);
+        }
+        let card_data = conn
+            .query_row(
+                "SELECT data FROM contact_cards WHERE contact_id = ?1 ORDER BY card_index ASC LIMIT 1",
+                rusqlite::params![contact_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(card_data)
+    }
+
     pub fn search_contacts_by_email(
         &self,
         email_like: &str,

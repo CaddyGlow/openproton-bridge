@@ -38,6 +38,18 @@ impl PimStore {
         &self.calendar
     }
 
+    pub fn contacts_store_for_dav(&self) -> Option<std::sync::Arc<ContactsStore>> {
+        ContactsStore::new(self.contacts.db_path().to_path_buf())
+            .ok()
+            .map(std::sync::Arc::new)
+    }
+
+    pub fn calendar_store_for_dav(&self) -> Option<std::sync::Arc<CalendarStore>> {
+        CalendarStore::new(self.calendar.db_path().to_path_buf())
+            .ok()
+            .map(std::sync::Arc::new)
+    }
+
     // -- Contact mutations --
 
     pub fn upsert_contact(&self, contact: &contacts::Contact) -> Result<()> {

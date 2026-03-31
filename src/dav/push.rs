@@ -16,8 +16,8 @@ use tokio::sync::broadcast;
 
 use crate::bridge::calendar_notify::CalendarChangeEvent;
 
-use super::http::DavResponse;
-use super::{DavError, Result};
+use gluon_rs_dav::http::DavResponse;
+use gluon_rs_dav::{DavError, Result};
 
 const DEFAULT_SUBSCRIPTION_TTL_SECS: i64 = 7 * 86400; // 7 days
 const _MIN_SUBSCRIPTION_TTL_SECS: i64 = 3 * 86400; // 3 days

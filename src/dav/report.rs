@@ -13,11 +13,12 @@ use crate::pim::store::PimStore;
 use crate::pim::sync_calendar;
 use crate::pim::{CalendarEventRange, QueryPage};
 
+use gluon_rs_dav::discovery;
+use gluon_rs_dav::etag;
+use gluon_rs_dav::http::DavResponse;
+use gluon_rs_dav::{DavError, Result};
+
 use super::calendar_crypto::{self, CalendarDecryptContext};
-use super::discovery;
-use super::etag;
-use super::http::DavResponse;
-use super::{DavError, Result};
 
 const CALDAV_EMPTY_SYNC_BACKFILL_COOLDOWN: Duration = Duration::from_secs(300);
 

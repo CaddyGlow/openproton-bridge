@@ -70,6 +70,7 @@ hmac = "0.12"
 uuid = { version = "1", features = ["v4"] }
 sha1 = "0.10"
 base32 = "0.5"
+gluon-rs-dav = { path = "crates/gluon-rs-dav" }
 gluon-rs-mail = { path = "crates/gluon-rs-mail" }
 gluon-rs-contacts = { path = "crates/gluon-rs-contacts" }
 gluon-rs-calendar = { path = "crates/gluon-rs-calendar" }
@@ -122,6 +123,7 @@ opt-level = 2
 [workspace]
 members = [
     "crates/gluon-rs-core",
+    "crates/gluon-rs-dav",
     "crates/gluon-rs-mail",
     "crates/gluon-rs-contacts",
     "crates/gluon-rs-calendar",

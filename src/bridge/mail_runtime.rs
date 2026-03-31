@@ -911,13 +911,14 @@ async fn run_runtime(
     let vapid_keys = Arc::new(dav::push::VapidKeyPair::generate());
 
     let mut dav_task = dav_listener.map(|listener| {
-        let config = dav::server::DavServerConfig {
+        let setup = dav::server::DavSetup {
             auth_router: dav_auth_router,
             pim_stores: dav_pim_stores,
             runtime_accounts: Some(runtime_accounts.clone()),
             push_subscriptions: Some(push_subscription_store.clone()),
             vapid_keys: Some(vapid_keys.clone()),
         };
+        let config = setup.into_server_config();
         tokio::spawn(async move {
             dav::server::run_server_with_listener_and_config(listener, config).await
         })

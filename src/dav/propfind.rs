@@ -9,14 +9,15 @@ use crate::pim::store::PimStore;
 use crate::pim::QueryPage;
 use crate::pim::StoredCalendar;
 
-use super::discovery;
-use super::http::DavResponse;
-use super::push::VapidKeyPair;
-use super::xml::{
+use gluon_rs_dav::discovery;
+use gluon_rs_dav::http::DavResponse;
+use gluon_rs_dav::xml::{
     multistatus_xml_for_propfind, DavPropResource, DavPropfindMode, DavResourceKind,
     WebDavPushConfig,
 };
-use super::{DavError, Result};
+use gluon_rs_dav::{DavError, Result};
+
+use super::push::VapidKeyPair;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavDepth {

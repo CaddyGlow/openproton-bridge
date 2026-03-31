@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 
-use crate::bridge::auth_router::AuthRoute;
-use crate::bridge::auth_router::AuthRouter;
+use crate::types::AuthContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DavAuthError {
@@ -13,10 +12,17 @@ pub enum DavAuthError {
     InvalidCredentials,
 }
 
+/// Trait for resolving DAV authentication.
+///
+/// Implemented by the main crate to map bridge passwords to account sessions.
+pub trait DavAuthenticator: Send + Sync {
+    fn resolve_login(&self, username: &str, password: &str) -> Option<AuthContext>;
+}
+
 pub fn resolve_basic_auth(
     headers: &HashMap<String, String>,
-    auth_router: &AuthRouter,
-) -> std::result::Result<AuthRoute, DavAuthError> {
+    authenticator: &dyn DavAuthenticator,
+) -> std::result::Result<AuthContext, DavAuthError> {
     let Some(authorization) = headers.get("authorization") else {
         tracing::trace!(
             header_present = false,
@@ -73,13 +79,13 @@ pub fn resolve_basic_auth(
         "dav auth check: parsed basic credentials"
     );
 
-    let route = auth_router
+    let context = authenticator
         .resolve_login(username, password)
         .ok_or(DavAuthError::InvalidCredentials);
-    match &route {
+    match &context {
         Ok(resolved) => tracing::trace!(
             username = username,
-            account_id = resolved.account_id.0,
+            account_id = resolved.account_id,
             "dav auth check: credentials resolved"
         ),
         Err(_) => tracing::trace!(
@@ -87,7 +93,7 @@ pub fn resolve_basic_auth(
             "dav auth check: credentials did not match any active account"
         ),
     }
-    route
+    context
 }
 
 #[cfg(test)]
@@ -97,45 +103,39 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine;
 
-    use crate::api::types::Session;
-    use crate::bridge::accounts::AccountRegistry;
-    use crate::bridge::auth_router::AuthRouter;
+    use crate::types::AuthContext;
 
-    use super::{resolve_basic_auth, DavAuthError};
+    use super::{resolve_basic_auth, DavAuthError, DavAuthenticator};
 
-    fn session(uid: &str, email: &str, bridge_password: &str) -> Session {
-        Session {
-            uid: uid.to_string(),
-            access_token: String::new(),
-            refresh_token: "refresh-token".to_string(),
-            email: email.to_string(),
-            display_name: email.to_string(),
-            api_mode: crate::api::types::ApiMode::Bridge,
-            key_passphrase: None,
-            bridge_password: Some(bridge_password.to_string()),
+    struct TestAuth;
+
+    impl DavAuthenticator for TestAuth {
+        fn resolve_login(&self, username: &str, password: &str) -> Option<AuthContext> {
+            if username == "alice@proton.me" && password == "secret" {
+                Some(AuthContext {
+                    account_id: "uid-1".to_string(),
+                    primary_email: "alice@proton.me".to_string(),
+                })
+            } else {
+                None
+            }
         }
     }
 
     #[test]
     fn resolves_valid_basic_auth_header() {
-        let router = AuthRouter::new(AccountRegistry::from_single_session(session(
-            "uid-1",
-            "alice@proton.me",
-            "secret",
-        )));
         let mut headers = HashMap::new();
         let encoded = BASE64_STANDARD.encode("alice@proton.me:secret");
         headers.insert("authorization".to_string(), format!("Basic {encoded}"));
 
-        let route = resolve_basic_auth(&headers, &router).expect("auth should pass");
-        assert_eq!(route.account_id.0, "uid-1");
+        let context = resolve_basic_auth(&headers, &TestAuth).expect("auth should pass");
+        assert_eq!(context.account_id, "uid-1");
     }
 
     #[test]
     fn rejects_missing_header() {
-        let router = AuthRouter::default();
         let headers = HashMap::new();
-        let err = resolve_basic_auth(&headers, &router).unwrap_err();
+        let err = resolve_basic_auth(&headers, &TestAuth).unwrap_err();
         assert_eq!(err, DavAuthError::MissingAuthorization);
     }
 }

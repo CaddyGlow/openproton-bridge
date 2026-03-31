@@ -1,27 +1,25 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::api::contacts::{Contact, ContactCard, ContactEmail, ContactMetadata};
-use crate::bridge::auth_router::AuthRoute;
-use crate::pim::store::PimStore;
-use crate::pim::QueryPage;
+use gluon_rs_dav::discovery;
+use gluon_rs_dav::etag;
+use gluon_rs_dav::http::DavResponse;
+use gluon_rs_dav::types::AuthContext;
+use gluon_rs_dav::{DavError, Result};
 
-use super::discovery;
-use super::etag;
-use super::http::DavResponse;
-use super::{DavError, Result};
+use crate::store::ContactsStore;
+use crate::types::{ContactCardUpsert, ContactEmailUpsert, ContactUpsert, QueryPage};
 
 pub fn handle_request(
     method: &str,
     raw_path: &str,
     headers: &HashMap<String, String>,
     body: &[u8],
-    auth: &AuthRoute,
-    store: &Arc<PimStore>,
+    auth: &AuthContext,
+    store: &ContactsStore,
 ) -> Result<Option<DavResponse>> {
     let path = normalize_path(raw_path);
-    let collection = discovery::default_addressbook_path(&auth.account_id.0);
+    let collection = discovery::default_addressbook_path(&auth.account_id);
     if path == collection {
         return match method {
             "GET" | "HEAD" => {
@@ -55,12 +53,9 @@ pub fn handle_request(
             let Some(stored) = stored else {
                 return Ok(Some(not_found_response()));
             };
-            let payload = store
-                .get_contact_payload(&contact_id, false)
-                .map_err(|err| DavError::Backend(err.to_string()))?;
-            let vcard = payload
-                .as_ref()
-                .and_then(|contact| contact.cards.first().map(|card| card.data.clone()))
+            let vcard = store
+                .get_contact_card_data(&contact_id, false)
+                .map_err(|err| DavError::Backend(err.to_string()))?
                 .unwrap_or_else(|| synthesize_vcard(&stored.uid, &stored.name, None));
             let etag_value = etag::from_updated_ms(&stored.id, stored.updated_at_ms);
             let mut response = DavResponse {
@@ -160,7 +155,7 @@ fn parse_contact_resource_id(collection: &str, path: &str) -> Option<String> {
     }
 }
 
-fn parse_vcard(id: &str, raw: &str, create_time: i64, modify_time: i64) -> Contact {
+pub fn parse_vcard(id: &str, raw: &str, create_time: i64, modify_time: i64) -> ContactUpsert {
     let mut uid = None;
     let mut full_name = None;
     let mut email = None;
@@ -188,36 +183,35 @@ fn parse_vcard(id: &str, raw: &str, create_time: i64, modify_time: i64) -> Conta
     let uid = uid.unwrap_or_else(|| format!("uid-{id}"));
     let full_name = full_name.unwrap_or_else(|| id.to_string());
     let email = email.unwrap_or_else(|| format!("{id}@invalid"));
-    Contact {
-        metadata: ContactMetadata {
-            id: id.to_string(),
-            name: full_name.clone(),
-            uid,
-            size: raw.len() as i64,
-            create_time,
-            modify_time,
-            contact_emails: vec![ContactEmail {
-                id: format!("email-{id}"),
-                email,
-                name: full_name,
-                kind: vec!["OTHER".to_string()],
-                defaults: None,
-                order: None,
-                contact_id: id.to_string(),
-                label_ids: vec![],
-                last_used_time: None,
-            }],
-            label_ids: vec![],
-        },
-        cards: vec![ContactCard {
+    ContactUpsert {
+        id: id.to_string(),
+        uid,
+        name: full_name.clone(),
+        size: raw.len() as i64,
+        create_time,
+        modify_time,
+        raw_json: String::new(),
+        cards: vec![ContactCardUpsert {
             card_type: 0,
             data: raw.to_string(),
             signature: None,
         }],
+        emails: vec![ContactEmailUpsert {
+            id: format!("email-{id}"),
+            contact_id: id.to_string(),
+            email,
+            name: full_name,
+            kind_json: r#"["OTHER"]"#.to_string(),
+            defaults: None,
+            order: None,
+            label_ids_json: "[]".to_string(),
+            last_used_time: None,
+            raw_json: String::new(),
+        }],
     }
 }
 
-fn synthesize_vcard(uid: &str, full_name: &str, email: Option<&str>) -> String {
+pub fn synthesize_vcard(uid: &str, full_name: &str, email: Option<&str>) -> String {
     let email_line = email
         .map(|value| format!("EMAIL:{value}\n"))
         .unwrap_or_default();
@@ -266,8 +260,8 @@ mod tests {
             1,
             2,
         );
-        assert_eq!(contact.metadata.uid, "uid-1");
-        assert_eq!(contact.metadata.name, "Alice");
-        assert_eq!(contact.metadata.contact_emails[0].email, "alice@proton.me");
+        assert_eq!(contact.uid, "uid-1");
+        assert_eq!(contact.name, "Alice");
+        assert_eq!(contact.emails[0].email, "alice@proton.me");
     }
 }
